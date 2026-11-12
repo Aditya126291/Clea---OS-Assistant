@@ -1,56 +1,78 @@
-# Clea Architecture (Milestone 1)
+# Clea Architecture (Milestone 1 + Phase 2 Desktop UI)
 
-Clea uses a **hub-and-spoke** architecture designed for a local, voice-first personal desktop assistant. Milestone 1 establishes the text-only core foundation.
+Clea uses a **hub-and-spoke** architecture designed for a local, voice-first personal desktop assistant. Milestone 1 established the text-only Python core; Phase 2 adds handshake security, interactive tool approvals, read-only memory/conversation queries, and the web + Electron desktop UI.
 
 ## System Topology
 
 ```
-+---------------------------+        ws://127.0.0.1:8765        +---------------------------+
-| Surface: CLI (`clea chat`) | <==============================> | Core Daemon (`clea daemon`) |
-| (imports protocol only)   |   Request / Event / Response JSON |                           |
-+---------------------------+                                   |  - SessionManager         |
-                                                                |  - AgentLoop              |
-  Future surfaces:                                              |  - ToolRegistry + Audit   |
-  - Voice process                                               |  - MemoryStore (Markdown) |
-  - Desktop UI                                                  |  - LLMProvider (Gemini)   |
-                                                                +---------------------------+
-                                                                              |
-                                                                              v
-                                                                OS User Data Dir (platformdirs)
-                                                                - MEMORY.md
-                                                                - memory/YYYY-MM-DD.md
-                                                                - logs/audit.jsonl
++-----------------------------------+
+| Surface: CLI (`clea chat`)        |
+| (protocol + auth only)            |----+
++-----------------------------------+    |
+                                         |  ws://127.0.0.1:8765
++-----------------------------------+    |  Sec-WebSocket-Protocol:
+| Surface: Desktop UI (`ui/`)       |    |    clea.v1, clea.token.<token>
+| - Browser dev: http://127.0.0.1:5173   |
+| - Electron app: clea-app://app    |----+----> +---------------------------+
+|   (Main window, Tray, Quick Ask)  |           | Core Daemon (`clea daemon`) |
++-----------------------------------+           | - Auth + Origin Allowlist |
+                                                | - SessionManager          |
+                                                | - AgentLoop               |
+                                                | - ToolRegistry + Audit    |
+                                                | - MemoryStore (Markdown)  |
+                                                | - LLMProvider (Gemini)    |
+                                                +---------------------------+
+                                                              |
+                                                              v
+                                                OS User Data Dir (platformdirs)
+                                                - session_token (per-run)
+                                                - desktop_config.json (optional)
+                                                - MEMORY.md
+                                                - memory/YYYY-MM-DD.md
+                                                - logs/audit.jsonl
 ```
 
 ## Components
 
-### 1. Typed WebSocket Protocol (`src/clea/core/protocol.py`)
-- Defines three Pydantic v2 frame types discriminated by `frame_type`:
-  - `RequestFrame` (`chat.send`, `session.new`, `health.ping`)
-  - `ResponseFrame` (`ok`, `result`, `error`, matched by request `id`)
-  - `EventFrame` (`text.delta`, `tool.start`, `tool.end`, `turn.done`, `error`)
-- Contains zero imports from core internals so surfaces remain decoupled.
+### 1. Typed WebSocket Protocol (`src/clea/core/protocol.py` & `scripts/gen_ts_types.py`)
+- Defines strict Pydantic v2 discriminated-union frames (`extra="forbid"`):
+  - **Requests** (`RequestFrame`, discriminated by `method`): `health.ping`, `session.new`, `chat.send`, `approval.respond`, `memory.get`, `memory.get_daily`, `conversations.list`, `conversations.get`, `settings.get`.
+  - **Responses** (`ResponseFrame`): paired by request `id`, carrying typed result models (`METHOD_RESULTS`).
+  - **Events** (`EventFrame`, discriminated by `event`): `assistant_token`, `tool_call_started`, `tool_call_finished`, `approval_requested`, `approval_resolved`, `task_status`, `voice_state` (`idle | listening | thinking | speaking`), `error`.
+- `scripts/gen_ts_types.py` compiles the Pydantic JSON Schema into `ui/src/protocol/generated.ts` via `json-schema-to-typescript` (`--check` fails on drift).
 
-### 2. Core Daemon & Agent Loop (`src/clea/core/`)
-- **`daemon.py` (`CleaDaemon`)**: Binds strictly to `127.0.0.1` (`localhost` / `::1`) using `websockets`. Rejects non-localhost bind addresses.
-- **`sessions.py` (`SessionManager`)**: Holds per-session conversation history (`Message` list) in memory.
-- **`agent.py` (`AgentLoop`)**: Prepends `MEMORY.md` to the system instruction, streams tokens from `LLMProvider`, executes any requested tools via `ToolRegistry`, feeds tool results back into the conversation loop, and persists each completed turn to the daily Markdown log.
+### 2. Core Daemon & Handshake Security (`src/clea/core/daemon.py`, `src/clea/core/auth.py`)
+- **`CleaDaemon`**: Binds strictly to `127.0.0.1` (`localhost` / `::1`) using `websockets`.
+- **Auth & Origin Check (`process_request`)**:
+  - Generates a fresh 256-bit token (`secrets.token_urlsafe`) on every daemon start, writes it to `<user_data_dir>/session_token` (`0600` best-effort), and removes it on graceful stop.
+  - Validates local `Host` header (DNS-rebinding defense), `Origin` against `CLEA_ALLOWED_ORIGINS` (defaults: `http://localhost:5173`, `http://127.0.0.1:5173`, `clea-app://app`; wildcards and `null` are rejected), and `Sec-WebSocket-Protocol` token via `hmac.compare_digest`.
+- **Concurrent Turns & Approvals**:
+  - Each `chat.send` runs as an asyncio task so the connection receive loop stays live for `approval.respond`.
+  - Pending approvals resolve on user response, timeout (defaults to `deny`), or disconnect (cancelled).
 
-### 3. Tool Registry & Permissions (`src/clea/tools/`)
-- **`registry.py` (`ToolRegistry`)**: Registers tools with `name`, `description`, JSON Schema `input_schema` (exportable in MCP format via `to_mcp_tool()`), and `RiskLevel` (`read_only`, `reversible`, `destructive`).
-- Refuses `destructive` tools with `PermissionDeniedError` unless an explicit confirmation callback returns `True`.
-- **`AuditLogger`**: Appends a JSONL record to `<user_data_dir>/logs/audit.jsonl` for every tool invocation (allowed, denied, or errored).
-- **`system_info.py`**: Provides `get_system_info` (`read_only`), returning local time/timezone and basic host OS details.
+### 3. Tool Registry & Permissions (`src/clea/tools/registry.py`)
+- **`RiskLevel`**: `read_only` (auto-allowed), `reversible` (asks confirmation), `destructive` (asks confirmation + explicit second click in UI / explicit `yes` in CLI).
+- **`AuditLogger`**: Appends a JSONL record to `<user_data_dir>/logs/audit.jsonl` for every tool invocation (`ok`, `denied`, `error`).
 
-### 4. Memory Store (`src/clea/memory/store.py`)
-- Stores human-readable Markdown outside the repository under `platformdirs.user_data_dir("clea", appauthor=False)` (overridable via `CLEA_DATA_DIR`):
-  - `MEMORY.md`: long-term memory loaded into the system prompt.
-  - `memory/YYYY-MM-DD.md`: append-only daily conversation logs.
+### 4. Memory Store (`src/clea/memory/store.py` & `src/clea/paths.py`)
+- Stores `MEMORY.md` and `memory/YYYY-MM-DD.md` outside the repo under `platformdirs.user_data_dir("clea", appauthor=False)` (or `CLEA_DATA_DIR`).
+- Provides read-only `list_days()`, `read_daily_on()` (with strict `YYYY-MM-DD` validation), `list_conversations()`, and `get_conversation()` exposed over the daemon protocol.
 
-### 5. LLM Provider Interface (`src/clea/providers/`)
-- **`base.py` (`LLMProvider`)**: Abstract streaming interface (`stream_turn`) using provider-agnostic `Message`, `ToolCall`, and `StreamChunk` models.
-- **`gemini.py` (`GeminiProvider`)**: Implements `LLMProvider` on top of the `google-genai` Interactions API (`gemini-3.8-flash` by default, `store=False`).
+### 5. Desktop UI (`ui/`)
+- **Pure Client**: React 19, TypeScript, Vite 8, Tailwind CSS v4, shadcn-style primitives + `cmdk`, Zustand (`ui/src/protocol/store.ts`), `CleaClient` with exponential backoff + jitter (`ui/src/protocol/client.ts`).
+- **Screens**:
+  - **Chat**: streaming Markdown (`react-markdown` + `remark-gfm`), collapsible tool cards, inline approval cards (two-click confirmation for `destructive`), `Enter` send / `Shift+Enter` newline.
+  - **Sidebar & Command Palette (`Ctrl/Cmd+K`)**: navigation to Chat, Activity, Memory, Settings; read-only historical conversations grouped by date; system/dark/light theme toggle.
+  - **Activity**: live/completed `task_status` list.
+  - **Memory**: read-only `MEMORY.md` and daily logs fetched from the daemon.
+  - **Settings**: non-secret daemon status, provider/model, permission tiers, registered tools.
+  - **Call Overlay**: floating glass orb driven by `voice_state` events (`prefers-reduced-motion` respected). Dev-only simulation panel (`DevVoiceMockPanel.tsx`) is dynamically imported only under `import.meta.env.DEV && VITE_CLEA_MOCKS === "true"` and excluded from production builds.
+  - **Daemon Offline Screen**: clear startup instructions (`uv run clea daemon`) and auto-reconnect.
+- **Browser Dev Token (`ui/dev-token-plugin.ts`)**: dev-only Vite plugin serving `/__clea/token` to localhost Host/Origin with `Cache-Control: no-store` and no CORS headers; excluded from production builds.
 
-### 6. Terminal Surface (`src/clea/surfaces/cli/main.py`)
-- Provides `clea daemon` and `clea chat`.
-- `clea chat` communicates exclusively via `clea.core.protocol` over `ws://127.0.0.1:8765`, streaming `text.delta` events live to stdout.
+### 6. Electron Shell (`ui/electron/`)
+- Built with `electron-vite`. Does not bundle or auto-start the daemon.
+- **Hardening**: `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`, `webSecurity: true`, strict CSP, navigation and `window.open` blocked.
+- **Custom Protocol (`clea-app://app`)**: registered as `standard` + `secure` with Fetch/WebSocket support, strictly scoped to `out/renderer/` (rejects path traversal).
+- **Preload (`ui/electron/preload.ts`)**: exposes only `isElectron`, `getConnection()`, `onQuickAskFocus()`, and `closeQuickAsk()`.
+- **System Tray & Quick Ask**: Tray menu (`Open`, `Quick Ask`, `Quit`), close-to-tray behavior, and a configurable global shortcut (default `CommandOrControl+Alt+Space`, overridable via `<user_data_dir>/desktop_config.json`) opening an always-on-top glass Quick-Ask window.
