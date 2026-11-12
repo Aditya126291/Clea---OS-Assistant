@@ -29,8 +29,7 @@ _LOCALHOST_ONLY = {"127.0.0.1", "localhost", "::1"}
 def _validate_localhost(host: str) -> str:
     if host not in _LOCALHOST_ONLY:
         raise ValueError(
-            f"Refusing to bind Clea daemon to non-localhost address '{host}'. "
-            "Use 127.0.0.1 only."
+            f"Refusing to bind Clea daemon to non-localhost address '{host}'. Use 127.0.0.1 only."
         )
     return host
 
