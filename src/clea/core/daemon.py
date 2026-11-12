@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import logging.handlers
 import time
 from collections.abc import Awaitable, Iterable
 from datetime import UTC, datetime
@@ -117,6 +118,7 @@ class CleaDaemon:
         port: int = DEFAULT_PORT,
         token: str | None = None,
         token_file: Path | None = None,
+        lock_file: Path | None = None,
         allowed_origins: Iterable[str] | None = None,
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     ) -> None:
@@ -126,6 +128,8 @@ class CleaDaemon:
         self.sessions = sessions or SessionManager()
         self.token = token or auth.generate_token()
         self.token_file = token_file or auth.token_path(agent.memory.base_dir)
+        self.lock_file = lock_file or auth.lock_path(agent.memory.base_dir)
+        self._instance_lock = auth.InstanceLock(self.lock_file)
         self.allowed_origins = (
             auth.normalize_origins(allowed_origins)
             if allowed_origins is not None
@@ -143,31 +147,36 @@ class CleaDaemon:
         return self.port
 
     async def start(self) -> None:
-        """Start listening for localhost WebSocket connections and write the session token."""
+        """Acquire single-instance lock, listen on localhost, and write the session token."""
         self.agent.memory.ensure_initialized()
-        self._server = await serve(
-            self._handle_connection,
-            self.host,
-            self.port,
-            process_request=self._authenticate,
-            select_subprotocol=self._select_subprotocol,
-        )
+        self._instance_lock.acquire(host=self.host, port=self.port)
         try:
+            self._server = await serve(
+                self._handle_connection,
+                self.host,
+                self.port,
+                process_request=self._authenticate,
+                select_subprotocol=self._select_subprotocol,
+            )
+            self._instance_lock.update_port(host=self.host, port=self.bound_port)
             auth.write_token(self.token, self.token_file)
         except Exception:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+            if self._server is not None:
+                self._server.close()
+                await self._server.wait_closed()
+                self._server = None
+            self._instance_lock.release()
             raise
         logger.info("Clea daemon listening on ws://%s:%d", self.host, self.bound_port)
 
     async def stop(self) -> None:
-        """Gracefully close the WebSocket server and remove the token file."""
+        """Gracefully close the WebSocket server and remove the token and lock files."""
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
         auth.remove_token(self.token_file, self.token)
+        self._instance_lock.release()
 
     async def serve_forever(self) -> None:
         """Start the daemon and run until cancelled."""
@@ -543,6 +552,7 @@ def build_daemon(
     registry: ToolRegistry | None = None,
     token: str | None = None,
     token_file: Path | None = None,
+    lock_file: Path | None = None,
     allowed_origins: Iterable[str] | None = None,
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
 ) -> CleaDaemon:
@@ -563,20 +573,54 @@ def build_daemon(
         port=port,
         token=token,
         token_file=token_file,
+        lock_file=lock_file,
         allowed_origins=allowed_origins,
         approval_timeout=approval_timeout,
     )
 
 
-def run_daemon(*, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
-    """Blocking entrypoint used by ``clea daemon``."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+def daemon_log_path(data_dir: Path | None = None) -> Path:
+    """Return the path to the rotating background daemon log file."""
+    mem = MemoryStore(base_dir=data_dir)
+    return mem.base_dir / "logs" / "daemon.log"
+
+
+def configure_daemon_logging(*, background: bool, data_dir: Path | None = None) -> Path | None:
+    """Configure console logging (foreground) or rotating file logging (background)."""
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    if not background:
+        logging.basicConfig(level=logging.INFO, format=fmt)
+        return None
+
+    log_file = daemon_log_path(data_dir)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
     )
-    daemon = build_daemon(host=host, port=port)
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(daemon.serve_forever())
+    handler.setFormatter(logging.Formatter(fmt))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    return log_file
+
+
+def run_daemon(
+    *,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    background: bool = False,
+) -> None:
+    """Blocking entrypoint used by ``clea daemon``."""
+    configure_daemon_logging(background=background)
+    try:
+        daemon = build_daemon(host=host, port=port)
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(daemon.serve_forever())
+    except Exception:
+        if background:
+            logger.exception("Clea background daemon failed")
+        raise
 
 
 def get_daemon_info() -> dict[str, Any]:
@@ -586,5 +630,6 @@ def get_daemon_info() -> dict[str, Any]:
         "data_dir": str(mem.base_dir),
         "daily_log": str(mem.daily_log_path()),
         "token_file": str(auth.token_path(mem.base_dir)),
+        "daemon_log": str(daemon_log_path(mem.base_dir)),
         "allowed_origins": sorted(auth.allowed_origins_from_env()),
     }

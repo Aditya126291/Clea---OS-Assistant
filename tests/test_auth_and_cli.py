@@ -41,6 +41,47 @@ def test_token_roundtrip_and_comparison(tmp_path: Path) -> None:
     assert not path.exists()
 
 
+def test_write_token_restricts_windows_acl_to_current_user(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    path = tmp_path / "session_token"
+    auth.write_token("tok-secret", path)
+    assert auth.read_token(path) == "tok-secret"
+
+    if sys.platform == "win32":
+        res = subprocess.run(["icacls", str(path)], capture_output=True, text=True, check=True)
+        acl_text = res.stdout.replace(str(path), "")
+        # Inheritance disabled and no broad inherited groups remain
+        assert "(I)" not in acl_text
+        assert "Everyone" not in acl_text
+        assert "Users" not in acl_text
+        assert ":(F)" in acl_text
+
+
+def test_cli_daemon_exits_cleanly_when_instance_lock_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("clea.surfaces.cli.main.load_dotenv", lambda: None)
+
+    lock = auth.InstanceLock(auth.lock_path(tmp_path))
+    lock.acquire(host="127.0.0.1", port=8765)
+    auth.write_token("running-tok", auth.token_path(tmp_path))
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["daemon", "--host", "127.0.0.1", "--port", "0"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "already running" in err
+        assert auth.read_token(auth.token_path(tmp_path)) == "running-tok"
+    finally:
+        lock.release()
+
+
 @pytest.mark.parametrize("bad_origin", ["*", "http://*", "null", "NULL", "localhost:5173"])
 def test_normalize_origins_rejects_unsafe_values(bad_origin: str) -> None:
     with pytest.raises(ValueError):

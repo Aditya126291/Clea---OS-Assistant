@@ -633,3 +633,65 @@ async def test_daemon_closes_server_if_write_token_fails(
         sock.bind(("127.0.0.1", reserved_port))
     finally:
         sock.close()
+
+
+async def test_daemon_single_instance_lock_prevents_second_start_and_preserves_token(
+    tmp_path: Path,
+) -> None:
+    first = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeToolCallingProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+    await first.start()
+    try:
+        second = build_daemon(
+            host="127.0.0.1",
+            port=0,
+            provider=FakeToolCallingProvider(),
+            memory=MemoryStore(base_dir=tmp_path),
+        )
+        with pytest.raises(auth.DaemonAlreadyRunningError, match="already running"):
+            await second.start()
+        assert auth.read_token(first.token_file) == first.token
+    finally:
+        await first.stop()
+
+    assert not first.lock_file.exists()
+
+    # After clean stop, another daemon can start using the same data dir.
+    third = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeToolCallingProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+    await third.start()
+    await third.stop()
+
+
+async def test_daemon_port_conflict_across_data_dirs_releases_second_lock(tmp_path: Path) -> None:
+    dir1 = tmp_path / "one"
+    dir2 = tmp_path / "two"
+    first = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeToolCallingProvider(),
+        memory=MemoryStore(base_dir=dir1),
+    )
+    await first.start()
+    try:
+        second = build_daemon(
+            host="127.0.0.1",
+            port=first.bound_port,
+            provider=FakeToolCallingProvider(),
+            memory=MemoryStore(base_dir=dir2),
+        )
+        with pytest.raises(OSError):
+            await second.start()
+        assert not second.lock_file.exists()
+        assert not second.token_file.exists()
+        assert auth.read_token(first.token_file) == first.token
+    finally:
+        await first.stop()
