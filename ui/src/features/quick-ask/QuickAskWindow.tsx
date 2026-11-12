@@ -53,8 +53,8 @@ export function QuickAskWindow() {
   const latestAssistant = [...messages].reverse().find((m) => m.role === "assistant");
 
   return (
-    <main className="flex h-full w-full items-stretch p-2">
-      <div className="clea-glass flex w-full flex-col rounded-2xl p-3 shadow-2xl">
+    <main className="flex h-full w-full items-start p-2">
+      <div className="clea-glass flex max-h-full w-full flex-col rounded-2xl p-3 shadow-2xl">
         <form
           className="flex items-center gap-2"
           onSubmit={(e) => {

@@ -55,6 +55,7 @@ export interface CleaStoreState {
   setActiveView: (view: AppView) => void;
   setCommandPaletteOpen: (open: boolean) => void;
   setCallOverlayOpen: (open: boolean) => void;
+  clearError: () => void;
 
   newSession: () => Promise<void>;
   sendMessage: (text: string) => Promise<void>;
@@ -73,6 +74,7 @@ export interface CleaStoreState {
 
 let activeClient: CleaClient | null = null;
 let localMsgSeq = 0;
+let sessionEpoch = 0;
 
 function nextRequestId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -144,8 +146,10 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     const client = new CleaClient({
       ...clientOptions,
       onConnected: () => {
-        set({ connectionState: "connected", reconnectAttempt: 0, lastError: null });
-        void get().newSession();
+        set({ connectionState: "connected", reconnectAttempt: 0, lastError: null, sending: false });
+        if (!get().sessionId) {
+          void get().newSession();
+        }
         void get().loadConversations();
         void get().loadSettings();
         clientOptions.onConnected?.();
@@ -186,20 +190,27 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   setActiveView: (view) => set({ activeView: view }),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
   setCallOverlayOpen: (open) => set({ callOverlayOpen: open }),
+  clearError: () => set({ lastError: null }),
 
   newSession: async () => {
+    const epoch = ++sessionEpoch;
+    set({
+      sessionId: null,
+      messages: [],
+      selectedConversation: null,
+      activeView: "chat",
+      sending: false,
+      lastError: null,
+    });
     if (!activeClient?.isConnected) return;
     try {
       const res = await activeClient.request("session.new", {});
-      set({
-        sessionId: res.session_id,
-        messages: [],
-        selectedConversation: null,
-        activeView: "chat",
-        sending: false,
-      });
+      if (epoch !== sessionEpoch || get().sessionId !== null) return;
+      set({ sessionId: res.session_id });
     } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
+      if (epoch === sessionEpoch) {
+        set({ lastError: err instanceof Error ? err.message : String(err) });
+      }
     }
   },
 
@@ -207,11 +218,17 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     const text = rawText.trim();
     if (!text || !activeClient?.isConnected) return;
 
+    const epoch = ++sessionEpoch;
     let sessionId = get().sessionId;
     if (!sessionId) {
-      const res = await activeClient.request("session.new", {});
-      sessionId = res.session_id;
-      set({ sessionId });
+      try {
+        const res = await activeClient.request("session.new", {});
+        sessionId = res.session_id;
+        set({ sessionId });
+      } catch (err) {
+        set({ lastError: err instanceof Error ? err.message : String(err) });
+        return;
+      }
     }
 
     const requestId = nextRequestId();
@@ -248,6 +265,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         { text },
         { id: requestId, sessionId, timeoutMs: 600_000 },
       );
+      if (epoch !== sessionEpoch) return;
       set((state) => ({
         sending: false,
         messages: state.messages.map((m) =>
@@ -262,6 +280,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       }));
       void get().loadConversations();
     } catch (err) {
+      if (epoch !== sessionEpoch) return;
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
         sending: false,
@@ -293,7 +312,17 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         { sessionId: get().sessionId },
       );
     } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
+      set((state) => ({
+        lastError: err instanceof Error ? err.message : String(err),
+        messages: state.messages.map((m) => ({
+          ...m,
+          approvals: m.approvals.map((a) =>
+            a.approvalId === approvalId && a.status === "submitting"
+              ? { ...a, status: "pending", decision: undefined }
+              : a,
+          ),
+        })),
+      }));
     }
   },
 

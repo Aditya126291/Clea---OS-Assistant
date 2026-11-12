@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { useCleaStore } from "@/protocol/store";
 import type { VoiceState } from "@/protocol/types";
 import { CallOverlay } from "./CallOverlay";
+import { DevVoiceMockPanel } from "./DevVoiceMockPanel";
 
 describe("CallOverlay", () => {
   beforeEach(() => {
@@ -29,5 +30,21 @@ describe("CallOverlay", () => {
     fireEvent.click(screen.getByRole("button", { name: /End Call/i }));
     expect(useCleaStore.getState().callOverlayOpen).toBe(false);
     expect(useCleaStore.getState().voiceState).toBe("idle");
+  });
+
+  it("drives CallOverlay through all four states from DevVoiceMockPanel", () => {
+    const { container } = render(
+      <>
+        <CallOverlay />
+        <DevVoiceMockPanel />
+      </>,
+    );
+
+    const states: VoiceState[] = ["listening", "thinking", "speaking", "idle"];
+    for (const state of states) {
+      fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${state}$`, "i") }));
+      expect(container.querySelector(`[data-voice-state="${state}"]`)).not.toBeNull();
+      expect(useCleaStore.getState().voiceState).toBe(state);
+    }
   });
 });

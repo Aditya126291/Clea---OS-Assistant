@@ -33,6 +33,13 @@ export function ChatView() {
     bottomRef.current?.scrollIntoView({ behavior: "auto" });
   }, [messages.length, lastContent]);
 
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [draft]);
+
   const handleSubmit = () => {
     const trimmed = draft.trim();
     if (!trimmed || sending) return;
