@@ -1,0 +1,128 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CleaClient, computeBackoffMs, type WebSocketLike } from "./client";
+
+class MockSocket implements WebSocketLike {
+  readyState = 0;
+  sent: string[] = [];
+  closed = false;
+  onopen: ((ev: Event) => void) | null = null;
+  onmessage: ((ev: MessageEvent<unknown>) => void) | null = null;
+  onerror: ((ev: Event) => void) | null = null;
+  onclose: ((ev: CloseEvent) => void) | null = null;
+
+  constructor(
+    public readonly url: string,
+    public readonly protocols: string[],
+  ) {}
+
+  send(data: string): void {
+    this.sent.push(data);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.readyState = 3;
+  }
+
+  triggerOpen(): void {
+    this.readyState = 1;
+    this.onopen?.(new Event("open"));
+  }
+
+  triggerMessage(payload: unknown): void {
+    this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+  }
+
+  triggerClose(code = 1006): void {
+    this.readyState = 3;
+    this.onclose?.({ code } as CloseEvent);
+  }
+}
+
+describe("CleaClient", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("authenticates via Sec-WebSocket-Protocol subprotocol and correlates requests", async () => {
+    let created: MockSocket | null = null;
+    const events: string[] = [];
+    const onConnected = vi.fn();
+
+    const client = new CleaClient({
+      resolveConnection: async () => ({
+        ok: true,
+        info: { token: "secret-tok", wsUrl: "ws://127.0.0.1:8765" },
+      }),
+      createWebSocket: (url, protocols) => {
+        created = new MockSocket(url, protocols);
+        return created;
+      },
+      onConnected,
+      onEvent: (ev) => events.push(ev.event ?? ""),
+    });
+
+    await client.connect();
+    expect(created).not.toBeNull();
+    expect(created!.url).toBe("ws://127.0.0.1:8765");
+    expect(created!.protocols).toEqual(["clea.v1", "clea.token.secret-tok"]);
+
+    created!.triggerOpen();
+    expect(onConnected).toHaveBeenCalledTimes(1);
+
+    const pingPromise = client.request("health.ping", {}, { id: "req-1" });
+    expect(JSON.parse(created!.sent[0])).toMatchObject({
+      frame_type: "request",
+      id: "req-1",
+      method: "health.ping",
+    });
+
+    created!.triggerMessage({
+      frame_type: "event",
+      event: "voice_state",
+      data: { state: "listening" },
+    });
+    expect(events).toEqual(["voice_state"]);
+
+    created!.triggerMessage({
+      frame_type: "response",
+      id: "req-1",
+      ok: true,
+      result: { status: "ok" },
+    });
+    await expect(pingPromise).resolves.toEqual({ status: "ok" });
+
+    client.dispose();
+  });
+
+  it("marks daemon_offline and schedules auto-reconnect with bounded backoff", async () => {
+    const disconnects: Array<{ reason: string; attempt: number }> = [];
+    let calls = 0;
+
+    const client = new CleaClient({
+      resolveConnection: async () => {
+        calls += 1;
+        return { ok: false, reason: "daemon_offline" };
+      },
+      onDisconnected: (reason, attempt) => disconnects.push({ reason, attempt }),
+    });
+
+    await client.connect();
+    expect(calls).toBe(1);
+    expect(disconnects).toEqual([{ reason: "daemon_offline", attempt: 1 }]);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(calls).toBe(2);
+    expect(disconnects[1]).toEqual({ reason: "daemon_offline", attempt: 2 });
+
+    expect(computeBackoffMs(0, () => 0)).toBe(1000);
+    expect(computeBackoffMs(10, () => 0)).toBe(15000);
+    expect(computeBackoffMs(10, () => 1)).toBe(18750);
+
+    client.dispose();
+  });
+});
