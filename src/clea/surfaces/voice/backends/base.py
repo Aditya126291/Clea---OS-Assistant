@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clea.surfaces.voice.config import MediaResolution
 
@@ -143,6 +143,16 @@ class ContextCompressionConfig(_StrictModel):
     trigger_tokens: int | None = Field(default=None, gt=0)
     target_tokens: int | None = Field(default=None, gt=0)
 
+    @model_validator(mode="after")
+    def _validate_thresholds(self) -> ContextCompressionConfig:
+        if (
+            self.trigger_tokens is not None
+            and self.target_tokens is not None
+            and self.target_tokens > self.trigger_tokens
+        ):
+            raise ValueError("target_tokens must be <= trigger_tokens.")
+        return self
+
 
 class VoiceSessionConfig(_StrictModel):
     """Vendor-agnostic session setup passed to ``VoiceBackend.connect``."""
@@ -179,7 +189,7 @@ class AudioOutputEvent(_StrictModel):
 
     type: Literal["audio_output"] = "audio_output"
     pcm_bytes: bytes
-    sample_rate_hz: int = OUTPUT_AUDIO_SAMPLE_RATE_HZ
+    sample_rate_hz: int = Field(default=OUTPUT_AUDIO_SAMPLE_RATE_HZ, gt=0)
 
 
 class TranscriptOutputEvent(_StrictModel):
@@ -231,18 +241,18 @@ class GoAwayEvent(_StrictModel):
     """Advance notice that the backend will close the connection soon."""
 
     type: Literal["go_away"] = "go_away"
-    time_left_seconds: float | None = None
+    time_left_seconds: float | None = Field(default=None, ge=0.0)
 
 
 class UsageUpdateEvent(_StrictModel):
     """Cumulative or per-turn token usage reported by the live backend."""
 
     type: Literal["usage"] = "usage"
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    cached_tokens: int | None = None
-    thought_tokens: int | None = None
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    cached_tokens: int | None = Field(default=None, ge=0)
+    thought_tokens: int | None = Field(default=None, ge=0)
 
 
 class BackendErrorEvent(_StrictModel):
@@ -292,6 +302,10 @@ class VoiceBackend(ABC):
     async def send_audio(self, pcm_bytes: bytes) -> None:
         """Stream a chunk of 16 kHz mono 16-bit PCM microphone audio."""
         raise NotImplementedError
+
+    async def end_audio_stream(self) -> None:
+        """Signal an end/pause of microphone audio input (e.g. half-duplex mute)."""
+        return None
 
     @abstractmethod
     async def send_video_frame(

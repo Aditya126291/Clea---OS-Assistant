@@ -241,6 +241,11 @@ def test_voice_events_roundtrip_and_validation() -> None:
     assert usage.data.total_tokens == 165
     assert usage.data.cached_tokens == 20
 
+    with pytest.raises(ValidationError):
+        UsageData(input_tokens=-1)
+    with pytest.raises(ValidationError):
+        CallEndedData(call_id="c1", duration_seconds=-0.5)
+
 
 def test_voice_requests_roundtrip() -> None:
     start_req = parse_frame(

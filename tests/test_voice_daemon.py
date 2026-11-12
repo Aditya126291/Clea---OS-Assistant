@@ -176,6 +176,8 @@ async def test_daemon_voice_call_lifecycle_and_status(tmp_path: Path) -> None:
             assert end_resp.ok and end_resp.result["call_state"] == "idle"
             assert ended_evt.data.call_id == call_id
             assert ended_evt.data.reason == "user_done"
+            assert ended_evt.data.duration_seconds is not None
+            assert ended_evt.data.duration_seconds >= 0.0
 
             ui_ended = parse_frame(await ui_ws.recv())
             assert isinstance(ui_ended, CallEndedEvent)
@@ -323,5 +325,100 @@ async def test_daemon_voice_delegate_task_failure(tmp_path: Path) -> None:
             assert "background task boom" in (final_resp.error or "")
             assert any(isinstance(e, TaskStatusEvent) and e.data.status == "failed" for e in events)
             assert any(isinstance(e, ErrorEvent) and e.data.code == "turn_failed" for e in events)
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_voice_delegate_task_disconnect_cleans_up_activity_and_approval(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
+    executed = False
+
+    def gated(note: str) -> str:
+        nonlocal executed
+        executed = True
+        return note
+
+    registry.register(
+        name="edit_note",
+        description="Edit a note.",
+        input_schema={"type": "object", "properties": {"note": {"type": "string"}}},
+        risk_level=RiskLevel.REVERSIBLE,
+        handler=gated,
+    )
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeSlowGatedProvider("edit_note", {"note": "x"}),
+        memory=MemoryStore(base_dir=tmp_path),
+        registry=registry,
+        approval_timeout=5.0,
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ui_ws:
+            voice_ws = await connect(
+                url,
+                subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+            )
+            req = VoiceDelegateTaskRequest(
+                params=VoiceDelegateTaskParams(description="Edit note before drop")
+            )
+            await voice_ws.send(req.model_dump_json())
+
+            # Wait for UI to receive TaskStatusEvent(running) and ApprovalRequestedEvent
+            ui_events: list[BaseEvent] = []
+            while not any(isinstance(e, ApprovalRequestedEvent) for e in ui_events):
+                frame = parse_frame(await ui_ws.recv())
+                if isinstance(frame, BaseEvent):
+                    ui_events.append(frame)
+
+            # Drop the voice socket unexpectedly mid-approval
+            await voice_ws.close()
+
+            while not any(
+                isinstance(e, TaskStatusEvent) and e.data.status == "failed" for e in ui_events
+            ):
+                frame = parse_frame(await asyncio.wait_for(ui_ws.recv(), timeout=2.0))
+                if isinstance(frame, BaseEvent):
+                    ui_events.append(frame)
+
+            resolved = [e for e in ui_events if isinstance(e, ApprovalResolvedEvent)]
+            assert len(resolved) == 1
+            assert resolved[0].data.decision == "deny"
+            failed = [
+                e for e in ui_events if isinstance(e, TaskStatusEvent) and e.data.status == "failed"
+            ]
+            assert len(failed) == 1
+            assert failed[0].data.task_id == req.id
+            assert executed is False
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_voice_start_call_rejects_ending_state(tmp_path: Path) -> None:
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeVoiceTaskProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+    daemon._call_state = "ending"
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            await ws.send(VoiceStartCallRequest().model_dump_json())
+            resp = parse_frame(await ws.recv())
+            assert isinstance(resp, ResponseFrame) and not resp.ok
     finally:
         await daemon.stop()

@@ -124,12 +124,20 @@ def test_empty_device_string_normalizes_to_none(tmp_path: Path) -> None:
     [
         "wake_threshold = 1.5\n",
         "wake_threshold = -0.1\n",
+        "wake_threshold = true\n",
+        "wake_threshold = nan\n",
         'media_resolution = "ultra"\n',
         'consent_mode = "always"\n',
         "silence_timeout_seconds = 0\n",
+        "silence_timeout_seconds = inf\n",
+        "silence_timeout_seconds = false\n",
         "max_burst_seconds = -5\n",
+        "max_burst_seconds = inf\n",
         "image_max_side = 16\n",
         "reconnect_limit = -1\n",
+        "reconnect_limit = true\n",
+        "input_device = true\n",
+        "output_device = -1\n",
         'wake_word_model = "   "\n',
         'hotkey = ""\n',
         "unknown_setting = true\n",
@@ -140,3 +148,10 @@ def test_invalid_voice_config_rejected(tmp_path: Path, toml_body: str) -> None:
     cfg_path.write_text(toml_body, encoding="utf-8")
     with pytest.raises(ValidationError):
         load_voice_config(cfg_path)
+
+
+def test_load_voice_config_handles_utf8_bom(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "voice_config.toml"
+    cfg_path.write_text("\ufeffwake_threshold = 0.65\n", encoding="utf-8")
+    cfg = load_voice_config(cfg_path)
+    assert cfg.wake_threshold == 0.65

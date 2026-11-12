@@ -149,6 +149,7 @@ class CleaDaemon:
         self._shared_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._voice_call_id: str | None = None
         self._call_state: CallState = "idle"
+        self._call_started_monotonic: float | None = None
         self._voice_state: VoiceState = "idle"
         self._screen_capture_active: bool = False
         self._screen_capture_target: ScreenCaptureTarget | None = None
@@ -387,12 +388,13 @@ class CleaDaemon:
                 ),
             )
         elif method == "voice.start_call":
-            if self._call_state in {"connecting", "active"}:
+            if self._call_state != "idle":
                 await self._respond(ws, req, error="A voice call is already active.")
                 return
             call_id = new_id()
             self._voice_call_id = call_id
             self._call_state = "active"
+            self._call_started_monotonic = time.monotonic()
             self._voice_state = "idle"
             self._screen_capture_active = False
             self._screen_capture_target = None
@@ -435,8 +437,14 @@ class CleaDaemon:
                 )
                 return
             ended_id = self._voice_call_id
+            duration_seconds = (
+                round(max(0.0, time.monotonic() - self._call_started_monotonic), 3)
+                if self._call_started_monotonic is not None
+                else None
+            )
             self._voice_call_id = None
             self._call_state = "idle"
+            self._call_started_monotonic = None
             self._voice_state = "idle"
             self._screen_capture_active = False
             self._screen_capture_target = None
@@ -448,6 +456,7 @@ class CleaDaemon:
                         call_id=ended_id,
                         call_state="idle",
                         reason=req.params.reason,
+                        duration_seconds=duration_seconds,
                     ),
                 )
             )
@@ -680,6 +689,9 @@ class CleaDaemon:
         state = _TurnState()
         started_at = _now_iso()
         title = " ".join(description.split())[:80]
+        task_started = False
+        task_finished = False
+        pending_approval_id: str | None = None
 
         async def task_status(status: str, detail: str | None = None) -> None:
             await self._broadcast(
@@ -707,44 +719,48 @@ class CleaDaemon:
             state.current_call_id = call.id
             state.started[call.id] = time.monotonic()
             state.approval_wait[call.id] = 0.0
-            await self._send(
-                ws,
-                ToolCallStartedEvent(
-                    request_id=req.id,
-                    session_id=session.id,
-                    data=ToolCallStartedData(
-                        call_id=call.id,
-                        name=call.name,
-                        arguments=call.arguments,
-                        risk_level=risk_of(call.name),  # type: ignore[arg-type]
+            with contextlib.suppress(ConnectionClosed):
+                await self._send(
+                    ws,
+                    ToolCallStartedEvent(
+                        request_id=req.id,
+                        session_id=session.id,
+                        data=ToolCallStartedData(
+                            call_id=call.id,
+                            name=call.name,
+                            arguments=call.arguments,
+                            risk_level=risk_of(call.name),  # type: ignore[arg-type]
+                        ),
                     ),
-                ),
-            )
+                )
 
         async def on_tool_end(call: ToolCall, output: str, is_error: bool) -> None:
             elapsed = time.monotonic() - state.started.pop(call.id, time.monotonic())
             elapsed -= state.approval_wait.pop(call.id, 0.0)
-            await self._send(
-                ws,
-                ToolCallFinishedEvent(
-                    request_id=req.id,
-                    session_id=session.id,
-                    data=ToolCallFinishedData(
-                        call_id=call.id,
-                        name=call.name,
-                        is_error=is_error,
-                        output=output,
-                        duration_ms=max(0, round(elapsed * 1000)),
+            with contextlib.suppress(ConnectionClosed):
+                await self._send(
+                    ws,
+                    ToolCallFinishedEvent(
+                        request_id=req.id,
+                        session_id=session.id,
+                        data=ToolCallFinishedData(
+                            call_id=call.id,
+                            name=call.name,
+                            is_error=is_error,
+                            output=output,
+                            duration_ms=max(0, round(elapsed * 1000)),
+                        ),
                     ),
-                ),
-            )
+                )
 
         async def confirm(definition: ToolDefinition, arguments: dict[str, Any]) -> bool:
+            nonlocal pending_approval_id
             approval_id = new_id()
             call_id = state.current_call_id
             future: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
             conn.approvals[approval_id] = future
             self._shared_approvals[approval_id] = future
+            pending_approval_id = approval_id
             await self._broadcast(
                 ApprovalRequestedEvent(
                     request_id=req.id,
@@ -784,10 +800,12 @@ class CleaDaemon:
                     ),
                 ),
             )
+            pending_approval_id = None
             return decision == "allow"
 
         try:
             await task_status("running")
+            task_started = True
             try:
                 reply = await self.agent.run_turn(
                     session=session,
@@ -797,30 +815,52 @@ class CleaDaemon:
                     confirm=confirm,
                 )
             except (ConnectionClosed, asyncio.CancelledError):
+                if pending_approval_id is not None:
+                    with contextlib.suppress(Exception):
+                        await self._broadcast(
+                            ApprovalResolvedEvent(
+                                request_id=req.id,
+                                session_id=session.id,
+                                data=ApprovalResolvedData(
+                                    approval_id=pending_approval_id,
+                                    decision="deny",
+                                    reason="timeout",
+                                ),
+                            )
+                        )
+                    pending_approval_id = None
+                if task_started and not task_finished:
+                    task_finished = True
+                    with contextlib.suppress(Exception):
+                        await task_status("failed", "Cancelled")
                 raise
             except Exception as exc:
                 logger.exception("Error while running delegated voice task")
+                task_finished = True
                 await task_status("failed", str(exc))
-                await self._send(
-                    ws,
-                    ErrorEvent(
-                        request_id=req.id,
-                        session_id=session.id,
-                        data=ErrorData(message=str(exc), code="turn_failed"),
-                    ),
-                )
-                await self._respond(ws, req, error=str(exc), session_id=session.id)
+                with contextlib.suppress(ConnectionClosed):
+                    await self._send(
+                        ws,
+                        ErrorEvent(
+                            request_id=req.id,
+                            session_id=session.id,
+                            data=ErrorData(message=str(exc), code="turn_failed"),
+                        ),
+                    )
+                    await self._respond(ws, req, error=str(exc), session_id=session.id)
                 return
 
+            task_finished = True
             await task_status("succeeded")
-            await self._respond(
-                ws,
-                req,
-                METHOD_RESULTS["voice.delegate_task"](
-                    task_id=req.id, status="succeeded", output=reply
-                ),
-                session_id=session.id,
-            )
+            with contextlib.suppress(ConnectionClosed):
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS["voice.delegate_task"](
+                        task_id=req.id, status="succeeded", output=reply
+                    ),
+                    session_id=session.id,
+                )
         finally:
             self._busy_sessions.discard(session.id)
 

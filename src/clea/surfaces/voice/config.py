@@ -28,7 +28,7 @@ class ScreenBlocklistConfig(BaseModel):
 class VoiceConfig(BaseModel):
     """Validated settings loaded from ``voice_config.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     wake_word_model: str = Field(
         default="hey_jarvis",
@@ -48,11 +48,34 @@ class VoiceConfig(BaseModel):
     consent_mode: ConsentMode = "ask"
     reconnect_limit: int = Field(default=3, ge=0)
 
+    @field_validator(
+        "wake_threshold",
+        "silence_timeout_seconds",
+        "max_burst_seconds",
+        "image_max_side",
+        "reconnect_limit",
+        mode="before",
+    )
+    @classmethod
+    def _reject_bool_for_numeric(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("Boolean value is not valid for a numeric setting.")
+        return value
+
     @field_validator("input_device", "output_device", mode="before")
     @classmethod
-    def _empty_device_is_none(cls, value: Any) -> Any:
-        if isinstance(value, str) and not value.strip():
-            return None
+    def _validate_device(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError(
+                "Audio device must be a device name string, non-negative index, or null."
+            )
+        if isinstance(value, int) and value < 0:
+            raise ValueError("Audio device index must be >= 0.")
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            return stripped
         return value
 
     @field_validator("wake_word_model", "hotkey", mode="after")
@@ -137,6 +160,6 @@ def load_voice_config(
             return VoiceConfig()
         ensure_voice_config(target)
 
-    with target.open("rb") as fh:
-        raw = tomllib.load(fh)
+    raw_text = target.read_text(encoding="utf-8-sig")
+    raw = tomllib.loads(raw_text)
     return VoiceConfig.model_validate(raw)

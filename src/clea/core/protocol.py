@@ -369,7 +369,7 @@ class CallEndedData(_Model):
     call_id: str
     call_state: CallState = "idle"
     reason: str | None = None
-    duration_seconds: float | None = None
+    duration_seconds: float | None = Field(default=None, ge=0.0)
 
 
 class TranscriptData(_Model):
@@ -387,11 +387,11 @@ class ScreenCaptureStateData(_Model):
 
 class UsageData(_Model):
     call_id: str | None = None
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    cached_tokens: int | None = None
-    thought_tokens: int | None = None
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    cached_tokens: int | None = Field(default=None, ge=0)
+    thought_tokens: int | None = Field(default=None, ge=0)
 
 
 class ErrorData(_Model):

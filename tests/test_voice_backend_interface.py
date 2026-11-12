@@ -175,8 +175,22 @@ async def test_concrete_voice_backend_lifecycle_and_events() -> None:
     assert isinstance(received[4], AudioOutputEvent)
     assert received[4].sample_rate_hz == 24_000
     assert backend.tool_responses[0].scheduling == "when_idle"
+    await backend.end_audio_stream()
     await backend.close()
     assert backend.closed is True
+
+
+def test_voice_backend_model_validation_rejects_invalid_bounds() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ContextCompressionConfig(trigger_tokens=1000, target_tokens=2000)
+    with pytest.raises(ValidationError):
+        AudioOutputEvent(pcm_bytes=b"\x00", sample_rate_hz=0)
+    with pytest.raises(ValidationError):
+        GoAwayEvent(time_left_seconds=-1.0)
+    with pytest.raises(ValidationError):
+        UsageUpdateEvent(input_tokens=-1)
 
 
 async def test_deferred_memory_hooks_are_explicitly_stubbed() -> None:
