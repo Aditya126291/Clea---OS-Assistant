@@ -143,9 +143,8 @@ class CleaDaemon:
         return self.port
 
     async def start(self) -> None:
-        """Write the session token and start listening for localhost WebSocket connections."""
+        """Start listening for localhost WebSocket connections and write the session token."""
         self.agent.memory.ensure_initialized()
-        auth.write_token(self.token, self.token_file)
         self._server = await serve(
             self._handle_connection,
             self.host,
@@ -153,6 +152,13 @@ class CleaDaemon:
             process_request=self._authenticate,
             select_subprotocol=self._select_subprotocol,
         )
+        try:
+            auth.write_token(self.token, self.token_file)
+        except Exception:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+            raise
         logger.info("Clea daemon listening on ws://%s:%d", self.host, self.bound_port)
 
     async def stop(self) -> None:

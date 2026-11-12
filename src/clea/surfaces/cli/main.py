@@ -194,6 +194,13 @@ def _run_daemon_cmd(host: str, port: int) -> None:
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    except OSError as exc:
+        print(
+            f"Could not start Clea daemon on ws://{host}:{port} ({exc}).\n"
+            "The address/port may already be in use by another 'clea daemon' process.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:

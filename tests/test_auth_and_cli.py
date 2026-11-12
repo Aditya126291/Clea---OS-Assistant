@@ -11,7 +11,13 @@ from clea.core.daemon import build_daemon
 from clea.core.protocol import ApprovalRequestedData, ApprovalRequestedEvent
 from clea.memory import MemoryStore
 from clea.providers.base import LLMProvider, Message, StreamChunk
-from clea.surfaces.cli.main import _load_token_or_exit, _prompt_approval, _send_and_stream
+from clea.surfaces.cli.main import (
+    _load_token_or_exit,
+    _prompt_approval,
+    _run_daemon_cmd,
+    _send_and_stream,
+    main,
+)
 from clea.tools import AuditLogger, RiskLevel, ToolDefinition, ToolRegistry
 
 
@@ -138,3 +144,49 @@ async def test_cli_send_and_stream_against_live_daemon(
         assert "CLI hello" in out
     finally:
         await daemon.stop()
+
+
+def test_cli_daemon_exits_cleanly_when_port_already_in_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import socket
+
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("clea.surfaces.cli.main.load_dotenv", lambda: None)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    occupied_port = sock.getsockname()[1]
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["daemon", "--host", "127.0.0.1", "--port", str(occupied_port)])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "already be in use" in err
+        assert "clea daemon" in err
+        assert not auth.token_path(tmp_path).exists()
+    finally:
+        sock.close()
+
+
+def test_cli_run_daemon_cmd_handles_oserror_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+
+    def fail_bind(*, host: str, port: int) -> None:
+        raise OSError(f"Address ('{host}', {port}) already in use")
+
+    monkeypatch.setattr("clea.core.daemon.run_daemon", fail_bind)
+    with pytest.raises(SystemExit) as exc:
+        _run_daemon_cmd("127.0.0.1", 8765)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Could not start Clea daemon" in err
+    assert "clea daemon" in err

@@ -558,3 +558,44 @@ async def test_daemon_provider_failure_emits_error_and_failed_task(tmp_path: Pat
             assert events[2].data.code == "turn_failed"
     finally:
         await daemon.stop()
+
+
+async def test_daemon_bind_failure_does_not_overwrite_or_create_token_file(
+    tmp_path: Path,
+) -> None:
+    first = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeToolCallingProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+    await first.start()
+    try:
+        assert auth.read_token(first.token_file) == first.token
+
+        # Second daemon targeting the already-bound port and same token_file must fail
+        # without clobbering the active daemon's session token.
+        second_same_file = build_daemon(
+            host="127.0.0.1",
+            port=first.bound_port,
+            provider=FakeToolCallingProvider(),
+            memory=MemoryStore(base_dir=tmp_path),
+        )
+        with pytest.raises(OSError):
+            await second_same_file.start()
+        assert auth.read_token(first.token_file) == first.token
+
+        # Second daemon with an unused token_file must not leave a dead token file behind.
+        fresh_token_file = tmp_path / "other" / "session_token"
+        second_fresh_file = build_daemon(
+            host="127.0.0.1",
+            port=first.bound_port,
+            provider=FakeToolCallingProvider(),
+            memory=MemoryStore(base_dir=tmp_path),
+            token_file=fresh_token_file,
+        )
+        with pytest.raises(OSError):
+            await second_fresh_file.start()
+        assert not fresh_token_file.exists()
+    finally:
+        await first.stop()
