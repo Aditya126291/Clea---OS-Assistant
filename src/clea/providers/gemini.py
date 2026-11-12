@@ -70,6 +70,12 @@ def _to_gemini_steps(messages: list[Message]) -> list[dict[str, Any]]:
 class GeminiProvider(LLMProvider):
     """LLMProvider backed by Google's Gemini Interactions API."""
 
+    provider_name = "gemini"
+
+    @property
+    def model_name(self) -> str:
+        return self.model
+
     def __init__(
         self,
         *,

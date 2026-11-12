@@ -41,6 +41,14 @@ class StreamChunk(BaseModel):
 class LLMProvider(ABC):
     """Abstract interface allowing Clea to swap LLM backends without changing core."""
 
+    provider_name: str = "unknown"
+    """Short display name of the backend, shown read-only in Settings."""
+
+    @property
+    def model_name(self) -> str:
+        """Display name of the model in use."""
+        return "unknown"
+
     @abstractmethod
     def stream_turn(
         self,

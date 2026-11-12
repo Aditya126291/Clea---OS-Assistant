@@ -14,6 +14,7 @@ from clea.tools import (
     ToolNotFoundError,
     ToolRegistry,
     register_builtin_tools,
+    requires_approval,
 )
 
 
@@ -106,3 +107,34 @@ async def test_unknown_tool_raises(tmp_path: Path) -> None:
     registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "audit.jsonl"))
     with pytest.raises(ToolNotFoundError):
         await registry.execute("does_not_exist")
+
+
+def test_requires_approval_policy() -> None:
+    assert requires_approval(RiskLevel.READ_ONLY) is False
+    assert requires_approval(RiskLevel.REVERSIBLE) is True
+    assert requires_approval(RiskLevel.DESTRUCTIVE) is True
+
+
+async def test_reversible_tool_requires_confirmation(tmp_path: Path) -> None:
+    audit_path = tmp_path / "logs" / "audit.jsonl"
+    registry = ToolRegistry(audit_logger=AuditLogger(audit_path))
+    registry.register(
+        name="rename_note",
+        description="Rename a note.",
+        input_schema={"type": "object", "properties": {"name": {"type": "string"}}},
+        risk_level=RiskLevel.REVERSIBLE,
+        handler=lambda name: f"renamed {name}",
+    )
+
+    with pytest.raises(PermissionDeniedError):
+        await registry.execute("rename_note", {"name": "a.md"})
+
+    with pytest.raises(PermissionDeniedError):
+        await registry.execute("rename_note", {"name": "a.md"}, confirm=lambda _d, _a: False)
+
+    assert (
+        await registry.execute("rename_note", {"name": "a.md"}, confirm=lambda _d, _a: True)
+        == "renamed a.md"
+    )
+    entries = _read_audit_entries(audit_path)
+    assert [e["outcome"] for e in entries] == ["denied", "denied", "ok"]

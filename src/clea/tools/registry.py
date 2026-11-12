@@ -24,6 +24,11 @@ class RiskLevel(StrEnum):
     DESTRUCTIVE = "destructive"
 
 
+def requires_approval(level: RiskLevel) -> bool:
+    """Policy: read_only runs automatically; reversible and destructive need approval."""
+    return level is not RiskLevel.READ_ONLY
+
+
 class ToolDefinition(BaseModel):
     """MCP-compatible metadata and JSON Schema for a tool."""
 
@@ -157,12 +162,12 @@ class ToolRegistry:
         tool = self._tools[name]
         args = arguments or {}
 
-        if tool.definition.risk_level is RiskLevel.DESTRUCTIVE:
+        if requires_approval(tool.definition.risk_level):
             approved = False
             if confirm is not None:
                 approved = bool(await _maybe_await(confirm(tool.definition, args)))
             if not approved:
-                msg = f"Permission denied for destructive tool '{name}'."
+                msg = f"Permission denied for {tool.definition.risk_level.value} tool '{name}'."
                 self._audit.record(
                     tool_name=name,
                     risk_level=tool.definition.risk_level,

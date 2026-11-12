@@ -8,6 +8,7 @@ from clea.tools.registry import (
     ToolDefinition,
     ToolNotFoundError,
     ToolRegistry,
+    requires_approval,
 )
 from clea.tools.system_info import register_builtin_tools
 
@@ -20,4 +21,5 @@ __all__ = [
     "ToolNotFoundError",
     "ToolRegistry",
     "register_builtin_tools",
+    "requires_approval",
 ]

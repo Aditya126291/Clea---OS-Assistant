@@ -2,21 +2,55 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
 from websockets.asyncio.client import connect
+from websockets.exceptions import InvalidStatus
 
+from clea.core import auth
 from clea.core.daemon import CleaDaemon, build_daemon
-from clea.core.protocol import EventFrame, RequestFrame, ResponseFrame, parse_frame
+from clea.core.protocol import (
+    ApprovalRequestedEvent,
+    ApprovalResolvedEvent,
+    ApprovalRespondParams,
+    ApprovalRespondRequest,
+    AssistantTokenEvent,
+    BaseEvent,
+    ChatSendParams,
+    ChatSendRequest,
+    ConversationGetParams,
+    ConversationsGetRequest,
+    ConversationsListRequest,
+    DailyParams,
+    ErrorEvent,
+    HealthPingRequest,
+    MemoryGetDailyRequest,
+    MemoryGetRequest,
+    ResponseFrame,
+    SessionNewRequest,
+    SettingsGetRequest,
+    TaskStatusEvent,
+    ToolCallFinishedEvent,
+    ToolCallStartedEvent,
+    parse_frame,
+)
 from clea.memory import MemoryStore
 from clea.providers.base import LLMProvider, Message, StreamChunk, ToolCall
-from clea.tools import AuditLogger, ToolDefinition, ToolRegistry, register_builtin_tools
+from clea.tools import AuditLogger, RiskLevel, ToolDefinition, ToolRegistry, register_builtin_tools
 
 
 class FakeToolCallingProvider(LLMProvider):
     """Deterministic provider that calls get_system_info once then streams a reply."""
+
+    provider_name = "fake"
+
+    @property
+    def model_name(self) -> str:
+        return "fake-model"
 
     async def stream_turn(
         self,
@@ -44,6 +78,50 @@ class FakeToolCallingProvider(LLMProvider):
         yield StreamChunk(type="done")
 
 
+class FakeApprovalProvider(LLMProvider):
+    """Calls a specified gated tool and reports the outcome."""
+
+    provider_name = "fake"
+
+    def __init__(self, tool_name: str, arguments: dict[str, object]) -> None:
+        self._tool_name = tool_name
+        self._arguments = arguments
+
+    async def stream_turn(
+        self,
+        *,
+        messages: list[Message],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+    ) -> AsyncIterator[StreamChunk]:
+        tool_msgs = [msg for msg in messages if msg.role == "tool"]
+        if tool_msgs:
+            last = tool_msgs[-1]
+            reply = "Denied." if last.is_error else f"Done: {last.content}"
+            yield StreamChunk(type="text_delta", text=reply)
+            yield StreamChunk(type="done")
+            return
+
+        yield StreamChunk(
+            type="tool_call",
+            tool_call=ToolCall(id="call-gated", name=self._tool_name, arguments=self._arguments),
+        )
+        yield StreamChunk(type="done")
+
+
+class FailingProvider(LLMProvider):
+    async def stream_turn(
+        self,
+        *,
+        messages: list[Message],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+    ) -> AsyncIterator[StreamChunk]:
+        if False:
+            yield StreamChunk(type="done")
+        raise RuntimeError("provider exploded")
+
+
 def test_daemon_rejects_non_localhost_host(tmp_path: Path) -> None:
     registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "audit.jsonl"))
     register_builtin_tools(registry)
@@ -69,27 +147,30 @@ async def test_daemon_streams_reply_runs_tool_and_writes_daily_log(tmp_path: Pat
         registry=registry,
     )
     await daemon.start()
+    assert daemon.token_file.exists()
 
     try:
         url = f"ws://127.0.0.1:{daemon.bound_port}"
-        async with connect(url) as ws:
-            await ws.send(RequestFrame(method="session.new").model_dump_json())
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            await ws.send(SessionNewRequest().model_dump_json())
             session_resp = parse_frame(await ws.recv())
             assert isinstance(session_resp, ResponseFrame)
             assert session_resp.ok and session_resp.session_id
 
-            req = RequestFrame(
-                method="chat.send",
+            req = ChatSendRequest(
                 session_id=session_resp.session_id,
-                params={"text": "What time is it?"},
+                params=ChatSendParams(text="What time is it?"),
             )
             await ws.send(req.model_dump_json())
 
-            events: list[EventFrame] = []
+            events: list[BaseEvent] = []
             final_resp: ResponseFrame | None = None
             while final_resp is None:
                 frame = parse_frame(await ws.recv())
-                if isinstance(frame, EventFrame):
+                if isinstance(frame, BaseEvent):
                     events.append(frame)
                 elif isinstance(frame, ResponseFrame) and frame.id == req.id:
                     final_resp = frame
@@ -97,15 +178,383 @@ async def test_daemon_streams_reply_runs_tool_and_writes_daily_log(tmp_path: Pat
             assert final_resp.ok is True
             assert final_resp.result["text"] == "Hello from Clea!"
             assert [e.event for e in events] == [
-                "tool.start",
-                "tool.end",
-                "text.delta",
-                "text.delta",
-                "turn.done",
+                "task_status",
+                "tool_call_started",
+                "tool_call_finished",
+                "assistant_token",
+                "assistant_token",
+                "task_status",
             ]
+            assert isinstance(events[0], TaskStatusEvent)
+            assert events[0].data.status == "running"
+            assert isinstance(events[1], ToolCallStartedEvent)
+            assert events[1].data.risk_level == "read_only"
+            assert isinstance(events[2], ToolCallFinishedEvent)
+            assert events[2].data.is_error is False
+            assert isinstance(events[3], AssistantTokenEvent)
+            assert isinstance(events[5], TaskStatusEvent)
+            assert events[5].data.status == "succeeded"
 
             daily_content = memory.read_daily()
             assert "**User:** What time is it?" in daily_content
             assert "**Clea:** Hello from Clea!" in daily_content
+    finally:
+        await daemon.stop()
+    assert not daemon.token_file.exists()
+
+
+async def test_daemon_auth_and_origin_enforcement(tmp_path: Path) -> None:
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeToolCallingProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+    await daemon.start()
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+
+    try:
+        # Missing token -> 401
+        with pytest.raises(InvalidStatus) as missing_exc:
+            async with connect(url):
+                pass
+        assert missing_exc.value.response.status_code == 401
+
+        # Wrong token -> 401
+        with pytest.raises(InvalidStatus) as wrong_exc:
+            async with connect(
+                url,
+                subprotocols=auth.client_subprotocols("not-the-right-token"),  # type: ignore[arg-type]
+            ):
+                pass
+        assert wrong_exc.value.response.status_code == 401
+
+        # Wrong Origin -> 403
+        with pytest.raises(InvalidStatus) as bad_origin_exc:
+            async with connect(
+                url,
+                subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+                origin="http://evil.example",  # type: ignore[arg-type]
+            ):
+                pass
+        assert bad_origin_exc.value.response.status_code == 403
+
+        # "null" Origin -> 403
+        with pytest.raises(InvalidStatus) as null_origin_exc:
+            async with connect(
+                url,
+                subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+                origin="null",  # type: ignore[arg-type]
+            ):
+                pass
+        assert null_origin_exc.value.response.status_code == 403
+
+        # Non-local Host header -> 403
+        with pytest.raises(InvalidStatus) as bad_host_exc:
+            async with connect(
+                url,
+                subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+                additional_headers={"Host": "evil.example:8765"},
+            ):
+                pass
+        assert bad_host_exc.value.response.status_code == 403
+
+        # Allowed browser/Electron Origins with valid token -> 101
+        for allowed in ("http://localhost:5173", "clea-app://app"):
+            async with connect(
+                url,
+                subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+                origin=allowed,  # type: ignore[arg-type]
+            ) as ws:
+                ping = HealthPingRequest()
+                await ws.send(ping.model_dump_json())
+                resp = parse_frame(await ws.recv())
+                assert isinstance(resp, ResponseFrame)
+                assert resp.ok and resp.result == {"status": "ok"}
+    finally:
+        await daemon.stop()
+
+
+@pytest.mark.parametrize(
+    ("risk_level", "decision", "expected_error"),
+    [
+        (RiskLevel.REVERSIBLE, "allow", False),
+        (RiskLevel.DESTRUCTIVE, "deny", True),
+    ],
+)
+async def test_daemon_approval_allow_and_deny(
+    tmp_path: Path,
+    risk_level: RiskLevel,
+    decision: str,
+    expected_error: bool,
+) -> None:
+    registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
+    ran = False
+
+    def gated_tool(target: str) -> str:
+        nonlocal ran
+        ran = True
+        return f"acted on {target}"
+
+    registry.register(
+        name="gated_tool",
+        description="A gated tool.",
+        input_schema={"type": "object", "properties": {"target": {"type": "string"}}},
+        risk_level=risk_level,
+        handler=gated_tool,
+    )
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeApprovalProvider("gated_tool", {"target": "note.txt"}),
+        memory=MemoryStore(base_dir=tmp_path),
+        registry=registry,
+        approval_timeout=5.0,
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            req = ChatSendRequest(params=ChatSendParams(text="Please run gated tool"))
+            await ws.send(req.model_dump_json())
+
+            events: list[BaseEvent] = []
+            final_resp: ResponseFrame | None = None
+            while final_resp is None:
+                frame = parse_frame(await ws.recv())
+                if isinstance(frame, BaseEvent):
+                    events.append(frame)
+                    if isinstance(frame, ApprovalRequestedEvent):
+                        assert frame.data.tool == "gated_tool"
+                        assert frame.data.risk_level == risk_level.value
+                        await ws.send(
+                            ApprovalRespondRequest(
+                                session_id=frame.session_id,
+                                params=ApprovalRespondParams(
+                                    approval_id=frame.data.approval_id,
+                                    decision=decision,  # type: ignore[arg-type]
+                                ),
+                            ).model_dump_json()
+                        )
+                elif isinstance(frame, ResponseFrame) and frame.id == req.id:
+                    final_resp = frame
+
+            assert final_resp.ok is True
+            resolved = next(e for e in events if isinstance(e, ApprovalResolvedEvent))
+            assert resolved.data.decision == decision
+            assert resolved.data.reason == "user"
+            finished = next(e for e in events if isinstance(e, ToolCallFinishedEvent))
+            assert finished.data.is_error is expected_error
+            assert ran is (not expected_error)
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_approval_timeout_denies(tmp_path: Path) -> None:
+    registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
+    ran = False
+
+    def wipe(item: str) -> str:
+        nonlocal ran
+        ran = True
+        return item
+
+    registry.register(
+        name="wipe",
+        description="Wipe",
+        input_schema={"type": "object", "properties": {"item": {"type": "string"}}},
+        risk_level=RiskLevel.DESTRUCTIVE,
+        handler=wipe,
+    )
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeApprovalProvider("wipe", {"item": "x"}),
+        memory=MemoryStore(base_dir=tmp_path),
+        registry=registry,
+        approval_timeout=0.05,
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            req = ChatSendRequest(params=ChatSendParams(text="Wipe it"))
+            await ws.send(req.model_dump_json())
+
+            events: list[BaseEvent] = []
+            final_resp: ResponseFrame | None = None
+            while final_resp is None:
+                frame = parse_frame(await ws.recv())
+                if isinstance(frame, BaseEvent):
+                    events.append(frame)
+                elif isinstance(frame, ResponseFrame) and frame.id == req.id:
+                    final_resp = frame
+
+            assert final_resp.ok is True
+            assert final_resp.result["text"] == "Denied."
+            resolved = next(e for e in events if isinstance(e, ApprovalResolvedEvent))
+            assert resolved.data.decision == "deny"
+            assert resolved.data.reason == "timeout"
+            assert ran is False
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_disconnect_cancels_pending_approval(tmp_path: Path) -> None:
+    registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
+    ran = False
+
+    def wipe(item: str) -> str:
+        nonlocal ran
+        ran = True
+        return item
+
+    registry.register(
+        name="wipe",
+        description="Wipe",
+        input_schema={"type": "object", "properties": {"item": {"type": "string"}}},
+        risk_level=RiskLevel.DESTRUCTIVE,
+        handler=wipe,
+    )
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeApprovalProvider("wipe", {"item": "x"}),
+        memory=MemoryStore(base_dir=tmp_path),
+        registry=registry,
+        approval_timeout=5.0,
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            await ws.send(ChatSendRequest(params=ChatSendParams(text="Wipe it")).model_dump_json())
+            while True:
+                frame = parse_frame(await ws.recv())
+                if isinstance(frame, ApprovalRequestedEvent):
+                    break
+        await asyncio.sleep(0.05)
+        assert ran is False
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_memory_conversations_settings_and_errors(tmp_path: Path) -> None:
+    memory = MemoryStore(base_dir=tmp_path)
+    memory.ensure_initialized()
+    memory.write_long_term("# Long-Term\n\n- User loves keyboard shortcuts.\n")
+    memory.append_daily_turn(session_id="s1", user_text="Hi", assistant_text="Hello!")
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeToolCallingProvider(),
+        memory=memory,
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            # memory.get
+            await ws.send(MemoryGetRequest().model_dump_json())
+            mem_resp = parse_frame(await ws.recv())
+            assert isinstance(mem_resp, ResponseFrame) and mem_resp.ok
+            assert "keyboard shortcuts" in mem_resp.result["long_term"]
+            assert len(mem_resp.result["days"]) == 1
+            day = mem_resp.result["days"][0]
+
+            # memory.get_daily valid & invalid
+            await ws.send(MemoryGetDailyRequest(params=DailyParams(date=day)).model_dump_json())
+            daily_resp = parse_frame(await ws.recv())
+            assert isinstance(daily_resp, ResponseFrame) and daily_resp.ok
+            assert "**User:** Hi" in daily_resp.result["content"]
+
+            await ws.send(
+                MemoryGetDailyRequest(params=DailyParams(date="../etc")).model_dump_json()
+            )
+            bad_daily = parse_frame(await ws.recv())
+            assert isinstance(bad_daily, ResponseFrame) and not bad_daily.ok
+
+            # conversations.list & conversations.get
+            await ws.send(ConversationsListRequest().model_dump_json())
+            conv_list = parse_frame(await ws.recv())
+            assert isinstance(conv_list, ResponseFrame) and conv_list.ok
+            assert len(conv_list.result["conversations"]) == 1
+            assert conv_list.result["conversations"][0]["session_id"] == "s1"
+
+            await ws.send(
+                ConversationsGetRequest(
+                    params=ConversationGetParams(date=day, session_id="s1")
+                ).model_dump_json()
+            )
+            conv_get = parse_frame(await ws.recv())
+            assert isinstance(conv_get, ResponseFrame) and conv_get.ok
+            assert conv_get.result["turns"][0]["assistant"] == "Hello!"
+
+            # settings.get never leaks the token
+            await ws.send(SettingsGetRequest().model_dump_json())
+            settings_resp = parse_frame(await ws.recv())
+            assert isinstance(settings_resp, ResponseFrame) and settings_resp.ok
+            assert settings_resp.result["provider"] == "fake"
+            assert settings_resp.result["model"] == "fake-model"
+            assert daemon.token not in json.dumps(settings_resp.result)
+
+            # invalid frame returns ErrorEvent
+            await ws.send("{not valid json")
+            err_frame = parse_frame(await ws.recv())
+            assert isinstance(err_frame, ErrorEvent)
+            assert err_frame.data.code == "invalid_frame"
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_provider_failure_emits_error_and_failed_task(tmp_path: Path) -> None:
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FailingProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            req = ChatSendRequest(params=ChatSendParams(text="Hi"))
+            await ws.send(req.model_dump_json())
+
+            events: list[BaseEvent] = []
+            final_resp: ResponseFrame | None = None
+            while final_resp is None:
+                frame = parse_frame(await ws.recv())
+                if isinstance(frame, BaseEvent):
+                    events.append(frame)
+                elif isinstance(frame, ResponseFrame) and frame.id == req.id:
+                    final_resp = frame
+
+            assert final_resp.ok is False
+            assert "exploded" in (final_resp.error or "")
+            assert [e.event for e in events] == ["task_status", "task_status", "error"]
+            assert isinstance(events[1], TaskStatusEvent)
+            assert events[1].data.status == "failed"
+            assert isinstance(events[2], ErrorEvent)
+            assert events[2].data.code == "turn_failed"
     finally:
         await daemon.stop()

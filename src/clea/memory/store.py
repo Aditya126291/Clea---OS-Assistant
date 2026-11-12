@@ -6,24 +6,16 @@ Stores long-term memory in ``MEMORY.md`` and daily conversation logs in
 
 from __future__ import annotations
 
-import os
+import re
 from datetime import date, datetime
 from pathlib import Path
 
-from platformdirs import user_data_dir
+from clea.paths import default_data_dir
 
 _DEFAULT_LONG_TERM_HEADER = """# Clea Long-Term Memory
 
 Persistent preferences, facts, and project context live here.
 """
-
-
-def default_data_dir() -> Path:
-    """Return the user data directory for Clea state, memory, and audit logs."""
-    override = os.environ.get("CLEA_DATA_DIR")
-    if override:
-        return Path(override).expanduser().resolve()
-    return Path(user_data_dir("clea", appauthor=False))
 
 
 class MemoryStore:
@@ -92,3 +84,78 @@ class MemoryStore:
             handle.write("".join(chunks))
 
         return path
+
+    # --- Read-only views used by the daemon for surfaces (memory viewer, sidebar) ---
+
+    def list_days(self) -> list[str]:
+        """Return ISO dates that have a daily log, newest first."""
+        if not self.memory_dir.is_dir():
+            return []
+        days = [p.stem for p in self.memory_dir.glob("*.md") if _DAY_RE.fullmatch(p.stem)]
+        return sorted(days, reverse=True)
+
+    def read_daily_on(self, day: str) -> str:
+        """Read the daily log for an ISO date string. Raises ValueError on malformed input."""
+        return self.read_daily(parse_day(day))
+
+    def get_conversation(self, day: str, session_id: str) -> list[dict[str, str]]:
+        """Return the logged turns (time, user, assistant) for one session on one day."""
+        return [
+            {"time": time, "user": user, "assistant": assistant}
+            for sid, time, user, assistant in _parse_turns(self.read_daily_on(day))
+            if sid == session_id
+        ]
+
+    def list_conversations(self) -> list[dict[str, str | int]]:
+        """Group daily-log session headings into conversations, newest first."""
+        conversations: list[dict[str, str | int]] = []
+        for day in self.list_days():
+            by_session: dict[str, dict[str, str | int]] = {}
+            for sid, time, user, _assistant in _parse_turns(self.read_daily_on(day)):
+                entry = by_session.get(sid)
+                if entry is None:
+                    entry = {
+                        "date": day,
+                        "session_id": sid,
+                        "title": _truncate(user),
+                        "turns": 0,
+                        "last_time": time,
+                    }
+                    by_session[sid] = entry
+                entry["turns"] = int(entry["turns"]) + 1
+                entry["last_time"] = time
+            conversations.extend(reversed(by_session.values()))
+        return conversations
+
+
+_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_HEADING_RE = re.compile(r"^## (?P<time>.+?) \(session `(?P<sid>[A-Za-z0-9_-]+)`\)\s*$", re.M)
+_TURN_RE = re.compile(r"\*\*User:\*\* ?(?P<user>.*?)\n\n\*\*Clea:\*\* ?(?P<assistant>.*)\Z", re.S)
+
+
+def parse_day(value: str) -> date:
+    """Strictly parse YYYY-MM-DD (also guards against path traversal in log lookups)."""
+    if not _DAY_RE.fullmatch(value):
+        raise ValueError(f"Invalid date '{value}'. Expected YYYY-MM-DD.")
+    return date.fromisoformat(value)
+
+
+def _truncate(text: str, limit: int = 60) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _parse_turns(markdown: str) -> list[tuple[str, str, str, str]]:
+    """Parse a daily log into (session_id, time, user_text, assistant_text) tuples."""
+    matches = list(_HEADING_RE.finditer(markdown))
+    turns: list[tuple[str, str, str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
+        body = markdown[match.end() : end].strip()
+        parsed = _TURN_RE.search(body)
+        if parsed:
+            user, assistant = parsed.group("user").strip(), parsed.group("assistant").strip()
+        else:
+            user, assistant = body, ""
+        turns.append((match.group("sid"), match.group("time"), user, assistant))
+    return turns
