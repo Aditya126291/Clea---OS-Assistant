@@ -182,18 +182,25 @@ async def _send_and_stream(ws_url: str, *, token: str | None = None) -> None:
         raise SystemExit(1) from exc
 
 
-def _run_daemon_cmd(host: str, port: int) -> None:
+def _run_daemon_cmd(host: str, port: int, *, background: bool = False) -> None:
     from clea.core.daemon import get_daemon_info, run_daemon
 
     info = get_daemon_info()
-    print(f"Starting Clea daemon on ws://{host}:{port}")
-    print(f"Data directory: {info['data_dir']}")
-    print(f"Today's daily log: {info['daily_log']}")
-    print(f"Token file: {info['token_file']}")
+    if not background:
+        print(f"Starting Clea daemon on ws://{host}:{port}")
+        print(f"Data directory: {info['data_dir']}")
+        print(f"Today's daily log: {info['daily_log']}")
+        print(f"Token file: {info['token_file']}")
     try:
-        run_daemon(host=host, port=port)
+        if background:
+            run_daemon(host=host, port=port, background=True)
+        else:
+            run_daemon(host=host, port=port)
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except auth.DaemonAlreadyRunningError as exc:
+        print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
     except OSError as exc:
         is_addr_in_use = (
@@ -205,6 +212,43 @@ def _run_daemon_cmd(host: str, port: int) -> None:
         if is_addr_in_use:
             msg += "\nThe address/port may already be in use by another 'clea daemon' process."
         print(msg, file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
+def _run_autostart_cmd(action: str) -> None:
+    from clea.core.daemon import daemon_log_path
+    from clea.surfaces.cli.autostart import (
+        install_autostart,
+        status_autostart,
+        uninstall_autostart,
+    )
+
+    try:
+        if action == "install":
+            status = install_autostart()
+            print(f"Installed Windows logon task '{status.task_name}'.")
+            print(f"Command: {status.command}")
+            print(f"Working directory: {status.working_dir}")
+            print(f"Daemon log: {daemon_log_path()}")
+        elif action == "uninstall":
+            removed = uninstall_autostart()
+            if removed:
+                print("Removed Windows logon task 'CleaDaemon'.")
+            else:
+                print("Windows logon task 'CleaDaemon' is not installed.")
+        elif action == "status":
+            status = status_autostart()
+            if not status.installed:
+                print(f"Task '{status.task_name}': not installed")
+            else:
+                print(f"Task '{status.task_name}': installed ({status.state or 'Ready'})")
+                if status.command:
+                    print(f"Command: {status.command}")
+                if status.working_dir:
+                    print(f"Working directory: {status.working_dir}")
+                print(f"Daemon log: {daemon_log_path()}")
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
 
 
@@ -225,12 +269,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("CLEA_PORT", DEFAULT_PORT)),
         help="WebSocket port (default: 8765)",
     )
+    daemon_parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Log to a rotating file in the user data directory instead of stdout",
+    )
 
     chat_parser = subparsers.add_parser("chat", help="Connect to the running Clea daemon")
     chat_parser.add_argument(
         "--url",
         default=None,
         help="Daemon WebSocket URL (default: ws://127.0.0.1:8765)",
+    )
+
+    autostart_parser = subparsers.add_parser(
+        "autostart",
+        help="Manage Windows logon auto-start for the Clea daemon",
+    )
+    autostart_parser.add_argument(
+        "action",
+        choices=["install", "uninstall", "status"],
+        help="Install, uninstall, or inspect the Task Scheduler logon task",
     )
     return parser
 
@@ -242,9 +301,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "daemon":
-        _run_daemon_cmd(args.host, args.port)
+        _run_daemon_cmd(args.host, args.port, background=args.background)
     elif args.command == "chat":
         host = os.environ.get("CLEA_HOST", DEFAULT_HOST)
         port = int(os.environ.get("CLEA_PORT", DEFAULT_PORT))
         ws_url = args.url or f"ws://{host}:{port}"
         asyncio.run(_send_and_stream(ws_url))
+    elif args.command == "autostart":
+        _run_autostart_cmd(args.action)
