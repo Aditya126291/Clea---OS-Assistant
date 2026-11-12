@@ -211,38 +211,39 @@ class CleaDaemon:
     async def _handle_connection(self, ws: ServerConnection) -> None:
         conn = _Connection(ws)
         try:
-            async for raw_message in ws:
-                if isinstance(raw_message, bytes):
-                    raw_text = raw_message.decode("utf-8", errors="replace")
-                else:
-                    raw_text = raw_message
+            with contextlib.suppress(ConnectionClosed):
+                async for raw_message in ws:
+                    if isinstance(raw_message, bytes):
+                        raw_text = raw_message.decode("utf-8", errors="replace")
+                    else:
+                        raw_text = raw_message
 
-                try:
-                    frame = parse_frame(raw_text)
-                except ValidationError as exc:
-                    await self._send(
-                        ws,
-                        ErrorEvent(
-                            data=ErrorData(
-                                message=f"Invalid protocol frame: {exc}", code="invalid_frame"
-                            )
-                        ),
-                    )
-                    continue
+                    try:
+                        frame = parse_frame(raw_text)
+                    except ValidationError as exc:
+                        await self._send(
+                            ws,
+                            ErrorEvent(
+                                data=ErrorData(
+                                    message=f"Invalid protocol frame: {exc}", code="invalid_frame"
+                                )
+                            ),
+                        )
+                        continue
 
-                if not isinstance(frame, BaseRequest):
-                    await self._send(
-                        ws,
-                        ErrorEvent(
-                            data=ErrorData(
-                                message="Client may only send 'request' frames.",
-                                code="invalid_frame",
-                            )
-                        ),
-                    )
-                    continue
+                    if not isinstance(frame, BaseRequest):
+                        await self._send(
+                            ws,
+                            ErrorEvent(
+                                data=ErrorData(
+                                    message="Client may only send 'request' frames.",
+                                    code="invalid_frame",
+                                )
+                            ),
+                        )
+                        continue
 
-                await self._dispatch_request(conn, frame)
+                    await self._dispatch_request(conn, frame)
         finally:
             await conn.close()
 

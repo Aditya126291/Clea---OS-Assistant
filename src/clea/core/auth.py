@@ -120,7 +120,7 @@ def allowed_origins_from_env() -> frozenset[str]:
 
 def host_header_is_local(host_header: str | None) -> bool:
     """True if the Host header names loopback (guards against DNS rebinding)."""
-    if not host_header:
+    if not host_header or "@" in host_header or any(ch.isspace() for ch in host_header):
         return False
     try:
         hostname = urlsplit(f"//{host_header}").hostname
