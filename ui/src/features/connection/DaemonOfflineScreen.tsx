@@ -1,4 +1,5 @@
-import { AlertCircle, RefreshCw, Terminal } from "lucide-react";
+import { AlertCircle, Play, RefreshCw, Terminal } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { ConnectionState } from "@/protocol/types";
@@ -15,6 +16,39 @@ export function DaemonOfflineScreen({
   onRetry,
 }: DaemonOfflineScreenProps) {
   const isAuthError = connectionState === "auth_error";
+  const startDaemon = typeof window !== "undefined" ? window.cleaDesktop?.startDaemon : undefined;
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (retryTimerRef.current !== null) {
+        clearTimeout(retryTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleStartDaemon = async () => {
+    if (!startDaemon || starting) return;
+    setStarting(true);
+    setStartError(null);
+    try {
+      const res = await startDaemon();
+      if (!res.ok) {
+        setStartError(res.error || "Could not start the background daemon.");
+        return;
+      }
+      onRetry();
+      retryTimerRef.current = setTimeout(() => {
+        onRetry();
+      }, 650);
+    } catch (err) {
+      setStartError(err instanceof Error ? err.message : "Could not start the background daemon.");
+    } finally {
+      setStarting(false);
+    }
+  };
 
   return (
     <main className="flex h-full items-center justify-center bg-[var(--bg)] p-6">
@@ -41,6 +75,12 @@ export function DaemonOfflineScreen({
             <code>uv run clea daemon</code>
           </div>
 
+          {startError && (
+            <p role="alert" className="text-xs text-[var(--danger)]">
+              {startError}
+            </p>
+          )}
+
           <div className="flex items-center justify-between gap-3">
             <span className="text-xs text-[var(--text-subtle)]" aria-live="polite">
               {connectionState === "connecting"
@@ -49,10 +89,23 @@ export function DaemonOfflineScreen({
                   ? `Auto-reconnecting (attempt ${reconnectAttempt})…`
                   : "Waiting for local daemon…"}
             </span>
-            <Button onClick={onRetry} size="sm">
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-              Retry now
-            </Button>
+            <div className="flex items-center gap-2">
+              {startDaemon && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleStartDaemon()}
+                  disabled={starting}
+                >
+                  <Play className="h-3.5 w-3.5" aria-hidden="true" />
+                  {starting ? "Starting…" : "Start daemon"}
+                </Button>
+              )}
+              <Button onClick={onRetry} size="sm">
+                <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                Retry now
+              </Button>
+            </div>
           </div>
         </CardContent>
       </Card>

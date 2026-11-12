@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -15,7 +16,14 @@ import {
   Tray,
   type WebContents,
 } from "electron";
-import { readDaemonConnection, readDesktopConfig, resolveRendererAssetPath } from "./paths";
+import {
+  buildLoginItemConfig,
+  readDaemonConnection,
+  readDesktopConfig,
+  resolveDaemonLauncher,
+  resolveRendererAssetPath,
+  shouldStartHidden,
+} from "./paths";
 import { createTrayIconPngBuffer } from "./tray-icon";
 
 const APP_ORIGIN = "clea-app://app";
@@ -125,7 +133,7 @@ function registerAppProtocol(): void {
   });
 }
 
-function createMainWindow(): BrowserWindow {
+function createMainWindow(options: { startHidden?: boolean } = {}): BrowserWindow {
   const win = new BrowserWindow({
     width: 1080,
     height: 740,
@@ -146,7 +154,9 @@ function createMainWindow(): BrowserWindow {
   hardenWebContents(win.webContents);
 
   win.once("ready-to-show", () => {
-    win.show();
+    if (!options.startHidden) {
+      win.show();
+    }
   });
 
   win.on("close", (event) => {
@@ -258,18 +268,79 @@ function createTray(): void {
   tray.on("click", showMainWindow);
 }
 
+function getAutoLaunchEnabled(): boolean {
+  const cfg = buildLoginItemConfig(false, app.isPackaged, process.execPath, app.getAppPath());
+  return app.getLoginItemSettings({ path: cfg.path, args: cfg.args }).openAtLogin;
+}
+
+function setAutoLaunchEnabled(enabled: boolean): boolean {
+  const cfg = buildLoginItemConfig(enabled, app.isPackaged, process.execPath, app.getAppPath());
+  app.setLoginItemSettings({
+    openAtLogin: cfg.openAtLogin,
+    path: cfg.path,
+    args: cfg.args,
+  });
+  return getAutoLaunchEnabled();
+}
+
+function startBackgroundDaemon(): { ok: boolean; error?: string } {
+  const spec = resolveDaemonLauncher(app.getAppPath());
+  if (!spec) {
+    return {
+      ok: false,
+      error: "Could not locate the Clea .venv Python interpreter.",
+    };
+  }
+  try {
+    const child = spawn(spec.command, spec.args, {
+      cwd: spec.cwd,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      shell: false,
+    });
+    child.unref();
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", (_event, argv) => {
+    if (!argv.includes("--hidden")) {
+      showMainWindow();
+    }
+  });
+}
+
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return;
+
   if (!DEV_RENDERER_URL) {
     registerAppProtocol();
   }
   registerCsp();
 
+  // Read session_token fresh from disk on every connect/reconnect; never cache it.
   ipcMain.handle("clea:get-connection", () => readDaemonConnection());
+  ipcMain.handle("clea:get-auto-launch", () => getAutoLaunchEnabled());
+  ipcMain.handle("clea:set-auto-launch", (_event, enabled: unknown) =>
+    setAutoLaunchEnabled(Boolean(enabled)),
+  );
+  ipcMain.handle("clea:start-daemon", () => startBackgroundDaemon());
   ipcMain.on("clea:close-quick-ask", () => {
     quickAskWindow?.hide();
   });
 
-  mainWindow = createMainWindow();
+  const startHidden = shouldStartHidden(process.argv, app.getLoginItemSettings());
+  mainWindow = createMainWindow({ startHidden });
   quickAskWindow = createQuickAskWindow();
   createTray();
 

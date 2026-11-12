@@ -1,9 +1,10 @@
 import { RefreshCw } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useTheme, type ThemePreference } from "@/lib/theme-context";
+import { cn } from "@/lib/utils";
 import { useCleaStore } from "@/protocol/store";
 
 const POLICY_LABELS: Record<string, { label: string; variant: "success" | "warning" | "danger" }> =
@@ -19,10 +20,36 @@ export function SettingsView() {
   const settingsLoading = useCleaStore((s) => s.settingsLoading);
   const loadSettings = useCleaStore((s) => s.loadSettings);
   const { preference, setPreference } = useTheme();
+  const desktopBridge = typeof window !== "undefined" ? window.cleaDesktop : undefined;
+  const hasAutoLaunch = Boolean(desktopBridge?.getAutoLaunch && desktopBridge?.setAutoLaunch);
+  const [autoLaunch, setAutoLaunch] = useState(false);
+  const [autoLaunchBusy, setAutoLaunchBusy] = useState(false);
 
   useEffect(() => {
     void loadSettings();
   }, [loadSettings]);
+
+  useEffect(() => {
+    if (!desktopBridge?.getAutoLaunch) return;
+    let active = true;
+    void desktopBridge.getAutoLaunch().then((enabled) => {
+      if (active) setAutoLaunch(Boolean(enabled));
+    });
+    return () => {
+      active = false;
+    };
+  }, [desktopBridge]);
+
+  const handleToggleAutoLaunch = async () => {
+    if (!desktopBridge?.setAutoLaunch || autoLaunchBusy) return;
+    setAutoLaunchBusy(true);
+    try {
+      const next = await desktopBridge.setAutoLaunch(!autoLaunch);
+      setAutoLaunch(Boolean(next));
+    } finally {
+      setAutoLaunchBusy(false);
+    }
+  };
 
   return (
     <section aria-label="Settings" className="flex h-full flex-col">
@@ -70,6 +97,48 @@ export function SettingsView() {
                   </Button>
                 ))}
               </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Desktop Startup</CardTitle>
+            </CardHeader>
+            <CardContent className="flex items-center justify-between gap-4">
+              <div>
+                <div id="auto-launch-label" className="text-xs font-medium text-[var(--text)]">
+                  Launch Clea at login
+                </div>
+                <p className="text-xs text-[var(--text-muted)]">
+                  {hasAutoLaunch
+                    ? "Starts Clea hidden in the system tray when you sign in."
+                    : "Available when running the Electron desktop app."}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoLaunch}
+                aria-labelledby="auto-launch-label"
+                disabled={!hasAutoLaunch || autoLaunchBusy}
+                onClick={() => void handleToggleAutoLaunch()}
+                className={cn(
+                  "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                  autoLaunch
+                    ? "border-[var(--accent)] bg-[var(--accent)]"
+                    : "border-[var(--border-strong)] bg-[var(--bg-subtle)]",
+                )}
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "pointer-events-none inline-block h-3.5 w-3.5 rounded-full transition-transform",
+                    autoLaunch
+                      ? "translate-x-4 bg-[var(--accent-fg)]"
+                      : "translate-x-0.5 bg-[var(--text-muted)]",
+                  )}
+                />
+              </button>
             </CardContent>
           </Card>
 

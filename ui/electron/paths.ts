@@ -11,6 +11,18 @@ export interface DesktopConfig {
   quickAskShortcut: string;
 }
 
+export interface DaemonLauncherSpec {
+  command: string;
+  args: string[];
+  cwd: string;
+}
+
+export interface LoginItemConfig {
+  openAtLogin: boolean;
+  path: string;
+  args: string[];
+}
+
 export const DEFAULT_QUICK_ASK_SHORTCUT = "CommandOrControl+Alt+Space";
 
 export function resolveCleaDataDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -95,4 +107,60 @@ export function resolveRendererAssetPath(rendererDir: string, requestUrl: string
     return null;
   }
   return candidate;
+}
+
+export function shouldStartHidden(
+  argv: readonly string[],
+  loginSettings?: { wasOpenedAtLogin?: boolean },
+): boolean {
+  return argv.includes("--hidden") || Boolean(loginSettings?.wasOpenedAtLogin);
+}
+
+export function buildLoginItemConfig(
+  openAtLogin: boolean,
+  isPackaged: boolean,
+  execPath: string,
+  appPath: string,
+): LoginItemConfig {
+  return {
+    openAtLogin,
+    path: execPath,
+    args: isPackaged ? ["--hidden"] : [appPath, "--hidden"],
+  };
+}
+
+/**
+ * Locate the project venv's background Python (`pythonw.exe` on Windows) and
+ * the repo working directory so Electron can launch `clea daemon --background`
+ * without a console window or shell interpolation.
+ */
+export function resolveDaemonLauncher(
+  startDir: string,
+  platform: NodeJS.Platform = process.platform,
+): DaemonLauncherSpec | null {
+  let cursor = path.resolve(startDir);
+  for (let i = 0; i < 6; i += 1) {
+    const pyproject = path.join(cursor, "pyproject.toml");
+    if (fs.existsSync(pyproject)) {
+      const candidates =
+        platform === "win32"
+          ? [
+              path.join(cursor, ".venv", "Scripts", "pythonw.exe"),
+              path.join(cursor, ".venv", "Scripts", "python.exe"),
+            ]
+          : [path.join(cursor, ".venv", "bin", "python")];
+
+      const command = candidates.find((candidate) => fs.existsSync(candidate));
+      if (!command) return null;
+      return {
+        command,
+        args: ["-m", "clea", "daemon", "--background"],
+        cwd: cursor,
+      };
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return null;
 }

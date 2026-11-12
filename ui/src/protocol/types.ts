@@ -132,9 +132,17 @@ export interface CleaConnectionInfo {
   wsUrl: string;
 }
 
+export interface StartDaemonResult {
+  ok: boolean;
+  error?: string;
+}
+
 export interface CleaDesktopBridge {
   isElectron: true;
   getConnection: () => Promise<CleaConnectionInfo | null>;
+  getAutoLaunch?: () => Promise<boolean>;
+  setAutoLaunch?: (enabled: boolean) => Promise<boolean>;
+  startDaemon?: () => Promise<StartDaemonResult>;
   onQuickAskFocus?: (cb: () => void) => () => void;
   closeQuickAsk?: () => void;
 }

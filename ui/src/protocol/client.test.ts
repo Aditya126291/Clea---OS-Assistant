@@ -125,4 +125,46 @@ describe("CleaClient", () => {
 
     client.dispose();
   });
+
+  it("re-reads a new session token when reconnecting after daemon restart", async () => {
+    let phase: "offline" | "first" | "second" = "offline";
+    const sockets: MockSocket[] = [];
+    const onConnected = vi.fn();
+
+    const client = new CleaClient({
+      resolveConnection: async () => {
+        if (phase === "offline") return { ok: false, reason: "daemon_offline" };
+        const token = phase === "first" ? "tok-first" : "tok-second";
+        return { ok: true, info: { token, wsUrl: "ws://127.0.0.1:8765" } };
+      },
+      createWebSocket: (url, protocols) => {
+        const sock = new MockSocket(url, protocols);
+        sockets.push(sock);
+        return sock;
+      },
+      onConnected,
+    });
+
+    await client.connect();
+    expect(sockets).toHaveLength(0);
+
+    // Daemon starts later
+    phase = "first";
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].protocols).toEqual(["clea.v1", "clea.token.tok-first"]);
+    sockets[0].triggerOpen();
+    expect(onConnected).toHaveBeenCalledTimes(1);
+
+    // Daemon restarts with a brand new token
+    phase = "second";
+    sockets[0].triggerClose(1006);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(sockets).toHaveLength(2);
+    expect(sockets[1].protocols).toEqual(["clea.v1", "clea.token.tok-second"]);
+    sockets[1].triggerOpen();
+    expect(onConnected).toHaveBeenCalledTimes(2);
+
+    client.dispose();
+  });
 });

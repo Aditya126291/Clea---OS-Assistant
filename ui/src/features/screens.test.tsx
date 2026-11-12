@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "@/App";
 import { ActivityView } from "@/features/activity/ActivityView";
@@ -127,19 +127,37 @@ describe("UI screens & navigation", () => {
     expect(loadDailyMemory).toHaveBeenCalledWith("2026-11-12");
   });
 
-  it("renders non-secret provider, endpoint, and permission tiers in SettingsView", () => {
+  it("renders non-secret provider, endpoint, and permission tiers in SettingsView", async () => {
     const loadSettings = vi.fn().mockResolvedValue(undefined);
+    const getAutoLaunch = vi.fn().mockResolvedValue(false);
+    const setAutoLaunch = vi.fn().mockResolvedValue(true);
+    window.cleaDesktop = {
+      isElectron: true,
+      getConnection: async () => null,
+      getAutoLaunch,
+      setAutoLaunch,
+    };
     useCleaStore.setState({ loadSettings });
 
-    render(
-      <ThemeProvider>
-        <SettingsView />
-      </ThemeProvider>,
-    );
-    expect(screen.getByText("gemini")).toBeInTheDocument();
-    expect(screen.getByText("gemini-3.8-flash")).toBeInTheDocument();
-    expect(screen.getByText("ws://127.0.0.1:8765")).toBeInTheDocument();
-    expect(screen.getByText("Ask + confirm")).toBeInTheDocument();
+    try {
+      render(
+        <ThemeProvider>
+          <SettingsView />
+        </ThemeProvider>,
+      );
+      expect(screen.getByText("gemini")).toBeInTheDocument();
+      expect(screen.getByText("gemini-3.8-flash")).toBeInTheDocument();
+      expect(screen.getByText("ws://127.0.0.1:8765")).toBeInTheDocument();
+      expect(screen.getByText("Ask + confirm")).toBeInTheDocument();
+
+      const toggle = screen.getByRole("switch", { name: /Launch Clea at login/i });
+      expect(toggle).toHaveAttribute("aria-checked", "false");
+      fireEvent.click(toggle);
+      await waitFor(() => expect(setAutoLaunch).toHaveBeenCalledWith(true));
+      await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+    } finally {
+      delete window.cleaDesktop;
+    }
   });
 
   it("toggles CommandPalette on Ctrl+K", () => {
