@@ -283,30 +283,55 @@ function setAutoLaunchEnabled(enabled: boolean): boolean {
   return getAutoLaunchEnabled();
 }
 
-function startBackgroundDaemon(): { ok: boolean; error?: string } {
+function startBackgroundDaemon(): Promise<{ ok: boolean; error?: string }> {
   const spec = resolveDaemonLauncher(app.getAppPath());
   if (!spec) {
-    return {
+    return Promise.resolve({
       ok: false,
       error: "Could not locate the Clea .venv Python interpreter.",
-    };
-  }
-  try {
-    const child = spawn(spec.command, spec.args, {
-      cwd: spec.cwd,
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-      shell: false,
     });
-    child.unref();
-    return { ok: true };
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
   }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: { ok: boolean; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    try {
+      const child = spawn(spec.command, spec.args, {
+        cwd: spec.cwd,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+        shell: false,
+      });
+      const timer = setTimeout(() => {
+        child.unref();
+        finish({ ok: true });
+      }, 400);
+      child.once("error", (err) => {
+        clearTimeout(timer);
+        finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      });
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        if (code === 0) {
+          finish({ ok: true });
+        } else {
+          finish({
+            ok: false,
+            error: `Background daemon exited immediately (code ${code ?? "unknown"}). Check daemon.log.`,
+          });
+        }
+      });
+    } catch (err) {
+      finish({
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();

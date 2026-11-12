@@ -147,3 +147,14 @@ def test_configure_daemon_logging_writes_rotating_log_in_background(tmp_path: Pa
         for h in root.handlers:
             h.close()
         root.handlers = old_handlers
+
+
+def test_python_module_entrypoint_runs_cli() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-m", "clea", "daemon", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "--background" in proc.stdout

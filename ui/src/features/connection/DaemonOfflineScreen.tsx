@@ -19,13 +19,14 @@ export function DaemonOfflineScreen({
   const startDaemon = typeof window !== "undefined" ? window.cleaDesktop?.startDaemon : undefined;
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
-  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
 
   useEffect(() => {
     return () => {
-      if (retryTimerRef.current !== null) {
-        clearTimeout(retryTimerRef.current);
+      for (const timer of retryTimersRef.current) {
+        clearTimeout(timer);
       }
+      retryTimersRef.current = [];
     };
   }, []);
 
@@ -40,9 +41,12 @@ export function DaemonOfflineScreen({
         return;
       }
       onRetry();
-      retryTimerRef.current = setTimeout(() => {
-        onRetry();
-      }, 650);
+      for (const delayMs of [650, 1600]) {
+        const timer = setTimeout(() => {
+          onRetry();
+        }, delayMs);
+        retryTimersRef.current.push(timer);
+      }
     } catch (err) {
       setStartError(err instanceof Error ? err.message : "Could not start the background daemon.");
     } finally {
