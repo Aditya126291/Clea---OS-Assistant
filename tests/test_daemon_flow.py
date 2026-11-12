@@ -599,3 +599,37 @@ async def test_daemon_bind_failure_does_not_overwrite_or_create_token_file(
         assert not fresh_token_file.exists()
     finally:
         await first.stop()
+
+
+async def test_daemon_closes_server_if_write_token_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    reserved_port = probe.getsockname()[1]
+    probe.close()
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=reserved_port,
+        provider=FakeToolCallingProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+
+    def fail_write(_token: str, _path: Path) -> None:
+        raise PermissionError("disk read-only")
+
+    monkeypatch.setattr(auth, "write_token", fail_write)
+    with pytest.raises(PermissionError, match="disk read-only"):
+        await daemon.start()
+    assert daemon._server is None
+
+    # The port must be released cleanly so another listener can bind it.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", reserved_port))
+    finally:
+        sock.close()

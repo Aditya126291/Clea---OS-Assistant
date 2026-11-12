@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import json
 import os
 import sys
@@ -195,11 +196,15 @@ def _run_daemon_cmd(host: str, port: int) -> None:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except OSError as exc:
-        print(
-            f"Could not start Clea daemon on ws://{host}:{port} ({exc}).\n"
-            "The address/port may already be in use by another 'clea daemon' process.",
-            file=sys.stderr,
+        is_addr_in_use = (
+            exc.errno == errno.EADDRINUSE
+            or getattr(exc, "winerror", None) == 10048
+            or (exc.errno is None and "already in use" in str(exc).lower())
         )
+        msg = f"Could not start Clea daemon on ws://{host}:{port} ({exc})."
+        if is_addr_in_use:
+            msg += "\nThe address/port may already be in use by another 'clea daemon' process."
+        print(msg, file=sys.stderr)
         raise SystemExit(1) from exc
 
 

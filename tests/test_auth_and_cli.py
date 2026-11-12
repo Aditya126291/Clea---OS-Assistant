@@ -169,6 +169,13 @@ def test_cli_daemon_exits_cleanly_when_port_already_in_use(
         assert "already be in use" in err
         assert "clea daemon" in err
         assert not auth.token_path(tmp_path).exists()
+
+        existing_token = auth.token_path(tmp_path)
+        auth.write_token("live-daemon-token", existing_token)
+        with pytest.raises(SystemExit) as exc2:
+            main(["daemon", "--host", "127.0.0.1", "--port", str(occupied_port)])
+        assert exc2.value.code == 1
+        assert auth.read_token(existing_token) == "live-daemon-token"
     finally:
         sock.close()
 
@@ -190,3 +197,25 @@ def test_cli_run_daemon_cmd_handles_oserror_cleanly(
     err = capsys.readouterr().err
     assert "Could not start Clea daemon" in err
     assert "clea daemon" in err
+
+
+def test_cli_run_daemon_cmd_distinguishes_non_eaddrinuse_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import errno
+
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+
+    def fail_perm(*, host: str, port: int) -> None:
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr("clea.core.daemon.run_daemon", fail_perm)
+    with pytest.raises(SystemExit) as exc:
+        _run_daemon_cmd("127.0.0.1", 8765)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Could not start Clea daemon" in err
+    assert "Permission denied" in err
+    assert "already be in use" not in err
