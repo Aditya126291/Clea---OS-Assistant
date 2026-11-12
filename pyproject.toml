@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clea"
+version = "0.1.0"
+description = "Voice-first personal AI assistant for the desktop (text-only Milestone 1 foundation)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "google-genai>=3.2,<4",
+    "platformdirs>=4.14,<5",
+    "pydantic>=2.14,<3",
+    "python-dotenv>=1.2,<2",
+    "websockets>=17.4,<18",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.17",
+]
+
+[project.scripts]
+clea = "clea.surfaces.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clea"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
