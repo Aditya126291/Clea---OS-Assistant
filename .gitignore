@@ -45,3 +45,10 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Node / UI / Electron
+node_modules/
+ui/dist/
+ui/out/
+ui/.vite/
+*.tsbuildinfo
