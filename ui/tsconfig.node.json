@@ -8,9 +8,19 @@
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": true,
+    "composite": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/tsc-node",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
     "strict": true,
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "vitest.config.ts", "dev-token-plugin.ts", "tests"]
+  "include": [
+    "vite.config.ts",
+    "vitest.config.ts",
+    "electron.vite.config.ts",
+    "dev-token-plugin.ts",
+    "tests"
+  ],
+  "references": [{ "path": "./tsconfig.electron.json" }]
 }

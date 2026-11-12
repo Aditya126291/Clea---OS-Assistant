@@ -8,9 +8,12 @@
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": true,
+    "composite": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/tsc-electron",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.electron.tsbuildinfo",
     "strict": true,
     "types": ["node"]
   },
-  "include": ["electron", "electron.vite.config.ts"]
+  "include": ["electron"]
 }
