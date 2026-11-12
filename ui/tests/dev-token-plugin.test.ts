@@ -4,14 +4,17 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { handleDevTokenRequest } from "../dev-token-plugin";
 
-function makeRes() {
-  const headers: Record<string, string> = {};
+function makeRes(initialHeaders: Record<string, string> = {}) {
+  const headers: Record<string, string> = { ...initialHeaders };
   let body = "";
   const res = {
     statusCode: 200,
     setHeader(name: string, value: string | number | readonly string[]) {
       headers[name.toLowerCase()] = String(value);
       return res;
+    },
+    removeHeader(name: string) {
+      delete headers[name.toLowerCase()];
     },
     end(chunk?: unknown) {
       body = chunk ? String(chunk) : "";
@@ -35,7 +38,7 @@ describe("cleaDevTokenPlugin", () => {
     tmpDirs.push(tmpDir);
     fs.writeFileSync(path.join(tmpDir, "session_token"), "tok-abc\n", "utf-8");
 
-    const ok = makeRes();
+    const ok = makeRes({ "access-control-allow-origin": "http://localhost:5173" });
     handleDevTokenRequest(
       {
         url: "/",
@@ -77,6 +80,14 @@ describe("cleaDevTokenPlugin", () => {
       { CLEA_DATA_DIR: tmpDir },
     );
     expect(nullOrigin.res.statusCode).toBe(403);
+
+    const userinfoHost = makeRes();
+    handleDevTokenRequest(
+      { url: "/", method: "GET", headers: { host: "user@127.0.0.1:5173" } },
+      userinfoHost.res,
+      { CLEA_DATA_DIR: tmpDir },
+    );
+    expect(userinfoHost.res.statusCode).toBe(403);
   });
 
   it("returns 404 when daemon token file is absent", () => {

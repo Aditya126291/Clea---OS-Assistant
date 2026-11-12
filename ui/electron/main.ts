@@ -21,7 +21,7 @@ import { createTrayIconPngBuffer } from "./tray-icon";
 const APP_ORIGIN = "clea-app://app";
 const DEV_RENDERER_URL = process.env.ELECTRON_RENDERER_URL;
 const RENDERER_DIR = path.resolve(import.meta.dirname, "../renderer");
-const PRELOAD_PATH = path.resolve(import.meta.dirname, "../preload/preload.mjs");
+const PRELOAD_PATH = path.resolve(import.meta.dirname, "../preload/preload.cjs");
 
 // Must run before app.whenReady(). Allows Fetch/WebSocket from clea-app://app.
 protocol.registerSchemesAsPrivileged([
@@ -225,7 +225,16 @@ function toggleQuickAsk(): void {
   }
   quickAskWindow.show();
   quickAskWindow.focus();
-  quickAskWindow.webContents.send("clea:quick-ask-focus");
+  const win = quickAskWindow;
+  if (win.webContents.isLoading()) {
+    win.webContents.once("did-finish-load", () => {
+      if (!win.isDestroyed()) {
+        win.webContents.send("clea:quick-ask-focus");
+      }
+    });
+  } else {
+    win.webContents.send("clea:quick-ask-focus");
+  }
 }
 
 function createTray(): void {

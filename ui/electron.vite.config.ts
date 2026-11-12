@@ -18,6 +18,10 @@ export default defineConfig({
       outDir: "out/preload",
       rollupOptions: {
         input: path.resolve(import.meta.dirname, "electron/preload.ts"),
+        output: {
+          format: "cjs",
+          entryFileNames: "[name].cjs",
+        },
       },
     },
   },

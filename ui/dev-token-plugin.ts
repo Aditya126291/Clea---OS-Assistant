@@ -25,7 +25,7 @@ function isLocalHostname(hostname: string | null | undefined): boolean {
 }
 
 export function isValidLocalHostHeader(hostHeader: string | undefined): boolean {
-  if (!hostHeader) return false;
+  if (!hostHeader || hostHeader.includes("@") || /\s/.test(hostHeader)) return false;
   try {
     const parsed = new URL(`http://${hostHeader}`);
     return isLocalHostname(parsed.hostname.replace(/^\[|\]$/g, ""));
@@ -50,8 +50,18 @@ export function isValidLocalOrigin(originHeader: string | undefined): boolean {
 export interface DevTokenResponse {
   statusCode: number;
   setHeader: (name: string, value: string) => unknown;
+  removeHeader?: (name: string) => unknown;
   end: (chunk?: string) => unknown;
 }
+
+const CORS_HEADERS = [
+  "access-control-allow-origin",
+  "access-control-allow-credentials",
+  "access-control-allow-headers",
+  "access-control-allow-methods",
+  "access-control-expose-headers",
+  "access-control-max-age",
+];
 
 export function handleDevTokenRequest(
   req: Pick<IncomingMessage, "url" | "method" | "headers">,
@@ -60,6 +70,9 @@ export function handleDevTokenRequest(
 ): boolean {
   if (req.url && req.url !== "/" && req.url !== "") {
     return false;
+  }
+  for (const header of CORS_HEADERS) {
+    res.removeHeader?.(header);
   }
   if (req.method !== "GET") {
     res.statusCode = 405;
@@ -93,7 +106,9 @@ export function handleDevTokenRequest(
   }
 
   const wsHost = env.CLEA_HOST || "127.0.0.1";
-  const wsPort = Number(env.CLEA_PORT || 8765);
+  const parsedPort = Number(env.CLEA_PORT || 8765);
+  const wsPort =
+    Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 8765;
   res.statusCode = 200;
   res.end(JSON.stringify({ token, wsUrl: `ws://${wsHost}:${wsPort}` }));
   return true;

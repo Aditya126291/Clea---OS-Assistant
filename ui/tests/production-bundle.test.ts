@@ -21,10 +21,13 @@ function readAllBuiltText(dir: string): string {
 }
 
 describe("Production bundle hygiene", () => {
-  it("excludes dev-only mocks and the /__clea/token endpoint from vite build output", () => {
-    const cleanEnv: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: "production" };
+  it("excludes dev-only mocks and the /__clea/token endpoint from vite build output even if VITE_CLEA_MOCKS=true", () => {
+    const cleanEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      NODE_ENV: "production",
+      VITE_CLEA_MOCKS: "true",
+    };
     delete cleanEnv.VITEST;
-    delete cleanEnv.VITE_CLEA_MOCKS;
 
     execSync("pnpm build", { cwd: UI_ROOT, stdio: "pipe", env: cleanEnv });
     expect(fs.existsSync(DIST_DIR)).toBe(true);

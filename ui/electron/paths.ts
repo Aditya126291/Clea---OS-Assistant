@@ -43,7 +43,9 @@ export function readDaemonConnection(
   if (!token) return null;
 
   const host = env.CLEA_HOST || "127.0.0.1";
-  const port = Number(env.CLEA_PORT || 8765);
+  const parsedPort = Number(env.CLEA_PORT || 8765);
+  const port =
+    Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 8765;
   return { token, wsUrl: `ws://${host}:${port}` };
 }
 
