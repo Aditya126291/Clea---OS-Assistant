@@ -21,9 +21,9 @@ ENV/
 *.key
 
 # Memory, logs, and local data (should live in user data dir, never in repo)
-memory/
-MEMORY.md
-logs/
+/memory/
+/MEMORY.md
+/logs/
 *.log
 *.jsonl
 *.db
