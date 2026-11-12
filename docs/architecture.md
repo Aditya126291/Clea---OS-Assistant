@@ -43,8 +43,12 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
 
 ### 2. Core Daemon & Handshake Security (`src/clea/core/daemon.py`, `src/clea/core/auth.py`)
 - **`CleaDaemon`**: Binds strictly to `127.0.0.1` (`localhost` / `::1`) using `websockets`.
+- **Single-Instance & Background Mode**:
+  - `InstanceLock` (`<user_data_dir>/daemon.lock`) guarantees only one daemon runs per data directory and prevents a second start from overwriting the active `session_token`.
+  - `clea daemon --background` writes structured logs to `<user_data_dir>/logs/daemon.log` (`RotatingFileHandler`, 5 MB x 3 backups, UTF-8) instead of stdout/stderr.
+  - On Windows, `clea autostart install | uninstall | status` configures a current-user Task Scheduler task (`CleaDaemon`) in the interactive logon session (`pythonw.exe`) rather than a Session 0 Windows Service (see [ADR 0002](decisions/0002-windows-autostart-session.md)).
 - **Auth & Origin Check (`process_request`)**:
-  - Generates a fresh 256-bit token (`secrets.token_urlsafe`) on every daemon start, writes it to `<user_data_dir>/session_token` (`0600` best-effort), and removes it on graceful stop.
+  - Generates a fresh 256-bit token (`secrets.token_urlsafe`) on every daemon start, writes it to `<user_data_dir>/session_token` (POSIX `0600` or Windows current-user SID NTFS ACL via `icacls`), and removes it on graceful stop.
   - Validates local `Host` header (DNS-rebinding defense), `Origin` against `CLEA_ALLOWED_ORIGINS` (defaults: `http://localhost:5173`, `http://127.0.0.1:5173`, `clea-app://app`; wildcards and `null` are rejected), and `Sec-WebSocket-Protocol` token via `hmac.compare_digest`.
 - **Concurrent Turns & Approvals**:
   - Each `chat.send` runs as an asyncio task so the connection receive loop stays live for `approval.respond`.
@@ -71,8 +75,8 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
 - **Browser Dev Token (`ui/dev-token-plugin.ts`)**: dev-only Vite plugin serving `/__clea/token` to localhost Host/Origin with `Cache-Control: no-store` and no CORS headers; excluded from production builds.
 
 ### 6. Electron Shell (`ui/electron/`)
-- Built with `electron-vite`. Does not bundle or auto-start the daemon.
+- Built with `electron-vite` (uses `app.requestSingleInstanceLock()`). Does not bundle the daemon, though the offline screen offers an explicit **Start daemon** action in Electron that spawns the repo venv's `pythonw.exe -m clea daemon --background` (no shell).
 - **Hardening**: `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`, `webSecurity: true`, strict CSP, navigation and `window.open` blocked.
 - **Custom Protocol (`clea-app://app`)**: registered as `standard` + `secure` with Fetch/WebSocket support, strictly scoped to `out/renderer/` (rejects path traversal).
-- **Preload (`ui/electron/preload.ts`)**: exposes only `isElectron`, `getConnection()`, `onQuickAskFocus()`, and `closeQuickAsk()`.
-- **System Tray & Quick Ask**: Tray menu (`Open`, `Quick Ask`, `Quit`), close-to-tray behavior, and a configurable global shortcut (default `CommandOrControl+Alt+Space`, overridable via `<user_data_dir>/desktop_config.json`) opening an always-on-top glass Quick-Ask window.
+- **Preload (`ui/electron/preload.ts`)**: exposes `window.cleaDesktop` with `isElectron`, `getConnection()` (re-reads `session_token` fresh from disk on every connect/reconnect, never cached), `onQuickAskFocus()`, `closeQuickAsk()`, `getAutoLaunch()`, `setAutoLaunch()`, and `startDaemon()`.
+- **System Tray, Auto-Launch & Quick Ask**: Tray menu (`Open`, `Quick Ask`, `Quit`), close-to-tray behavior, optional **Launch Clea at login** toggle in Settings (default off; starts hidden in tray via `--hidden` / `wasOpenedAtLogin`), and a configurable global shortcut (default `CommandOrControl+Alt+Space`, overridable via `<user_data_dir>/desktop_config.json`) opening an always-on-top glass Quick-Ask window.

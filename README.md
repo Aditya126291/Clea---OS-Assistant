@@ -32,11 +32,29 @@ Start the daemon in terminal 1:
 uv run clea daemon
 ```
 
+Or run it in background logging mode (writes to `%LOCALAPPDATA%\clea\logs\daemon.log` on Windows):
+
+```powershell
+uv run clea daemon --background
+```
+
 Connect the chat client in terminal 2:
 
 ```powershell
 uv run clea chat
 ```
+
+## Windows Auto-Start at Login
+
+To register a current-user Task Scheduler logon task (`CleaDaemon`) that runs `pythonw.exe -m clea daemon --background` hidden in your interactive session (no admin rights required):
+
+```powershell
+uv run clea autostart install
+uv run clea autostart status
+uv run clea autostart uninstall
+```
+
+In the Electron desktop app, open **Settings -> Launch Clea at login** (off by default) to start the app minimized to the system tray at login. When the daemon restarts, the desktop app re-reads `<user_data_dir>/session_token` automatically on reconnect (manual check: restart the daemon with `clea daemon --background` while the Electron window is open and verify it reconnects without restarting the app).
 
 ## Development Checks
 
@@ -44,6 +62,19 @@ uv run clea chat
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
+uv run python scripts/gen_ts_types.py --check
 ```
 
-See [docs/architecture.md](docs/architecture.md) and [CLAUDE.md](CLAUDE.md) for architecture details and rules.
+UI & Electron checks (`ui/`):
+
+```powershell
+cd ui
+pnpm format:check
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm desktop:build
+```
+
+See [docs/architecture.md](docs/architecture.md), [docs/decisions/0002-windows-autostart-session.md](docs/decisions/0002-windows-autostart-session.md), and [CLAUDE.md](CLAUDE.md) for architecture details and rules.
