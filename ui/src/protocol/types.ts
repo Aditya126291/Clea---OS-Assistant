@@ -5,6 +5,9 @@ import type {
   ApprovalResolvedData,
   ApprovalRespondParams,
   ApprovalRespondResult,
+  CallEndedData,
+  CallStartedData,
+  CallState,
   ChatSendParams,
   ChatSendResult,
   ConversationGetParams,
@@ -21,6 +24,8 @@ import type {
   Request,
   ResponseFrame,
   RiskTier,
+  ScreenCaptureStateData,
+  ScreenCaptureTarget1 as ScreenCaptureTarget,
   SessionNewResult,
   SettingsGetResult,
   TaskState,
@@ -28,7 +33,18 @@ import type {
   ToolCallFinishedData,
   ToolCallStartedData,
   ToolInfo,
+  TranscriptData,
+  TranscriptRole,
+  UsageData,
+  VoiceDelegateTaskParams,
+  VoiceDelegateTaskResult,
+  VoiceEndCallParams,
+  VoiceEndCallResult,
+  VoiceStartCallParams,
+  VoiceStartCallResult,
   VoiceState,
+  VoiceStatusResult,
+  VoiceTrigger,
 } from "./generated";
 
 export type {
@@ -38,6 +54,9 @@ export type {
   ApprovalResolvedData,
   ApprovalRespondParams,
   ApprovalRespondResult,
+  CallEndedData,
+  CallStartedData,
+  CallState,
   ChatSendParams,
   ChatSendResult,
   ConversationGetParams,
@@ -54,6 +73,8 @@ export type {
   Request as CleaRequest,
   ResponseFrame,
   RiskTier,
+  ScreenCaptureStateData,
+  ScreenCaptureTarget,
   SessionNewResult,
   SettingsGetResult,
   TaskState,
@@ -61,7 +82,18 @@ export type {
   ToolCallFinishedData,
   ToolCallStartedData,
   ToolInfo,
+  TranscriptData,
+  TranscriptRole,
+  UsageData,
+  VoiceDelegateTaskParams,
+  VoiceDelegateTaskResult,
+  VoiceEndCallParams,
+  VoiceEndCallResult,
+  VoiceStartCallParams,
+  VoiceStartCallResult,
   VoiceState,
+  VoiceStatusResult,
+  VoiceTrigger,
 };
 
 export type CleaMethod = NonNullable<Request["method"]>;
@@ -76,6 +108,10 @@ export interface MethodParamsMap {
   "conversations.list": Record<string, never>;
   "conversations.get": ConversationGetParams;
   "settings.get": Record<string, never>;
+  "voice.start_call": VoiceStartCallParams;
+  "voice.end_call": VoiceEndCallParams;
+  "voice.status": Record<string, never>;
+  "voice.delegate_task": VoiceDelegateTaskParams;
 }
 
 export interface MethodResultMap {
@@ -88,6 +124,10 @@ export interface MethodResultMap {
   "conversations.list": ConversationsListResult;
   "conversations.get": ConversationsGetResult;
   "settings.get": SettingsGetResult;
+  "voice.start_call": VoiceStartCallResult;
+  "voice.end_call": VoiceEndCallResult;
+  "voice.status": VoiceStatusResult;
+  "voice.delegate_task": VoiceDelegateTaskResult;
 }
 
 export type ConnectionState =

@@ -3,13 +3,17 @@ import { CleaClient, type CleaClientOptions } from "./client";
 import type {
   AppView,
   ApprovalDecision,
+  CallState,
   ChatMessage,
   CleaEvent,
   ConnectionState,
   ConversationSummary,
   ConversationTurn,
+  ScreenCaptureTarget,
   SettingsGetResult,
   TaskStatusData,
+  TranscriptData,
+  UsageData,
   VoiceState,
 } from "./types";
 
@@ -47,7 +51,13 @@ export interface CleaStoreState {
   settingsLoading: boolean;
 
   voiceState: VoiceState;
+  callState: CallState;
+  activeCallId: string | null;
   callOverlayOpen: boolean;
+  screenCaptureActive: boolean;
+  screenCaptureTarget: ScreenCaptureTarget | null;
+  voiceTranscripts: TranscriptData[];
+  lastCallUsage: UsageData | null;
 
   connect: (clientOptions?: CleaClientOptions) => void;
   disconnect: () => void;
@@ -135,7 +145,13 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   settingsLoading: false,
 
   voiceState: "idle",
+  callState: "idle",
+  activeCallId: null,
   callOverlayOpen: false,
+  screenCaptureActive: false,
+  screenCaptureTarget: null,
+  voiceTranscripts: [],
+  lastCallUsage: null,
 
   connect: (clientOptions = {}) => {
     if (activeClient) {
@@ -505,6 +521,44 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       }
       case "voice_state": {
         set({ voiceState: event.data.state });
+        break;
+      }
+      case "call_started": {
+        set({
+          activeCallId: event.data.call_id,
+          callState: event.data.call_state ?? "active",
+          callOverlayOpen: true,
+          voiceTranscripts: [],
+        });
+        break;
+      }
+      case "call_ended": {
+        set({
+          activeCallId: null,
+          callState: event.data.call_state ?? "idle",
+          voiceState: "idle",
+          screenCaptureActive: false,
+          screenCaptureTarget: null,
+          callOverlayOpen: false,
+        });
+        break;
+      }
+      case "transcript": {
+        const entry = event.data;
+        set((state) => ({
+          voiceTranscripts: [...state.voiceTranscripts, entry].slice(-200),
+        }));
+        break;
+      }
+      case "screen_capture_state": {
+        set({
+          screenCaptureActive: event.data.active,
+          screenCaptureTarget: event.data.target ?? null,
+        });
+        break;
+      }
+      case "usage": {
+        set({ lastCallUsage: event.data });
         break;
       }
       case "error": {

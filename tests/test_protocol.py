@@ -17,11 +17,28 @@ from clea.core.protocol import (
     AssistantTokenEvent,
     BaseEvent,
     BaseRequest,
+    CallEndedData,
+    CallEndedEvent,
+    CallStartedData,
+    CallStartedEvent,
     ChatSendParams,
     ChatSendRequest,
     ResponseFrame,
+    ScreenCaptureStateData,
+    ScreenCaptureStateEvent,
+    TranscriptData,
+    TranscriptEvent,
+    UsageData,
+    UsageEvent,
+    VoiceDelegateTaskParams,
+    VoiceDelegateTaskRequest,
+    VoiceEndCallParams,
+    VoiceEndCallRequest,
+    VoiceStartCallParams,
+    VoiceStartCallRequest,
     VoiceStateData,
     VoiceStateEvent,
+    VoiceStatusRequest,
     parse_frame,
 )
 from clea.tools import RiskLevel
@@ -84,6 +101,11 @@ def test_all_required_event_types_exist_and_roundtrip() -> None:
         "approval_resolved",
         "task_status",
         "voice_state",
+        "call_started",
+        "call_ended",
+        "transcript",
+        "screen_capture_state",
+        "usage",
         "error",
     }
     assert set(EVENT_NAMES) == required
@@ -137,6 +159,10 @@ def test_every_method_has_a_result_model() -> None:
             ("conversations.list", {}),
             ("conversations.get", {"date": "2026-01-01", "session_id": "s"}),
             ("settings.get", {}),
+            ("voice.start_call", {}),
+            ("voice.end_call", {}),
+            ("voice.status", {}),
+            ("voice.delegate_task", {"description": "check calendar"}),
         ]
     }
     assert methods == set(METHOD_RESULTS)
@@ -148,3 +174,104 @@ def test_risk_tiers_match_registry_risk_levels() -> None:
     from clea.core.protocol import RiskTier
 
     assert set(get_args(RiskTier)) == {level.value for level in RiskLevel}
+
+
+@pytest.mark.parametrize("call_state", ["idle", "connecting", "active", "ending"])
+def test_call_state_values_roundtrip_on_call_events(call_state: str) -> None:
+    started = parse_frame(
+        CallStartedEvent(
+            data=CallStartedData(call_id="call-1", call_state=call_state)  # type: ignore[arg-type]
+        ).model_dump_json()
+    )
+    assert isinstance(started, CallStartedEvent)
+    assert started.data.call_state == call_state
+
+    ended = parse_frame(
+        CallEndedEvent(
+            data=CallEndedData(call_id="call-1", call_state=call_state, reason="hangup")  # type: ignore[arg-type]
+        ).model_dump_json()
+    )
+    assert isinstance(ended, CallEndedEvent)
+    assert ended.data.call_state == call_state
+    assert ended.data.reason == "hangup"
+
+
+def test_call_state_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError):
+        CallStartedData(call_id="call-1", call_state="paused")  # type: ignore[arg-type]
+
+
+def test_voice_events_roundtrip_and_validation() -> None:
+    tr = parse_frame(
+        TranscriptEvent(
+            data=TranscriptData(role="user", text="Kya haal hai?", final=True, call_id="c1")
+        ).model_dump_json()
+    )
+    assert isinstance(tr, TranscriptEvent)
+    assert tr.data.role == "user"
+    assert tr.data.final is True
+
+    with pytest.raises(ValidationError):
+        TranscriptData(role="system", text="nope")  # type: ignore[arg-type]
+
+    sc = parse_frame(
+        ScreenCaptureStateEvent(
+            data=ScreenCaptureStateData(active=True, target="active_window", call_id="c1")
+        ).model_dump_json()
+    )
+    assert isinstance(sc, ScreenCaptureStateEvent)
+    assert sc.data.active is True
+    assert sc.data.target == "active_window"
+
+    with pytest.raises(ValidationError):
+        ScreenCaptureStateData(active=True, target="webcam")  # type: ignore[arg-type]
+
+    usage = parse_frame(
+        UsageEvent(
+            data=UsageData(
+                call_id="c1",
+                input_tokens=120,
+                output_tokens=45,
+                total_tokens=165,
+                cached_tokens=20,
+            )
+        ).model_dump_json()
+    )
+    assert isinstance(usage, UsageEvent)
+    assert usage.data.total_tokens == 165
+    assert usage.data.cached_tokens == 20
+
+
+def test_voice_requests_roundtrip() -> None:
+    start_req = parse_frame(
+        VoiceStartCallRequest(params=VoiceStartCallParams(trigger="hotkey")).model_dump_json()
+    )
+    assert isinstance(start_req, VoiceStartCallRequest)
+    assert start_req.params.trigger == "hotkey"
+
+    end_req = parse_frame(
+        VoiceEndCallRequest(
+            params=VoiceEndCallParams(call_id="c1", reason="user_hangup")
+        ).model_dump_json()
+    )
+    assert isinstance(end_req, VoiceEndCallRequest)
+    assert end_req.params.call_id == "c1"
+
+    status_req = parse_frame(VoiceStatusRequest().model_dump_json())
+    assert isinstance(status_req, VoiceStatusRequest)
+
+    delegate_req = parse_frame(
+        VoiceDelegateTaskRequest(
+            params=VoiceDelegateTaskParams(
+                description="Summarize desktop files",
+                call_id="c1",
+                tool_call_id="tc-1",
+            )
+        ).model_dump_json()
+    )
+    assert isinstance(delegate_req, VoiceDelegateTaskRequest)
+    assert delegate_req.params.description == "Summarize desktop files"
+    assert delegate_req.params.tool_call_id == "tc-1"
+
+    with pytest.raises(ValidationError):
+        parse_frame('{"frame_type": "request", "method": "voice.delegate_task", "params": {}}')

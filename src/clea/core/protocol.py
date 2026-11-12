@@ -19,6 +19,10 @@ ApprovalDecision = Literal["allow", "deny"]
 ApprovalReason = Literal["user", "timeout"]
 TaskState = Literal["running", "succeeded", "failed"]
 VoiceState = Literal["idle", "listening", "thinking", "speaking"]
+CallState = Literal["idle", "connecting", "active", "ending"]
+TranscriptRole = Literal["user", "assistant"]
+ScreenCaptureTarget = Literal["active_window", "full_screen"]
+VoiceTrigger = Literal["manual", "wake_word", "hotkey"]
 
 
 def new_id() -> str:
@@ -55,6 +59,21 @@ class DailyParams(_Model):
 class ConversationGetParams(_Model):
     date: str = Field(description="ISO date, YYYY-MM-DD")
     session_id: str
+
+
+class VoiceStartCallParams(_Model):
+    trigger: VoiceTrigger = "manual"
+
+
+class VoiceEndCallParams(_Model):
+    call_id: str | None = None
+    reason: str | None = None
+
+
+class VoiceDelegateTaskParams(_Model):
+    description: str
+    call_id: str | None = None
+    tool_call_id: str | None = None
 
 
 class _Request(_Model):
@@ -110,6 +129,26 @@ class SettingsGetRequest(_Request):
     params: _EmptyParams = Field(default_factory=_EmptyParams)
 
 
+class VoiceStartCallRequest(_Request):
+    method: Literal["voice.start_call"] = "voice.start_call"
+    params: VoiceStartCallParams = Field(default_factory=VoiceStartCallParams)
+
+
+class VoiceEndCallRequest(_Request):
+    method: Literal["voice.end_call"] = "voice.end_call"
+    params: VoiceEndCallParams = Field(default_factory=VoiceEndCallParams)
+
+
+class VoiceStatusRequest(_Request):
+    method: Literal["voice.status"] = "voice.status"
+    params: _EmptyParams = Field(default_factory=_EmptyParams)
+
+
+class VoiceDelegateTaskRequest(_Request):
+    method: Literal["voice.delegate_task"] = "voice.delegate_task"
+    params: VoiceDelegateTaskParams
+
+
 RequestFrame = Annotated[
     HealthPingRequest
     | SessionNewRequest
@@ -119,7 +158,11 @@ RequestFrame = Annotated[
     | MemoryGetDailyRequest
     | ConversationsListRequest
     | ConversationsGetRequest
-    | SettingsGetRequest,
+    | SettingsGetRequest
+    | VoiceStartCallRequest
+    | VoiceEndCallRequest
+    | VoiceStatusRequest
+    | VoiceDelegateTaskRequest,
     Field(discriminator="method"),
 ]
 """Any client-to-daemon request (discriminated by ``method``)."""
@@ -216,6 +259,32 @@ class SettingsGetResult(_Model):
     permission_tiers: list[PermissionTierInfo]
 
 
+class VoiceStartCallResult(_Model):
+    call_id: str
+    call_state: CallState
+    voice_state: VoiceState = "idle"
+
+
+class VoiceEndCallResult(_Model):
+    call_id: str | None = None
+    call_state: CallState = "idle"
+    voice_state: VoiceState = "idle"
+
+
+class VoiceStatusResult(_Model):
+    call_id: str | None = None
+    call_state: CallState = "idle"
+    voice_state: VoiceState = "idle"
+    screen_capture_active: bool = False
+    screen_capture_target: ScreenCaptureTarget | None = None
+
+
+class VoiceDelegateTaskResult(_Model):
+    task_id: str
+    status: TaskState
+    output: str = ""
+
+
 METHOD_RESULTS: dict[str, type[_Model]] = {
     "health.ping": HealthPingResult,
     "session.new": SessionNewResult,
@@ -226,6 +295,10 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "conversations.list": ConversationsListResult,
     "conversations.get": ConversationsGetResult,
     "settings.get": SettingsGetResult,
+    "voice.start_call": VoiceStartCallResult,
+    "voice.end_call": VoiceEndCallResult,
+    "voice.status": VoiceStatusResult,
+    "voice.delegate_task": VoiceDelegateTaskResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""
 
@@ -286,6 +359,41 @@ class VoiceStateData(_Model):
     state: VoiceState
 
 
+class CallStartedData(_Model):
+    call_id: str
+    call_state: CallState = "active"
+    started_at: str | None = None
+
+
+class CallEndedData(_Model):
+    call_id: str
+    call_state: CallState = "idle"
+    reason: str | None = None
+    duration_seconds: float | None = None
+
+
+class TranscriptData(_Model):
+    role: TranscriptRole
+    text: str
+    final: bool = False
+    call_id: str | None = None
+
+
+class ScreenCaptureStateData(_Model):
+    active: bool
+    target: ScreenCaptureTarget | None = None
+    call_id: str | None = None
+
+
+class UsageData(_Model):
+    call_id: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cached_tokens: int | None = None
+    thought_tokens: int | None = None
+
+
 class ErrorData(_Model):
     message: str
     code: str | None = None
@@ -326,6 +434,31 @@ class VoiceStateEvent(_Event):
     data: VoiceStateData
 
 
+class CallStartedEvent(_Event):
+    event: Literal["call_started"] = "call_started"
+    data: CallStartedData
+
+
+class CallEndedEvent(_Event):
+    event: Literal["call_ended"] = "call_ended"
+    data: CallEndedData
+
+
+class TranscriptEvent(_Event):
+    event: Literal["transcript"] = "transcript"
+    data: TranscriptData
+
+
+class ScreenCaptureStateEvent(_Event):
+    event: Literal["screen_capture_state"] = "screen_capture_state"
+    data: ScreenCaptureStateData
+
+
+class UsageEvent(_Event):
+    event: Literal["usage"] = "usage"
+    data: UsageData
+
+
 class ErrorEvent(_Event):
     event: Literal["error"] = "error"
     data: ErrorData
@@ -339,6 +472,11 @@ EventFrame = Annotated[
     | ApprovalResolvedEvent
     | TaskStatusEvent
     | VoiceStateEvent
+    | CallStartedEvent
+    | CallEndedEvent
+    | TranscriptEvent
+    | ScreenCaptureStateEvent
+    | UsageEvent
     | ErrorEvent,
     Field(discriminator="event"),
 ]
@@ -355,6 +493,11 @@ EVENT_NAMES: tuple[str, ...] = (
     "approval_resolved",
     "task_status",
     "voice_state",
+    "call_started",
+    "call_ended",
+    "transcript",
+    "screen_capture_state",
+    "usage",
     "error",
 )
 
