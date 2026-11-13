@@ -30,6 +30,7 @@ from clea.surfaces.voice.backends.base import (
     VoiceToolResponse,
     default_voice_tools,
 )
+from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
 
 __all__ = [
     "AUDIO_CHANNELS",
@@ -39,6 +40,7 @@ __all__ = [
     "AudioOutputEvent",
     "BackendErrorEvent",
     "ContextCompressionConfig",
+    "GeminiLiveBackend",
     "GoAwayEvent",
     "InterruptedEvent",
     "ScreenCaptureTarget",

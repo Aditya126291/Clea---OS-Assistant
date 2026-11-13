@@ -51,6 +51,7 @@ def test_default_toml_contains_comments_and_roundtrips_to_defaults() -> None:
     assert cfg.blocklist.processes == []
     assert cfg.consent_mode == "ask"
     assert cfg.reconnect_limit == 3
+    assert cfg.enable_web_search is False
 
 
 def test_load_voice_config_creates_default_file_if_missing(

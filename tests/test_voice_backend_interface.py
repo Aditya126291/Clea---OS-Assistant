@@ -83,7 +83,7 @@ def test_voice_session_config_defaults_and_language_code_omitted() -> None:
     assert cfg.input_sample_rate_hz == INPUT_AUDIO_SAMPLE_RATE_HZ == 16_000
     assert cfg.output_sample_rate_hz == OUTPUT_AUDIO_SAMPLE_RATE_HZ == 24_000
     assert cfg.media_resolution == "medium"
-    assert cfg.enable_web_search is True
+    assert cfg.enable_web_search is False
     assert cfg.session_resumption == SessionResumptionConfig(enabled=True, handle=None)
     assert cfg.context_compression == ContextCompressionConfig(enabled=True)
     assert cfg.reconnect_limit == 3

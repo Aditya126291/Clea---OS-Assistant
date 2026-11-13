@@ -47,6 +47,7 @@ class VoiceConfig(BaseModel):
     blocklist: ScreenBlocklistConfig = Field(default_factory=ScreenBlocklistConfig)
     consent_mode: ConsentMode = "ask"
     reconnect_limit: int = Field(default=3, ge=0)
+    enable_web_search: bool = False
 
     @field_validator(
         "wake_threshold",
@@ -119,6 +120,9 @@ silence_timeout_seconds = 60
 
 # Maximum automatic reconnection attempts on transient session drops or GoAway notices.
 reconnect_limit = 3
+
+# Google Search grounding: set to true to enable Live Google Search grounding tool.
+enable_web_search = false
 
 # Screen capture settings for look_at_screen and watch_screen.
 # Consent mode: "ask" (prompt user), "auto_allow", or "deny".

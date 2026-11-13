@@ -159,7 +159,7 @@ class VoiceSessionConfig(_StrictModel):
 
     system_instruction: str
     tools: list[VoiceToolDeclaration] = Field(default_factory=default_voice_tools)
-    enable_web_search: bool = True
+    enable_web_search: bool = False
     media_resolution: MediaResolution = "medium"
     input_sample_rate_hz: int = Field(default=INPUT_AUDIO_SAMPLE_RATE_HZ, gt=0)
     output_sample_rate_hz: int = Field(default=OUTPUT_AUDIO_SAMPLE_RATE_HZ, gt=0)
