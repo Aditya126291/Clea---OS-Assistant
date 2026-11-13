@@ -34,9 +34,13 @@ from clea.core.protocol import (
     ErrorEvent,
     EventFrame,
     HealthPingRequest,
+    MemoryArchiveRequest,
     MemoryEpisodesRequest,
+    MemoryFactsRequest,
     MemoryGetDailyRequest,
     MemoryGetRequest,
+    MemoryReconsolidateRequest,
+    MemoryStatusRequest,
     RequestFrame,
     ResponseFrame,
     RiskTier,
@@ -104,6 +108,10 @@ def build_json_schema() -> dict[str, Any]:
         memory_get_request: MemoryGetRequest
         memory_get_daily_request: MemoryGetDailyRequest
         memory_episodes_request: MemoryEpisodesRequest
+        memory_facts_request: MemoryFactsRequest
+        memory_archive_request: MemoryArchiveRequest
+        memory_status_request: MemoryStatusRequest
+        memory_reconsolidate_request: MemoryReconsolidateRequest
         transcripts_list_request: TranscriptsListRequest
         transcripts_get_request: TranscriptsGetRequest
         conversations_list_request: ConversationsListRequest

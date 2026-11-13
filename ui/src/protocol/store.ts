@@ -10,6 +10,9 @@ import type {
   ConversationSummary,
   ConversationTurn,
   EpisodeItem,
+  MemoryArchiveItem,
+  MemorySectionItem,
+  MemoryStatusResult,
   ScreenCaptureTarget,
   SettingsGetResult,
   TaskStatusData,
@@ -52,6 +55,11 @@ export interface CleaStoreState {
   lastConsolidated: string | null;
   failedConsolidation: string | null;
   episodes: EpisodeItem[];
+  memoryFacts: MemorySectionItem[];
+  memoryArchive: MemoryArchiveItem[];
+  memoryArchiveRaw: string;
+  memoryStatus: MemoryStatusResult | null;
+  reconsolidating: Record<string, boolean>;
   transcripts: TranscriptSummaryItem[];
   selectedTranscript: TranscriptsGetResult | null;
   memorySubView: "overview" | "transcripts";
@@ -88,6 +96,10 @@ export interface CleaStoreState {
   loadMemory: () => Promise<void>;
   loadDailyMemory: (day: string) => Promise<void>;
   loadEpisodes: () => Promise<void>;
+  loadMemoryFacts: () => Promise<void>;
+  loadMemoryArchive: () => Promise<void>;
+  loadMemoryStatus: () => Promise<void>;
+  reconsolidate: (sessionId: string) => Promise<boolean>;
   loadTranscripts: () => Promise<void>;
   openTranscript: (sessionId: string) => Promise<void>;
   emitDevSampleTask: () => Promise<void>;
@@ -157,6 +169,11 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   lastConsolidated: null,
   failedConsolidation: null,
   episodes: [],
+  memoryFacts: [],
+  memoryArchive: [],
+  memoryArchiveRaw: "",
+  memoryStatus: null,
+  reconsolidating: {},
   transcripts: [],
   selectedTranscript: null,
   memorySubView: "overview",
@@ -419,6 +436,9 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         memoryLoading: false,
       });
       void get().loadEpisodes();
+      void get().loadMemoryFacts();
+      void get().loadMemoryArchive();
+      void get().loadMemoryStatus();
     } catch {
       set({ memoryLoading: false });
     }
@@ -438,10 +458,70 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   loadEpisodes: async () => {
     if (!activeClient?.isConnected) return;
     try {
-      const res = await activeClient.request("memory.episodes", { limit: 20 });
+      const res = await activeClient.request("memory.episodes", { limit: 50 });
       set({ episodes: res.episodes });
     } catch {
       // keep existing episodes
+    }
+  },
+
+  loadMemoryFacts: async () => {
+    if (!activeClient?.isConnected) return;
+    try {
+      const res = await activeClient.request("memory.facts", {});
+      set({
+        memoryFacts: res.sections ?? [],
+        lastConsolidated: res.last_consolidated ?? null,
+        failedConsolidation: res.failed_consolidation ?? null,
+      });
+    } catch {
+      // keep existing
+    }
+  },
+
+  loadMemoryArchive: async () => {
+    if (!activeClient?.isConnected) return;
+    try {
+      const res = await activeClient.request("memory.archive", {});
+      set({
+        memoryArchive: res.entries ?? [],
+        memoryArchiveRaw: res.raw ?? "",
+      });
+    } catch {
+      // keep existing
+    }
+  },
+
+  loadMemoryStatus: async () => {
+    if (!activeClient?.isConnected) return;
+    try {
+      const res = await activeClient.request("memory.status", {});
+      set({
+        memoryStatus: res,
+      });
+    } catch {
+      // keep existing
+    }
+  },
+
+  reconsolidate: async (sessionId: string) => {
+    if (!activeClient?.isConnected) return false;
+    set((s) => ({ reconsolidating: { ...s.reconsolidating, [sessionId]: true } }));
+    try {
+      const res = await activeClient.request("memory.reconsolidate", { session_id: sessionId });
+      void get().loadMemoryStatus();
+      void get().loadEpisodes();
+      void get().loadMemoryFacts();
+      void get().loadMemory();
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      set((s) => {
+        const next = { ...s.reconsolidating };
+        delete next[sessionId];
+        return { reconsolidating: next };
+      });
     }
   },
 

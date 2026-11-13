@@ -10,6 +10,7 @@ import type {
   CallState,
   ChatSendParams,
   ChatSendResult,
+  ConsolidationSessionStatus,
   ConversationGetParams,
   ConversationsGetResult,
   ConversationsListResult,
@@ -20,10 +21,18 @@ import type {
   EpisodeItem,
   Event,
   HealthPingResult,
+  MemoryArchiveItem,
+  MemoryArchiveResult,
   MemoryEpisodesParams,
   MemoryEpisodesResult,
+  MemoryFactItem,
+  MemoryFactsResult,
   MemoryGetDailyResult,
   MemoryGetResult,
+  MemoryReconsolidateParams,
+  MemoryReconsolidateResult,
+  MemorySectionItem,
+  MemoryStatusResult,
   PermissionTierInfo,
   Request,
   ResponseFrame,
@@ -70,6 +79,7 @@ export type {
   CallState,
   ChatSendParams,
   ChatSendResult,
+  ConsolidationSessionStatus,
   ConversationGetParams,
   ConversationsGetResult,
   ConversationsListResult,
@@ -80,10 +90,18 @@ export type {
   EpisodeItem,
   Event as CleaEvent,
   HealthPingResult,
+  MemoryArchiveItem,
+  MemoryArchiveResult,
   MemoryEpisodesParams,
   MemoryEpisodesResult,
+  MemoryFactItem,
+  MemoryFactsResult,
   MemoryGetDailyResult,
   MemoryGetResult,
+  MemoryReconsolidateParams,
+  MemoryReconsolidateResult,
+  MemorySectionItem,
+  MemoryStatusResult,
   PermissionTierInfo,
   Request as CleaRequest,
   ResponseFrame,
@@ -128,6 +146,10 @@ export interface MethodParamsMap {
   "memory.get": Record<string, never>;
   "memory.get_daily": DailyParams;
   "memory.episodes": MemoryEpisodesParams;
+  "memory.facts": Record<string, never>;
+  "memory.archive": Record<string, never>;
+  "memory.status": Record<string, never>;
+  "memory.reconsolidate": MemoryReconsolidateParams;
   "transcripts.list": TranscriptsListParams;
   "transcripts.get": TranscriptsGetParams;
   "conversations.list": Record<string, never>;
@@ -148,6 +170,10 @@ export interface MethodResultMap {
   "memory.get": MemoryGetResult;
   "memory.get_daily": MemoryGetDailyResult;
   "memory.episodes": MemoryEpisodesResult;
+  "memory.facts": MemoryFactsResult;
+  "memory.archive": MemoryArchiveResult;
+  "memory.status": MemoryStatusResult;
+  "memory.reconsolidate": MemoryReconsolidateResult;
   "transcripts.list": TranscriptsListResult;
   "transcripts.get": TranscriptsGetResult;
   "conversations.list": ConversationsListResult;
