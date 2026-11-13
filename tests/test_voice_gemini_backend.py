@@ -84,6 +84,8 @@ async def test_gemini_backend_connect_builds_correct_live_config() -> None:
     assert live_config.session_resumption.handle == "prev-handle"
     assert live_config.context_window_compression.trigger_tokens == 2000
     assert live_config.context_window_compression.sliding_window.target_tokens == 1000
+    assert live_config.input_audio_transcription is not None
+    assert live_config.output_audio_transcription is not None
 
     # Tools should contain function declaration with NON_BLOCKING and google_search
     assert len(live_config.tools) == 2

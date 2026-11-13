@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 
@@ -22,10 +23,17 @@ from clea.surfaces.voice.wake_word import (
     download_wake_word_models,
     wake_word_models_dir,
 )
+from clea.surfaces.voice.win32 import enable_per_monitor_dpi_awareness
 
 
 def run_voice_service(*, host: str = "127.0.0.1", port: int = 8765) -> None:
     """Run the main Clea voice background surface."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    enable_per_monitor_dpi_awareness()
     config = load_voice_config()
     daemon_url = f"ws://{host}:{port}"
     token = auth.read_token()
@@ -46,6 +54,7 @@ def run_voice_service(*, host: str = "127.0.0.1", port: int = 8765) -> None:
         print("Starting Clea voice service (press Ctrl+C to quit)...")
         print(f"Wake word: '{config.wake_word_model}' (threshold: {config.wake_threshold})")
         print(f"Toggle hotkey: {config.hotkey}")
+        print(f"Listening on mic for '{config.wake_word_model}' or press {config.hotkey}...")
         asyncio.run(runner.run_forever())
     except VoiceAlreadyRunningError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -138,6 +147,7 @@ def run_voice_doctor(*, download_models: bool = False) -> None:
 
 def run_voice_test() -> None:
     """Run interactive audio and wake word test."""
+    enable_per_monitor_dpi_awareness()
     print("=== Clea Voice Test ===")
     config = load_voice_config()
 

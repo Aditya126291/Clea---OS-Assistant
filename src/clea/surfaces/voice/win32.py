@@ -1,4 +1,4 @@
-"""Windows ctypes integration for global hotkeys with dedicated message pump.
+"""Windows ctypes integration for global hotkeys, DPI awareness, and window enumeration.
 
 All ctypes calls explicitly set argtypes and restype.
 """
@@ -11,6 +11,8 @@ import logging
 import sys
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,24 @@ WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 
 HOTKEY_ID = 0x0001
+
+# DPI Awareness Constants
+DEFAULT_DPI: int = 96
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: int = -4
+PROCESS_PER_MONITOR_DPI_AWARE: int = 2
+
+# Process Access Rights
+PROCESS_QUERY_LIMITED_INFORMATION: int = 0x1000
+
+
+@dataclass(frozen=True)
+class WindowInfo:
+    """Information for an enumerated top-level window."""
+
+    hwnd: int
+    title: str
+    process_name: str
+    is_visible: bool
 
 
 def parse_hotkey(hotkey_str: str) -> tuple[int, int]:
@@ -76,10 +96,82 @@ def parse_hotkey(hotkey_str: str) -> tuple[int, int]:
     return modifiers, vk
 
 
-class Win32API:
-    """Wrapper around user32 and kernel32 DLLs with strict ctypes argtypes and restype."""
+# ------------------------------------------------------------- DPI and Coordinate Scaling
 
-    def __init__(self, user32: Any = None, kernel32: Any = None) -> None:
+
+def dpi_to_scale_factor(dpi: int | float) -> float:
+    """Convert DPI value to a scale factor relative to standard 96 DPI."""
+    if dpi <= 0:
+        raise ValueError(f"DPI must be positive, got {dpi}")
+    return float(dpi) / float(DEFAULT_DPI)
+
+
+def scale_coordinate(coord: int | float, scale_factor: float) -> int:
+    """Scale a logical coordinate by the given DPI scale factor."""
+    return int(round(coord * scale_factor))
+
+
+def unscale_coordinate(coord: int | float, scale_factor: float) -> int:
+    """Convert a physical coordinate back to logical units."""
+    if scale_factor <= 0:
+        raise ValueError(f"Scale factor must be positive, got {scale_factor}")
+    return int(round(coord / scale_factor))
+
+
+def scale_point(
+    pt: tuple[int | float, int | float],
+    scale_factor: float,
+) -> tuple[int, int]:
+    """Scale an (x, y) point by the given scale factor."""
+    return (scale_coordinate(pt[0], scale_factor), scale_coordinate(pt[1], scale_factor))
+
+
+def unscale_point(
+    pt: tuple[int | float, int | float],
+    scale_factor: float,
+) -> tuple[int, int]:
+    """Convert a physical (x, y) point back to logical units."""
+    return (unscale_coordinate(pt[0], scale_factor), unscale_coordinate(pt[1], scale_factor))
+
+
+def scale_rect(
+    rect: tuple[int | float, int | float, int | float, int | float],
+    scale_factor: float,
+) -> tuple[int, int, int, int]:
+    """Scale a (left, top, right, bottom) rectangle by the given scale factor."""
+    return (
+        scale_coordinate(rect[0], scale_factor),
+        scale_coordinate(rect[1], scale_factor),
+        scale_coordinate(rect[2], scale_factor),
+        scale_coordinate(rect[3], scale_factor),
+    )
+
+
+def unscale_rect(
+    rect: tuple[int | float, int | float, int | float, int | float],
+    scale_factor: float,
+) -> tuple[int, int, int, int]:
+    """Convert a physical (left, top, right, bottom) rectangle back to logical units."""
+    return (
+        unscale_coordinate(rect[0], scale_factor),
+        unscale_coordinate(rect[1], scale_factor),
+        unscale_coordinate(rect[2], scale_factor),
+        unscale_coordinate(rect[3], scale_factor),
+    )
+
+
+# --------------------------------------------------------------------------- Win32 API Wrapper
+
+
+class Win32API:
+    """Wrapper around user32, kernel32, and shcore DLLs with strict ctypes argtypes and restype."""
+
+    def __init__(
+        self,
+        user32: Any = None,
+        kernel32: Any = None,
+        shcore: Any = None,
+    ) -> None:
         if user32 is None or kernel32 is None:
             if sys.platform != "win32":
                 raise OSError("Win32API requires Windows or mocked DLLs.")
@@ -87,7 +179,12 @@ class Win32API:
 
             u32 = ctypes.WinDLL("user32", use_last_error=True)
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            try:
+                shc = ctypes.WinDLL("shcore", use_last_error=True)
+            except OSError:
+                shc = None
 
+            # Hotkeys and message pump
             u32.RegisterHotKey.argtypes = [
                 wintypes.HWND,
                 ctypes.c_int,
@@ -124,11 +221,202 @@ class Win32API:
             k32.GetCurrentThreadId.argtypes = []
             k32.GetCurrentThreadId.restype = wintypes.DWORD
 
+            # DPI awareness
+            if hasattr(u32, "SetProcessDpiAwarenessContext"):
+                u32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+                u32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+            if hasattr(u32, "SetProcessDPIAware"):
+                u32.SetProcessDPIAware.argtypes = []
+                u32.SetProcessDPIAware.restype = wintypes.BOOL
+            if hasattr(u32, "GetDpiForSystem"):
+                u32.GetDpiForSystem.argtypes = []
+                u32.GetDpiForSystem.restype = wintypes.UINT
+            if hasattr(u32, "GetDpiForWindow"):
+                u32.GetDpiForWindow.argtypes = [wintypes.HWND]
+                u32.GetDpiForWindow.restype = wintypes.UINT
+            if shc is not None and hasattr(shc, "SetProcessDpiAwareness"):
+                shc.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+                shc.SetProcessDpiAwareness.restype = ctypes.HRESULT
+
+            # Window enumeration and inspection
+            WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            u32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+            u32.EnumWindows.restype = wintypes.BOOL
+
+            u32.IsWindowVisible.argtypes = [wintypes.HWND]
+            u32.IsWindowVisible.restype = wintypes.BOOL
+
+            u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+            u32.GetWindowTextLengthW.restype = ctypes.c_int
+
+            u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            u32.GetWindowTextW.restype = ctypes.c_int
+
+            u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
+
+            if hasattr(k32, "QueryFullProcessImageNameW"):
+                k32.QueryFullProcessImageNameW.argtypes = [
+                    wintypes.HANDLE,
+                    wintypes.DWORD,
+                    wintypes.LPWSTR,
+                    ctypes.POINTER(wintypes.DWORD),
+                ]
+                k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
             self.user32 = u32
             self.kernel32 = k32
+            self.shcore = shc
         else:
             self.user32 = user32
             self.kernel32 = kernel32
+            self.shcore = shcore
+
+
+def enable_per_monitor_dpi_awareness(api: Win32API | None = None) -> bool:
+    """Enable per-monitor DPI awareness at process start.
+
+    Tries SetProcessDpiAwarenessContext (v2) -> SetProcessDpiAwareness (shcore)
+    -> SetProcessDPIAware.
+    Returns True if successfully set, False otherwise.
+    """
+    if api is None:
+        if sys.platform != "win32":
+            logger.debug("DPI awareness is only supported on Windows.")
+            return False
+        try:
+            api = Win32API()
+        except OSError:
+            return False
+
+    # Tier 1: Windows 10 Creators Update (1703)+ Per-Monitor V2
+    if hasattr(api.user32, "SetProcessDpiAwarenessContext"):
+        try:
+            res = api.user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            )
+            if res:
+                logger.debug(
+                    "Enabled Per-Monitor V2 DPI awareness via SetProcessDpiAwarenessContext."
+                )
+                return True
+        except Exception as exc:
+            logger.debug("SetProcessDpiAwarenessContext failed: %s", exc)
+
+    # Tier 2: Windows 8.1+ SetProcessDpiAwareness via shcore
+    if api.shcore is not None and hasattr(api.shcore, "SetProcessDpiAwareness"):
+        try:
+            hr = api.shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+            # S_OK = 0, E_ACCESSDENIED / already set = 0x80070005
+            if hr == 0:
+                logger.debug("Enabled Per-Monitor DPI awareness via shcore.SetProcessDpiAwareness.")
+                return True
+        except Exception as exc:
+            logger.debug("shcore.SetProcessDpiAwareness failed: %s", exc)
+
+    # Tier 3: Windows Vista+ SetProcessDPIAware via user32
+    if hasattr(api.user32, "SetProcessDPIAware"):
+        try:
+            res = api.user32.SetProcessDPIAware()
+            if res:
+                logger.debug("Enabled system DPI awareness via SetProcessDPIAware.")
+                return True
+        except Exception as exc:
+            logger.debug("SetProcessDPIAware failed: %s", exc)
+
+    logger.warning("Could not enable DPI awareness on this platform.")
+    return False
+
+
+def get_window_title(hwnd: int, api: Win32API | None = None) -> str:
+    """Retrieve the title text of a window."""
+    if api is None:
+        api = Win32API()
+
+    length = int(api.user32.GetWindowTextLengthW(hwnd))
+    if length <= 0:
+        return ""
+
+    buf = ctypes.create_unicode_buffer(length + 1)
+    copied = api.user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value if copied > 0 else ""
+
+
+def get_window_process_name(hwnd: int, api: Win32API | None = None) -> str:
+    """Retrieve process executable name for a window.
+
+    If process cannot be opened (e.g. elevated window), returns '<unknown>'
+    rather than raising or blocking.
+    """
+    if api is None:
+        api = Win32API()
+
+    import ctypes.wintypes as wintypes
+
+    pid = wintypes.DWORD()
+    api.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == 0:
+        return "<unknown>"
+
+    # Try opening process with limited query rights
+    h_proc = api.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not h_proc:
+        # Access denied or process terminated (elevated window) -> treat as unknown
+        logger.debug(
+            "Could not open PID %d for HWND %s (elevated window); returning <unknown>.",
+            pid.value,
+            hwnd,
+        )
+        return "<unknown>"
+
+    try:
+        if hasattr(api.kernel32, "QueryFullProcessImageNameW"):
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if api.kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                return Path(buf.value).name
+        return "<unknown>"
+    finally:
+        with contextlib.suppress(Exception):
+            api.kernel32.CloseHandle(h_proc)
+
+
+def enumerate_visible_windows(api: Win32API | None = None) -> list[WindowInfo]:
+    """Enumerate visible top-level windows with titles and process names."""
+    if api is None:
+        api = Win32API()
+
+    import ctypes.wintypes as wintypes
+
+    results: list[WindowInfo] = []
+
+    def enum_proc(hwnd: int, lparam: int) -> bool:
+        if bool(api.user32.IsWindowVisible(hwnd)):
+            title = get_window_title(hwnd, api)
+            proc_name = get_window_process_name(hwnd, api)
+            results.append(
+                WindowInfo(
+                    hwnd=hwnd,
+                    title=title,
+                    process_name=proc_name,
+                    is_visible=True,
+                )
+            )
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    cb = WNDENUMPROC(enum_proc)
+    api.user32.EnumWindows(cb, 0)
+    return results
+
+
+# --------------------------------------------------------------------------- Global HotKey Manager
 
 
 class HotKeyManager:

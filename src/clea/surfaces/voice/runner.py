@@ -7,19 +7,27 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
 from clea.core import auth
 from clea.core.protocol import (
+    BaseEvent,
+    CallEndedData,
     CallEndedEvent,
+    CallStartedData,
     CallStartedEvent,
     ResponseFrame,
+    TranscriptData,
+    TranscriptEvent,
+    UsageData,
+    UsageEvent,
     VoiceDelegateTaskParams,
     VoiceDelegateTaskRequest,
     VoiceEndCallParams,
@@ -27,6 +35,9 @@ from clea.core.protocol import (
     VoiceStartCallParams,
     VoiceStartCallRequest,
     VoiceState,
+    VoiceStateData,
+    VoiceStateEvent,
+    new_id,
     parse_frame,
 )
 from clea.paths import default_data_dir
@@ -48,11 +59,29 @@ from clea.surfaces.voice.backends.base import (
 from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
 from clea.surfaces.voice.config import VoiceConfig, load_voice_config
 from clea.surfaces.voice.lock import VoiceInstanceLock
-from clea.surfaces.voice.memory_hooks import resolve_voice_system_instruction
+from clea.surfaces.voice.memory_hooks import (
+    resolve_voice_system_instruction,
+    safe_consolidate_voice_call,
+    safe_store_voice_transcript,
+)
 from clea.surfaces.voice.wake_word import WakeWordDetector, WakeWordModelNotFoundError
-from clea.surfaces.voice.win32 import HotKeyManager
+from clea.surfaces.voice.win32 import HotKeyManager, enable_per_monitor_dpi_awareness
 
 logger = logging.getLogger(__name__)
+
+# Root-mean-square amplitude threshold for 16-bit PCM to distinguish
+# active voice from background silence.
+SPEECH_RMS_THRESHOLD: float = 300.0
+
+
+def compute_audio_rms(pcm_bytes: bytes) -> float:
+    """Calculate RMS energy of 16-bit mono PCM audio chunk."""
+    if not pcm_bytes:
+        return 0.0
+    arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if len(arr) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
 
 
 def voice_metrics_path(data_dir: Path | None = None) -> Path:
@@ -75,6 +104,7 @@ class VoiceRunner:
         wake_word_detector: WakeWordDetector | None = None,
         hotkey_manager: HotKeyManager | None = None,
         enable_hotkey: bool = True,
+        on_event: Callable[[BaseEvent], None] | None = None,
     ) -> None:
         self.config = config or load_voice_config(create_if_missing=False)
         self.data_dir = data_dir
@@ -85,6 +115,7 @@ class VoiceRunner:
         self._wake_word = wake_word_detector
         self._hotkey_manager = hotkey_manager
         self._enable_hotkey = enable_hotkey
+        self._on_event = on_event
 
         self._lock = VoiceInstanceLock(path=(data_dir or default_data_dir()) / "voice.lock")
         self._state: VoiceState = "idle"
@@ -92,6 +123,9 @@ class VoiceRunner:
         self._call_id: str | None = None
         self._call_start_time: float = 0.0
         self._last_user_speech_time: float = 0.0
+        self._connect_latency_ms: float = 0.0
+        self._first_audio_latency_ms: float | None = None
+        self._transcript_history: list[dict[str, Any]] = []
         self._usage_record: dict[str, int] = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -100,6 +134,7 @@ class VoiceRunner:
             "thought_tokens": 0,
         }
 
+        self._events_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
         self._daemon_ws: ClientConnection | None = None
         self._active_backend: VoiceBackend | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -120,8 +155,30 @@ class VoiceRunner:
     def call_id(self) -> str | None:
         return self._call_id
 
+    def _set_voice_state(self, state: VoiceState) -> None:
+        """Update voice state and emit a typed VoiceStateEvent."""
+        if self._state != state:
+            self._state = state
+            self._emit_event(VoiceStateEvent(data=VoiceStateData(state=state)))
+
+    def _emit_event(self, event: BaseEvent) -> None:
+        """Emit a typed protocol event to subscriber callback and internal queue."""
+        self._events_queue.put_nowait(event)
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:
+                logger.exception("Error in voice runner on_event callback.")
+
+    async def events(self) -> AsyncIterator[BaseEvent]:
+        """Yield typed protocol events emitted during runner execution."""
+        while True:
+            evt = await self._events_queue.get()
+            yield evt
+
     async def start(self) -> None:
-        """Start the voice runner with lock acquisition and background tasks."""
+        """Start the voice runner with DPI awareness, lock acquisition, and background tasks."""
+        enable_per_monitor_dpi_awareness()
         self._loop = asyncio.get_running_loop()
         self._lock.acquire()
         try:
@@ -235,8 +292,11 @@ class VoiceRunner:
             except Exception:
                 logger.exception("Error during wake word processing.")
         elif self._call_state == "active" and self._active_backend is not None:
-            # Stream audio to backend
-            self._last_user_speech_time = time.monotonic()
+            # Check audio energy for real speech vs background silence
+            rms = compute_audio_rms(pcm_bytes)
+            if rms >= SPEECH_RMS_THRESHOLD:
+                self._last_user_speech_time = time.monotonic()
+
             asyncio.run_coroutine_threadsafe(
                 self._active_backend.send_audio(pcm_bytes),
                 self._loop,
@@ -248,9 +308,14 @@ class VoiceRunner:
             logger.debug("Cannot start call; current state is %s", self._call_state)
             return
 
+        if self._call_id is None:
+            self._call_id = new_id()
+
         self._call_state = "connecting"
-        self._state = "thinking"
-        logger.info("Starting call (trigger=%s)...", trigger)
+        self._set_voice_state("thinking")
+        self._transcript_history.clear()
+        self._first_audio_latency_ms = None
+        logger.info("Starting call (call_id=%s, trigger=%s)...", self._call_id, trigger)
 
         try:
             # 1. Start call in daemon if connected
@@ -263,7 +328,7 @@ class VoiceRunner:
             # 2. Resolve system instruction safely
             system_instruction = await resolve_voice_system_instruction()
 
-            # 3. Create backend and connect
+            # 3. Create backend and connect with latency measurement
             session_cfg = VoiceSessionConfig(
                 system_instruction=system_instruction,
                 enable_web_search=self.config.enable_web_search,
@@ -271,12 +336,14 @@ class VoiceRunner:
                 reconnect_limit=self.config.reconnect_limit,
                 session_resumption=SessionResumptionConfig(enabled=True),
             )
+            connect_t0 = time.monotonic()
             backend = self._backend_factory()
             await backend.connect(session_cfg)
+            self._connect_latency_ms = (time.monotonic() - connect_t0) * 1000
             self._active_backend = backend
 
             self._call_state = "active"
-            self._state = "listening"
+            self._set_voice_state("listening")
             self._call_start_time = time.monotonic()
             self._last_user_speech_time = time.monotonic()
             self._usage_record = {
@@ -286,6 +353,17 @@ class VoiceRunner:
                 "cached_tokens": 0,
                 "thought_tokens": 0,
             }
+
+            # Emit typed CallStartedEvent
+            self._emit_event(
+                CallStartedEvent(
+                    data=CallStartedData(
+                        call_id=self._call_id,
+                        call_state="active",
+                        started_at=datetime.now(UTC).isoformat(),
+                    )
+                )
+            )
 
             # Start backend event consumer
             self._backend_consume_task = asyncio.create_task(
@@ -297,7 +375,11 @@ class VoiceRunner:
                 self._silence_watchdog(),
                 name="VoiceRunnerSilenceWatchdog",
             )
-            logger.info("Call is now ACTIVE.")
+            logger.info(
+                "Call %s is now ACTIVE (connect_latency=%.1fms).",
+                self._call_id,
+                self._connect_latency_ms,
+            )
         except Exception as exc:
             logger.error("Failed starting voice call: %s", exc)
             await self.end_call(reason=f"start_failed: {exc}")
@@ -308,7 +390,14 @@ class VoiceRunner:
             return
 
         self._call_state = "ending"
-        logger.info("Ending call (call_id=%s, reason=%s)...", self._call_id, reason)
+        ended_call_id = self._call_id or new_id()
+        duration = time.monotonic() - self._call_start_time if self._call_start_time > 0 else 0.0
+        logger.info(
+            "Ending call (call_id=%s, reason=%s, duration=%.2fs)...",
+            ended_call_id,
+            reason,
+            duration,
+        )
 
         # Cancel watchdog and consumer
         if self._silence_watchdog_task is not None:
@@ -332,35 +421,70 @@ class VoiceRunner:
                 await self._backend_consume_task
             self._backend_consume_task = None
 
-        # Notify daemon if connected
-        duration = time.monotonic() - self._call_start_time if self._call_start_time > 0 else 0.0
-        if self._daemon_ws is not None and self._call_id:
+        # Notify daemon if connected and we initiated the end (not already from daemon)
+        if self._daemon_ws is not None and reason != "daemon_event":
             with contextlib.suppress(Exception):
                 end_req = VoiceEndCallRequest(
-                    params=VoiceEndCallParams(call_id=self._call_id, reason=reason)
+                    params=VoiceEndCallParams(call_id=ended_call_id, reason=reason)
                 )
                 await self._daemon_ws.send(end_req.model_dump_json())
 
+        # Safely invoke deferred transcript persistence and consolidation hooks
+        await safe_store_voice_transcript(
+            call_id=ended_call_id,
+            entries=list(self._transcript_history),
+        )
+        await safe_consolidate_voice_call(call_id=ended_call_id)
+
         # Write usage & metrics record
-        self._write_metrics_record(reason=reason, duration_seconds=duration)
+        self._write_metrics_record(
+            call_id=ended_call_id,
+            reason=reason,
+            duration_seconds=duration,
+        )
+
+        # Emit typed CallEndedEvent
+        self._emit_event(
+            CallEndedEvent(
+                data=CallEndedData(
+                    call_id=ended_call_id,
+                    call_state="idle",
+                    reason=reason,
+                    duration_seconds=round(duration, 3),
+                )
+            )
+        )
 
         # Reset states
         self._call_state = "idle"
-        self._state = "idle"
+        self._set_voice_state("idle")
         self._call_id = None
+        self._transcript_history.clear()
         if self._wake_word is not None:
             self._wake_word.reset()
-        logger.info("Call ended. Runner is now IDLE.")
+        logger.info("Call %s ended. Runner is now IDLE.", ended_call_id)
 
-    def _write_metrics_record(self, *, reason: str, duration_seconds: float) -> None:
+    def _write_metrics_record(
+        self,
+        *,
+        call_id: str,
+        reason: str,
+        duration_seconds: float,
+    ) -> None:
         try:
             log_path = voice_metrics_path(self.data_dir)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             record = {
                 "timestamp": datetime.now(UTC).isoformat(),
-                "call_id": self._call_id,
+                "call_id": call_id,
                 "reason": reason,
                 "duration_seconds": round(duration_seconds, 2),
+                "latency": {
+                    "connect_ms": round(self._connect_latency_ms, 1),
+                    "first_audio_ms": round(self._first_audio_latency_ms, 1)
+                    if self._first_audio_latency_ms is not None
+                    else None,
+                },
                 "usage": self._usage_record,
             }
             with open(log_path, "a", encoding="utf-8") as f:
@@ -392,7 +516,11 @@ class VoiceRunner:
                     break
 
                 if isinstance(event, AudioOutputEvent):
-                    self._state = "speaking"
+                    if self._first_audio_latency_ms is None:
+                        self._first_audio_latency_ms = (
+                            time.monotonic() - self._call_start_time
+                        ) * 1000
+                    self._set_voice_state("speaking")
                     if self._audio_manager is not None:
                         self._audio_manager.play_audio(event.pcm_bytes)
                 elif isinstance(event, InterruptedEvent):
@@ -400,13 +528,33 @@ class VoiceRunner:
                     logger.debug("Barge-in: flushing audio buffer.")
                     if self._audio_manager is not None:
                         self._audio_manager.stop_output()
-                    self._state = "listening"
+                    self._set_voice_state("listening")
                 elif isinstance(event, TurnCompleteEvent):
-                    self._state = "listening"
+                    self._set_voice_state("listening")
                 elif isinstance(event, TranscriptOutputEvent):
-                    self._last_user_speech_time = time.monotonic()
+                    if event.role == "user":
+                        self._last_user_speech_time = time.monotonic()
+                    self._transcript_history.append(
+                        {
+                            "role": event.role,
+                            "text": event.text,
+                            "final": event.final,
+                            "timestamp": time.monotonic(),
+                        }
+                    )
+                    self._emit_event(
+                        TranscriptEvent(
+                            data=TranscriptData(
+                                call_id=self._call_id,
+                                role=event.role,
+                                text=event.text,
+                                final=event.final,
+                            )
+                        )
+                    )
                     logger.debug("[%s]: %s", event.role, event.text)
                 elif isinstance(event, ToolCallEvent):
+                    self._set_voice_state("thinking")
                     await self._handle_tool_call(event, backend)
                 elif isinstance(event, ToolCallCancellationEvent):
                     for cid in event.call_ids:
@@ -421,6 +569,18 @@ class VoiceRunner:
                         self._usage_record["cached_tokens"] += event.cached_tokens
                     if event.thought_tokens:
                         self._usage_record["thought_tokens"] += event.thought_tokens
+                    self._emit_event(
+                        UsageEvent(
+                            data=UsageData(
+                                call_id=self._call_id,
+                                input_tokens=self._usage_record["input_tokens"],
+                                output_tokens=self._usage_record["output_tokens"],
+                                total_tokens=self._usage_record["total_tokens"],
+                                cached_tokens=self._usage_record["cached_tokens"] or None,
+                                thought_tokens=self._usage_record["thought_tokens"] or None,
+                            )
+                        )
+                    )
                 elif isinstance(event, BackendErrorEvent):
                     logger.warning(
                         "Backend error: %s (recoverable=%s)", event.message, event.recoverable

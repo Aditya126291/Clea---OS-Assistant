@@ -157,6 +157,8 @@ class GeminiLiveBackend(VoiceBackend):
             context_window_compression=compression_cfg,
             speech_config=speech_cfg,
             media_resolution=media_res,
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
         )
 
     async def _open_session(self, config: VoiceSessionConfig) -> None:

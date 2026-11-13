@@ -7,14 +7,20 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from clea.core.protocol import (
+    BaseEvent,
     CallEndedData,
     CallEndedEvent,
+    CallStartedEvent,
+    TranscriptEvent,
+    UsageEvent,
     VoiceDelegateTaskRequest,
+    VoiceStateEvent,
     parse_frame,
 )
 from clea.surfaces.voice.audio import AudioManager
@@ -22,6 +28,8 @@ from clea.surfaces.voice.backends.base import (
     AudioOutputEvent,
     InterruptedEvent,
     ToolCallEvent,
+    TranscriptOutputEvent,
+    UsageUpdateEvent,
     VoiceBackend,
     VoiceBackendEvent,
     VoiceSessionConfig,
@@ -219,8 +227,70 @@ async def test_voice_runner_ending_trigger_4_silence_timeout(tmp_path: Path) -> 
     assert metrics_file.exists()
     line = json.loads(metrics_file.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert line["reason"] == "silence_timeout"
+    assert "latency" in line
+    assert line["latency"]["connect_ms"] >= 0
 
     await runner.stop()
+
+
+async def test_voice_runner_silence_watchdog_with_streaming_silence_vs_speech(
+    tmp_path: Path,
+) -> None:
+    """Verify continuous silent mic chunks do not prevent silence timeout.
+
+    Active voice energy should reset the silence watchdog timer.
+    """
+    backend = FakeLiveBackend()
+    audio = create_fake_audio_manager()
+    cfg = VoiceConfig(silence_timeout_seconds=0.15)
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "active"
+
+    # 1. Feed pure silence chunks (RMS < 300) into _on_audio_chunk continuously
+    silence_chunk = b"\x00\x00" * 160
+    for _ in range(5):
+        runner._on_audio_chunk(silence_chunk)
+        await asyncio.sleep(0.04)
+
+    # Silence watchdog should have fired because chunks had zero speech energy
+    assert runner.call_state == "idle"
+    await runner.stop()
+
+    # 2. Now test speech energy (RMS >= 300) resetting the timer
+    runner2 = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: FakeLiveBackend(),
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner2.start()
+    await runner2.start_call(trigger="test")
+    assert runner2.call_state == "active"
+
+    # Speech chunk: high amplitude sine wave
+    t = np.linspace(0, 0.02, 320, endpoint=False)
+    speech_pcm = (np.sin(2 * np.pi * 300 * t) * 5000).astype(np.int16).tobytes()
+
+    for _ in range(5):
+        runner2._on_audio_chunk(speech_pcm)
+        await asyncio.sleep(0.04)
+
+    # Total elapsed ~0.2s > 0.15s, but because speech kept coming, call is STILL ACTIVE
+    assert runner2.call_state == "active"
+    await runner2.end_call(reason="done")
+    await runner2.stop()
 
 
 async def test_voice_runner_barge_in_and_audio_play(tmp_path: Path) -> None:
@@ -307,6 +377,122 @@ async def test_voice_runner_tool_delegation_to_daemon(tmp_path: Path) -> None:
     assert tool_resp.name == "delegate_task"
     assert tool_resp.response["status"] == "succeeded"
     assert tool_resp.response["output"] == "Done!"
+
+    await runner.stop()
+
+
+async def test_voice_runner_emits_all_typed_events(tmp_path: Path) -> None:
+    """Requirement: Emits typed events (voice_state, call_started, etc.)."""
+    backend = FakeLiveBackend()
+    audio = create_fake_audio_manager()
+    cfg = VoiceConfig(silence_timeout_seconds=60.0)
+
+    emitted_events: list[BaseEvent] = []
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        on_event=emitted_events.append,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Feed transcript
+    await backend.event_queue.put(
+        TranscriptOutputEvent(role="user", text="What is the weather?", final=True)
+    )
+    # Feed audio output
+    await backend.event_queue.put(AudioOutputEvent(pcm_bytes=b"\x00" * 320))
+    # Feed usage update
+    await backend.event_queue.put(
+        UsageUpdateEvent(
+            input_tokens=120,
+            output_tokens=60,
+            total_tokens=180,
+            cached_tokens=10,
+            thought_tokens=5,
+        )
+    )
+    await asyncio.sleep(0.08)
+
+    # End call
+    await runner.end_call(reason="completed")
+    await runner.stop()
+
+    event_types = [e.event for e in emitted_events]
+    assert "voice_state" in event_types
+    assert "call_started" in event_types
+    assert "transcript" in event_types
+    assert "usage" in event_types
+    assert "call_ended" in event_types
+
+    # Validate specific typed event instances
+    state_evt = next(e for e in emitted_events if isinstance(e, VoiceStateEvent))
+    assert state_evt.data.state in ("listening", "speaking", "thinking", "idle")
+
+    start_evt = next(e for e in emitted_events if isinstance(e, CallStartedEvent))
+    assert start_evt.data.call_state == "active"
+    assert start_evt.data.call_id is not None
+
+    transcript_evt = next(e for e in emitted_events if isinstance(e, TranscriptEvent))
+    assert transcript_evt.data.role == "user"
+    assert transcript_evt.data.text == "What is the weather?"
+
+    usage_evt = next(e for e in emitted_events if isinstance(e, UsageEvent))
+    assert usage_evt.data.total_tokens == 180
+
+    end_evt = next(e for e in emitted_events if isinstance(e, CallEndedEvent))
+    assert end_evt.data.call_state == "idle"
+    assert end_evt.data.reason == "completed"
+
+    # Also check async generator
+    assert not runner._events_queue.empty()
+
+
+async def test_voice_runner_invokes_deferred_transcript_and_consolidation_hooks(
+    tmp_path: Path,
+) -> None:
+    backend = FakeLiveBackend()
+    audio = create_fake_audio_manager()
+    cfg = VoiceConfig()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+
+    with (
+        patch(
+            "clea.surfaces.voice.runner.safe_store_voice_transcript",
+            new_callable=AsyncMock,
+        ) as mock_store,
+        patch(
+            "clea.surfaces.voice.runner.safe_consolidate_voice_call",
+            new_callable=AsyncMock,
+        ) as mock_cons,
+    ):
+        await runner.start_call(trigger="test")
+        await backend.event_queue.put(
+            TranscriptOutputEvent(role="user", text="Save me", final=True)
+        )
+        await asyncio.sleep(0.05)
+        await runner.end_call(reason="done")
+
+        assert mock_store.called
+        assert mock_cons.called
+        store_kwargs = mock_store.call_args.kwargs
+        assert store_kwargs["call_id"] is not None
+        assert len(store_kwargs["entries"]) == 1
+        assert store_kwargs["entries"][0]["text"] == "Save me"
 
     await runner.stop()
 
