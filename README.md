@@ -46,6 +46,35 @@ Connect the chat client in terminal 2:
 uv run clea chat
 ```
 
+## Voice Surface (Live Voice with Gemini Live & openWakeWord)
+
+Run the voice surface in a terminal:
+
+```powershell
+uv run clea voice
+```
+
+Diagnostics and testing:
+
+```powershell
+# Inspect audio devices, test 3s mic RMS, ping daemon, and test Live API:
+uv run clea voice doctor
+
+# Download openWakeWord models (hey_jarvis) if missing:
+uv run clea voice doctor --download-models
+
+# Test audio output, wake detector, and live prompt:
+uv run clea voice test
+
+# Run voice with real-time audio statistics (RMS, frames/sec) and server message logging:
+uv run clea voice --debug-audio
+```
+
+- Default wake word: `"hey_jarvis"` (calibrated threshold: `0.30`).
+- Global push-to-talk / call-toggle hotkey: `Ctrl+Alt+V`.
+- Audio configuration: `<user_data_dir>/voice_config.toml` (auto-negotiates Windows WASAPI sample rates to avoid `PaErrorCode -9997`, resamples to 16 kHz mono with strict 1280-sample FIFO framing).
+- Stall watchdog automatically reconnects using session resumption handles if outbound audio flows for 15s with no server response.
+
 ## Windows Auto-Start at Login
 
 To register a current-user Task Scheduler logon task (`CleaDaemon`) that runs `pythonw.exe -m clea daemon --background` hidden in your interactive session (no admin rights required):

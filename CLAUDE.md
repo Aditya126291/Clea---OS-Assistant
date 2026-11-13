@@ -29,6 +29,11 @@ This file defines the non-negotiable rules for working in the Clea repository.
    - Core code depends only on `LLMProvider` in `src/clea/providers/base.py`, never directly on a vendor SDK.
 8. **Dev mocks stay out of production**:
    - Any UI mock panels or dev-server helpers MUST be gated behind `import.meta.env.DEV` (and `VITE_CLEA_MOCKS` where applicable) so they are dead-code-eliminated from production builds.
+9. **Voice Surface & Audio Pipeline**:
+   - `clea.surfaces.voice` runs as a client surface connecting to the daemon over WebSocket.
+   - Audio input streams MUST negotiate hardware native rates (`negotiate_input_sample_rate`) and downmix/resample to 16 kHz mono (`resample_to_16k_mono`) to prevent PortAudio `PaErrorCode -9997` on Windows WASAPI (see `docs/decisions/0006-windows-wasapi-sample-rate-negotiation-and-wakeword-framing.md`).
+   - All wake word and Gemini Live audio input MUST pass through strict 1280-sample (80 ms / 2560 bytes) FIFO chunking (`AudioChunkBuffer`).
+   - Diagnostic tools (`clea voice doctor`) MUST run purely in-memory (no saving recorded audio, logs, or screenshots to disk; no secrets logged).
 
 ## Development Workflow
 
