@@ -27,6 +27,7 @@ from clea.core.protocol import (
     VoiceEndCallRequest,
     VoiceStartCallParams,
     VoiceStartCallRequest,
+    VoiceStateEvent,
     VoiceStatusRequest,
     parse_frame,
 )
@@ -487,4 +488,36 @@ async def test_daemon_voice_start_call_returns_memory_context_and_end_call_persi
             assert tr["messages"][1]["text"] == "New Delhi."
     finally:
         await daemon.stop()
+
+
+async def test_daemon_voice_start_call_ui_trigger_fails_when_no_voice_process_running(tmp_path: Path) -> None:
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeVoiceTaskProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            # UI starts call, but no voice runner process is connected
+            await ws.send(VoiceStartCallRequest(params=VoiceStartCallParams(trigger="ui")).model_dump_json())
+
+            # Expect broadcast error VoiceStateEvent and error ResponseFrame
+            frames = [parse_frame(await ws.recv()), parse_frame(await ws.recv())]
+            err_event = next(f for f in frames if isinstance(f, VoiceStateEvent))
+            err_resp = next(f for f in frames if isinstance(f, ResponseFrame))
+
+            assert err_event.data.state == "error"
+            assert "Voice process not running" in (err_event.data.error or "")
+
+            assert not err_resp.ok
+            assert "Voice process not running" in (err_resp.error or "")
+    finally:
+        await daemon.stop()
+
 

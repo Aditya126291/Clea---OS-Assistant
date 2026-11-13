@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
-import numpy as np
+from unittest.mock import patch
 
-from clea.surfaces.voice.audio import AudioManager, list_audio_devices
+import numpy as np
+import pytest
+
+from clea.surfaces.voice.audio import (
+    AmbiguousAudioDeviceError,
+    AudioDeviceNotFoundError,
+    AudioManager,
+    list_audio_devices,
+    resolve_audio_device,
+)
 
 
 def test_list_audio_devices_returns_valid_structure() -> None:
@@ -80,3 +89,43 @@ def test_audio_manager_start_and_stop_lifecycle_no_deadlock() -> None:
     assert manager._running is False
     assert manager._input_stream is None
     assert manager._output_stream is None
+
+
+def test_resolve_audio_device_by_substring_and_preferred_hostapi() -> None:
+    mock_devices = [
+        {"index": 0, "name": "USB Mic", "hostapi": 0, "hostapi_name": "MME", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 44100},
+        {"index": 1, "name": "USB Mic", "hostapi": 1, "hostapi_name": "Windows WASAPI", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000},
+        {"index": 2, "name": "Speakers", "hostapi": 1, "hostapi_name": "Windows WASAPI", "max_input_channels": 0, "max_output_channels": 2, "default_samplerate": 48000},
+    ]
+
+    with patch("clea.surfaces.voice.audio.list_audio_devices", return_value=mock_devices):
+        # 1. Resolves cleanly via preferred WASAPI hostapi
+        dev = resolve_audio_device("USB Mic", kind="input", preferred_hostapi="WASAPI")
+        assert dev["index"] == 1
+        assert dev["hostapi_name"] == "Windows WASAPI"
+
+        # 2. Resolves output device
+        out_dev = resolve_audio_device("Speakers", kind="output")
+        assert out_dev["index"] == 2
+
+        # 3. Non-existent substring raises AudioDeviceNotFoundError
+        with pytest.raises(AudioDeviceNotFoundError) as exc_nf:
+            resolve_audio_device("BluetoothHeadset", kind="input")
+        assert "BluetoothHeadset" in str(exc_nf.value)
+
+        # 4. Out of range integer index raises AudioDeviceNotFoundError
+        with pytest.raises(AudioDeviceNotFoundError):
+            resolve_audio_device(999, kind="input")
+
+
+def test_resolve_audio_device_raises_on_ambiguous_matches() -> None:
+    mock_devices = [
+        {"index": 0, "name": "Realtek Mic 1", "hostapi": 0, "hostapi_name": "Windows WASAPI", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000},
+        {"index": 1, "name": "Realtek Mic 2", "hostapi": 0, "hostapi_name": "Windows WASAPI", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000},
+    ]
+
+    with patch("clea.surfaces.voice.audio.list_audio_devices", return_value=mock_devices):
+        with pytest.raises(AmbiguousAudioDeviceError) as exc_amb:
+            resolve_audio_device("Realtek", kind="input", preferred_hostapi="WASAPI")
+        assert "Multiple audio input devices match 'Realtek'" in str(exc_amb.value)
+

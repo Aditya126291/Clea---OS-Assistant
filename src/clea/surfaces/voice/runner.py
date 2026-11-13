@@ -90,6 +90,11 @@ def voice_metrics_path(data_dir: Path | None = None) -> Path:
     return (data_dir or default_data_dir()) / "logs" / "voice_metrics.jsonl"
 
 
+def voice_log_path(data_dir: Path | None = None) -> Path:
+    """Return path to voice.log log file."""
+    return (data_dir or default_data_dir()) / "logs" / "voice.log"
+
+
 class VoiceRunner:
     """Manages the full lifecycle of the voice surface."""
 
@@ -107,11 +112,14 @@ class VoiceRunner:
         enable_hotkey: bool = True,
         on_event: Callable[[BaseEvent], None] | None = None,
         screen_service: ScreenCaptureService | None = None,
+        debug_audio: bool = False,
     ) -> None:
         self.config = config or load_voice_config(create_if_missing=False)
         self.data_dir = data_dir
         self.daemon_url = daemon_url
         self.token = token
+        self.debug_audio = debug_audio
+        self._setup_voice_file_logging()
         self._backend_factory = backend_factory or (lambda: GeminiLiveBackend())
         self._audio_manager = audio_manager
         self._wake_word = wake_word_detector
@@ -148,7 +156,32 @@ class VoiceRunner:
         self._stop_event = asyncio.Event()
         self._backend_consume_task: asyncio.Task[None] | None = None
         self._silence_watchdog_task: asyncio.Task[None] | None = None
+        self._stall_watchdog_task: asyncio.Task[None] | None = None
         self._pending_tasks: dict[str, asyncio.Future[dict[str, Any]]] = {}
+
+        self._audio_sent_start_time: float | None = None
+        self._frames_sent_window: int = 0
+        self._last_fps_report_time: float = time.monotonic()
+
+    def _setup_voice_file_logging(self) -> None:
+        """Ensure voice log file exists and receives log records."""
+        try:
+            log_file = voice_log_path(self.data_dir)
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            voice_logger = logging.getLogger("clea.surfaces.voice")
+            has_file = any(
+                isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == str(log_file)
+                for h in voice_logger.handlers
+            )
+            if not has_file:
+                fh = logging.FileHandler(log_file, encoding="utf-8")
+                fh.setLevel(logging.INFO)
+                fh.setFormatter(
+                    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+                )
+                voice_logger.addHandler(fh)
+        except Exception as exc:
+            logger.debug("Could not configure voice log file handler: %s", exc)
 
     @property
     def call_state(self) -> str:
@@ -162,11 +195,22 @@ class VoiceRunner:
     def call_id(self) -> str | None:
         return self._call_id
 
-    def _set_voice_state(self, state: VoiceState) -> None:
+    def _set_voice_state(self, state: VoiceState, error: str | None = None) -> None:
         """Update voice state and emit a typed VoiceStateEvent."""
-        if self._state != state:
+        if self._state != state or error is not None:
             self._state = state
-            self._emit_event(VoiceStateEvent(data=VoiceStateData(state=state)))
+            evt = VoiceStateEvent(data=VoiceStateData(state=state, error=error))
+            self._emit_event(evt)
+            if error:
+                logger.error("Voice state error: %s", error)
+            if self._daemon_ws is not None and self._loop is not None and not self._loop.is_closed():
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._daemon_ws.send(evt.model_dump_json()),
+                        self._loop,
+                    )
+                except Exception as exc:
+                    logger.debug("Could not send VoiceStateEvent to daemon: %s", exc)
 
     def _emit_event(self, event: BaseEvent) -> None:
         """Emit a typed protocol event to subscriber callback and internal queue."""
@@ -194,6 +238,7 @@ class VoiceRunner:
                 self._audio_manager = AudioManager(
                     input_device=self.config.input_device,
                     output_device=self.config.output_device,
+                    preferred_hostapi=self.config.preferred_hostapi,
                     mic_mute_while_speaking=self.config.mic_mute_while_speaking,
                     on_audio_input=self._on_audio_chunk,
                 )
@@ -201,6 +246,25 @@ class VoiceRunner:
                 self._audio_manager.set_input_callback(self._on_audio_chunk)
 
             self._audio_manager.start()
+
+            if self._audio_manager.resolved_input_device:
+                inp = self._audio_manager.resolved_input_device
+                logger.info(
+                    "Input device: #%d '%s' (host API: %s, native rate: %d Hz)",
+                    inp["index"],
+                    inp["name"],
+                    inp.get("hostapi_name", "Unknown"),
+                    int(inp.get("default_samplerate", 16000)),
+                )
+            if self._audio_manager.resolved_output_device:
+                out = self._audio_manager.resolved_output_device
+                logger.info(
+                    "Output device: #%d '%s' (host API: %s, native rate: %d Hz)",
+                    out["index"],
+                    out["name"],
+                    out.get("hostapi_name", "Unknown"),
+                    int(out.get("default_samplerate", 24000)),
+                )
 
             # 2. Initialize wake word detector if not provided
             if self._wake_word is None:
@@ -304,6 +368,18 @@ class VoiceRunner:
             if rms >= SPEECH_RMS_THRESHOLD:
                 self._last_user_speech_time = time.monotonic()
 
+            if self._audio_sent_start_time is None:
+                self._audio_sent_start_time = time.monotonic()
+
+            self._frames_sent_window += 1
+            now = time.monotonic()
+            if self.debug_audio and (now - self._last_fps_report_time) >= 1.0:
+                elapsed = now - self._last_fps_report_time
+                fps = self._frames_sent_window / elapsed
+                print(f"[AUDIO-DEBUG] Sent {fps:4.1f} fps | Mic RMS: {rms:6.1f}", flush=True)
+                self._frames_sent_window = 0
+                self._last_fps_report_time = now
+
             asyncio.run_coroutine_threadsafe(
                 self._active_backend.send_audio(pcm_bytes),
                 self._loop,
@@ -382,6 +458,11 @@ class VoiceRunner:
                 self._silence_watchdog(),
                 name="VoiceRunnerSilenceWatchdog",
             )
+            # Start stall watchdog
+            self._stall_watchdog_task = asyncio.create_task(
+                self._stall_watchdog(),
+                name="VoiceRunnerStallWatchdog",
+            )
             logger.info(
                 "Call %s is now ACTIVE (connect_latency=%.1fms).",
                 self._call_id,
@@ -410,6 +491,10 @@ class VoiceRunner:
         if self._silence_watchdog_task is not None:
             self._silence_watchdog_task.cancel()
             self._silence_watchdog_task = None
+
+        if self._stall_watchdog_task is not None:
+            self._stall_watchdog_task.cancel()
+            self._stall_watchdog_task = None
 
         if self._watch_screen_task is not None:
             self._watch_screen_task.cancel()
@@ -519,12 +604,49 @@ class VoiceRunner:
                 await self.end_call(reason="silence_timeout")
                 break
 
+    async def _stall_watchdog(self) -> None:
+        """Watch for audio streaming without server responses exceeding stall_timeout_seconds."""
+        stall_limit = self.config.stall_timeout_seconds
+        while self._call_state == "active":
+            await asyncio.sleep(1.0)
+            if self._audio_sent_start_time is not None:
+                elapsed = time.monotonic() - self._audio_sent_start_time
+                if elapsed >= stall_limit:
+                    logger.error(
+                        "STALL WATCHDOG: Audio streamed for %.1fs with no server response! "
+                        "Reconnecting with resumption handle '%s'...",
+                        elapsed,
+                        getattr(self._active_backend, "resumption_handle", None),
+                    )
+                    self._audio_sent_start_time = None
+                    self._set_voice_state("error", error="Session stalled: server not responding. Reconnecting...")
+                    if self._active_backend is not None and hasattr(self._active_backend, "_reconnect"):
+                        try:
+                            await self._active_backend._reconnect()
+                            self._set_voice_state("listening")
+                        except Exception as rec_err:
+                            logger.error("Stall watchdog reconnection failed: %s", rec_err)
+                            await self.end_call(reason="stall_timeout")
+                            break
+
     async def _consume_backend_events(self, backend: VoiceBackend) -> None:
         """Consume and route events from active voice backend."""
         try:
             async for event in backend.events():
                 if self._call_state != "active":
                     break
+
+                # Reset stall watchdog timer on any server response
+                self._audio_sent_start_time = None
+
+                if self.debug_audio:
+                    evt_type = type(event).__name__
+                    desc = ""
+                    if isinstance(event, AudioOutputEvent):
+                        desc = f"({len(event.pcm_bytes)}b audio)"
+                    elif isinstance(event, TranscriptOutputEvent):
+                        desc = f"({event.role}: '{event.text[:30]}')"
+                    print(f"[AUDIO-DEBUG] RECV server message: {evt_type} {desc}", flush=True)
 
                 if isinstance(event, AudioOutputEvent):
                     if self._first_audio_latency_ms is None:
@@ -596,6 +718,7 @@ class VoiceRunner:
                     logger.warning(
                         "Backend error: %s (recoverable=%s)", event.message, event.recoverable
                     )
+                    self._set_voice_state("error", error=event.message)
                     if not event.recoverable:
                         await self.end_call(reason=f"backend_error: {event.message}")
                         break
@@ -812,6 +935,12 @@ class VoiceRunner:
         ) as ws:
             self._daemon_ws = ws
             logger.info("Connected to daemon at %s.", self.daemon_url)
+            # Notify daemon that voice process is connected and register state
+            await ws.send(
+                VoiceStateEvent(
+                    data=VoiceStateData(state=self._state)
+                ).model_dump_json()
+            )
 
             while not self._stop_event.is_set():
                 raw = await ws.recv()

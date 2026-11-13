@@ -372,9 +372,12 @@ async def test_voice_runner_tool_delegation_to_daemon(tmp_path: Path) -> None:
     )
 
     await asyncio.sleep(0.1)
-    assert len(sent_to_daemon) == 1
-    req_frame = parse_frame(sent_to_daemon[0])
-    assert isinstance(req_frame, VoiceDelegateTaskRequest)
+    delegate_reqs = [
+        f for f in (parse_frame(t) for t in sent_to_daemon)
+        if isinstance(f, VoiceDelegateTaskRequest)
+    ]
+    assert len(delegate_reqs) == 1
+    req_frame = delegate_reqs[0]
     assert req_frame.params.description == "Search flight status"
 
     # Backend should have received response

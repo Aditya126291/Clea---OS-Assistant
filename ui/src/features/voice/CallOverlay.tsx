@@ -26,13 +26,18 @@ const ORB_STYLE: Record<VoiceState, { ring: string; label: string; anim: string 
     label: "Speaking",
     anim: "clea-orb-speaking",
   },
+  error: {
+    ring: "from-rose-500 to-red-700",
+    label: "Error",
+    anim: "clea-orb-error",
+  },
 };
 
 export function CallOverlay() {
   const open = useCleaStore((s) => s.callOverlayOpen);
   const voiceState = useCleaStore((s) => s.voiceState);
-  const setCallOverlayOpen = useCleaStore((s) => s.setCallOverlayOpen);
-  const applyEvent = useCleaStore((s) => s.applyEvent);
+  const voiceError = useCleaStore((s) => s.voiceError);
+  const endVoiceCall = useCleaStore((s) => s.endVoiceCall);
 
   const [MockPanel, setMockPanel] = useState<ComponentType | null>(null);
 
@@ -51,15 +56,10 @@ export function CallOverlay() {
 
   if (!open) return null;
 
-  const current = ORB_STYLE[voiceState];
+  const current = ORB_STYLE[voiceState] ?? ORB_STYLE.idle;
 
   const handleEndCall = () => {
-    applyEvent({
-      frame_type: "event",
-      event: "voice_state",
-      data: { state: "idle" },
-    });
-    setCallOverlayOpen(false);
+    void endVoiceCall();
   };
 
   return (
@@ -83,7 +83,13 @@ export function CallOverlay() {
         <div className="text-xs font-medium text-[var(--text)]" aria-live="polite">
           {current.label}
         </div>
-        <div className="mt-0.5 text-[11px] text-[var(--text-subtle)]">Voice session</div>
+        {voiceError ? (
+          <div className="mt-1 text-[11px] font-medium text-rose-500 text-center px-1">
+            {voiceError}
+          </div>
+        ) : (
+          <div className="mt-0.5 text-[11px] text-[var(--text-subtle)]">Voice session</div>
+        )}
 
         <Button size="sm" variant="destructive" onClick={handleEndCall} className="mt-3 w-full">
           <PhoneOff className="h-3.5 w-3.5" aria-hidden="true" />

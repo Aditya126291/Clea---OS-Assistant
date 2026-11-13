@@ -19,11 +19,11 @@ ApprovalDecision = Literal["allow", "deny"]
 ApprovalReason = Literal["user", "timeout"]
 TaskKind = Literal["chat_turn", "background_task", "scheduled", "agent_run"]
 TaskState = Literal["queued", "running", "succeeded", "failed", "cancelled"]
-VoiceState = Literal["idle", "listening", "thinking", "speaking"]
+VoiceState = Literal["idle", "listening", "thinking", "speaking", "error"]
 CallState = Literal["idle", "connecting", "active", "ending"]
 TranscriptRole = Literal["user", "assistant"]
 ScreenCaptureTarget = Literal["active_window", "full_screen"]
-VoiceTrigger = Literal["manual", "wake_word", "hotkey"]
+VoiceTrigger = Literal["manual", "wake_word", "hotkey", "ui"]
 
 
 def new_id() -> str:
@@ -446,6 +446,7 @@ class TaskStatusData(_Model):
 
 class VoiceStateData(_Model):
     state: VoiceState
+    error: str | None = None
 
 
 class CallStartedData(_Model):

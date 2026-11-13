@@ -48,10 +48,13 @@ class VoiceConfig(BaseModel):
     consent_mode: ConsentMode = "ask"
     reconnect_limit: int = Field(default=3, ge=0)
     enable_web_search: bool = False
+    stall_timeout_seconds: float = Field(default=15.0, gt=0.0)
+    preferred_hostapi: str = Field(default="WASAPI")
 
     @field_validator(
         "wake_threshold",
         "silence_timeout_seconds",
+        "stall_timeout_seconds",
         "max_burst_seconds",
         "image_max_side",
         "reconnect_limit",
@@ -117,6 +120,12 @@ mic_mute_while_speaking = false
 
 # Automatically end a call after this many seconds of silence.
 silence_timeout_seconds = 60
+
+# Stall watchdog timeout: reconnect if audio streamed for N seconds with no server response.
+stall_timeout_seconds = 15
+
+# Preferred audio host API (e.g. "WASAPI" on Windows) to avoid duplicate device entries.
+preferred_hostapi = "WASAPI"
 
 # Maximum automatic reconnection attempts on transient session drops or GoAway notices.
 reconnect_limit = 3

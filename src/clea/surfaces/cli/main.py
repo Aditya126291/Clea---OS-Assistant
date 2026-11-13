@@ -293,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     voice_parser = subparsers.add_parser("voice", help="Run or inspect the Clea live voice surface")
+    voice_parser.add_argument(
+        "--debug-audio",
+        action="store_true",
+        help="Print real-time audio statistics (RMS, frames/sec) and server message types",
+    )
     voice_subparsers = voice_parser.add_subparsers(dest="voice_subcommand")
 
     voice_doctor = voice_subparsers.add_parser(
@@ -304,7 +309,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download missing wake word models from official releases to <user_data_dir>/models/",
     )
 
-    voice_subparsers.add_parser("test", help="Test audio input/output and wake word detector")
+    voice_test = voice_subparsers.add_parser(
+        "test", help="Test audio input/output and wake word detector"
+    )
+    voice_test.add_argument(
+        "--debug-audio",
+        action="store_true",
+        help="Print real-time audio statistics (RMS, frames/sec) and server message types",
+    )
     return parser
 
 
@@ -326,11 +338,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "voice":
         from clea.surfaces.cli.voice import run_voice_doctor, run_voice_service, run_voice_test
 
+        debug_audio = getattr(args, "debug_audio", False)
         if args.voice_subcommand == "doctor":
             run_voice_doctor(download_models=args.download_models)
         elif args.voice_subcommand == "test":
-            run_voice_test()
+            run_voice_test(debug_audio=debug_audio)
         else:
             host = os.environ.get("CLEA_HOST", DEFAULT_HOST)
             port = int(os.environ.get("CLEA_PORT", DEFAULT_PORT))
-            run_voice_service(host=host, port=port)
+            run_voice_service(host=host, port=port, debug_audio=debug_audio)

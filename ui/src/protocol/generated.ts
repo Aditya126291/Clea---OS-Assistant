@@ -94,7 +94,7 @@ export type FrameType13 = "request";
 export type Id13 = string;
 export type SessionId15 = string | null;
 export type Method13 = "voice.start_call";
-export type Trigger = "manual" | "wake_word" | "hotkey";
+export type Trigger = "manual" | "wake_word" | "hotkey" | "ui";
 export type FrameType14 = "request";
 export type Id14 = string;
 export type SessionId16 = string | null;
@@ -192,7 +192,8 @@ export type FrameType24 = "event";
 export type RequestId6 = string | null;
 export type SessionId26 = string | null;
 export type Event7 = "voice_state";
-export type State = "idle" | "listening" | "thinking" | "speaking";
+export type State = "idle" | "listening" | "thinking" | "speaking" | "error";
+export type Error1 = string | null;
 export type FrameType25 = "event";
 export type RequestId7 = string | null;
 export type SessionId27 = string | null;
@@ -300,14 +301,14 @@ export type Policy = "auto_allow" | "ask" | "ask_confirm";
 export type PermissionTiers = PermissionTierInfo[];
 export type CallId10 = string;
 export type CallState2 = "idle" | "connecting" | "active" | "ending";
-export type VoiceState = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type MemoryContext = string | null;
 export type CallId11 = string | null;
 export type CallState3 = "idle" | "connecting" | "active" | "ending";
-export type VoiceState1 = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState1 = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type CallId12 = string | null;
 export type CallState4 = "idle" | "connecting" | "active" | "ending";
-export type VoiceState2 = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState2 = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type ScreenCaptureActive = boolean;
 export type ScreenCaptureTarget = ("active_window" | "full_screen") | null;
 export type TaskId1 = string;
@@ -318,11 +319,11 @@ export type ApprovalDecision = "allow" | "deny";
 export type ApprovalReason = "user" | "timeout";
 export type TaskState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type TaskKind = "chat_turn" | "background_task" | "scheduled" | "agent_run";
-export type VoiceState3 = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState3 = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type CallState5 = "idle" | "connecting" | "active" | "ending";
 export type TranscriptRole = "user" | "assistant";
 export type ScreenCaptureTarget1 = "active_window" | "full_screen";
-export type VoiceTrigger = "manual" | "wake_word" | "hotkey";
+export type VoiceTrigger = "manual" | "wake_word" | "hotkey" | "ui";
 
 export interface CleaProtocolSchema {
   request: Request;
@@ -639,6 +640,7 @@ export interface VoiceStateEvent {
 }
 export interface VoiceStateData {
   state: State;
+  error?: Error1;
 }
 export interface CallStartedEvent {
   frame_type?: FrameType25;
