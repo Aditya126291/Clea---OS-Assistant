@@ -44,6 +44,7 @@ class MemoryEntry(BaseModel):
     date: str
     source: SourceTag = "stated"
     text: str
+    section: str = ""
 
     def format_line(self) -> str:
         return f"- [{self.id}] ({self.date}, {self.source}) {self.text.strip()}"

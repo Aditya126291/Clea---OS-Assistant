@@ -69,3 +69,14 @@ def test_audio_manager_output_callback_zero_fills() -> None:
     manager._output_stream_callback(out, 100, None, 0)  # type: ignore[arg-type]
     assert np.all(out == 0)
     assert not manager.is_speaking
+
+
+def test_audio_manager_start_and_stop_lifecycle_no_deadlock() -> None:
+    """Verify start() and stop() complete cleanly without deadlocking on lock or stream closing."""
+    manager = AudioManager()
+    manager.start()
+    assert manager._running is True
+    manager.stop()
+    assert manager._running is False
+    assert manager._input_stream is None
+    assert manager._output_stream is None
