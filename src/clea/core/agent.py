@@ -97,11 +97,14 @@ class AgentLoop:
         system_prompt_tokens_est = _estimate_tokens(system_prompt)
         tools_schema_tokens_est = _estimate_tokens(json.dumps([t.model_dump() for t in tools]))
 
+        turn_start_msg_count = len(session.messages) - 1
+
         try:
             for round_idx in range(self.max_tool_rounds):
                 text_parts: list[str] = []
                 tool_calls: list[ToolCall] = []
                 call_usage: TokenUsage | None = None
+                captured_thought_signature: str | None = None
                 call_start = time.perf_counter()
                 call_ttft_ms: float | None = None
                 call_status = "error"
@@ -116,6 +119,8 @@ class AgentLoop:
                         tools=tools,
                         system_prompt=system_prompt,
                     ):
+                        if getattr(chunk, "thought_signature", None):
+                            captured_thought_signature = chunk.thought_signature
                         if chunk.type == "text_delta" and chunk.text:
                             now = time.perf_counter()
                             if ttft_ms is None:
@@ -156,7 +161,13 @@ class AgentLoop:
                 turn_text = "".join(text_parts)
 
                 if not tool_calls:
-                    session.messages.append(Message(role="assistant", content=turn_text))
+                    session.messages.append(
+                        Message(
+                            role="assistant",
+                            content=turn_text,
+                            thought_signature=captured_thought_signature,
+                        )
+                    )
                     self.memory.append_daily_turn(
                         session_id=session.id,
                         user_text=user_text,
@@ -166,7 +177,12 @@ class AgentLoop:
                     return turn_text
 
                 session.messages.append(
-                    Message(role="assistant", content=turn_text, tool_calls=tool_calls)
+                    Message(
+                        role="assistant",
+                        content=turn_text,
+                        tool_calls=tool_calls,
+                        thought_signature=captured_thought_signature,
+                    )
                 )
 
                 for call in tool_calls:
@@ -206,6 +222,9 @@ class AgentLoop:
             )
             status = "max_tool_rounds"
             return fallback
+        except Exception:
+            session.messages = session.messages[:turn_start_msg_count]
+            raise
         finally:
             total_ms = (time.perf_counter() - turn_start) * 1000.0
             input_tokens_sum = (

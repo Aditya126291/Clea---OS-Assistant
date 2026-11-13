@@ -42,6 +42,13 @@ def _to_gemini_steps(messages: list[Message]) -> list[dict[str, Any]]:
                 }
             )
         elif msg.role == "assistant":
+            if getattr(msg, "thought_signature", None):
+                steps.append(
+                    {
+                        "type": "thought",
+                        "signature": msg.thought_signature,
+                    }
+                )
             if msg.content:
                 steps.append(
                     {

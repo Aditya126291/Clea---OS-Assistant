@@ -55,6 +55,32 @@ def test_to_gemini_tools_and_steps() -> None:
     assert steps[2]["call_id"] == "c1"
 
 
+def test_to_gemini_steps_replays_thought_signature_before_function_call() -> None:
+    messages = [
+        Message(role="user", content="Search something"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="c1", name="search", arguments={"q": "clea"})],
+            thought_signature="sig_thought_999",
+        ),
+        Message(
+            role="tool",
+            content="search results",
+            tool_call_id="c1",
+            tool_name="search",
+        ),
+    ]
+    steps = _to_gemini_steps(messages)
+    assert len(steps) == 4
+    assert steps[0]["type"] == "user_input"
+    assert steps[1]["type"] == "thought"
+    assert steps[1]["signature"] == "sig_thought_999"
+    assert steps[2]["type"] == "function_call"
+    assert steps[2]["id"] == "c1"
+    assert steps[3]["type"] == "function_result"
+
+
 async def test_gemini_provider_extracts_and_sums_usage_across_hops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

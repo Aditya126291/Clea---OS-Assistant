@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -155,3 +156,64 @@ async def test_agent_logs_failed_model_call_duration_and_status(
     assert "status=error" in turn_logs[0]
     assert "model_calls=2" in turn_logs[0]
     assert ", " in turn_logs[0].split("call_durations_ms=[", 1)[1].split("]", 1)[0]
+
+
+async def test_failed_turn_rollback_and_subsequent_success(tmp_path: Path) -> None:
+    """Regression test: A failed turn rolls back session messages and the next turn succeeds."""
+    memory = MemoryStore(base_dir=tmp_path)
+    memory.ensure_initialized()
+
+    class _FlakyProvider(LLMProvider):
+        provider_name = "flaky"
+
+        def __init__(self) -> None:
+            self.turn_count = 0
+
+        async def stream_turn(
+            self,
+            *,
+            messages: list[Message],
+            tools: list[Any],
+            system_prompt: str,
+        ):
+            self.turn_count += 1
+            if self.turn_count == 2:
+                # Simulate a catastrophic failure on turn 2
+                raise RuntimeError("500 internal server error")
+            yield StreamChunk(type="text_delta", text=f"Answer {self.turn_count}")
+            yield StreamChunk(type="done", usage=TokenUsage(input_tokens=10, output_tokens=5))
+
+    flaky = _FlakyProvider()
+    agent = AgentLoop(
+        provider=flaky,
+        registry=_make_registry(tmp_path),
+        memory=memory,
+    )
+    session = Session(id="s-recovery")
+
+    # Turn 1: Success
+    res1 = await agent.run_turn(session=session, user_text="Hello 1")
+    assert res1 == "Answer 1"
+    assert len(session.messages) == 2
+    assert session.messages[0].role == "user"
+    assert session.messages[0].content == "Hello 1"
+    assert session.messages[1].role == "assistant"
+    assert session.messages[1].content == "Answer 1"
+
+    # Turn 2: Fails
+    with pytest.raises(RuntimeError, match="500 internal server error"):
+        await agent.run_turn(session=session, user_text="Hello 2 (will fail)")
+
+    # Messages must have been rolled back to turn 1!
+    assert len(session.messages) == 2
+    assert session.messages[0].content == "Hello 1"
+    assert session.messages[1].content == "Answer 1"
+
+    # Turn 3: Succeeds cleanly
+    res3 = await agent.run_turn(session=session, user_text="Hello 3")
+    assert res3 == "Answer 3"
+    assert len(session.messages) == 4
+    assert session.messages[2].role == "user"
+    assert session.messages[2].content == "Hello 3"
+    assert session.messages[3].role == "assistant"
+    assert session.messages[3].content == "Answer 3"

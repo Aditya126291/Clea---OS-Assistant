@@ -29,6 +29,7 @@ class Message(BaseModel):
     tool_name: str | None = None
     is_error: bool = False
     thought_signature: str | None = None
+    thought_signature: str | None = None
 
 
 class TokenUsage(BaseModel):
