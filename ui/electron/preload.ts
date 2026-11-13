@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld("cleaDesktop", {
   getAutoLaunch: () => ipcRenderer.invoke("clea:get-auto-launch"),
   setAutoLaunch: (enabled: boolean) => ipcRenderer.invoke("clea:set-auto-launch", Boolean(enabled)),
   startDaemon: () => ipcRenderer.invoke("clea:start-daemon"),
+  saveFile: (defaultPath: string, content: string) =>
+    ipcRenderer.invoke("clea:save-file", { defaultPath, content }),
   onQuickAskFocus: (callback: () => void) => {
     const handler = () => callback();
     ipcRenderer.on("clea:quick-ask-focus", handler);
