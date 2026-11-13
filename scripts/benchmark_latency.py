@@ -21,7 +21,11 @@ import time
 from datetime import datetime
 from typing import Any
 
+from dotenv import load_dotenv
+
 from clea.providers.gemini import GeminiProvider
+
+load_dotenv(".env")
 
 
 def calculate_percentiles(values: list[float]) -> dict[str, float]:
@@ -137,7 +141,7 @@ async def main() -> int:
         help="Spacing between calls in seconds (default: 1.0)",
     )
     parser.add_argument("--model1", type=str, default="gemini-3.5-flash-lite", help="Primary model")
-    parser.add_argument("--model2", type=str, default="gemini-2.5-flash", help="Comparison model")
+    parser.add_argument("--model2", type=str, default="gemini-3.8-flash", help="Comparison model")
     parser.add_argument(
         "--mock", action="store_true", help="Run simulated benchmark without calling API"
     )
