@@ -243,9 +243,16 @@ class GeminiLiveBackend(VoiceBackend):
         await self._reconnect()
 
     async def _reconnect(self) -> None:
+        if self._receive_task is not None and not self._receive_task.done():
+            self._receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receive_task
+            self._receive_task = None
         if self._session_ctx is not None:
             with contextlib.suppress(Exception):
                 await self._session_ctx.__aexit__(None, None, None)
+            self._session_ctx = None
+            self._session = None
         assert self._config is not None
         await self._open_session(self._config)
 

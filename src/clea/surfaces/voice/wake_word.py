@@ -201,6 +201,8 @@ class WakeWordDetector:
         if isinstance(pcm_bytes, np.ndarray):
             if pcm_bytes.size == 0:
                 return False, 0.0, ""
+            if np.issubdtype(pcm_bytes.dtype, np.floating):
+                pcm_bytes = np.nan_to_num(pcm_bytes, nan=0.0, posinf=32767.0, neginf=-32768.0)
             audio_arr = np.ascontiguousarray(pcm_bytes.reshape(-1), dtype=np.int16)
         else:
             if not pcm_bytes:

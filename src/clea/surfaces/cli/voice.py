@@ -423,10 +423,16 @@ def run_voice_test(*, debug_audio: bool = False) -> None:
             elapsed = time.monotonic() - start_t
             fps = chunks_count / elapsed if elapsed > 0 else 0.0
             avg_rms = sum(rms_vals) / len(rms_vals) if rms_vals else 0.0
-            print(
-                f"   [OK] Mic stream: {fps:.1f} fps | "
-                f"Avg RMS: {avg_rms:.1f} ({chunks_count} frames)"
-            )
+            if chunks_count == 0:
+                print(
+                    f"   [FAIL] Mic stream: 0 frames captured in {elapsed:.1f}s. "
+                    "Microphone may be muted, in exclusive use, or needs permissions."
+                )
+            else:
+                print(
+                    f"   [OK] Mic stream: {fps:.1f} fps | "
+                    f"Avg RMS: {avg_rms:.1f} ({chunks_count} frames)"
+                )
 
         # 4. Interactive Live API spoken prompt test if key configured
         live_key = (

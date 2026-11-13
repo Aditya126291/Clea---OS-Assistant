@@ -212,10 +212,16 @@ class VoiceRunner:
                 and not self._loop.is_closed()
             ):
                 try:
-                    asyncio.run_coroutine_threadsafe(
-                        self._daemon_ws.send(evt.model_dump_json()),
-                        self._loop,
-                    )
+                    running_loop = None
+                    with contextlib.suppress(RuntimeError):
+                        running_loop = asyncio.get_running_loop()
+                    if running_loop is self._loop:
+                        self._loop.create_task(self._daemon_ws.send(evt.model_dump_json()))
+                    else:
+                        asyncio.run_coroutine_threadsafe(
+                            self._daemon_ws.send(evt.model_dump_json()),
+                            self._loop,
+                        )
                 except Exception as exc:
                     logger.debug("Could not send VoiceStateEvent to daemon: %s", exc)
 
@@ -374,6 +380,7 @@ class VoiceRunner:
             try:
                 detected, score, _key = self._wake_word.process_audio(pcm_bytes)
                 if detected:
+                    self._wake_word.reset()
                     logger.info("Wake word detected locally with score %.3f!", score)
                     asyncio.run_coroutine_threadsafe(
                         self.start_call(trigger="wake_word"),
@@ -540,6 +547,16 @@ class VoiceRunner:
                 await self._backend_consume_task
             self._backend_consume_task = None
 
+        # Reset call and voice state
+        self._call_state = "idle"
+        if error is not None:
+            self._set_voice_state("error", error=error)
+        else:
+            self._set_voice_state("idle")
+        self._call_id = None
+        if self._wake_word is not None:
+            self._wake_word.reset()
+
         # Notify daemon if connected and we initiated the end (not already from daemon)
         if self._daemon_ws is not None and reason != "daemon_event":
             with contextlib.suppress(Exception):
@@ -554,6 +571,7 @@ class VoiceRunner:
             entries=list(self._transcript_history),
         )
         await safe_consolidate_voice_call(call_id=ended_call_id)
+        self._transcript_history.clear()
 
         # Write usage & metrics record
         self._write_metrics_record(
@@ -574,16 +592,6 @@ class VoiceRunner:
             )
         )
 
-        # Reset states
-        self._call_state = "idle"
-        if error is not None:
-            self._set_voice_state("error", error=error)
-        else:
-            self._set_voice_state("idle")
-        self._call_id = None
-        self._transcript_history.clear()
-        if self._wake_word is not None:
-            self._wake_word.reset()
         logger.info("Call %s ended. Runner is now IDLE.", ended_call_id)
 
     def _write_metrics_record(
@@ -635,6 +643,10 @@ class VoiceRunner:
         stall_limit = self.config.stall_timeout_seconds
         while self._call_state == "active":
             await asyncio.sleep(min(1.0, max(0.05, stall_limit / 4)))
+            if self._audio_manager and self._audio_manager.is_speaking:
+                # Assistant is actively speaking/playing audio; reset outbound stall timer
+                self._audio_sent_start_time = None
+                continue
             if self._audio_sent_start_time is not None:
                 elapsed = time.monotonic() - self._audio_sent_start_time
                 if elapsed >= stall_limit:
@@ -705,6 +717,10 @@ class VoiceRunner:
                 # Reset stall watchdog timer and reconnect state on any server response
                 self._audio_sent_start_time = None
                 self._stall_reconnected_once = False
+
+                # Clear transient error state if backend recovered and returned data
+                if self._state == "error" and not isinstance(event, BackendErrorEvent):
+                    self._set_voice_state("listening")
 
                 if self.debug_audio:
                     evt_type = type(event).__name__

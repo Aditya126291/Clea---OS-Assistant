@@ -694,3 +694,60 @@ async def test_voice_runner_fatal_backend_error_transitions_to_error(tmp_path: P
     assert runner.call_state == "idle"
     assert runner.voice_state == "error"
     await runner.stop()
+
+
+async def test_voice_runner_stall_watchdog_does_not_fire_while_speaking(tmp_path: Path) -> None:
+    """Watchdog must not fire if assistant is speaking out loud."""
+    cfg = VoiceConfig(stall_timeout_seconds=0.1)
+    backend = FakeLiveBackend()
+    audio_mgr = create_fake_audio_manager()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio_mgr,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Mark assistant as actively speaking
+    audio_mgr._is_speaking.set()
+    runner._on_audio_chunk(b"\x00" * 2560)
+
+    # Wait > stall_timeout_seconds
+    await asyncio.sleep(0.3)
+
+    # Watchdog must not have reconnected or ended the call
+    assert backend.reconnect_count == 0
+    assert runner.call_state == "active"
+    await runner.stop()
+
+
+async def test_voice_runner_wake_word_resets_immediately_on_detection(tmp_path: Path) -> None:
+    """WakeWordDetector must be reset immediately upon detection to avoid multi-triggering."""
+    cfg = VoiceConfig()
+    backend = FakeLiveBackend()
+    wake_detector = create_fake_wake_word()
+    wake_detector._model.predict.return_value = {"hey_jarvis_v0.1": 0.95}
+    wake_detector.reset = MagicMock()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=wake_detector,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    assert runner.call_state == "idle"
+
+    # Feed valid 1280-sample (2560 bytes) chunk triggering wake word
+    runner._on_audio_chunk(b"\x00" * 2560)
+
+    # Verify reset was called immediately
+    assert wake_detector.reset.called
+    await runner.stop()

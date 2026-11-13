@@ -547,3 +547,19 @@ def test_resolve_audio_device_wasapi_prioritization_and_substring() -> None:
         # 3. Numeric string index resolution
         dev_by_idx = resolve_audio_device("15", kind="input")
         assert dev_by_idx["index"] == 15
+
+
+def test_resample_to_16k_mono_sanitizes_nan_and_inf() -> None:
+    """Verify float array with NaNs/Infs is safely sanitized without warnings or exceptions."""
+    import warnings
+
+    arr_with_nan = np.array([1000.0, np.nan, -1000.0, np.inf, -np.inf], dtype=np.float32)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        resampled = resample_to_16k_mono(arr_with_nan, orig_sr=16000, target_sr=16000)
+        assert resampled.dtype == np.int16
+        assert len(resampled) == 5
+        assert resampled[1] == 0
+        assert resampled[3] == 32767
+        assert resampled[4] == -32768
+        assert not any("invalid value encountered" in str(w.message) for w in recorded)

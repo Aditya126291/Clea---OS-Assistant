@@ -207,6 +207,10 @@ def resample_to_16k_mono(
     if audio.size == 0:
         return np.empty(0, dtype=np.int16)
 
+    # Sanitize float inputs to guard against NaN/Inf warnings/failures
+    if np.issubdtype(audio.dtype, np.floating):
+        audio = np.nan_to_num(audio, nan=0.0, posinf=32767.0, neginf=-32768.0)
+
     # Downmix multi-channel to mono
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
@@ -239,7 +243,7 @@ class AudioChunkBuffer:
     def extend(self, pcm_bytes: bytes | np.ndarray) -> None:
         """Append PCM audio data (bytes or int16 numpy array) to the FIFO buffer."""
         if isinstance(pcm_bytes, np.ndarray):
-            raw = pcm_bytes.astype(np.int16).tobytes()
+            raw = np.ascontiguousarray(pcm_bytes.reshape(-1), dtype=np.int16).tobytes()
         else:
             raw = pcm_bytes
         if not raw:
@@ -499,7 +503,9 @@ class AudioManager:
             logger.debug("Audio input status flag: %s", status)
 
         if self.mic_mute_while_speaking and self._is_speaking.is_set():
-            # Mute microphone while assistant is talking
+            # Mute microphone while speaking; clear buffer to prevent stale stitching
+            if self._chunk_buffer is not None:
+                self._chunk_buffer.clear()
             return
 
         cb = self._on_audio_input
