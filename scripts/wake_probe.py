@@ -97,7 +97,7 @@ def main() -> None:
     print(f"Host API:     {host_api}")
     print(f"Native Rate:  {native_rate} Hz (recording at 16000 Hz, 16-bit mono)")
     print(f"Model:        '{model_name}' (threshold: {threshold:.2f})")
-    print(f"Chunk Size:   1280 samples (80 ms)")
+    print("Chunk Size:   1280 samples (80 ms)")
     print("=" * 65)
     print("Status: Initializing openWakeWord detector...")
 
@@ -153,9 +153,16 @@ def main() -> None:
 
             if detected:
                 print(
-                    f"\n>>> WAKE WORD DETECTED! model='{key}' score={score:.3f} >= threshold={threshold:.2f} <<<\n",
+                    f"\n>>> WAKE WORD DETECTED! model='{key}' "
+                    f"score={score:.3f} >= threshold={threshold:.2f} <<<\n",
                     flush=True,
                 )
+
+    extra_settings = (
+        sd.WasapiSettings(auto_convert=True)
+        if ("WASAPI" in host_api.upper() and hasattr(sd, "WasapiSettings"))
+        else None
+    )
 
     try:
         with sd.InputStream(
@@ -164,6 +171,7 @@ def main() -> None:
             channels=1,
             dtype="int16",
             blocksize=1280,
+            extra_settings=extra_settings,
             callback=audio_callback,
         ):
             while True:

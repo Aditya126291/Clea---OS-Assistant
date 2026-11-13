@@ -40,7 +40,11 @@ def list_audio_devices() -> list[dict[str, Any]]:
         for idx, dev in enumerate(raw_devices):
             host_idx = dev.get("hostapi")
             host_name = "Unknown"
-            if host_idx is not None and isinstance(hostapis, (list, tuple)) and 0 <= host_idx < len(hostapis):
+            if (
+                host_idx is not None
+                and isinstance(hostapis, (list, tuple))
+                and 0 <= host_idx < len(hostapis)
+            ):
                 host_name = hostapis[host_idx].get("name", "Unknown")
             devices.append(
                 {
@@ -80,6 +84,21 @@ def resolve_audio_device(
 
     # 1. Default device (spec is None)
     if spec is None:
+        if preferred_hostapi:
+            try:
+                hostapis = sd.query_hostapis()
+                for api in hostapis:
+                    if preferred_hostapi.lower() in api.get("name", "").lower():
+                        pref_def = api.get(
+                            "default_input_device" if kind == "input" else "default_output_device"
+                        )
+                        if pref_def is not None and pref_def >= 0:
+                            match = next((d for d in valid_devices if d["index"] == pref_def), None)
+                            if match is not None:
+                                return match
+            except Exception as exc:
+                logger.debug("Could not query hostapis for preferred default: %s", exc)
+
         try:
             def_idx = sd.default.device[0 if kind == "input" else 1]
             if def_idx is not None and def_idx >= 0:
@@ -214,7 +233,9 @@ class AudioManager:
                 inp_idx,
                 self.resolved_input_device["name"],
                 self.resolved_input_device.get("hostapi_name", "Unknown"),
-                int(self.resolved_input_device.get("default_samplerate", INPUT_AUDIO_SAMPLE_RATE_HZ)),
+                int(
+                    self.resolved_input_device.get("default_samplerate", INPUT_AUDIO_SAMPLE_RATE_HZ)
+                ),
                 self.resolved_input_device.get("max_input_channels", 1),
             )
             logger.info(
@@ -222,8 +243,25 @@ class AudioManager:
                 out_idx,
                 self.resolved_output_device["name"],
                 self.resolved_output_device.get("hostapi_name", "Unknown"),
-                int(self.resolved_output_device.get("default_samplerate", OUTPUT_AUDIO_SAMPLE_RATE_HZ)),
+                int(
+                    self.resolved_output_device.get(
+                        "default_samplerate", OUTPUT_AUDIO_SAMPLE_RATE_HZ
+                    )
+                ),
                 self.resolved_output_device.get("max_output_channels", 2),
+            )
+
+            inp_wasapi = "WASAPI" in self.resolved_input_device.get("hostapi_name", "").upper()
+            out_wasapi = "WASAPI" in self.resolved_output_device.get("hostapi_name", "").upper()
+            inp_extra = (
+                sd.WasapiSettings(auto_convert=True)
+                if (inp_wasapi and hasattr(sd, "WasapiSettings"))
+                else None
+            )
+            out_extra = (
+                sd.WasapiSettings(auto_convert=True)
+                if (out_wasapi and hasattr(sd, "WasapiSettings"))
+                else None
             )
 
             try:
@@ -233,6 +271,7 @@ class AudioManager:
                     dtype="int16",
                     device=inp_idx,
                     blocksize=1280,
+                    extra_settings=inp_extra,
                     callback=self._input_stream_callback,
                 )
                 self._output_stream = sd.OutputStream(
@@ -240,6 +279,7 @@ class AudioManager:
                     channels=AUDIO_CHANNELS,
                     dtype="int16",
                     device=out_idx,
+                    extra_settings=out_extra,
                     callback=self._output_stream_callback,
                 )
                 self._input_stream.start()

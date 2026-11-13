@@ -22,13 +22,14 @@ import urllib.request
 from typing import Any
 
 from dotenv import load_dotenv
-
-load_dotenv(".env")
-
 from google import genai
 from google.genai import types
 
-SAMPLE_SPEECH_URL = "https://storage.googleapis.com/generativeai-downloads/data/hello_are_you_there.pcm"
+load_dotenv(".env")
+
+SAMPLE_SPEECH_URL = (
+    "https://storage.googleapis.com/generativeai-downloads/data/hello_are_you_there.pcm"
+)
 
 
 def fetch_test_speech_pcm() -> bytes:
@@ -47,8 +48,29 @@ def record_mic_audio(device_idx: int | None, duration_seconds: float = 4.0) -> b
 
     rate = 16000
     frames = int(duration_seconds * rate)
-    print(f"Recording {duration_seconds:.1f}s from mic (device={device_idx})... Speak now!", flush=True)
-    data = sd.rec(frames, samplerate=rate, channels=1, dtype="int16", device=device_idx)
+    print(
+        f"Recording {duration_seconds:.1f}s from mic (device={device_idx})... Speak now!",
+        flush=True,
+    )
+
+    extra = None
+    if device_idx is not None and hasattr(sd, "WasapiSettings"):
+        try:
+            dev = sd.query_devices(device_idx)
+            hostapi = sd.query_hostapis(dev.get("hostapi", -1))
+            if "WASAPI" in hostapi.get("name", "").upper():
+                extra = sd.WasapiSettings(auto_convert=True)
+        except Exception:
+            pass
+
+    data = sd.rec(
+        frames,
+        samplerate=rate,
+        channels=1,
+        dtype="int16",
+        device=device_idx,
+        extra_settings=extra,
+    )
     sd.wait()
     return data.tobytes()
 
@@ -70,7 +92,9 @@ def summarize_message(msg: types.LiveServerMessage) -> list[str]:
         if sc.input_transcription is not None and sc.input_transcription.text:
             types_seen.append(f"input_transcription('{sc.input_transcription.text.strip()}')")
         if sc.output_transcription is not None and sc.output_transcription.text:
-            types_seen.append(f"output_transcription('{sc.output_transcription.text.strip()[:35]}')")
+            types_seen.append(
+                f"output_transcription('{sc.output_transcription.text.strip()[:35]}')"
+            )
         if sc.turn_complete:
             types_seen.append("turn_complete")
     if msg.tool_call is not None:
@@ -93,7 +117,9 @@ async def run_probe(
 ) -> dict[str, Any]:
     api_key = os.environ.get("GEMINI_LIVE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
-        print("Error: Neither GEMINI_LIVE_API_KEY nor GEMINI_API_KEY is configured.", file=sys.stderr)
+        print(
+            "Error: Neither GEMINI_LIVE_API_KEY nor GEMINI_API_KEY is configured.", file=sys.stderr
+        )
         sys.exit(1)
 
     client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
@@ -118,9 +144,9 @@ async def run_probe(
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f" PROBE RUN: mode={mode.upper()} | model={model}")
-    print(f"{'='*70}", flush=True)
+    print(f"{'=' * 70}", flush=True)
 
     t0 = time.monotonic()
     events_log: list[tuple[float, list[str]]] = []
@@ -130,10 +156,11 @@ async def run_probe(
     turn_complete_received = False
 
     async with client.aio.live.connect(model=model, config=config) as session:
+
         async def audio_sender():
             CHUNK_BYTES = 2560  # 1280 samples * 2 bytes = 80 ms
             if mode == "manual":
-                print(f"[{time.monotonic()-t0:6.2f}s] SEND: activity_start", flush=True)
+                print(f"[{time.monotonic() - t0:6.2f}s] SEND: activity_start", flush=True)
                 await session.send_realtime_input(activity_start=types.ActivityStart())
 
             # Stream speech audio in 80 ms chunks
@@ -145,12 +172,12 @@ async def run_probe(
                 await asyncio.sleep(0.08)
 
             print(
-                f"[{time.monotonic()-t0:6.2f}s] Finished streaming speech ({len(audio_bytes)} bytes).",
+                f"[{time.monotonic() - t0:6.2f}s] Finished speech ({len(audio_bytes)} bytes).",
                 flush=True,
             )
 
             if mode == "manual":
-                print(f"[{time.monotonic()-t0:6.2f}s] SEND: activity_end", flush=True)
+                print(f"[{time.monotonic() - t0:6.2f}s] SEND: activity_end", flush=True)
                 await session.send_realtime_input(activity_end=types.ActivityEnd())
             else:
                 # In default mode, continue streaming silence to let server VAD detect silence
@@ -192,7 +219,10 @@ async def run_probe(
         try:
             await asyncio.wait_for(asyncio.gather(sender_task, receiver_task), timeout=15.0)
         except TimeoutError:
-            print(f"[{time.monotonic()-t0:6.2f}s] Session timed out waiting for turn completion.", flush=True)
+            print(
+                f"[{time.monotonic() - t0:6.2f}s] Session timed out waiting for turn completion.",
+                flush=True,
+            )
             sender_task.cancel()
             receiver_task.cancel()
 
@@ -219,7 +249,7 @@ def main() -> None:
         "--source",
         choices=["sample", "mic"],
         default="sample",
-        help="Audio source: Google reference speech PCM in memory or physical mic (default: sample)",
+        help="Audio source: Google speech PCM in memory or mic (default: sample)",
     )
     parser.add_argument(
         "--device",

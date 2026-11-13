@@ -347,3 +347,7 @@ def main(argv: list[str] | None = None) -> None:
             host = os.environ.get("CLEA_HOST", DEFAULT_HOST)
             port = int(os.environ.get("CLEA_PORT", DEFAULT_PORT))
             run_voice_service(host=host, port=port, debug_audio=debug_audio)
+
+
+if __name__ == "__main__":
+    main()

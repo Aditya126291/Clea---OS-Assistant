@@ -405,6 +405,19 @@ class CleaDaemon:
                     await self._dispatch_request(conn, frame)
         finally:
             self._connections.discard(conn)
+            if conn.is_voice and self._call_state != "idle":
+                self._call_state = "idle"
+                self._voice_state = "idle"
+                await self._broadcast(
+                    CallEndedEvent(
+                        data=CallEndedData(
+                            call_id=self._voice_call_id or "",
+                            call_state="idle",
+                            reason="voice_process_disconnected",
+                            ended_at=_now_iso(),
+                        )
+                    )
+                )
             for approval_id in list(conn.approvals):
                 self._shared_approvals.pop(approval_id, None)
             if conn.current_session_id:
@@ -636,9 +649,7 @@ class CleaDaemon:
                 if not voice_connected:
                     err_msg = "Voice process not running. Start it with 'clea voice'."
                     await self._broadcast(
-                        VoiceStateEvent(
-                            data=VoiceStateData(state="error", error=err_msg)
-                        )
+                        VoiceStateEvent(data=VoiceStateData(state="error", error=err_msg))
                     )
                     await self._respond(ws, req, error=err_msg)
                     return
@@ -702,7 +713,8 @@ class CleaDaemon:
             self._screen_capture_active = False
             self._screen_capture_target = None
 
-            # If transcript is provided in req.params, persist to logs/transcripts/ and schedule consolidation
+            # If transcript is provided in req.params, persist to logs/transcripts/
+            # and schedule consolidation
             if getattr(req.params, "transcript", None):
                 for entry in req.params.transcript:
                     role = entry.get("role", "assistant")

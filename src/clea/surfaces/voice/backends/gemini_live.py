@@ -353,7 +353,7 @@ class GeminiLiveBackend(VoiceBackend):
         if self._session is None or self._closed:
             return
         turns = [types.Content(parts=[types.Part(text=text)], role="user")]
-        await self._session.send_client_content(turns=turns, end_of_turn=end_of_turn)
+        await self._session.send_client_content(turns=turns, turn_complete=end_of_turn)
 
     async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
         """Send tool execution responses back to the Live model."""

@@ -93,9 +93,33 @@ def test_audio_manager_start_and_stop_lifecycle_no_deadlock() -> None:
 
 def test_resolve_audio_device_by_substring_and_preferred_hostapi() -> None:
     mock_devices = [
-        {"index": 0, "name": "USB Mic", "hostapi": 0, "hostapi_name": "MME", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 44100},
-        {"index": 1, "name": "USB Mic", "hostapi": 1, "hostapi_name": "Windows WASAPI", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000},
-        {"index": 2, "name": "Speakers", "hostapi": 1, "hostapi_name": "Windows WASAPI", "max_input_channels": 0, "max_output_channels": 2, "default_samplerate": 48000},
+        {
+            "index": 0,
+            "name": "USB Mic",
+            "hostapi": 0,
+            "hostapi_name": "MME",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 44100,
+        },
+        {
+            "index": 1,
+            "name": "USB Mic",
+            "hostapi": 1,
+            "hostapi_name": "Windows WASAPI",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 16000,
+        },
+        {
+            "index": 2,
+            "name": "Speakers",
+            "hostapi": 1,
+            "hostapi_name": "Windows WASAPI",
+            "max_input_channels": 0,
+            "max_output_channels": 2,
+            "default_samplerate": 48000,
+        },
     ]
 
     with patch("clea.surfaces.voice.audio.list_audio_devices", return_value=mock_devices):
@@ -120,8 +144,24 @@ def test_resolve_audio_device_by_substring_and_preferred_hostapi() -> None:
 
 def test_resolve_audio_device_raises_on_ambiguous_matches() -> None:
     mock_devices = [
-        {"index": 0, "name": "Realtek Mic 1", "hostapi": 0, "hostapi_name": "Windows WASAPI", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000},
-        {"index": 1, "name": "Realtek Mic 2", "hostapi": 0, "hostapi_name": "Windows WASAPI", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000},
+        {
+            "index": 0,
+            "name": "Realtek Mic 1",
+            "hostapi": 0,
+            "hostapi_name": "Windows WASAPI",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 16000,
+        },
+        {
+            "index": 1,
+            "name": "Realtek Mic 2",
+            "hostapi": 0,
+            "hostapi_name": "Windows WASAPI",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 16000,
+        },
     ]
 
     with patch("clea.surfaces.voice.audio.list_audio_devices", return_value=mock_devices):
@@ -129,3 +169,38 @@ def test_resolve_audio_device_raises_on_ambiguous_matches() -> None:
             resolve_audio_device("Realtek", kind="input", preferred_hostapi="WASAPI")
         assert "Multiple audio input devices match 'Realtek'" in str(exc_amb.value)
 
+
+def test_resolve_audio_device_none_spec_respects_preferred_hostapi() -> None:
+    mock_devices = [
+        {
+            "index": 0,
+            "name": "MME Mic",
+            "hostapi": 0,
+            "hostapi_name": "MME",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 44100,
+        },
+        {
+            "index": 1,
+            "name": "WASAPI Mic",
+            "hostapi": 1,
+            "hostapi_name": "Windows WASAPI",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 48000,
+        },
+    ]
+    mock_hostapis = (
+        {"name": "MME", "default_input_device": 0, "default_output_device": -1},
+        {"name": "Windows WASAPI", "default_input_device": 1, "default_output_device": -1},
+    )
+
+    with (
+        patch("clea.surfaces.voice.audio.list_audio_devices", return_value=mock_devices),
+        patch("sounddevice.query_hostapis", return_value=mock_hostapis),
+    ):
+        # When preferred_hostapi is WASAPI, default device index 1 is resolved instead of 0
+        dev = resolve_audio_device(None, kind="input", preferred_hostapi="WASAPI")
+        assert dev["index"] == 1
+        assert dev["name"] == "WASAPI Mic"

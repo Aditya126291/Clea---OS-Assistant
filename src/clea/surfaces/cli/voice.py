@@ -43,9 +43,24 @@ def _run_mic_check(device_idx: int, duration: float = 3.0) -> tuple[float, float
     """Record 3 seconds from device_idx to measure RMS and peak in memory (never saved to disk)."""
     import sounddevice as sd
 
+    extra = None
+    if hasattr(sd, "WasapiSettings"):
+        try:
+            dev = sd.query_devices(device_idx)
+            hostapi = sd.query_hostapis(dev.get("hostapi", -1))
+            if "WASAPI" in hostapi.get("name", "").upper():
+                extra = sd.WasapiSettings(auto_convert=True)
+        except Exception:
+            pass
+
     try:
         data = sd.rec(
-            int(duration * 16000), samplerate=16000, channels=1, dtype="int16", device=device_idx
+            int(duration * 16000),
+            samplerate=16000,
+            channels=1,
+            dtype="int16",
+            device=device_idx,
+            extra_settings=extra,
         )
         sd.wait()
     except Exception:
@@ -100,7 +115,7 @@ async def _check_live_api_connection(api_key: str) -> tuple[bool, str]:
 
     backend = GeminiLiveBackend(api_key=api_key)
     try:
-        await backend.connect(VoiceSessionConfig())
+        await backend.connect(VoiceSessionConfig(system_instruction="Diagnostic connection check."))
         await asyncio.sleep(0.5)
         return True, "Connected successfully to Gemini Live API (gemini-3.8-live)."
     except Exception as exc:
@@ -117,10 +132,16 @@ async def _run_live_voice_test_prompt(
 
     backend = GeminiLiveBackend(api_key=api_key)
     try:
-        await backend.connect(VoiceSessionConfig())
+        await backend.connect(
+            VoiceSessionConfig(
+                system_instruction=(
+                    "You are a helpful voice assistant. Follow user requests concisely."
+                )
+            )
+        )
         prompt = "Please say: 'Clea voice test successful.'"
         if debug_audio:
-            print(f"   [AUDIO-DEBUG] Sending prompt to Gemini Live: \"{prompt}\"")
+            print(f'   [AUDIO-DEBUG] Sending prompt to Gemini Live: "{prompt}"')
         await backend.send_text(prompt, end_of_turn=True)
 
         async for event in backend.events():
@@ -262,7 +283,8 @@ def run_voice_doctor(*, download_models: bool = False) -> None:
 
     # 3. 3-second live mic check (reporting RMS and peak, warning if near-silent, NEVER saves audio)
     if chosen_input is not None:
-        print(f"Running 3-second microphone check on #{chosen_input['index']} '{chosen_input['name']}'...")
+        name_trunc = chosen_input["name"][:30]
+        print(f"Running 3-second microphone check on #{chosen_input['index']} '{name_trunc}'...")
         try:
             rms, peak = _run_mic_check(chosen_input["index"])
             print(f"[OK] 3-second mic check: RMS = {rms:.1f}, Peak = {peak:.1f}")
@@ -402,10 +424,16 @@ def run_voice_test(*, debug_audio: bool = False) -> None:
             elapsed = time.monotonic() - start_t
             fps = chunks_count / elapsed if elapsed > 0 else 0.0
             avg_rms = sum(rms_vals) / len(rms_vals) if rms_vals else 0.0
-            print(f"   [OK] Mic stream: {fps:.1f} fps | Avg RMS: {avg_rms:.1f} ({chunks_count} frames)")
+            print(
+                f"   [OK] Mic stream: {fps:.1f} fps | "
+                f"Avg RMS: {avg_rms:.1f} ({chunks_count} frames)"
+            )
 
         # 4. Interactive Live API spoken prompt test if key configured
-        live_key = os.environ.get("GEMINI_LIVE_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+        live_key = (
+            os.environ.get("GEMINI_LIVE_API_KEY", "").strip()
+            or os.environ.get("GEMINI_API_KEY", "").strip()
+        )
         if live_key:
             print("4. Testing Live API text prompt -> spoken answer...")
             asyncio.run(_run_live_voice_test_prompt(live_key, audio, debug_audio=debug_audio))

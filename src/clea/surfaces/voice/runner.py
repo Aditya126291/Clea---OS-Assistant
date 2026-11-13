@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
@@ -170,7 +171,8 @@ class VoiceRunner:
             log_file.parent.mkdir(parents=True, exist_ok=True)
             voice_logger = logging.getLogger("clea.surfaces.voice")
             has_file = any(
-                isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == str(log_file)
+                isinstance(h, logging.FileHandler)
+                and getattr(h, "baseFilename", None) == str(log_file)
                 for h in voice_logger.handlers
             )
             if not has_file:
@@ -203,7 +205,11 @@ class VoiceRunner:
             self._emit_event(evt)
             if error:
                 logger.error("Voice state error: %s", error)
-            if self._daemon_ws is not None and self._loop is not None and not self._loop.is_closed():
+            if (
+                self._daemon_ws is not None
+                and self._loop is not None
+                and not self._loop.is_closed()
+            ):
                 try:
                     asyncio.run_coroutine_threadsafe(
                         self._daemon_ws.send(evt.model_dump_json()),
@@ -402,7 +408,7 @@ class VoiceRunner:
 
         try:
             # 1. Start call in daemon if connected
-            if self._daemon_ws is not None:
+            if self._daemon_ws is not None and trigger != "daemon_event":
                 start_req = VoiceStartCallRequest(
                     params=VoiceStartCallParams(trigger=trigger)  # type: ignore[arg-type]
                 )
@@ -470,9 +476,10 @@ class VoiceRunner:
             )
         except Exception as exc:
             logger.error("Failed starting voice call: %s", exc)
-            await self.end_call(reason=f"start_failed: {exc}")
+            print(f"\n[ERROR] Voice call failed to start: {exc}", file=sys.stderr, flush=True)
+            await self.end_call(reason=f"start_failed: {exc}", error=f"Voice call failed: {exc}")
 
-    async def end_call(self, *, reason: str = "user_done") -> None:
+    async def end_call(self, *, reason: str = "user_done", error: str | None = None) -> None:
         """End the active call and transition back to IDLE."""
         if self._call_state == "idle":
             return
@@ -553,7 +560,10 @@ class VoiceRunner:
 
         # Reset states
         self._call_state = "idle"
-        self._set_voice_state("idle")
+        if error is not None:
+            self._set_voice_state("error", error=error)
+        else:
+            self._set_voice_state("idle")
         self._call_id = None
         self._transcript_history.clear()
         if self._wake_word is not None:
@@ -619,8 +629,12 @@ class VoiceRunner:
                         getattr(self._active_backend, "resumption_handle", None),
                     )
                     self._audio_sent_start_time = None
-                    self._set_voice_state("error", error="Session stalled: server not responding. Reconnecting...")
-                    if self._active_backend is not None and hasattr(self._active_backend, "_reconnect"):
+                    self._set_voice_state(
+                        "error", error="Session stalled: server not responding. Reconnecting..."
+                    )
+                    if self._active_backend is not None and hasattr(
+                        self._active_backend, "_reconnect"
+                    ):
                         try:
                             await self._active_backend._reconnect()
                             self._set_voice_state("listening")
@@ -718,15 +732,22 @@ class VoiceRunner:
                     logger.warning(
                         "Backend error: %s (recoverable=%s)", event.message, event.recoverable
                     )
-                    self._set_voice_state("error", error=event.message)
+                    print(f"\n[ERROR] Backend error: {event.message}", file=sys.stderr, flush=True)
                     if not event.recoverable:
-                        await self.end_call(reason=f"backend_error: {event.message}")
+                        await self.end_call(
+                            reason=f"backend_error: {event.message}", error=event.message
+                        )
                         break
+                    else:
+                        self._set_voice_state("error", error=event.message)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             logger.error("Error in backend event consumer: %s", exc)
-            await self.end_call(reason=f"consumer_error: {exc}")
+            print(f"\n[ERROR] Backend event consumer error: {exc}", file=sys.stderr, flush=True)
+            await self.end_call(
+                reason=f"consumer_error: {exc}", error=f"Voice stream failed: {exc}"
+            )
 
     async def _handle_tool_call(self, event: ToolCallEvent, backend: VoiceBackend) -> None:
         """Execute or delegate live voice tool call."""
@@ -936,11 +957,7 @@ class VoiceRunner:
             self._daemon_ws = ws
             logger.info("Connected to daemon at %s.", self.daemon_url)
             # Notify daemon that voice process is connected and register state
-            await ws.send(
-                VoiceStateEvent(
-                    data=VoiceStateData(state=self._state)
-                ).model_dump_json()
-            )
+            await ws.send(VoiceStateEvent(data=VoiceStateData(state=self._state)).model_dump_json())
 
             while not self._stop_event.is_set():
                 raw = await ws.recv()
