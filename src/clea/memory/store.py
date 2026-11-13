@@ -473,6 +473,7 @@ class MemoryStore:
         session_id: str,
         summary: str,
         now: datetime | None = None,
+        trivial: bool = False,
     ) -> Path:
         """Append an episode summary (3-5 lines) to memory/episodes/YYYY-MM-DD.md."""
         self.ensure_initialized()
@@ -485,14 +486,16 @@ class MemoryStore:
         if not path.exists():
             chunks.append(f"# Episodes — {date_str}\n")
 
-        chunks.append(f"\n### Session `{session_id}` ({time_str})\n\n{summary.strip()}\n")
+        trivial_suffix = " [trivial]" if trivial else ""
+        header = f"\n### Session `{session_id}` ({time_str}){trivial_suffix}\n\n"
+        chunks.append(f"{header}{summary.strip()}\n")
 
         with path.open("a", encoding="utf-8") as handle:
             handle.write("".join(chunks))
 
         return path
 
-    def get_recent_episodes(self, limit: int = 5) -> list[dict[str, str]]:
+    def get_recent_episodes(self, limit: int = 5) -> list[dict[str, Any]]:
         """Return the most recent episode summaries across all episode files, newest first."""
         if not self.episodes_dir.is_dir():
             return []
@@ -503,9 +506,10 @@ class MemoryStore:
             reverse=True,
         )
 
-        episodes: list[dict[str, str]] = []
+        episodes: list[dict[str, Any]] = []
         session_re = re.compile(
-            r"^### Session `(?P<sid>[^`]+)` \((?P<time>[^)]+)\)\s*\n(?P<body>.+?)(?=\n###|\Z)",
+            r"^### Session `(?P<sid>[^`]+)` \((?P<time>[^)]+)\)"
+            r"(?P<trivial_tag>\s*\[trivial\])?\s*\n(?P<body>.+?)(?=\n###|\Z)",
             re.M | re.S,
         )
 
@@ -513,18 +517,49 @@ class MemoryStore:
             content = f.read_text(encoding="utf-8")
             matches = list(session_re.finditer(content))
             for m in reversed(matches):
+                body_text = m.group("body").strip()
+                is_trivial = (
+                    bool(m.group("trivial_tag"))
+                    or body_text.startswith("Short session")
+                    or "greeting session" in body_text.lower()
+                    or "nothing discussed" in body_text.lower()
+                )
                 episodes.append(
                     {
                         "date": f.stem,
                         "session_id": m.group("sid"),
                         "time": m.group("time"),
-                        "summary": m.group("body").strip(),
+                        "summary": body_text,
+                        "trivial": is_trivial,
                     }
                 )
-                if len(episodes) >= limit:
+                if limit > 0 and len(episodes) >= limit:
                     return episodes
 
         return episodes
+
+    def read_archive(self) -> tuple[list[dict[str, Any]], str]:
+        """Read and parse MEMORY_ARCHIVE.md into structured entry items and raw markdown."""
+        if not self.archive_path.exists():
+            return [], ""
+        raw_text = self.archive_path.read_text(encoding="utf-8")
+        entry_re = re.compile(
+            r"^-\s*\[(?P<id>[^\]]+)\]\s*\((?P<date>[^,]+),\s*(?P<source>[^)]+)\)\s*(?P<text>.*?)(?:\s*\(archived:\s*(?P<archived_at>[^)]+)\))?$",
+            re.M,
+        )
+        entries: list[dict[str, Any]] = []
+        for m in entry_re.finditer(raw_text):
+            entries.append(
+                {
+                    "id": m.group("id"),
+                    "date": m.group("date"),
+                    "source": m.group("source"),
+                    "text": m.group("text").strip(),
+                    "archived_at": m.group("archived_at") or None,
+                    "reason": "Token capacity cap exceeded",
+                }
+            )
+        return entries, raw_text
 
     def build_injected_context(self, max_episodes: int = 5, token_cap: int = 2000) -> str:
         """Combine size-capped MEMORY.md and recent episodes without raw transcripts."""

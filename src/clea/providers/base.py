@@ -70,6 +70,7 @@ class LLMProvider(ABC):
         messages: list[Message],
         tools: list[ToolDefinition],
         system_prompt: str,
+        response_format: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream text deltas and any requested tool calls for the current turn."""
         raise NotImplementedError
