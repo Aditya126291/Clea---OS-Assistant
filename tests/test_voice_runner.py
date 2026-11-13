@@ -262,6 +262,12 @@ async def test_voice_runner_silence_watchdog_with_streaming_silence_vs_speech(
         runner._on_audio_chunk(silence_chunk)
         await asyncio.sleep(0.04)
 
+    # Allow watchdog poll interval to reliably trip on Windows timer resolution
+    for _ in range(10):
+        if runner.call_state == "idle":
+            break
+        await asyncio.sleep(0.03)
+
     # Silence watchdog should have fired because chunks had zero speech energy
     assert runner.call_state == "idle"
     await runner.stop()
