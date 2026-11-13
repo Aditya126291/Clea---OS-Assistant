@@ -31,6 +31,12 @@ from clea.surfaces.voice.memory_hooks import (
     store_voice_transcript,
 )
 from clea.surfaces.voice.runner import VoiceRunner, voice_metrics_path
+from clea.surfaces.voice.screen import (
+    ScreenCaptureResult,
+    ScreenCaptureService,
+    encode_frame,
+    is_window_blocked,
+)
 from clea.surfaces.voice.wake_word import (
     WakeWordDetector,
     WakeWordModelNotFoundError,
@@ -62,6 +68,8 @@ __all__ = [
     "HotKeyManager",
     "MediaResolution",
     "ScreenBlocklistConfig",
+    "ScreenCaptureResult",
+    "ScreenCaptureService",
     "VoiceAlreadyRunningError",
     "VoiceConfig",
     "VoiceInstanceLock",
@@ -76,10 +84,12 @@ __all__ = [
     "download_wake_word_models",
     "dpi_to_scale_factor",
     "enable_per_monitor_dpi_awareness",
+    "encode_frame",
     "ensure_voice_config",
     "enumerate_visible_windows",
     "get_window_process_name",
     "get_window_title",
+    "is_window_blocked",
     "list_audio_devices",
     "load_voice_config",
     "load_voice_memory_context",

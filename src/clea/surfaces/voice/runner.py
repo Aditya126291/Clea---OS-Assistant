@@ -64,6 +64,7 @@ from clea.surfaces.voice.memory_hooks import (
     safe_consolidate_voice_call,
     safe_store_voice_transcript,
 )
+from clea.surfaces.voice.screen import ScreenCaptureService
 from clea.surfaces.voice.wake_word import WakeWordDetector, WakeWordModelNotFoundError
 from clea.surfaces.voice.win32 import HotKeyManager, enable_per_monitor_dpi_awareness
 
@@ -105,6 +106,7 @@ class VoiceRunner:
         hotkey_manager: HotKeyManager | None = None,
         enable_hotkey: bool = True,
         on_event: Callable[[BaseEvent], None] | None = None,
+        screen_service: ScreenCaptureService | None = None,
     ) -> None:
         self.config = config or load_voice_config(create_if_missing=False)
         self.data_dir = data_dir
@@ -116,6 +118,11 @@ class VoiceRunner:
         self._hotkey_manager = hotkey_manager
         self._enable_hotkey = enable_hotkey
         self._on_event = on_event
+        self._screen_service = screen_service or ScreenCaptureService(
+            blocklist=self.config.blocklist,
+            image_max_side=self.config.image_max_side,
+        )
+        self._watch_screen_task: asyncio.Task[None] | None = None
 
         self._lock = VoiceInstanceLock(path=(data_dir or default_data_dir()) / "voice.lock")
         self._state: VoiceState = "idle"
@@ -399,10 +406,14 @@ class VoiceRunner:
             duration,
         )
 
-        # Cancel watchdog and consumer
+        # Cancel watchdog, screen watching, and consumer
         if self._silence_watchdog_task is not None:
             self._silence_watchdog_task.cancel()
             self._silence_watchdog_task = None
+
+        if self._watch_screen_task is not None:
+            self._watch_screen_task.cancel()
+            self._watch_screen_task = None
 
         # Stop audio playback and clear output buffer immediately
         if self._audio_manager is not None:
@@ -655,17 +666,137 @@ class VoiceRunner:
                 await backend.send_tool_responses([resp])
             return
 
-        # 3. look_at_screen / watch_screen stubs for Slice 1
-        resp = VoiceToolResponse(
-            call_id=event.call_id,
-            name=event.name,
-            response={
-                "status": "not_implemented_in_slice_1",
-                "note": "Screen capture arrives in Slice 2.",
-            },
-            scheduling="when_idle",
-        )
-        await backend.send_tool_responses([resp])
+        # 3. look_at_screen tool
+        if event.name == "look_at_screen":
+            if self.config.consent_mode == "deny":
+                resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={
+                        "status": "denied",
+                        "error": "Screen capture is disabled by configuration (consent_mode=deny).",
+                    },
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+                await backend.send_tool_responses([resp])
+                return
+
+            target = str(event.arguments.get("target", "full_screen"))
+            monitor = event.arguments.get("monitor")
+            res = self._screen_service.capture(target=target, monitor=monitor)
+
+            if res.blocked:
+                resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={
+                        "status": "blocked",
+                        "error": (
+                            f"Active window '{res.window_title}' ({res.process_name}) "
+                            "is protected by privacy blocklist."
+                        ),
+                    },
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+                await backend.send_tool_responses([resp])
+                return
+
+            if res.image_bytes is not None:
+                await backend.send_video_frame(res.image_bytes, mime_type="image/jpeg")
+                resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={
+                        "status": "success",
+                        "target": target,
+                        "width": res.width,
+                        "height": res.height,
+                        "window_title": res.window_title,
+                    },
+                    scheduling="when_idle",
+                )
+            else:
+                resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={
+                        "status": "error",
+                        "error": res.error or "Screen capture failed to produce an image.",
+                    },
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([resp])
+            return
+
+        # 4. watch_screen tool
+        if event.name == "watch_screen":
+            if self.config.consent_mode == "deny":
+                resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={
+                        "status": "denied",
+                        "error": "Continuous screen capture is disabled by configuration.",
+                    },
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+                await backend.send_tool_responses([resp])
+                return
+
+            try:
+                req_seconds = float(event.arguments.get("seconds", 10.0))
+            except (ValueError, TypeError):
+                req_seconds = 10.0
+
+            burst_seconds = max(1.0, min(req_seconds, self.config.max_burst_seconds))
+            reason = str(event.arguments.get("reason", "Continuous workflow guidance"))
+
+            if self._watch_screen_task is not None and not self._watch_screen_task.done():
+                self._watch_screen_task.cancel()
+
+            self._watch_screen_task = asyncio.create_task(
+                self._stream_screen_burst(burst_seconds=burst_seconds, backend=backend),
+                name="VoiceRunnerScreenBurst",
+            )
+            resp = VoiceToolResponse(
+                call_id=event.call_id,
+                name=event.name,
+                response={
+                    "status": "watching",
+                    "duration_seconds": burst_seconds,
+                    "reason": reason,
+                },
+                scheduling="when_idle",
+            )
+            await backend.send_tool_responses([resp])
+            return
+
+    async def _stream_screen_burst(
+        self,
+        *,
+        burst_seconds: float,
+        backend: VoiceBackend,
+        interval: float = 1.0,
+    ) -> None:
+        """Stream periodic screen frames for a bounded burst duration."""
+        t_end = time.monotonic() + burst_seconds
+        logger.info("Starting screen watch burst for %.1f seconds.", burst_seconds)
+        try:
+            while time.monotonic() < t_end and self._call_state == "active":
+                res = self._screen_service.capture(target="full_screen")
+                if res.image_bytes is not None and not res.blocked:
+                    await backend.send_video_frame(res.image_bytes, mime_type="image/jpeg")
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Error during screen stream burst: %s", exc)
+        finally:
+            logger.debug("Screen watch burst ended.")
 
     async def _connect_daemon_and_listen(self) -> None:
         """Connect to Clea daemon and process incoming daemon requests/events."""
