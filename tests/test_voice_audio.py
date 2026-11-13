@@ -463,3 +463,87 @@ def test_compute_audio_rms_empty_or_none() -> None:
     assert compute_audio_rms(b"") == 0.0
     assert compute_audio_rms(np.empty(0, dtype=np.int16)) == 0.0
     assert compute_audio_rms(None) == 0.0
+
+
+def test_audio_manager_resampling_and_1280_framing_in_capture_loop() -> None:
+    """Verify native 48 kHz/44.1 kHz input is resampled to 16 kHz mono and framed into 1280."""
+    received_chunks: list[bytes] = []
+
+    def on_input(data: bytes) -> None:
+        received_chunks.append(data)
+
+    manager = AudioManager(chunk_size=1280, on_audio_input=on_input)
+    manager.input_sample_rate = 48000
+    manager.input_channels = 2
+
+    # 1. Feed 48 kHz stereo block (3840 frames = 80 ms)
+    block_48k_stereo = np.full((3840, 2), 5000, dtype=np.int16)
+    manager._input_stream_callback(block_48k_stereo, 3840, None, 0)  # type: ignore[arg-type]
+
+    assert len(received_chunks) == 1
+    chunk1 = received_chunks[0]
+    assert len(chunk1) == 2560  # 1280 samples * 2 bytes = 2560 bytes
+    arr1 = np.frombuffer(chunk1, dtype=np.int16)
+    assert len(arr1) == 1280
+    assert arr1.dtype == np.int16
+
+    # 2. Feed 44.1 kHz mono block (3528 frames = 80 ms)
+    manager.input_sample_rate = 44100
+    manager.input_channels = 1
+    block_44k = np.full((3528, 1), 3000, dtype=np.int16)
+    manager._input_stream_callback(block_44k, 3528, None, 0)  # type: ignore[arg-type]
+
+    # After 3528 samples at 44.1k -> resamples to ~1279.9 -> FIFO buffer yields 1280 chunks
+    for c in received_chunks:
+        assert len(c) == 2560
+        arr = np.frombuffer(c, dtype=np.int16)
+        assert len(arr) == 1280
+
+
+def test_resolve_audio_device_wasapi_prioritization_and_substring() -> None:
+    """Verify substring matching and WASAPI host API prioritization across duplicate devices."""
+    mock_devices = [
+        {
+            "index": 10,
+            "name": "Microphone Array (Realtek(R) Audio)",
+            "hostapi": 0,
+            "hostapi_name": "MME",
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 44100,
+        },
+        {
+            "index": 15,
+            "name": "Microphone Array (Realtek(R) Audio)",
+            "hostapi": 1,
+            "hostapi_name": "Windows WASAPI",
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 48000,
+        },
+        {
+            "index": 14,
+            "name": "Headset (Earphone)",
+            "hostapi": 1,
+            "hostapi_name": "Windows WASAPI",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 16000,
+        },
+    ]
+
+    with patch("clea.surfaces.voice.audio.list_audio_devices", return_value=mock_devices):
+        # 1. Substring "realtek" matches MME (#10) and WASAPI (#15); WASAPI selects #15
+        dev = resolve_audio_device("Realtek", kind="input", preferred_hostapi="WASAPI")
+        assert dev["index"] == 15
+        assert dev["hostapi_name"] == "Windows WASAPI"
+        assert dev["default_samplerate"] == 48000
+
+        # 2. Substring "earphone" resolves Headset #14
+        dev_earphone = resolve_audio_device("earphone", kind="input", preferred_hostapi="WASAPI")
+        assert dev_earphone["index"] == 14
+        assert dev_earphone["default_samplerate"] == 16000
+
+        # 3. Numeric string index resolution
+        dev_by_idx = resolve_audio_device("15", kind="input")
+        assert dev_by_idx["index"] == 15

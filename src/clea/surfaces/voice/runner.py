@@ -161,6 +161,7 @@ class VoiceRunner:
         self._pending_tasks: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
         self._audio_sent_start_time: float | None = None
+        self._stall_reconnected_once: bool = False
         self._frames_sent_window: int = 0
         self._last_fps_report_time: float = time.monotonic()
 
@@ -247,6 +248,7 @@ class VoiceRunner:
                     preferred_hostapi=self.config.preferred_hostapi,
                     mic_mute_while_speaking=self.config.mic_mute_while_speaking,
                     on_audio_input=self._on_audio_chunk,
+                    chunk_size=1280,
                 )
             else:
                 self._audio_manager.set_input_callback(self._on_audio_chunk)
@@ -357,6 +359,17 @@ class VoiceRunner:
             return
 
         if self._call_state == "idle" and self._wake_word is not None:
+            now = time.monotonic()
+            self._frames_sent_window += 1
+            if self.debug_audio and (now - self._last_fps_report_time) >= 1.0:
+                elapsed = now - self._last_fps_report_time
+                fps = self._frames_sent_window / elapsed
+                rms = compute_audio_rms(pcm_bytes)
+                msg = f"[AUDIO-DEBUG] Wake listen: {fps:4.1f} fps | 16 kHz RMS: {rms:6.1f}"
+                print(msg, flush=True)
+                self._frames_sent_window = 0
+                self._last_fps_report_time = now
+
             # Local wake word check in IDLE
             try:
                 detected, score, _key = self._wake_word.process_audio(pcm_bytes)
@@ -424,12 +437,15 @@ class VoiceRunner:
                 media_resolution=self.config.media_resolution,
                 reconnect_limit=self.config.reconnect_limit,
                 session_resumption=SessionResumptionConfig(enabled=True),
+                vad_mode=self.config.vad_mode,
             )
             connect_t0 = time.monotonic()
             backend = self._backend_factory()
             await backend.connect(session_cfg)
             self._connect_latency_ms = (time.monotonic() - connect_t0) * 1000
             self._active_backend = backend
+            self._stall_reconnected_once = False
+            self._audio_sent_start_time = None
 
             self._call_state = "active"
             self._set_voice_state("listening")
@@ -618,30 +634,66 @@ class VoiceRunner:
         """Watch for audio streaming without server responses exceeding stall_timeout_seconds."""
         stall_limit = self.config.stall_timeout_seconds
         while self._call_state == "active":
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(min(1.0, max(0.05, stall_limit / 4)))
             if self._audio_sent_start_time is not None:
                 elapsed = time.monotonic() - self._audio_sent_start_time
                 if elapsed >= stall_limit:
-                    logger.error(
-                        "STALL WATCHDOG: Audio streamed for %.1fs with no server response! "
-                        "Reconnecting with resumption handle '%s'...",
-                        elapsed,
-                        getattr(self._active_backend, "resumption_handle", None),
-                    )
-                    self._audio_sent_start_time = None
-                    self._set_voice_state(
-                        "error", error="Session stalled: server not responding. Reconnecting..."
-                    )
-                    if self._active_backend is not None and hasattr(
-                        self._active_backend, "_reconnect"
-                    ):
-                        try:
-                            await self._active_backend._reconnect()
+                    handle = getattr(self._active_backend, "resumption_handle", None)
+                    if not self._stall_reconnected_once:
+                        self._stall_reconnected_once = True
+                        logger.error(
+                            "STALL WATCHDOG: Audio streamed for %.1fs with zero server response! "
+                            "Reconnecting live session with resumption handle '%s'...",
+                            elapsed,
+                            handle,
+                        )
+                        print(
+                            f"\n[STALL WATCHDOG] Audio streamed for {elapsed:.1f}s with zero "
+                            f"server response. Reconnecting live session with handle '{handle}'...",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        self._audio_sent_start_time = None
+                        self._set_voice_state(
+                            "error", error="Session stalled: server not responding. Reconnecting..."
+                        )
+                        reconnected = False
+                        if self._active_backend is not None:
+                            try:
+                                if hasattr(self._active_backend, "reconnect"):
+                                    await self._active_backend.reconnect()
+                                    reconnected = True
+                                elif hasattr(self._active_backend, "_reconnect"):
+                                    await self._active_backend._reconnect()
+                                    reconnected = True
+                            except Exception as rec_err:
+                                logger.error("Stall watchdog reconnection failed: %s", rec_err)
+
+                        if reconnected:
                             self._set_voice_state("listening")
-                        except Exception as rec_err:
-                            logger.error("Stall watchdog reconnection failed: %s", rec_err)
-                            await self.end_call(reason="stall_timeout")
+                        else:
+                            await self.end_call(
+                                reason="stall_timeout",
+                                error="Session stalled: server not responding.",
+                            )
                             break
+                    else:
+                        logger.error(
+                            "STALL WATCHDOG: Reconnection already attempted; server still not "
+                            "responding after %.1fs. Ending call.",
+                            elapsed,
+                        )
+                        print(
+                            f"\n[STALL WATCHDOG] Server still not responding after reconnect "
+                            f"({elapsed:.1f}s). Ending call.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        await self.end_call(
+                            reason="stall_timeout",
+                            error="Session stalled: server not responding after reconnect.",
+                        )
+                        break
 
     async def _consume_backend_events(self, backend: VoiceBackend) -> None:
         """Consume and route events from active voice backend."""
@@ -650,8 +702,9 @@ class VoiceRunner:
                 if self._call_state != "active":
                     break
 
-                # Reset stall watchdog timer on any server response
+                # Reset stall watchdog timer and reconnect state on any server response
                 self._audio_sent_start_time = None
+                self._stall_reconnected_once = False
 
                 if self.debug_audio:
                     evt_type = type(event).__name__

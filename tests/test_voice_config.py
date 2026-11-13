@@ -38,7 +38,8 @@ def test_default_toml_contains_comments_and_roundtrips_to_defaults() -> None:
     cfg = VoiceConfig.model_validate(parsed)
     assert cfg == VoiceConfig()
     assert cfg.wake_word_model == "hey_jarvis"
-    assert cfg.wake_threshold == 0.5
+    assert cfg.wake_threshold == 0.30
+    assert cfg.vad_mode == "server"
     assert cfg.input_device is None
     assert cfg.output_device is None
     assert cfg.mic_mute_while_speaking is False

@@ -168,6 +168,7 @@ class VoiceSessionConfig(_StrictModel):
     voice_name: str | None = None
     # Intentionally None by default so the live model can code-switch (e.g. English/Hindi).
     language_code: str | None = None
+    vad_mode: Literal["server", "client"] = "server"
     reconnect_limit: int = Field(default=3, ge=0)
 
 
@@ -287,6 +288,18 @@ class VoiceBackend(ABC):
     def model_name(self) -> str:
         """Display name of the live voice model in use."""
         return "unknown"
+
+    @property
+    def resumption_handle(self) -> str | None:
+        """Current session resumption handle if available."""
+        return None
+
+    async def reconnect(self) -> None:
+        """Attempt to reconnect using session resumption handle."""
+        recon = getattr(self, "_reconnect", None)
+        if callable(recon):
+            await recon()
+        return None
 
     @abstractmethod
     async def connect(self, config: VoiceSessionConfig) -> None:

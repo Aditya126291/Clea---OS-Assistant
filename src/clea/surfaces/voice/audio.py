@@ -290,12 +290,19 @@ class AudioManager:
         preferred_hostapi: str | None = "WASAPI",
         mic_mute_while_speaking: bool = False,
         on_audio_input: Callable[[bytes], None] | None = None,
+        chunk_size: int | None = None,
     ) -> None:
         self.input_device = input_device
         self.output_device = output_device
         self.preferred_hostapi = preferred_hostapi
         self.mic_mute_while_speaking = mic_mute_while_speaking
         self._on_audio_input = on_audio_input
+        self.chunk_size = chunk_size
+        self._chunk_buffer: AudioChunkBuffer | None = (
+            AudioChunkBuffer(chunk_size=chunk_size) if chunk_size else None
+        )
+        self.input_sample_rate: int = INPUT_AUDIO_SAMPLE_RATE_HZ
+        self.input_channels: int = AUDIO_CHANNELS
 
         self.resolved_input_device: dict[str, Any] | None = None
         self.resolved_output_device: dict[str, Any] | None = None
@@ -368,6 +375,25 @@ class AudioManager:
                 self.resolved_output_device.get("max_output_channels", 2),
             )
 
+            # Negotiate hardware sample rate and channels
+            native_rate = int(
+                self.resolved_input_device.get("default_samplerate", INPUT_AUDIO_SAMPLE_RATE_HZ)
+            )
+            sample_rate, channels = negotiate_input_sample_rate(
+                device_idx=inp_idx,
+                default_samplerate=native_rate,
+                candidate_rates=(16000, 48000, 44100),
+                preferred_channels=1,
+            )
+            self.input_sample_rate = sample_rate
+            self.input_channels = channels
+            blocksize = int(sample_rate * 0.08)
+
+            if self._chunk_buffer is None:
+                self._chunk_buffer = AudioChunkBuffer(chunk_size=self.chunk_size or 1280)
+            else:
+                self._chunk_buffer.clear()
+
             inp_wasapi = "WASAPI" in self.resolved_input_device.get("hostapi_name", "").upper()
             out_wasapi = "WASAPI" in self.resolved_output_device.get("hostapi_name", "").upper()
             inp_extra = (
@@ -383,11 +409,11 @@ class AudioManager:
 
             try:
                 self._input_stream = sd.InputStream(
-                    samplerate=INPUT_AUDIO_SAMPLE_RATE_HZ,
-                    channels=AUDIO_CHANNELS,
+                    samplerate=sample_rate,
+                    channels=channels,
                     dtype="int16",
                     device=inp_idx,
-                    blocksize=1280,
+                    blocksize=blocksize,
                     extra_settings=inp_extra,
                     callback=self._input_stream_callback,
                 )
@@ -421,6 +447,8 @@ class AudioManager:
             self._input_stream = None
             self._output_stream = None
             self._input_accumulator.clear()
+            if self._chunk_buffer is not None:
+                self._chunk_buffer.clear()
 
         self.stop_output()
 
@@ -475,10 +503,25 @@ class AudioManager:
             return
 
         cb = self._on_audio_input
-        if cb is not None:
-            pcm_bytes = indata.tobytes()
+        if cb is None:
+            return
+
+        resampled_16k = resample_to_16k_mono(
+            indata,
+            orig_sr=getattr(self, "input_sample_rate", INPUT_AUDIO_SAMPLE_RATE_HZ),
+            target_sr=INPUT_AUDIO_SAMPLE_RATE_HZ,
+        )
+
+        if self._chunk_buffer is not None:
+            self._chunk_buffer.extend(resampled_16k)
+            for chunk in self._chunk_buffer.get_chunks():
+                try:
+                    cb(chunk.tobytes())
+                except Exception:
+                    logger.exception("Error in audio input callback.")
+        else:
             try:
-                cb(pcm_bytes)
+                cb(resampled_16k.tobytes())
             except Exception:
                 logger.exception("Error in audio input callback.")
 

@@ -156,6 +156,13 @@ class GeminiLiveBackend(VoiceBackend):
             config.media_resolution, types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
         )
 
+        # VAD configuration
+        realtime_input_cfg = None
+        if config.vad_mode == "client":
+            realtime_input_cfg = types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+            )
+
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(
@@ -167,6 +174,7 @@ class GeminiLiveBackend(VoiceBackend):
             context_window_compression=compression_cfg,
             speech_config=speech_cfg,
             media_resolution=media_res,
+            realtime_input_config=realtime_input_cfg,
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
@@ -226,6 +234,10 @@ class GeminiLiveBackend(VoiceBackend):
         finally:
             if self._closed:
                 await self._events_queue.put(None)
+
+    async def reconnect(self) -> None:
+        """Reconnect to Live API using current configuration and session resumption handle."""
+        await self._reconnect()
 
     async def _reconnect(self) -> None:
         if self._session_ctx is not None:

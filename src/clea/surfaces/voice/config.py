@@ -35,7 +35,11 @@ class VoiceConfig(BaseModel):
         min_length=1,
         description="Built-in openwakeword model name or path to a .onnx wake-word file.",
     )
-    wake_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    wake_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
+    vad_mode: Literal["server", "client"] = Field(
+        default="server",
+        description="Voice Activity Detection mode: 'server' or 'client'.",
+    )
     input_device: str | int | None = None
     output_device: str | int | None = None
     mic_mute_while_speaking: bool = False
@@ -105,8 +109,11 @@ def default_voice_config_toml() -> str:
 # Wake word model name (e.g. "hey_jarvis") or path to a custom .onnx model file.
 wake_word_model = "hey_jarvis"
 
-# Wake word detection threshold in [0.0, 1.0]. Higher reduces false triggers.
-wake_threshold = 0.5
+# Wake word detection threshold in [0.0, 1.0]. Calibrated for WASAPI input (0.30 default).
+wake_threshold = 0.30
+
+# Voice Activity Detection mode: "server" (server-side Gemini VAD) or "client".
+vad_mode = "server"
 
 # Global push-to-talk / call-toggle hotkey.
 hotkey = "Ctrl+Alt+V"

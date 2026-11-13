@@ -606,6 +606,39 @@ async def test_voice_runner_stall_watchdog_triggers_reconnect(tmp_path: Path) ->
     await runner.stop()
 
 
+async def test_voice_runner_stall_watchdog_ends_call_after_second_stall(tmp_path: Path) -> None:
+    """Verify stall watchdog ends call when server fails to respond after reconnect."""
+    cfg = VoiceConfig(stall_timeout_seconds=0.1)
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Send audio chunk to start stall timer
+    pcm_chunk = b"\x00" * 2560
+    runner._on_audio_chunk(pcm_chunk)
+
+    # Wait for first stall -> reconnect
+    await asyncio.sleep(0.3)
+    assert backend.reconnect_count == 1
+
+    # Send audio again without server response -> second stall
+    runner._on_audio_chunk(pcm_chunk)
+    await asyncio.sleep(0.3)
+
+    assert runner.call_state == "idle"
+    assert runner.voice_state == "error"
+    await runner.stop()
+
+
 async def test_voice_runner_daemon_event_does_not_send_redundant_start_req(tmp_path: Path) -> None:
     """Verify start_call(trigger='daemon_event') does not echo a request back to daemon."""
     cfg = VoiceConfig()
@@ -661,4 +694,3 @@ async def test_voice_runner_fatal_backend_error_transitions_to_error(tmp_path: P
     assert runner.call_state == "idle"
     assert runner.voice_state == "error"
     await runner.stop()
-
