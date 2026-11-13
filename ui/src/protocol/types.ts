@@ -16,8 +16,12 @@ import type {
   ConversationSummary,
   ConversationTurn,
   DailyParams,
+  DevEmitSampleTaskResult,
+  EpisodeItem,
   Event,
   HealthPingResult,
+  MemoryEpisodesParams,
+  MemoryEpisodesResult,
   MemoryGetDailyResult,
   MemoryGetResult,
   PermissionTierInfo,
@@ -28,13 +32,20 @@ import type {
   ScreenCaptureTarget1 as ScreenCaptureTarget,
   SessionNewResult,
   SettingsGetResult,
+  TaskKind,
   TaskState,
   TaskStatusData,
   ToolCallFinishedData,
   ToolCallStartedData,
   ToolInfo,
   TranscriptData,
+  TranscriptMessageItem,
   TranscriptRole,
+  TranscriptSummaryItem,
+  TranscriptsGetParams,
+  TranscriptsGetResult,
+  TranscriptsListParams,
+  TranscriptsListResult,
   UsageData,
   VoiceDelegateTaskParams,
   VoiceDelegateTaskResult,
@@ -65,8 +76,12 @@ export type {
   ConversationSummary,
   ConversationTurn,
   DailyParams,
+  DevEmitSampleTaskResult,
+  EpisodeItem,
   Event as CleaEvent,
   HealthPingResult,
+  MemoryEpisodesParams,
+  MemoryEpisodesResult,
   MemoryGetDailyResult,
   MemoryGetResult,
   PermissionTierInfo,
@@ -77,13 +92,20 @@ export type {
   ScreenCaptureTarget,
   SessionNewResult,
   SettingsGetResult,
+  TaskKind,
   TaskState,
   TaskStatusData,
   ToolCallFinishedData,
   ToolCallStartedData,
   ToolInfo,
   TranscriptData,
+  TranscriptMessageItem,
   TranscriptRole,
+  TranscriptSummaryItem,
+  TranscriptsGetParams,
+  TranscriptsGetResult,
+  TranscriptsListParams,
+  TranscriptsListResult,
   UsageData,
   VoiceDelegateTaskParams,
   VoiceDelegateTaskResult,
@@ -105,9 +127,13 @@ export interface MethodParamsMap {
   "approval.respond": ApprovalRespondParams;
   "memory.get": Record<string, never>;
   "memory.get_daily": DailyParams;
+  "memory.episodes": MemoryEpisodesParams;
+  "transcripts.list": TranscriptsListParams;
+  "transcripts.get": TranscriptsGetParams;
   "conversations.list": Record<string, never>;
   "conversations.get": ConversationGetParams;
   "settings.get": Record<string, never>;
+  "dev.emit_sample_task": Record<string, never>;
   "voice.start_call": VoiceStartCallParams;
   "voice.end_call": VoiceEndCallParams;
   "voice.status": Record<string, never>;
@@ -121,9 +147,13 @@ export interface MethodResultMap {
   "approval.respond": ApprovalRespondResult;
   "memory.get": MemoryGetResult;
   "memory.get_daily": MemoryGetDailyResult;
+  "memory.episodes": MemoryEpisodesResult;
+  "transcripts.list": TranscriptsListResult;
+  "transcripts.get": TranscriptsGetResult;
   "conversations.list": ConversationsListResult;
   "conversations.get": ConversationsGetResult;
   "settings.get": SettingsGetResult;
+  "dev.emit_sample_task": DevEmitSampleTaskResult;
   "voice.start_call": VoiceStartCallResult;
   "voice.end_call": VoiceEndCallResult;
   "voice.status": VoiceStatusResult;

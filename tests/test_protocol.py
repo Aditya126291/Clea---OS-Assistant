@@ -23,11 +23,16 @@ from clea.core.protocol import (
     CallStartedEvent,
     ChatSendParams,
     ChatSendRequest,
+    DevEmitSampleTaskRequest,
+    MemoryEpisodesRequest,
     ResponseFrame,
     ScreenCaptureStateData,
     ScreenCaptureStateEvent,
+    TaskStatusEvent,
     TranscriptData,
     TranscriptEvent,
+    TranscriptsGetRequest,
+    TranscriptsListRequest,
     UsageData,
     UsageEvent,
     VoiceDelegateTaskParams,
@@ -159,6 +164,10 @@ def test_every_method_has_a_result_model() -> None:
             ("conversations.list", {}),
             ("conversations.get", {"date": "2026-01-01", "session_id": "s"}),
             ("settings.get", {}),
+            ("memory.episodes", {}),
+            ("transcripts.list", {}),
+            ("transcripts.get", {"session_id": "s1"}),
+            ("dev.emit_sample_task", {}),
             ("voice.start_call", {}),
             ("voice.end_call", {}),
             ("voice.status", {}),
@@ -280,3 +289,66 @@ def test_voice_requests_roundtrip() -> None:
 
     with pytest.raises(ValidationError):
         parse_frame('{"frame_type": "request", "method": "voice.delegate_task", "params": {}}')
+
+
+def test_task_status_kinds_and_fields() -> None:
+    frame = parse_frame(
+        json.dumps(
+            {
+                "frame_type": "event",
+                "event": "task_status",
+                "data": {
+                    "task_id": "t1",
+                    "kind": "background_task",
+                    "title": "Summarising session 18:11",
+                    "status": "running",
+                    "started_at": "2026-11-13T18:11:00Z",
+                    "next_run_at": "2026-11-13T18:26:00Z",
+                },
+            }
+        )
+    )
+    assert isinstance(frame, TaskStatusEvent)
+    assert frame.data.kind == "background_task"
+    assert frame.data.title == "Summarising session 18:11"
+    assert frame.data.next_run_at == "2026-11-13T18:26:00Z"
+
+    # Default kind is chat_turn
+    legacy_frame = parse_frame(
+        json.dumps(
+            {
+                "frame_type": "event",
+                "event": "task_status",
+                "data": {
+                    "task_id": "t2",
+                    "title": "Turn",
+                    "started_at": "2026-11-13T10:00:00Z",
+                    "status": "succeeded",
+                },
+            }
+        )
+    )
+    assert isinstance(legacy_frame, TaskStatusEvent)
+    assert legacy_frame.data.kind == "chat_turn"
+
+
+def test_new_memory_and_transcript_requests() -> None:
+    ep_req = parse_frame(
+        '{"frame_type": "request", "method": "memory.episodes", "params": {"limit": 3}}'
+    )
+    assert isinstance(ep_req, MemoryEpisodesRequest)
+    assert ep_req.params.limit == 3
+
+    tr_list = parse_frame('{"frame_type": "request", "method": "transcripts.list", "params": {}}')
+    assert isinstance(tr_list, TranscriptsListRequest)
+
+    tr_get = parse_frame(
+        '{"frame_type": "request", "method": "transcripts.get", "params": {"session_id": "abc"}}'
+    )
+    assert isinstance(tr_get, TranscriptsGetRequest)
+    assert tr_get.params.session_id == "abc"
+
+    dev_req = parse_frame(
+        '{"frame_type": "request", "method": "dev.emit_sample_task", "params": {}}'
+    )
+    assert isinstance(dev_req, DevEmitSampleTaskRequest)

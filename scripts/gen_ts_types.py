@@ -30,9 +30,11 @@ from clea.core.protocol import (
     ChatSendRequest,
     ConversationsGetRequest,
     ConversationsListRequest,
+    DevEmitSampleTaskRequest,
     ErrorEvent,
     EventFrame,
     HealthPingRequest,
+    MemoryEpisodesRequest,
     MemoryGetDailyRequest,
     MemoryGetRequest,
     RequestFrame,
@@ -42,12 +44,15 @@ from clea.core.protocol import (
     ScreenCaptureTarget,
     SessionNewRequest,
     SettingsGetRequest,
+    TaskKind,
     TaskState,
     TaskStatusEvent,
     ToolCallFinishedEvent,
     ToolCallStartedEvent,
     TranscriptEvent,
     TranscriptRole,
+    TranscriptsGetRequest,
+    TranscriptsListRequest,
     UsageEvent,
     VoiceDelegateTaskRequest,
     VoiceEndCallRequest,
@@ -85,6 +90,7 @@ def build_json_schema() -> dict[str, Any]:
         approval_decision: ApprovalDecision
         approval_reason: ApprovalReason
         task_state: TaskState
+        task_kind: TaskKind
         voice_state: VoiceState
         call_state: CallState
         transcript_role: TranscriptRole
@@ -97,9 +103,13 @@ def build_json_schema() -> dict[str, Any]:
         approval_respond_request: ApprovalRespondRequest
         memory_get_request: MemoryGetRequest
         memory_get_daily_request: MemoryGetDailyRequest
+        memory_episodes_request: MemoryEpisodesRequest
+        transcripts_list_request: TranscriptsListRequest
+        transcripts_get_request: TranscriptsGetRequest
         conversations_list_request: ConversationsListRequest
         conversations_get_request: ConversationsGetRequest
         settings_get_request: SettingsGetRequest
+        dev_emit_sample_task_request: DevEmitSampleTaskRequest
         voice_start_call_request: VoiceStartCallRequest
         voice_end_call_request: VoiceEndCallRequest
         voice_status_request: VoiceStatusRequest

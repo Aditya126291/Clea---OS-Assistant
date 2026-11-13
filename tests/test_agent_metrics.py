@@ -217,3 +217,35 @@ async def test_failed_turn_rollback_and_subsequent_success(tmp_path: Path) -> No
     assert session.messages[2].content == "Hello 3"
     assert session.messages[3].role == "assistant"
     assert session.messages[3].content == "Answer 3"
+
+
+async def test_session_history_cap_sliding_window(tmp_path: Path) -> None:
+    """Session history is capped with sliding window and summary of older turns."""
+    memory = MemoryStore(base_dir=tmp_path)
+    memory.ensure_initialized()
+
+    class _SimpleEchoProvider(LLMProvider):
+        provider_name = "echo"
+
+        async def stream_turn(
+            self, *, messages: list[Message], tools: list[Any], system_prompt: str
+        ):
+            yield StreamChunk(type="text_delta", text=f"Echo {messages[-1].content}")
+            yield StreamChunk(type="done", usage=TokenUsage(input_tokens=10, output_tokens=5))
+
+    agent = AgentLoop(
+        provider=_SimpleEchoProvider(),
+        registry=_make_registry(tmp_path),
+        memory=memory,
+        max_history_messages=6,  # Cap at 6
+    )
+    session = Session(id="s-cap")
+
+    # Run 5 turns (each turn adds user + assistant = 2 messages -> total 10 messages)
+    for i in range(1, 6):
+        await agent.run_turn(session=session, user_text=f"Turn {i}")
+
+    # History cap should have compacted earlier messages
+    # Must have summary of older turns in the first message
+    assert len(session.messages) <= 6
+    assert "[Earlier conversation summary:" in session.messages[0].content

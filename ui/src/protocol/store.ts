@@ -9,10 +9,13 @@ import type {
   ConnectionState,
   ConversationSummary,
   ConversationTurn,
+  EpisodeItem,
   ScreenCaptureTarget,
   SettingsGetResult,
   TaskStatusData,
   TranscriptData,
+  TranscriptSummaryItem,
+  TranscriptsGetResult,
   UsageData,
   VoiceState,
 } from "./types";
@@ -46,6 +49,12 @@ export interface CleaStoreState {
   selectedMemoryDay: string | null;
   memoryDailyContent: string;
   memoryLoading: boolean;
+  lastConsolidated: string | null;
+  failedConsolidation: string | null;
+  episodes: EpisodeItem[];
+  transcripts: TranscriptSummaryItem[];
+  selectedTranscript: TranscriptsGetResult | null;
+  memorySubView: "overview" | "transcripts";
 
   settings: SettingsGetResult | null;
   settingsLoading: boolean;
@@ -63,6 +72,7 @@ export interface CleaStoreState {
   disconnect: () => void;
   retryNow: () => void;
   setActiveView: (view: AppView) => void;
+  setMemorySubView: (view: "overview" | "transcripts") => void;
   setCommandPaletteOpen: (open: boolean) => void;
   setCallOverlayOpen: (open: boolean) => void;
   clearError: () => void;
@@ -77,6 +87,10 @@ export interface CleaStoreState {
 
   loadMemory: () => Promise<void>;
   loadDailyMemory: (day: string) => Promise<void>;
+  loadEpisodes: () => Promise<void>;
+  loadTranscripts: () => Promise<void>;
+  openTranscript: (sessionId: string) => Promise<void>;
+  emitDevSampleTask: () => Promise<void>;
   loadSettings: () => Promise<void>;
 
   applyEvent: (event: CleaEvent) => void;
@@ -140,6 +154,12 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   selectedMemoryDay: null,
   memoryDailyContent: "",
   memoryLoading: false,
+  lastConsolidated: null,
+  failedConsolidation: null,
+  episodes: [],
+  transcripts: [],
+  selectedTranscript: null,
+  memorySubView: "overview",
 
   settings: null,
   settingsLoading: false,
@@ -204,6 +224,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   },
 
   setActiveView: (view) => set({ activeView: view }),
+  setMemorySubView: (view) => set({ memorySubView: view }),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
   setCallOverlayOpen: (open) => set({ callOverlayOpen: open }),
   clearError: () => set({ lastError: null }),
@@ -381,7 +402,8 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     set({ memoryLoading: true });
     try {
       const res = await activeClient.request("memory.get", {});
-      const firstDay = res.days[0] ?? null;
+      const days = res.days ?? [];
+      const firstDay = days[0] ?? null;
       let dailyContent = "";
       if (firstDay) {
         const daily = await activeClient.request("memory.get_daily", { date: firstDay });
@@ -389,11 +411,14 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       }
       set({
         memoryLongTerm: res.long_term,
-        memoryDays: res.days,
+        memoryDays: days,
         selectedMemoryDay: firstDay,
         memoryDailyContent: dailyContent,
+        lastConsolidated: res.last_consolidated ?? null,
+        failedConsolidation: res.failed_consolidation ?? null,
         memoryLoading: false,
       });
+      void get().loadEpisodes();
     } catch {
       set({ memoryLoading: false });
     }
@@ -407,6 +432,45 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       set({ memoryDailyContent: daily.content, memoryLoading: false });
     } catch {
       set({ memoryLoading: false });
+    }
+  },
+
+  loadEpisodes: async () => {
+    if (!activeClient?.isConnected) return;
+    try {
+      const res = await activeClient.request("memory.episodes", { limit: 20 });
+      set({ episodes: res.episodes });
+    } catch {
+      // keep existing episodes
+    }
+  },
+
+  loadTranscripts: async () => {
+    if (!activeClient?.isConnected) return;
+    try {
+      const res = await activeClient.request("transcripts.list", { limit: 50 });
+      set({ transcripts: res.transcripts });
+    } catch {
+      // keep existing transcripts
+    }
+  },
+
+  openTranscript: async (sessionId: string) => {
+    if (!activeClient?.isConnected) return;
+    try {
+      const res = await activeClient.request("transcripts.get", { session_id: sessionId });
+      set({ selectedTranscript: res });
+    } catch {
+      set({ selectedTranscript: null });
+    }
+  },
+
+  emitDevSampleTask: async () => {
+    if (!activeClient?.isConnected) return;
+    try {
+      await activeClient.request("dev.emit_sample_task", {});
+    } catch {
+      // ignore
     }
   },
 
@@ -508,14 +572,17 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       }
       case "task_status": {
         const task = event.data;
+        if (task.kind === "chat_turn") {
+          break;
+        }
         set((state) => {
           const existingIdx = state.tasks.findIndex((t) => t.task_id === task.task_id);
           if (existingIdx === -1) {
-            return { tasks: [task, ...state.tasks].slice(0, 100) };
+            return { tasks: [task, ...state.tasks].slice(0, 50) };
           }
           const next = [...state.tasks];
           next[existingIdx] = task;
-          return { tasks: next };
+          return { tasks: next.slice(0, 50) };
         });
         break;
       }

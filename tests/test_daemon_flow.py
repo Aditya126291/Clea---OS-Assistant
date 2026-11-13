@@ -187,6 +187,7 @@ async def test_daemon_streams_reply_runs_tool_and_writes_daily_log(tmp_path: Pat
             ]
             assert isinstance(events[0], TaskStatusEvent)
             assert events[0].data.status == "running"
+            assert events[0].data.kind == "chat_turn"
             assert isinstance(events[1], ToolCallStartedEvent)
             assert events[1].data.risk_level == "read_only"
             assert isinstance(events[2], ToolCallFinishedEvent)
@@ -194,6 +195,7 @@ async def test_daemon_streams_reply_runs_tool_and_writes_daily_log(tmp_path: Pat
             assert isinstance(events[3], AssistantTokenEvent)
             assert isinstance(events[5], TaskStatusEvent)
             assert events[5].data.status == "succeeded"
+            assert events[5].data.kind == "chat_turn"
 
             daily_content = memory.read_daily()
             assert "**User:** What time is it?" in daily_content
@@ -505,6 +507,59 @@ async def test_daemon_memory_conversations_settings_and_errors(tmp_path: Path) -
             conv_get = parse_frame(await ws.recv())
             assert isinstance(conv_get, ResponseFrame) and conv_get.ok
             assert conv_get.result["turns"][0]["assistant"] == "Hello!"
+
+            # memory.episodes
+            await ws.send(
+                '{"frame_type": "request", "method": "memory.episodes", "params": {"limit": 5}}'
+            )
+            ep_resp = parse_frame(await ws.recv())
+            assert isinstance(ep_resp, ResponseFrame) and ep_resp.ok
+            assert "episodes" in ep_resp.result
+
+            # transcripts.list & transcripts.get
+            await ws.send(
+                json.dumps(
+                    {
+                        "frame_type": "request",
+                        "method": "transcripts.list",
+                        "params": {},
+                    }
+                )
+            )
+            tr_list = parse_frame(await ws.recv())
+            assert isinstance(tr_list, ResponseFrame) and tr_list.ok
+            assert len(tr_list.result["transcripts"]) >= 1
+
+            await ws.send(
+                json.dumps(
+                    {
+                        "frame_type": "request",
+                        "method": "transcripts.get",
+                        "params": {"session_id": "s1"},
+                    }
+                )
+            )
+            tr_get = parse_frame(await ws.recv())
+            assert isinstance(tr_get, ResponseFrame) and tr_get.ok
+            assert tr_get.result["session_id"] == "s1"
+            assert len(tr_get.result["messages"]) == 2
+
+            # dev.emit_sample_task
+            await ws.send(
+                '{"frame_type": "request", "method": "dev.emit_sample_task", "params": {}}'
+            )
+            # Receives 4 broadcast TaskStatusEvents then the response frame
+            received_kinds = []
+            for _ in range(4):
+                f = parse_frame(await ws.recv())
+                if isinstance(f, TaskStatusEvent):
+                    received_kinds.append(f.data.kind)
+            assert "background_task" in received_kinds
+            assert "scheduled" in received_kinds
+            assert "agent_run" in received_kinds
+
+            dev_resp = parse_frame(await ws.recv())
+            assert isinstance(dev_resp, ResponseFrame) and dev_resp.ok
 
             # settings.get never leaks the token
             await ws.send(SettingsGetRequest().model_dump_json())

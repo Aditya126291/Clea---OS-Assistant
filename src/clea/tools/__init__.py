@@ -1,5 +1,6 @@
 """Tool registry and built-in tools."""
 
+from clea.tools.memory_tools import register_memory_tools
 from clea.tools.registry import (
     AuditLogger,
     ConfirmationCallback,
@@ -21,5 +22,6 @@ __all__ = [
     "ToolNotFoundError",
     "ToolRegistry",
     "register_builtin_tools",
+    "register_memory_tools",
     "requires_approval",
 ]
