@@ -633,7 +633,9 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         break;
       }
       case "voice_state": {
-        const errorMsg = (event.data as any).error ?? (event.data.state === "error" ? "Voice error" : null);
+        const errorMsg =
+          ("error" in event.data && typeof event.data.error === "string" ? event.data.error : null) ??
+          (event.data.state === "error" ? "Voice error" : null);
         set((state) => ({
           voiceState: event.data.state,
           voiceError: errorMsg,
@@ -651,14 +653,14 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         break;
       }
       case "call_ended": {
-        set({
+        set((state) => ({
           activeCallId: null,
           callState: event.data.call_state ?? "idle",
-          voiceState: "idle",
+          voiceState: state.voiceState === "error" ? "error" : "idle",
           screenCaptureActive: false,
           screenCaptureTarget: null,
-          callOverlayOpen: false,
-        });
+          callOverlayOpen: state.voiceState === "error" ? true : false,
+        }));
         break;
       }
       case "transcript": {

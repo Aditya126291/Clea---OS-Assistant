@@ -409,6 +409,11 @@ class CleaDaemon:
                 self._call_state = "idle"
                 self._voice_state = "idle"
                 await self._broadcast(
+                    VoiceStateEvent(
+                        data=VoiceStateData(state="error", error="Voice process disconnected.")
+                    )
+                )
+                await self._broadcast(
                     CallEndedEvent(
                         data=CallEndedData(
                             call_id=self._voice_call_id or "",

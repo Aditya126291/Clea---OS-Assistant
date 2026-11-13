@@ -17,6 +17,8 @@ from clea.surfaces.voice.audio import (
     AudioManager,
     compute_audio_rms,
     list_audio_devices,
+    negotiate_input_sample_rate,
+    resample_to_16k_mono,
     resolve_audio_device,
 )
 from clea.surfaces.voice.backends.base import (
@@ -43,39 +45,36 @@ def _run_mic_check(device_idx: int, duration: float = 3.0) -> tuple[float, float
     """Record 3 seconds from device_idx to measure RMS and peak in memory (never saved to disk)."""
     import sounddevice as sd
 
+    dev_info = sd.query_devices(device_idx)
+    native_rate = int(dev_info.get("default_samplerate", 16000))
+
     extra = None
     if hasattr(sd, "WasapiSettings"):
         try:
-            dev = sd.query_devices(device_idx)
-            hostapi = sd.query_hostapis(dev.get("hostapi", -1))
+            hostapi = sd.query_hostapis(dev_info.get("hostapi", -1))
             if "WASAPI" in hostapi.get("name", "").upper():
                 extra = sd.WasapiSettings(auto_convert=True)
         except Exception:
             pass
 
-    try:
-        data = sd.rec(
-            int(duration * 16000),
-            samplerate=16000,
-            channels=1,
-            dtype="int16",
-            device=device_idx,
-            extra_settings=extra,
-        )
-        sd.wait()
-    except Exception:
-        dev_info = sd.query_devices(device_idx)
-        native_rate = int(dev_info.get("default_samplerate", 44100))
-        data = sd.rec(
-            int(duration * native_rate),
-            samplerate=native_rate,
-            channels=1,
-            dtype="int16",
-            device=device_idx,
-        )
-        sd.wait()
+    sample_rate, channels = negotiate_input_sample_rate(
+        device_idx=device_idx,
+        default_samplerate=native_rate,
+        preferred_channels=1,
+    )
 
-    arr = data.flatten().astype(np.float64)
+    data = sd.rec(
+        int(duration * sample_rate),
+        samplerate=sample_rate,
+        channels=channels,
+        dtype="int16",
+        device=device_idx,
+        extra_settings=extra,
+    )
+    sd.wait()
+
+    resampled_16k = resample_to_16k_mono(data, orig_sr=sample_rate, target_sr=16000)
+    arr = resampled_16k.flatten().astype(np.float64)
     if len(arr) == 0:
         return 0.0, 0.0
     rms = float(np.sqrt(np.mean(arr**2)))
