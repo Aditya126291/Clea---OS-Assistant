@@ -183,7 +183,7 @@ export type FrameType27 = "request";
 export type Id28 = string;
 export type SessionId36 = string | null;
 export type Method27 = "voice.start_call";
-export type Trigger = "manual" | "wake_word" | "hotkey";
+export type Trigger = "manual" | "wake_word" | "hotkey" | "ui";
 export type FrameType28 = "request";
 export type Id29 = string;
 export type SessionId37 = string | null;
@@ -283,7 +283,8 @@ export type FrameType38 = "event";
 export type RequestId6 = string | null;
 export type SessionId47 = string | null;
 export type Event7 = "voice_state";
-export type State = "idle" | "listening" | "thinking" | "speaking";
+export type State = "idle" | "listening" | "thinking" | "speaking" | "error";
+export type Error1 = string | null;
 export type FrameType39 = "event";
 export type RequestId7 = string | null;
 export type SessionId48 = string | null;
@@ -389,7 +390,7 @@ export type LastConsolidatedAt = string | null;
 export type SessionId59 = string;
 export type Status2 = string;
 export type RetryCount = number;
-export type Error1 = string | null;
+export type Error2 = string | null;
 export type LastAttemptAt = string | null;
 export type NextRetryAt = string | null;
 export type Pending = ConsolidationSessionStatus[];
@@ -398,7 +399,7 @@ export type CompletedCount = number;
 export type SessionId60 = string;
 export type Ok1 = boolean;
 export type Status3 = string;
-export type Error2 = string | null;
+export type Error3 = string | null;
 export type Ok2 = boolean;
 export type RemovedCount = number;
 export type RemovedIds = string[];
@@ -471,14 +472,14 @@ export type Policy = "auto_allow" | "ask" | "ask_confirm";
 export type PermissionTiers = PermissionTierInfo[];
 export type CallId10 = string;
 export type CallState2 = "idle" | "connecting" | "active" | "ending";
-export type VoiceState = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type MemoryContext = string | null;
 export type CallId11 = string | null;
 export type CallState3 = "idle" | "connecting" | "active" | "ending";
-export type VoiceState1 = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState1 = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type CallId12 = string | null;
 export type CallState4 = "idle" | "connecting" | "active" | "ending";
-export type VoiceState2 = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState2 = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type ScreenCaptureActive = boolean;
 export type ScreenCaptureTarget = ("active_window" | "full_screen") | null;
 export type TaskId1 = string;
@@ -489,11 +490,11 @@ export type ApprovalDecision = "allow" | "deny";
 export type ApprovalReason = "user" | "timeout";
 export type TaskState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type TaskKind = "chat_turn" | "background_task" | "scheduled" | "agent_run";
-export type VoiceState3 = "idle" | "listening" | "thinking" | "speaking";
+export type VoiceState3 = "idle" | "listening" | "thinking" | "speaking" | "error";
 export type CallState5 = "idle" | "connecting" | "active" | "ending";
 export type TranscriptRole = "user" | "assistant";
 export type ScreenCaptureTarget1 = "active_window" | "full_screen";
-export type VoiceTrigger = "manual" | "wake_word" | "hotkey";
+export type VoiceTrigger = "manual" | "wake_word" | "hotkey" | "ui";
 
 export interface CleaProtocolSchema {
   request: Request;
@@ -974,6 +975,7 @@ export interface VoiceStateEvent {
 }
 export interface VoiceStateData {
   state: State;
+  error?: Error1;
 }
 export interface CallStartedEvent {
   frame_type?: FrameType39;
@@ -1182,7 +1184,7 @@ export interface ConsolidationSessionStatus {
   session_id: SessionId59;
   status: Status2;
   retry_count: RetryCount;
-  error?: Error1;
+  error?: Error2;
   last_attempt_at?: LastAttemptAt;
   next_retry_at?: NextRetryAt;
 }
@@ -1190,7 +1192,7 @@ export interface MemoryReconsolidateResult {
   session_id: SessionId60;
   ok: Ok1;
   status: Status3;
-  error?: Error2;
+  error?: Error3;
 }
 export interface MemoryForgetResult {
   ok?: Ok2;

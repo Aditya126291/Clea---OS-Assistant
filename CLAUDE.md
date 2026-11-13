@@ -35,6 +35,11 @@ This file defines the non-negotiable rules for working in the Clea repository.
 9. **Conversation resume and management**:
    - Past conversations resume from transcripts (`conversation.resume`) surviving daemon restarts and navigation. Replaying past turns formats tool steps as plain assistant text notes without fabricating `tool_calls` or `thought_signature`.
    - Transcripts can be renamed, pinned, exported (Markdown), and soft-deleted into `<user_data_dir>/logs/transcripts_trash/` with a 10s undo window before permanent purge. Deletions are audit-logged and never exposed to model tools. Strict regex (`^[a-zA-Z0-9_-]{1,64}$`) and path containment prevent path traversal.
+10. **Voice Surface & Audio Pipeline**:
+   - `clea.surfaces.voice` runs as a client surface connecting to the daemon over WebSocket.
+   - Audio input streams MUST negotiate hardware native rates (`negotiate_input_sample_rate`) and downmix/resample to 16 kHz mono (`resample_to_16k_mono`) to prevent PortAudio `PaErrorCode -9997` on Windows WASAPI (see `docs/decisions/0007-windows-wasapi-sample-rate-negotiation-and-wakeword-framing.md`).
+   - All wake word and Gemini Live audio input MUST pass through strict 1280-sample (80 ms / 2560 bytes) FIFO chunking (`AudioChunkBuffer`).
+   - Diagnostic tools (`clea voice doctor`) MUST run purely in-memory (no saving recorded audio, logs, or screenshots to disk; no secrets logged).
 
 ## Development Workflow
 

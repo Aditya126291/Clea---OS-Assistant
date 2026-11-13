@@ -287,3 +287,37 @@ async def test_gemini_backend_send_tool_responses_maps_scheduling() -> None:
     assert sent_list[2].response == {"error": "denied"}
 
     await backend.close()
+
+
+async def test_gemini_backend_reconnect_cancels_existing_receive_task() -> None:
+    """reconnect() must cancel the old receive loop and open a fresh session cleanly."""
+    mock_session = MagicMock()
+
+    async def empty_recv() -> Any:
+        # Long-running generator simulating active connection
+        while True:
+            await asyncio.sleep(1.0)
+            yield types.LiveServerMessage()
+
+    mock_session.receive.side_effect = empty_recv
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys"))
+    first_task = backend._receive_task
+    assert first_task is not None
+    assert not first_task.done()
+
+    # Reconnect
+    await backend.reconnect()
+    second_task = backend._receive_task
+
+    assert second_task is not None
+    assert second_task is not first_task
+    assert first_task.cancelled() or first_task.done()
+
+    await backend.close()

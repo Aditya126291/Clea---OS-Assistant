@@ -63,6 +63,8 @@ from clea.core.protocol import (
     TranscriptMessageItem,
     TranscriptSummaryItem,
     VoiceState,
+    VoiceStateData,
+    VoiceStateEvent,
     new_id,
     parse_frame,
 )
@@ -110,6 +112,7 @@ class _Connection:
         self.tasks: set[asyncio.Task[None]] = set()
         self.approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self.current_session_id: str | None = None
+        self.is_voice: bool = False
 
     def spawn(self, coro: Awaitable[None]) -> None:
         task = asyncio.ensure_future(coro)
@@ -400,6 +403,11 @@ class CleaDaemon:
                         continue
 
                     if not isinstance(frame, BaseRequest):
+                        if isinstance(frame, VoiceStateEvent):
+                            conn.is_voice = True
+                            self._voice_state = frame.data.state
+                            await self._broadcast(frame)
+                            continue
                         await self._send(
                             ws,
                             ErrorEvent(
@@ -414,6 +422,24 @@ class CleaDaemon:
                     await self._dispatch_request(conn, frame)
         finally:
             self._connections.discard(conn)
+            if conn.is_voice and self._call_state != "idle":
+                self._call_state = "idle"
+                self._voice_state = "idle"
+                await self._broadcast(
+                    VoiceStateEvent(
+                        data=VoiceStateData(state="error", error="Voice process disconnected.")
+                    )
+                )
+                await self._broadcast(
+                    CallEndedEvent(
+                        data=CallEndedData(
+                            call_id=self._voice_call_id or "",
+                            call_state="idle",
+                            reason="voice_process_disconnected",
+                            ended_at=_now_iso(),
+                        )
+                    )
+                )
             for approval_id in list(conn.approvals):
                 self._shared_approvals.pop(approval_id, None)
             if conn.current_session_id:
@@ -986,6 +1012,18 @@ class CleaDaemon:
             if self._call_state != "idle":
                 await self._respond(ws, req, error="A voice call is already active.")
                 return
+            trigger = getattr(req.params, "trigger", "manual")
+            if trigger in ("wake_word", "hotkey"):
+                conn.is_voice = True
+            elif trigger == "ui":
+                voice_connected = any(getattr(c, "is_voice", False) for c in self._connections)
+                if not voice_connected:
+                    err_msg = "Voice process not running. Start it with 'clea voice'."
+                    await self._broadcast(
+                        VoiceStateEvent(data=VoiceStateData(state="error", error=err_msg))
+                    )
+                    await self._respond(ws, req, error=err_msg)
+                    return
             call_id = new_id()
             self._voice_call_id = call_id
             self._call_state = "active"

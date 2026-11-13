@@ -126,7 +126,10 @@ class GeminiLiveBackend(VoiceBackend):
 
         # Context compression
         compression_cfg = None
-        if config.context_compression.enabled:
+        if (
+            config.context_compression.enabled
+            and config.context_compression.trigger_tokens is not None
+        ):
             sliding = None
             if config.context_compression.target_tokens is not None:
                 sliding = types.SlidingWindow(
@@ -156,6 +159,13 @@ class GeminiLiveBackend(VoiceBackend):
             config.media_resolution, types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
         )
 
+        # VAD configuration
+        realtime_input_cfg = None
+        if config.vad_mode == "client":
+            realtime_input_cfg = types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+            )
+
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(
@@ -167,6 +177,7 @@ class GeminiLiveBackend(VoiceBackend):
             context_window_compression=compression_cfg,
             speech_config=speech_cfg,
             media_resolution=media_res,
+            realtime_input_config=realtime_input_cfg,
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
@@ -227,10 +238,21 @@ class GeminiLiveBackend(VoiceBackend):
             if self._closed:
                 await self._events_queue.put(None)
 
+    async def reconnect(self) -> None:
+        """Reconnect to Live API using current configuration and session resumption handle."""
+        await self._reconnect()
+
     async def _reconnect(self) -> None:
+        if self._receive_task is not None and not self._receive_task.done():
+            self._receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receive_task
+            self._receive_task = None
         if self._session_ctx is not None:
             with contextlib.suppress(Exception):
                 await self._session_ctx.__aexit__(None, None, None)
+            self._session_ctx = None
+            self._session = None
         assert self._config is not None
         await self._open_session(self._config)
 
@@ -352,8 +374,7 @@ class GeminiLiveBackend(VoiceBackend):
         """Send a text prompt or system notification to the live session."""
         if self._session is None or self._closed:
             return
-        turns = [types.Content(parts=[types.Part(text=text)], role="user")]
-        await self._session.send_client_content(turns=turns, end_of_turn=end_of_turn)
+        await self._session.send_realtime_input(text=text)
 
     async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
         """Send tool execution responses back to the Live model."""

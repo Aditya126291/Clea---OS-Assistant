@@ -78,6 +78,7 @@ export interface CleaStoreState {
   settingsLoading: boolean;
 
   voiceState: VoiceState;
+  voiceError: string | null;
   callState: CallState;
   activeCallId: string | null;
   callOverlayOpen: boolean;
@@ -93,6 +94,8 @@ export interface CleaStoreState {
   setMemorySubView: (view: "overview" | "transcripts") => void;
   setCommandPaletteOpen: (open: boolean) => void;
   setCallOverlayOpen: (open: boolean) => void;
+  startVoiceCall: () => Promise<void>;
+  endVoiceCall: () => Promise<void>;
   clearError: () => void;
 
   newSession: () => Promise<void>;
@@ -207,6 +210,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   settingsLoading: false,
 
   voiceState: "idle",
+  voiceError: null,
   callState: "idle",
   activeCallId: null,
   callOverlayOpen: false,
@@ -303,6 +307,48 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   setMemorySubView: (view) => set({ memorySubView: view }),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
   setCallOverlayOpen: (open) => set({ callOverlayOpen: open }),
+
+  startVoiceCall: async () => {
+    if (!activeClient?.isConnected) {
+      set({
+        callOverlayOpen: true,
+        voiceState: "error",
+        voiceError: "Daemon not connected.",
+      });
+      return;
+    }
+    set({ callOverlayOpen: true, voiceError: null });
+    try {
+      await activeClient.request("voice.start_call", { trigger: "ui" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      set({
+        voiceState: "error",
+        voiceError: msg || "Voice process not running.",
+      });
+    }
+  },
+
+  endVoiceCall: async () => {
+    const { activeCallId } = get();
+    if (activeClient?.isConnected && activeCallId) {
+      try {
+        await activeClient.request("voice.end_call", {
+          call_id: activeCallId,
+          reason: "ui_button",
+        });
+      } catch (err) {
+        console.error("Failed ending voice call:", err);
+      }
+    }
+    set({
+      callOverlayOpen: false,
+      voiceState: "idle",
+      voiceError: null,
+      callState: "idle",
+      activeCallId: null,
+    });
+  },
   clearError: () => set({ lastError: null }),
 
   newSession: async () => {
@@ -957,7 +1003,14 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         break;
       }
       case "voice_state": {
-        set({ voiceState: event.data.state });
+        const errorMsg =
+          ("error" in event.data && typeof event.data.error === "string" ? event.data.error : null) ??
+          (event.data.state === "error" ? "Voice error" : null);
+        set((state) => ({
+          voiceState: event.data.state,
+          voiceError: errorMsg,
+          callOverlayOpen: event.data.state === "error" ? true : state.callOverlayOpen,
+        }));
         break;
       }
       case "call_started": {
@@ -970,14 +1023,14 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         break;
       }
       case "call_ended": {
-        set({
+        set((state) => ({
           activeCallId: null,
           callState: event.data.call_state ?? "idle",
-          voiceState: "idle",
+          voiceState: state.voiceState === "error" ? "error" : "idle",
           screenCaptureActive: false,
           screenCaptureTarget: null,
-          callOverlayOpen: false,
-        });
+          callOverlayOpen: state.voiceState === "error" ? true : false,
+        }));
         break;
       }
       case "transcript": {

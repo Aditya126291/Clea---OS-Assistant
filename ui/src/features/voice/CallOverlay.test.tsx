@@ -94,4 +94,63 @@ describe("CallOverlay", () => {
     expect(useCleaStore.getState().screenCaptureActive).toBe(false);
     expect(useCleaStore.getState().callOverlayOpen).toBe(false);
   });
+
+  it("surfaces clear error state in CallOverlay when daemon is offline", async () => {
+    useCleaStore.setState({ callOverlayOpen: false, voiceState: "idle", voiceError: null });
+    render(<CallOverlay />);
+
+    await act(async () => {
+      await useCleaStore.getState().startVoiceCall();
+    });
+
+    const store = useCleaStore.getState();
+    expect(store.callOverlayOpen).toBe(true);
+    expect(store.voiceState).toBe("error");
+    expect(store.voiceError).toBe("Daemon not connected.");
+    expect(screen.getByText("Daemon not connected.")).toBeInTheDocument();
+    expect(screen.getByText("Error")).toBeInTheDocument();
+  });
+
+  it("surfaces voice process offline error in CallOverlay when voice process is not running", () => {
+    useCleaStore.setState({ callOverlayOpen: false, voiceState: "idle", voiceError: null });
+    render(<CallOverlay />);
+
+    act(() => {
+      useCleaStore.getState().applyEvent({
+        frame_type: "event",
+        event: "voice_state",
+        data: { state: "error", error: "Voice process not running. Start it with 'clea voice'." },
+      });
+    });
+
+    const store = useCleaStore.getState();
+    expect(store.callOverlayOpen).toBe(true);
+    expect(store.voiceState).toBe("error");
+    expect(store.voiceError).toBe("Voice process not running. Start it with 'clea voice'.");
+    expect(screen.getByText("Voice process not running. Start it with 'clea voice'.")).toBeInTheDocument();
+  });
+
+  it("retains error state in CallOverlay when call_ended occurs after error until dismissed", () => {
+    useCleaStore.setState({ callOverlayOpen: true, voiceState: "error", voiceError: "Voice stream failed: timeout" });
+    render(<CallOverlay />);
+
+    act(() => {
+      useCleaStore.getState().applyEvent({
+        frame_type: "event",
+        event: "call_ended",
+        data: { call_id: "call-99", call_state: "idle", reason: "error" },
+      });
+    });
+
+    // Overlay remains open in error state so the user is informed
+    expect(useCleaStore.getState().callOverlayOpen).toBe(true);
+    expect(useCleaStore.getState().voiceState).toBe("error");
+    expect(screen.getByText("Voice stream failed: timeout")).toBeInTheDocument();
+
+    // User dismisses with End Call
+    fireEvent.click(screen.getByRole("button", { name: /End Call/i }));
+    expect(useCleaStore.getState().callOverlayOpen).toBe(false);
+    expect(useCleaStore.getState().voiceState).toBe("idle");
+    expect(useCleaStore.getState().voiceError).toBeNull();
+  });
 });

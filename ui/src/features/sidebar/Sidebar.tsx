@@ -48,7 +48,8 @@ export function Sidebar() {
   const newSession = useCleaStore((s) => s.newSession);
   const tasks = useCleaStore((s) => s.tasks);
   const callOverlayOpen = useCleaStore((s) => s.callOverlayOpen);
-  const setCallOverlayOpen = useCleaStore((s) => s.setCallOverlayOpen);
+  const startVoiceCall = useCleaStore((s) => s.startVoiceCall);
+  const endVoiceCall = useCleaStore((s) => s.endVoiceCall);
   const setCommandPaletteOpen = useCleaStore((s) => s.setCommandPaletteOpen);
 
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
@@ -414,7 +415,13 @@ export function Sidebar() {
         <Button
           size="sm"
           variant={callOverlayOpen ? "default" : "ghost"}
-          onClick={() => setCallOverlayOpen(!callOverlayOpen)}
+          onClick={() => {
+            if (!callOverlayOpen) {
+              void startVoiceCall();
+            } else {
+              void endVoiceCall();
+            }
+          }}
           aria-pressed={callOverlayOpen}
           className="text-xs"
         >

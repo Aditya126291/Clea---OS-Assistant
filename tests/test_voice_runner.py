@@ -26,6 +26,7 @@ from clea.core.protocol import (
 from clea.surfaces.voice.audio import AudioManager
 from clea.surfaces.voice.backends.base import (
     AudioOutputEvent,
+    BackendErrorEvent,
     InterruptedEvent,
     ToolCallEvent,
     TranscriptOutputEvent,
@@ -51,6 +52,10 @@ class FakeLiveBackend(VoiceBackend):
         self.sent_audio: list[bytes] = []
         self.sent_tool_responses: list[VoiceToolResponse] = []
         self.event_queue: asyncio.Queue[VoiceBackendEvent | None] = asyncio.Queue()
+        self.reconnect_count = 0
+
+    async def _reconnect(self) -> None:
+        self.reconnect_count += 1
 
     @property
     def model_name(self) -> str:
@@ -372,9 +377,13 @@ async def test_voice_runner_tool_delegation_to_daemon(tmp_path: Path) -> None:
     )
 
     await asyncio.sleep(0.1)
-    assert len(sent_to_daemon) == 1
-    req_frame = parse_frame(sent_to_daemon[0])
-    assert isinstance(req_frame, VoiceDelegateTaskRequest)
+    delegate_reqs = [
+        f
+        for f in (parse_frame(t) for t in sent_to_daemon)
+        if isinstance(f, VoiceDelegateTaskRequest)
+    ]
+    assert len(delegate_reqs) == 1
+    req_frame = delegate_reqs[0]
     assert req_frame.params.description == "Search flight status"
 
     # Backend should have received response
@@ -528,3 +537,217 @@ async def test_voice_runner_single_instance_guard(tmp_path: Path) -> None:
         await runner2.start()
 
     await runner1.stop()
+
+
+async def test_voice_runner_surfaces_error_on_start_failure(tmp_path: Path) -> None:
+    """Verify that if backend connection fails, VoiceRunner surfaces an error state with message."""
+    cfg = VoiceConfig()
+    backend = FakeLiveBackend()
+
+    async def fail_connect(_cfg: VoiceSessionConfig) -> None:
+        raise ConnectionError("Live API unreachable")
+
+    backend.connect = fail_connect  # type: ignore[method-assign]
+
+    states_seen: list[tuple[str, str | None]] = []
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        on_event=lambda evt: (
+            states_seen.append((evt.data.state, getattr(evt.data, "error", None)))
+            if isinstance(evt, VoiceStateEvent)
+            else None
+        ),
+    )
+    await runner.start()
+
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "idle"
+    assert runner.voice_state == "error"
+    # Verify that an error event was emitted with the error message
+    error_events = [s for s in states_seen if s[0] == "error"]
+    assert len(error_events) >= 1
+    assert "Live API unreachable" in (error_events[-1][1] or "")
+
+    await runner.stop()
+
+
+async def test_voice_runner_stall_watchdog_triggers_reconnect(tmp_path: Path) -> None:
+    """Verify stall watchdog triggers reconnection when audio streams without server responses."""
+    # Set short stall timeout of 0.2s for testing
+    cfg = VoiceConfig(stall_timeout_seconds=0.2)
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Simulate audio chunks sent to active backend
+    pcm_chunk = b"\x00" * 2560
+    runner._on_audio_chunk(pcm_chunk)
+
+    # Wait for stall watchdog to fire (sleep > 1.2s since watchdog checks every 1.0s)
+    await asyncio.sleep(1.3)
+
+    assert backend.reconnect_count >= 1
+    await runner.end_call(reason="test_done")
+    await runner.stop()
+
+
+async def test_voice_runner_stall_watchdog_ends_call_after_second_stall(tmp_path: Path) -> None:
+    """Verify stall watchdog ends call when server fails to respond after reconnect."""
+    cfg = VoiceConfig(stall_timeout_seconds=0.1)
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Send audio chunk to start stall timer
+    pcm_chunk = b"\x00" * 2560
+    runner._on_audio_chunk(pcm_chunk)
+
+    # Wait for first stall -> reconnect
+    await asyncio.sleep(0.3)
+    assert backend.reconnect_count == 1
+
+    # Send audio again without server response -> second stall
+    runner._on_audio_chunk(pcm_chunk)
+    await asyncio.sleep(0.3)
+
+    assert runner.call_state == "idle"
+    assert runner.voice_state == "error"
+    await runner.stop()
+
+
+async def test_voice_runner_daemon_event_does_not_send_redundant_start_req(tmp_path: Path) -> None:
+    """Verify start_call(trigger='daemon_event') does not echo a request back to daemon."""
+    cfg = VoiceConfig()
+    backend = FakeLiveBackend()
+
+    mock_ws = AsyncMock()
+    sent_msgs: list[str] = []
+    mock_ws.send = AsyncMock(side_effect=lambda msg: sent_msgs.append(msg))
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    runner._daemon_ws = mock_ws
+    await runner.start()
+
+    await runner.start_call(trigger="daemon_event")
+    # Verify no VoiceStartCallRequest was sent
+    start_calls = [m for m in sent_msgs if "voice.start_call" in m]
+    assert len(start_calls) == 0
+
+    await runner.end_call(reason="done")
+    await runner.stop()
+
+
+async def test_voice_runner_fatal_backend_error_transitions_to_error(tmp_path: Path) -> None:
+    """Verify that a fatal BackendErrorEvent sets voice state to error and ends the call."""
+    cfg = VoiceConfig()
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "active"
+
+    # Emit non-recoverable BackendErrorEvent
+    await backend.event_queue.put(
+        BackendErrorEvent(message="Quota exceeded 1011", recoverable=False)
+    )
+    await asyncio.sleep(0.05)
+
+    assert runner.call_state == "idle"
+    assert runner.voice_state == "error"
+    await runner.stop()
+
+
+async def test_voice_runner_stall_watchdog_does_not_fire_while_speaking(tmp_path: Path) -> None:
+    """Watchdog must not fire if assistant is speaking out loud."""
+    cfg = VoiceConfig(stall_timeout_seconds=0.1)
+    backend = FakeLiveBackend()
+    audio_mgr = create_fake_audio_manager()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio_mgr,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Mark assistant as actively speaking
+    audio_mgr._is_speaking.set()
+    runner._on_audio_chunk(b"\x00" * 2560)
+
+    # Wait > stall_timeout_seconds
+    await asyncio.sleep(0.3)
+
+    # Watchdog must not have reconnected or ended the call
+    assert backend.reconnect_count == 0
+    assert runner.call_state == "active"
+    await runner.stop()
+
+
+async def test_voice_runner_wake_word_resets_immediately_on_detection(tmp_path: Path) -> None:
+    """WakeWordDetector must be reset immediately upon detection to avoid multi-triggering."""
+    cfg = VoiceConfig()
+    backend = FakeLiveBackend()
+    wake_detector = create_fake_wake_word()
+    wake_detector._model.predict.return_value = {"hey_jarvis_v0.1": 0.95}
+    wake_detector.reset = MagicMock()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=wake_detector,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    assert runner.call_state == "idle"
+
+    # Feed valid 1280-sample (2560 bytes) chunk triggering wake word
+    runner._on_audio_chunk(b"\x00" * 2560)
+
+    # Verify reset was called immediately
+    assert wake_detector.reset.called
+    await runner.stop()
