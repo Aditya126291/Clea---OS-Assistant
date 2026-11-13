@@ -97,6 +97,10 @@ async def benchmark_model(
             t_first = first_token_time or t_total
             ttfts.append(t_first)
             totals.append(t_total)
+            hdrs = getattr(provider, "last_response_headers", {})
+            for k, v in hdrs.items():
+                if "tier" in k.lower():
+                    service_tiers_observed.add(f"{k}: {v}")
             print(f"[{i + 1}/{calls}] TTFT: {t_first:.1f} ms | Total: {t_total:.1f} ms")
         except Exception as exc:
             print(f"[{i + 1}/{calls}] Error: {exc}", file=sys.stderr)

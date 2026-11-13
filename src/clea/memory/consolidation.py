@@ -193,8 +193,10 @@ class ConsolidationManager:
         session_id: str,
         *,
         on_task_status: Callable[[str, str | None], Awaitable[None]] | None = None,
+        task_callback: Any = None,
     ) -> bool:
         """Consolidate a completed or idle session into episodes and MEMORY.md."""
+        effective_status_cb = on_task_status or task_callback
         if self.is_consolidated(session_id):
             return True
 
@@ -209,8 +211,8 @@ class ConsolidationManager:
             self.save_state(state)
             return True
 
-        if on_task_status is not None:
-            await on_task_status("running", None)
+        if effective_status_cb is not None:
+            await effective_status_cb("running", None)
 
         # Build prompt from transcript
         t_lines = [f"Session ID: {session_id}"]
@@ -247,8 +249,8 @@ class ConsolidationManager:
                 "attempted_at": now_iso,
             }
             self.save_state(state)
-            if on_task_status is not None:
-                await on_task_status("failed", error_msg)
+            if effective_status_cb is not None:
+                await effective_status_cb("failed", error_msg)
             return False
 
         # 1. Append episode summary
@@ -293,16 +295,18 @@ class ConsolidationManager:
         self.save_state(state)
 
         logger.info("Successfully consolidated session %s", session_id)
-        if on_task_status is not None:
-            await on_task_status("succeeded", None)
+        if effective_status_cb is not None:
+            await effective_status_cb("succeeded", None)
         return True
 
     async def run_crash_recovery(
         self,
         *,
         on_task_status: Callable[[str, str, str | None], Awaitable[None]] | None = None,
+        task_callback: Any = None,
     ) -> int:
         """Scan transcripts and consolidate any sessions that were never processed."""
+        effective_cb = on_task_status or task_callback
         transcripts = self.memory.list_transcripts(limit=100)
         state = self.load_state()
         consolidated_count = 0
@@ -310,13 +314,17 @@ class ConsolidationManager:
         for t in transcripts:
             sid = t["session_id"]
             session_state = state.get("sessions", {}).get(sid)
-            if not session_state or session_state.get("status") != "completed":
+            # Only process sessions that were never processed or crashed mid-run
+            if not session_state or session_state.get("status") == "running":
                 logger.info("Crash recovery consolidating unconsolidated session: %s", sid)
 
                 def _make_status_cb(session_id: str):
                     async def _status_cb(st: str, detail: str | None = None) -> None:
-                        if on_task_status is not None:
-                            await on_task_status(session_id, st, detail)
+                        if effective_cb is not None:
+                            try:
+                                await effective_cb(session_id, st, detail)
+                            except TypeError:
+                                await effective_cb(st, detail)
 
                     return _status_cb
 

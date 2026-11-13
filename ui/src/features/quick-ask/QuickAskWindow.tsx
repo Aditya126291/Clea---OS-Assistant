@@ -5,6 +5,27 @@ import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { MarkdownContent } from "@/features/chat/MarkdownContent";
 import { useCleaStore } from "@/protocol/store";
 
+function StreamingIndicator() {
+  const [stillWorking, setStillWorking] = useState(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setStillWorking(true);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 text-xs text-[var(--text-subtle)]"
+      aria-live="polite"
+    >
+      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--text-muted)]" />
+      {stillWorking ? "Still working…" : "Thinking…"}
+    </span>
+  );
+}
+
 export function QuickAskWindow() {
   const connectionState = useCleaStore((s) => s.connectionState);
   const messages = useCleaStore((s) => s.messages);
@@ -108,7 +129,7 @@ export function QuickAskWindow() {
             {latestAssistant.content ? (
               <MarkdownContent content={latestAssistant.content} />
             ) : latestAssistant.streaming ? (
-              <span className="text-xs text-[var(--text-subtle)]">Thinking…</span>
+              <StreamingIndicator />
             ) : null}
             {latestAssistant.error && (
               <p className="text-xs text-[var(--danger)]">{latestAssistant.error}</p>

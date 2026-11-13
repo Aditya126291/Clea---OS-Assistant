@@ -82,15 +82,33 @@ class AgentLoop:
         keep = keep_recent if keep_recent is not None else max(1, self.max_history_messages - 2)
         if keep + 1 > self.max_history_messages:
             keep = max(1, self.max_history_messages - 1)
-        older = session.messages[:-keep]
-        recent = session.messages[-keep:]
+
+        # Slice on a clean user turn boundary so tool results are never orphaned
+        split_idx = max(0, len(session.messages) - keep)
+        while split_idx > 0 and session.messages[split_idx].role != "user":
+            split_idx -= 1
+
+        older = session.messages[:split_idx]
+        recent = session.messages[split_idx:]
+        if not older:
+            return
+
         summary_snippets: list[str] = []
         for msg in older:
             if msg.role in ("user", "assistant") and msg.content:
                 first_line = msg.content.strip().split("\n")[0][:80]
                 summary_snippets.append(f"{msg.role}: {first_line}")
         summary_text = "[Earlier conversation summary: " + " | ".join(summary_snippets[-6:]) + "]"
-        session.messages = [Message(role="user", content=summary_text)] + recent
+
+        if recent and recent[0].role == "user":
+            first_user = recent[0]
+            new_first = Message(
+                role="user",
+                content=f"{summary_text}\n\n{first_user.content}",
+            )
+            session.messages = [new_first] + list(recent[1:])
+        else:
+            session.messages = [Message(role="user", content=summary_text)] + list(recent)
 
     async def run_turn(
         self,
@@ -104,11 +122,13 @@ class AgentLoop:
     ) -> str:
         """Process one user message, execute requested tools, and log the conversation."""
         turn_start = time.perf_counter()
+        pre_turn_messages = list(session.messages)
         ttft_ms: float | None = None
         call_durations_ms: list[float] = []
         call_usages: list[TokenUsage] = []
         model_calls = 0
         status = "error"
+        executed_tool_calls: list[dict[str, Any]] = []
 
         self._apply_history_cap(session, keep_recent=max(1, self.max_history_messages - 3))
         session.messages.append(Message(role="user", content=user_text))
@@ -118,8 +138,6 @@ class AgentLoop:
         initial_history_tokens_est = _estimate_history_tokens(session.messages)
         system_prompt_tokens_est = _estimate_tokens(system_prompt)
         tools_schema_tokens_est = _estimate_tokens(json.dumps([t.model_dump() for t in tools]))
-
-        turn_start_msg_count = len(session.messages) - 1
 
         async def effective_confirm(definition: ToolDefinition, arguments: dict[str, Any]) -> bool:
             if definition.name == "forget" and "query" in arguments and "matches" not in arguments:
@@ -209,6 +227,7 @@ class AgentLoop:
                         session_id=session.id,
                         user_text=user_text,
                         assistant_text=turn_text,
+                        tool_calls=executed_tool_calls or None,
                     )
                     self._apply_history_cap(session)
                     status = "ok"
@@ -224,6 +243,7 @@ class AgentLoop:
                 )
 
                 for call in tool_calls:
+                    executed_tool_calls.append({"name": call.name, "arguments": call.arguments})
                     if on_tool_start is not None:
                         await on_tool_start(call)
                     is_error = False
@@ -257,11 +277,12 @@ class AgentLoop:
                 session_id=session.id,
                 user_text=user_text,
                 assistant_text=fallback,
+                tool_calls=executed_tool_calls or None,
             )
             status = "max_tool_rounds"
             return fallback
         except Exception:
-            session.messages = session.messages[:turn_start_msg_count]
+            session.messages = pre_turn_messages
             raise
         finally:
             total_ms = (time.perf_counter() - turn_start) * 1000.0

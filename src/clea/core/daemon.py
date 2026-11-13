@@ -270,22 +270,36 @@ class CleaDaemon:
             with contextlib.suppress(ConnectionClosed):
                 await conn.ws.send(payload)
 
+    def _format_session_consolidation_title(self, session_id: str) -> str:
+        """Generate title like 'Summarising session 18:11' based on session start time."""
+        time_str = ""
+        try:
+            tr = self.agent.memory.get_transcript(session_id)
+            if tr and tr.get("started_at"):
+                dt = datetime.fromisoformat(tr["started_at"])
+                time_str = dt.strftime("%H:%M")
+        except Exception:
+            pass
+        if not time_str:
+            time_str = datetime.now().astimezone().strftime("%H:%M")
+        return f"Summarising session {time_str}"
+
     async def _emit_consolidation_task_status(
         self,
-        task_id: str,
-        title: str,
+        session_id: str,
         status: str,
-        started_at: str,
-        finished_at: str | None = None,
         detail: str | None = None,
     ) -> None:
+        title = self._format_session_consolidation_title(session_id)
+        now_iso = _now_iso()
+        finished_at = now_iso if status in ("succeeded", "failed") else None
         await self._broadcast(
             TaskStatusEvent(
                 data=TaskStatusData(
-                    task_id=task_id,
+                    task_id=f"cons-{session_id}",
                     title=title,
                     status=status,  # type: ignore[arg-type]
-                    started_at=started_at,
+                    started_at=now_iso,
                     finished_at=finished_at,
                     kind="background_task",
                     detail=detail,
@@ -296,7 +310,9 @@ class CleaDaemon:
     async def _run_startup_consolidation(self) -> None:
         try:
             await self.consolidation.run_crash_recovery(
-                task_callback=self._emit_consolidation_task_status
+                on_task_status=lambda sid, st, det=None: self._emit_consolidation_task_status(
+                    sid, st, det
+                )
             )
         except Exception:
             logger.exception("Error during startup memory consolidation crash recovery")
@@ -310,7 +326,10 @@ class CleaDaemon:
             try:
                 await asyncio.sleep(self.consolidation_idle_seconds)
                 await self.consolidation.consolidate_session(
-                    session_id, task_callback=self._emit_consolidation_task_status
+                    session_id,
+                    on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
+                        session_id, st, det
+                    ),
                 )
             except asyncio.CancelledError:
                 pass
@@ -329,7 +348,10 @@ class CleaDaemon:
         async def _run() -> None:
             try:
                 await self.consolidation.consolidate_session(
-                    session_id, task_callback=self._emit_consolidation_task_status
+                    session_id,
+                    on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
+                        session_id, st, det
+                    ),
                 )
             except Exception:
                 logger.exception("Error consolidating session %s on end/switch", session_id)

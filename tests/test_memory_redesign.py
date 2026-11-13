@@ -10,7 +10,7 @@ import pytest
 
 from clea.memory.consolidation import ConsolidationManager
 from clea.memory.store import MemoryStore, is_secret_or_sensitive
-from clea.providers.base import LLMProvider, Message, StreamChunk
+from clea.providers.base import LLMProvider, Message, StreamChunk, ToolCall
 from clea.tools.memory_tools import register_memory_tools
 from clea.tools.registry import RiskLevel, ToolRegistry
 
@@ -66,7 +66,7 @@ def test_memory_atomic_write_and_backup(tmp_path: Path) -> None:
     store.ensure_initialized()
 
     store.write_long_term("# Version 1\n")
-    bak_path = tmp_path / "MEMORY.md.bak"
+    bak_path = store.long_term_path.with_name(store.long_term_path.name + ".bak")
 
     store.write_long_term("# Version 2\n")
     assert store.read_long_term() == "# Version 2\n"
@@ -334,3 +334,152 @@ def test_memory_injection_token_cap_and_no_raw_transcripts(tmp_path: Path) -> No
     assert "Engineer." in injected
     assert "Discussed architecture" in injected
     assert "Raw confidential transcript text" not in injected
+
+
+def test_get_recent_episodes_returns_strictly_newest_first_same_day(tmp_path: Path) -> None:
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    # Append 6 episodes across the day
+    for i in range(1, 7):
+        store.append_episode(
+            session_id=f"sess-{i}",
+            summary=f"Episode summary for session {i}",
+        )
+
+    recent = store.get_recent_episodes(limit=3)
+    assert len(recent) == 3
+    # Must be newest first: sess-6, sess-5, sess-4
+    assert recent[0]["session_id"] == "sess-6"
+    assert recent[1]["session_id"] == "sess-5"
+    assert recent[2]["session_id"] == "sess-4"
+
+
+async def test_forget_tool_effective_confirm_with_matches_in_agent_loop(tmp_path: Path) -> None:
+    """Ensure agent loop effective_confirm enriches matches without raising AttributeError."""
+    from clea.core.agent import AgentLoop
+    from clea.core.sessions import Session
+    from clea.tools.registry import ToolDefinition
+
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+    store.add_or_update_entry(
+        text="User prefers light theme.",
+        section="Preferences",
+        source="stated",
+    )
+
+    registry = ToolRegistry()
+    register_memory_tools(registry, store)
+
+    class _ForgetInvokingProvider(LLMProvider):
+        provider_name = "forget-invoker"
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def stream_turn(
+            self, *, messages: list[Message], tools: list[Any], system_prompt: str
+        ):
+            self.turn += 1
+            if self.turn == 1:
+                yield StreamChunk(
+                    type="tool_call",
+                    tool_call=ToolCall(
+                        id="c_forget", name="forget", arguments={"query": "light theme"}
+                    ),
+                )
+                yield StreamChunk(type="done")
+            else:
+                yield StreamChunk(type="text_delta", text="I forgot that preference for you.")
+                yield StreamChunk(type="done")
+
+    agent = AgentLoop(
+        provider=_ForgetInvokingProvider(),
+        registry=registry,
+        memory=store,
+    )
+    session = Session(id="s-forget")
+
+    confirmed_args = []
+
+    async def confirm_cb(definition: ToolDefinition, arguments: dict[str, Any]) -> bool:
+        confirmed_args.append(arguments)
+        return True
+
+    res = await agent.run_turn(
+        session=session,
+        user_text="Forget my light theme preference",
+        confirm=confirm_cb,
+    )
+    assert "I forgot that preference" in res
+    assert len(confirmed_args) == 1
+    assert "matches" in confirmed_args[0]
+    matched = confirmed_args[0]["matches"]
+    assert len(matched) == 1
+    assert matched[0]["section"] == "Preferences"
+    assert "light theme" in matched[0]["text"]
+    assert "light theme" not in store.read_long_term()
+
+
+def test_memory_decision2_condensation_merges_before_archiving(tmp_path: Path) -> None:
+    store = MemoryStore(base_dir=tmp_path, token_cap=70)
+    store.ensure_initialized()
+
+    # Add two near-duplicate/overlapping entries in Preferences
+    store.add_or_update_entry(
+        text="Prefers short concise terminal answers.",
+        section="Preferences",
+        source="stated",
+    )
+    store.add_or_update_entry(
+        text="Prefers concise terminal answers with code.",
+        section="Preferences",
+        source="confirmed",
+    )
+
+    long_term = store.read_long_term()
+    # Condensation merged them rather than archiving
+    assert "terminal answers" in long_term
+
+
+def test_history_cap_preserves_user_turn_boundary_without_orphaning_tools(tmp_path: Path) -> None:
+    from clea.core.agent import AgentLoop
+    from clea.core.sessions import Session
+
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    agent = AgentLoop(
+        provider=_FakeConsolidationProvider([]),
+        registry=ToolRegistry(),
+        memory=store,
+        max_history_messages=4,
+    )
+    session = Session(id="s-cap-tool")
+
+    # Set up messages with a tool call in the middle
+    session.messages = [
+        Message(role="user", content="Turn 1 user"),
+        Message(role="assistant", content="Turn 1 assistant"),
+        Message(role="user", content="Turn 2 user"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="call_1", name="dummy", arguments={})],
+        ),
+        Message(role="tool", content="tool output", tool_call_id="call_1"),
+        Message(role="assistant", content="Turn 2 final assistant"),
+    ]
+
+    agent._apply_history_cap(session, keep_recent=2)
+
+    # First message in history must be a user message (not an orphaned tool or assistant)
+    assert session.messages[0].role == "user"
+    assert "[Earlier conversation summary:" in session.messages[0].content
+    # Subsequent messages must preserve tool call/result pairing
+    for idx, msg in enumerate(session.messages):
+        if msg.role == "tool":
+            prev = session.messages[idx - 1]
+            assert prev.role == "assistant"
+            assert prev.tool_calls is not None

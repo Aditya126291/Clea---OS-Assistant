@@ -154,6 +154,7 @@ class GeminiProvider(LLMProvider):
                 float(env_timeout) if env_timeout is not None else DEFAULT_FIRST_EVENT_TIMEOUT
             )
         self.max_retries = max_retries
+        self.last_response_headers: dict[str, str] = {}
         self._client = genai.Client(api_key=resolved_key)
 
     async def stream_turn(
@@ -184,43 +185,40 @@ class GeminiProvider(LLMProvider):
             attempt_start = time.perf_counter()
             attempt_ctx = None
             try:
-                raw_stream = await self._client.aio.interactions.create(**kwargs)
-                headers = _extract_headers(raw_stream)
-                gemini_headers = {
-                    k: v for k, v in headers.items() if k.lower().startswith("x-gemini-")
-                }
-                logger.info(
-                    "Gemini model response attempt=%d timestamp=%s headers=%s x_gemini_headers=%s",
-                    attempt,
-                    datetime.now().astimezone().isoformat(),
-                    headers,
-                    gemini_headers,
-                )
 
-                attempt_ctx = (
-                    raw_stream
-                    if hasattr(raw_stream, "__aenter__")
-                    else _NullAsyncContext(raw_stream)
-                )
-                stream_obj = await attempt_ctx.__aenter__()
-
-                if hasattr(stream_obj, "__aiter__"):
-                    aiter = stream_obj.__aiter__()
-                else:
-                    aiter = stream_obj
-
-                try:
-                    first_event = await asyncio.wait_for(
-                        aiter.__anext__(),
-                        timeout=self.first_event_timeout_s,
+                async def _init_stream_and_first_event(att: int):
+                    nonlocal attempt_ctx
+                    raw = await self._client.aio.interactions.create(**kwargs)
+                    headers = _extract_headers(raw)
+                    self.last_response_headers = headers
+                    gemini_headers = {
+                        k: v for k, v in headers.items() if k.lower().startswith("x-gemini-")
+                    }
+                    logger.info(
+                        "Gemini model response attempt=%d timestamp=%s headers=%s "
+                        "x_gemini_headers=%s",
+                        att,
+                        datetime.now().astimezone().isoformat(),
+                        headers,
+                        gemini_headers,
                     )
-                    has_first_event = True
-                except StopAsyncIteration:
-                    has_first_event = False
-                    first_event = None
+                    actx = raw if hasattr(raw, "__aenter__") else _NullAsyncContext(raw)
+                    attempt_ctx = actx
+                    sobj = await actx.__aenter__()
+                    ait = sobj.__aiter__() if hasattr(sobj, "__aiter__") else sobj
+                    try:
+                        fe = await ait.__anext__()
+                        hfe = True
+                    except StopAsyncIteration:
+                        fe = None
+                        hfe = False
+                    return actx, ait, fe, hfe
 
+                attempt_ctx, stream_iter, first_event, has_first_event = await asyncio.wait_for(
+                    _init_stream_and_first_event(attempt),
+                    timeout=self.first_event_timeout_s,
+                )
                 stream_ctx = attempt_ctx
-                stream_iter = aiter
                 break
             except Exception as exc:
                 duration_s = time.perf_counter() - attempt_start

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -750,3 +751,58 @@ async def test_daemon_port_conflict_across_data_dirs_releases_second_lock(tmp_pa
         assert auth.read_token(first.token_file) == first.token
     finally:
         await first.stop()
+
+
+async def test_daemon_consolidation_emits_background_task_status_with_session_time(
+    tmp_path: Path,
+) -> None:
+    """Consolidation emits background_task with title 'Summarising session HH:MM'."""
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    mem.append_transcript_message(
+        session_id="s-idle-1",
+        role="user",
+        text="Discussing Project Clea",
+        timestamp=datetime(2026, 11, 13, 18, 11, 0).astimezone(),
+    )
+    mem.append_transcript_message(
+        session_id="s-idle-1",
+        role="assistant",
+        text="Noted.",
+        timestamp=datetime(2026, 11, 13, 18, 11, 5).astimezone(),
+    )
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeToolCallingProvider(),
+        memory=mem,
+    )
+    daemon.consolidation_idle_seconds = 0.05
+    await daemon.start()
+
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            # Trigger session idle timer
+            daemon._reset_session_idle_timer("s-idle-1")
+
+            # Await broadcast events from consolidation
+            events = []
+            for _ in range(2):
+                frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                if isinstance(frame, TaskStatusEvent):
+                    events.append(frame)
+
+            assert len(events) == 2
+            assert events[0].data.kind == "background_task"
+            assert "Summarising session 18:11" in events[0].data.title
+            assert events[0].data.status == "running"
+            assert events[1].data.kind == "background_task"
+            assert events[1].data.status in ("succeeded", "failed")
+    finally:
+        await daemon.stop()

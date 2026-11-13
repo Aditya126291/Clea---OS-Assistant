@@ -100,7 +100,7 @@ class MemoryStore:
         self.memory_dir = self.base_dir / "memory"
         self.episodes_dir = self.memory_dir / "episodes"
         self.transcripts_dir = self.base_dir / "logs" / "transcripts"
-        self.long_term_path = self.base_dir / "MEMORY.md"
+        self.long_term_path = self.memory_dir / "MEMORY.md"
         self.archive_path = self.memory_dir / "MEMORY_ARCHIVE.md"
         self.backup_legacy_dir = self.memory_dir / "backup_legacy_logs"
         self.token_cap = token_cap
@@ -110,6 +110,14 @@ class MemoryStore:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.episodes_dir.mkdir(parents=True, exist_ok=True)
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+
+        # Migrate legacy root MEMORY.md if present
+        legacy_root_long_term = self.base_dir / "MEMORY.md"
+        if legacy_root_long_term.exists() and not self.long_term_path.exists():
+            try:
+                shutil.copyfile(legacy_root_long_term, self.long_term_path)
+            except Exception as exc:
+                logger.warning("Could not migrate legacy root MEMORY.md: %s", exc)
 
         if not self.long_term_path.exists():
             initial_text = self._build_empty_long_term_markdown()
@@ -186,6 +194,7 @@ class MemoryStore:
                         date=match.group("date"),
                         source=match.group("source"),  # type: ignore[arg-type]
                         text=match.group("text"),
+                        section=current_sec,
                     )
                 )
             else:
@@ -201,6 +210,7 @@ class MemoryStore:
                             date=dt,
                             source=src,  # type: ignore[arg-type]
                             text=flex_match.group("text"),
+                            section=current_sec,
                         )
                     )
 
@@ -274,6 +284,7 @@ class MemoryStore:
             date=today_str,
             source=source,
             text=text.strip(),
+            section=target_section,
         )
 
         if existing_idx is not None:
@@ -333,8 +344,66 @@ class MemoryStore:
             self.write_long_term(self.format_sections(sections))
         return removed
 
+    def _condense_sections(self, sections: dict[str, list[MemoryEntry]]) -> int:
+        """Condense and merge near-duplicate or overlapping entries in the same section.
+
+        Returns count of merged pairs. Stated/confirmed facts are never dropped.
+        """
+        total_condensed = 0
+        sources = ["stated", "confirmed", "inferred-low-confidence"]
+        for sec_name, entries in sections.items():
+            if len(entries) < 2:
+                continue
+            i = 0
+            while i < len(entries):
+                e1 = entries[i]
+                words1 = set(re.findall(r"\w+", e1.text.lower()))
+                j = i + 1
+                while j < len(entries):
+                    e2 = entries[j]
+                    words2 = set(re.findall(r"\w+", e2.text.lower()))
+                    overlap = len(words1 & words2)
+                    union = len(words1 | words2)
+                    similarity = overlap / union if union > 0 else 0.0
+
+                    # Merge if substantial word overlap or substring match
+                    if (
+                        similarity >= 0.55
+                        or (len(e1.text) > 12 and e1.text.lower() in e2.text.lower())
+                        or (len(e2.text) > 12 and e2.text.lower() in e1.text.lower())
+                    ):
+                        merged_text = e1.text if len(e1.text) >= len(e2.text) else e2.text
+                        src1_rank = sources.index(e1.source) if e1.source in sources else 2
+                        src2_rank = sources.index(e2.source) if e2.source in sources else 2
+                        merged_src = e1.source if src1_rank <= src2_rank else e2.source
+                        merged_date = max(e1.date, e2.date)
+
+                        logger.info(
+                            "Condensed memory entries [%s] and [%s] in %s: '%s' + '%s' -> '%s'",
+                            e1.id,
+                            e2.id,
+                            sec_name,
+                            e1.text,
+                            e2.text,
+                            merged_text,
+                        )
+                        entries[i] = MemoryEntry(
+                            id=e1.id,
+                            date=merged_date,
+                            source=merged_src,  # type: ignore[arg-type]
+                            text=merged_text,
+                            section=sec_name,
+                        )
+                        entries.pop(j)
+                        words1 = set(re.findall(r"\w+", entries[i].text.lower()))
+                        total_condensed += 1
+                    else:
+                        j += 1
+                i += 1
+        return total_condensed
+
     def _enforce_size_cap_and_archive(self, sections: dict[str, list[MemoryEntry]]) -> None:
-        """Archive oldest inferred low-confidence entries to MEMORY_ARCHIVE.md if over cap."""
+        """Condense and merge first, then archive oldest low-confidence entries to archive."""
         current_md = self.format_sections(sections)
         current_tokens = estimate_tokens(current_md)
         if current_tokens <= self.token_cap:
@@ -346,6 +415,14 @@ class MemoryStore:
             self.token_cap,
         )
 
+        # 1. Decision 2: Condense and merge entries within sections first
+        condensed_count = self._condense_sections(sections)
+        if condensed_count > 0:
+            logger.info("Decision 2 condensation merged %d entry pairs", condensed_count)
+            if estimate_tokens(self.format_sections(sections)) <= self.token_cap:
+                return
+
+        # 2. Archive oldest inferred low-confidence entries (never drop stated/confirmed)
         low_conf_entries: list[tuple[str, int, MemoryEntry]] = []
         for sec_name, entries in sections.items():
             for idx, entry in enumerate(entries):
@@ -434,7 +511,8 @@ class MemoryStore:
 
         for f in day_files:
             content = f.read_text(encoding="utf-8")
-            for m in session_re.finditer(content):
+            matches = list(session_re.finditer(content))
+            for m in reversed(matches):
                 episodes.append(
                     {
                         "date": f.stem,
@@ -601,6 +679,7 @@ class MemoryStore:
         session_id: str,
         user_text: str,
         assistant_text: str,
+        tool_calls: list[dict[str, Any]] | None = None,
         now: datetime | None = None,
     ) -> Path:
         """Append turn to structured transcript AND today's daily Markdown log."""
@@ -618,6 +697,7 @@ class MemoryStore:
             session_id=session_id,
             role="assistant",
             text=assistant_text,
+            tool_calls=tool_calls,
             timestamp=dt,
         )
 
@@ -656,7 +736,16 @@ class MemoryStore:
                     pass
 
                 date_str = dt_obj.date().isoformat() if dt_obj else "unknown"
-                time_str = _format_time_local(dt_obj) if dt_obj else ""
+                last_time_str = ""
+                messages = full.get("messages", [])
+                if messages:
+                    last_ts = messages[-1].get("timestamp", "")
+                    try:
+                        last_time_str = _format_time_local(datetime.fromisoformat(last_ts))
+                    except Exception:
+                        pass
+                if not last_time_str:
+                    last_time_str = _format_time_local(dt_obj) if dt_obj else ""
 
                 conversations.append(
                     {
@@ -664,26 +753,28 @@ class MemoryStore:
                         "session_id": sid,
                         "title": item.get("title", "Conversation"),
                         "turns": (item.get("message_count", 0) + 1) // 2,
-                        "last_time": time_str,
+                        "last_time": last_time_str,
                     }
                 )
             return conversations
 
         for day in self.list_days():
             by_session: dict[str, dict[str, str | int]] = {}
-            for sid, time, user, _assistant in _parse_turns(self.read_daily_on(day)):
+            for sid, time_str, user, _assistant in _parse_turns(self.read_daily_on(day)):
                 entry = by_session.get(sid)
+                t_match = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)", time_str)
+                fmt_time = t_match.group(1)[:5] if t_match else time_str
                 if entry is None:
                     entry = {
                         "date": day,
                         "session_id": sid,
                         "title": _truncate(user),
                         "turns": 0,
-                        "last_time": time,
+                        "last_time": fmt_time,
                     }
                     by_session[sid] = entry
                 entry["turns"] = int(entry["turns"]) + 1
-                entry["last_time"] = time
+                entry["last_time"] = fmt_time
             conversations.extend(reversed(by_session.values()))
         return conversations
 
@@ -754,12 +845,27 @@ class MemoryStore:
                 if tpath.exists():
                     continue
 
+                day_d = None
                 try:
                     day_d = date.fromisoformat(f.stem)
+                except Exception:
+                    pass
+
+                first_time_str = turns[0][1] if turns else ""
+                t_match = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", first_time_str)
+                if day_d and t_match:
+                    h, m = int(t_match.group(1)), int(t_match.group(2))
+                    s = int(t_match.group(3)) if t_match.group(3) else 0
+                    started_iso = (
+                        datetime(day_d.year, day_d.month, day_d.day, h, m, s)
+                        .astimezone()
+                        .isoformat()
+                    )
+                elif day_d:
                     started_iso = (
                         datetime.combine(day_d, datetime.min.time()).astimezone().isoformat()
                     )
-                except Exception:
+                else:
                     started_iso = datetime.now().astimezone().isoformat()
 
                 first_user = turns[0][2]
@@ -768,14 +874,25 @@ class MemoryStore:
                 header = {"session_id": sid, "started_at": started_iso, "title": title}
                 lines = [json.dumps(header, ensure_ascii=False) + "\n"]
 
-                for _, _turn_time, user, assistant in turns:
+                for _, turn_time_str, user, assistant in turns:
+                    msg_time_iso = started_iso
+                    t_match_msg = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", turn_time_str)
+                    if day_d and t_match_msg:
+                        h, m = int(t_match_msg.group(1)), int(t_match_msg.group(2))
+                        s = int(t_match_msg.group(3)) if t_match_msg.group(3) else 0
+                        msg_time_iso = (
+                            datetime(day_d.year, day_d.month, day_d.day, h, m, s)
+                            .astimezone()
+                            .isoformat()
+                        )
+
                     if user:
                         lines.append(
                             json.dumps(
                                 {
                                     "role": "user",
                                     "text": user,
-                                    "timestamp": started_iso,
+                                    "timestamp": msg_time_iso,
                                     "tool_calls": [],
                                 },
                                 ensure_ascii=False,
@@ -788,7 +905,7 @@ class MemoryStore:
                                 {
                                     "role": "assistant",
                                     "text": assistant,
-                                    "timestamp": started_iso,
+                                    "timestamp": msg_time_iso,
                                     "tool_calls": [],
                                 },
                                 ensure_ascii=False,
