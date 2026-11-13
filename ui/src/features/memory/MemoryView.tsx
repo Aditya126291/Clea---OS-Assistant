@@ -168,6 +168,16 @@ export function MemoryView() {
   // Collapsed sections in Facts view
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({});
 
+  // Collapsed days in Episodes view
+  const [openDays, setOpenDays] = useState<Record<string, boolean>>({});
+
+  const toggleDay = (date: string) => {
+    setOpenDays((prev) => ({
+      ...prev,
+      [date]: prev[date] !== undefined ? !prev[date] : false,
+    }));
+  };
+
   // Banner state: details expanded & dismissed errors
   const [bannerDetailsOpen, setBannerDetailsOpen] = useState(false);
   const [dismissedWarnings, setDismissedWarnings] = useState<string[]>(() => {
@@ -351,9 +361,10 @@ export function MemoryView() {
               <h1 className="text-sm font-medium text-[var(--text)]">
                 {subView === "transcripts" ? "Session Transcripts" : "Memory"}
               </h1>
-              {lastConsolidated && (
+              {(lastConsolidated || memoryStatus?.last_consolidated_at) && (
                 <span className="text-[11px] text-[var(--text-subtle)]">
-                  · Last consolidated {formatLocalTime(lastConsolidated)}
+                  · Last consolidated{" "}
+                  {formatLocalTime(lastConsolidated || memoryStatus?.last_consolidated_at)}
                 </span>
               )}
             </div>
@@ -685,7 +696,7 @@ export function MemoryView() {
                                         : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20",
                                   )}
                                 >
-                                  {entry.source}
+                                  {entry.source.startsWith("inferred") ? "inferred" : entry.source}
                                 </span>
                               </div>
                             ))
@@ -794,61 +805,77 @@ export function MemoryView() {
               </Card>
             ) : (
               <div className="space-y-4">
-                {groupedEpisodes.map((group) => (
-                  <Card key={group.date} className="border border-[var(--border)]">
-                    <CardHeader className="py-2.5 px-4 border-b border-[var(--border)] bg-[var(--surface)]">
-                      <div className="flex items-center justify-between">
+                {groupedEpisodes.map((group) => {
+                  const isDayOpen =
+                    openDays[group.date] !== undefined ? openDays[group.date] : true;
+                  return (
+                    <Card key={group.date} className="border border-[var(--border)]">
+                      <button
+                        type="button"
+                        aria-expanded={isDayOpen}
+                        onClick={() => toggleDay(group.date)}
+                        className="w-full flex items-center justify-between py-2.5 px-4 text-left border-b border-[var(--border)] bg-[var(--surface)] hover:bg-[var(--bg-subtle)] rounded-t-lg transition-colors cursor-pointer"
+                      >
                         <div className="flex items-center gap-2">
+                          <ChevronRight
+                            className={cn(
+                              "h-3.5 w-3.5 text-[var(--text-subtle)] transition-transform",
+                              isDayOpen && "rotate-90",
+                            )}
+                          />
                           <Calendar className="h-3.5 w-3.5 text-[var(--text-subtle)]" />
                           <span className="text-xs font-semibold text-[var(--text)] font-mono">
                             {group.date}
                           </span>
                         </div>
                         <Badge variant="neutral">{group.episodes.length} episodes</Badge>
-                      </div>
-                    </CardHeader>
-                    <CardContent className="p-4 space-y-3">
-                      {group.episodes.map((ep, idx) => (
-                        <div
-                          key={`${ep.session_id}-${idx}`}
-                          className="rounded-lg border border-[var(--border)] p-3 bg-[var(--bg-subtle)] space-y-2"
-                        >
-                          <div className="flex items-center justify-between text-xs">
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono text-[11px] text-[var(--text-subtle)] font-medium">
-                                {ep.session_id.slice(0, 8)}
-                              </span>
-                              <span className="text-[11px] text-[var(--text-subtle)]">
-                                {formatLocalTime(ep.time)}
-                              </span>
-                              {ep.trivial && (
-                                <Badge variant="neutral" className="text-[10px] px-1.5 py-0">
-                                  Short session
-                                </Badge>
-                              )}
-                            </div>
+                      </button>
 
-                            <button
-                              type="button"
-                              onClick={() => {
-                                void openTranscript(ep.session_id);
-                                setSubView("transcripts");
-                              }}
-                              className="text-[11px] text-[var(--accent)] hover:underline flex items-center gap-1 cursor-pointer"
+                      {isDayOpen && (
+                        <CardContent className="p-4 space-y-3">
+                          {group.episodes.map((ep, idx) => (
+                            <div
+                              key={`${ep.session_id}-${idx}`}
+                              className="rounded-lg border border-[var(--border)] p-3 bg-[var(--bg-subtle)] space-y-2"
                             >
-                              <span>View transcript</span>
-                              <ChevronRight className="h-3 w-3" />
-                            </button>
-                          </div>
+                              <div className="flex items-center justify-between text-xs">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-[11px] text-[var(--text-subtle)] font-medium">
+                                    {ep.session_id.slice(0, 8)}
+                                  </span>
+                                  <span className="text-[11px] text-[var(--text-subtle)]">
+                                    {formatLocalTime(ep.time)}
+                                  </span>
+                                  {ep.trivial && (
+                                    <Badge variant="neutral" className="text-[10px] px-1.5 py-0">
+                                      Short session
+                                    </Badge>
+                                  )}
+                                </div>
 
-                          <p className="text-xs leading-relaxed text-[var(--text)] whitespace-pre-wrap">
-                            {ep.summary}
-                          </p>
-                        </div>
-                      ))}
-                    </CardContent>
-                  </Card>
-                ))}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    void openTranscript(ep.session_id);
+                                    setSubView("transcripts");
+                                  }}
+                                  className="text-[11px] text-[var(--accent)] hover:underline flex items-center gap-1 cursor-pointer"
+                                >
+                                  <span>View transcript</span>
+                                  <ChevronRight className="h-3 w-3" />
+                                </button>
+                              </div>
+
+                              <p className="text-xs leading-relaxed text-[var(--text)] whitespace-pre-wrap">
+                                {ep.summary}
+                              </p>
+                            </div>
+                          ))}
+                        </CardContent>
+                      )}
+                    </Card>
+                  );
+                })}
               </div>
             )}
           </div>

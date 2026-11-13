@@ -96,6 +96,12 @@ describe("MemoryView component", () => {
               source: "confirmed",
               text: "Prefers Python over Node.",
             },
+            {
+              id: "pref-2",
+              date: "2026-11-13",
+              source: "inferred-low-confidence",
+              text: "Prefers dark mode theme.",
+            },
           ],
         },
       ],
@@ -116,6 +122,7 @@ describe("MemoryView component", () => {
     expect(screen.getByText("Prefers Python over Node.")).toBeInTheDocument();
     expect(screen.getByText("stated")).toBeInTheDocument();
     expect(screen.getByText("confirmed")).toBeInTheDocument();
+    expect(screen.getByText("inferred")).toBeInTheDocument();
 
     // Search filter
     const searchInput = screen.getByPlaceholderText(/Search facts\.\.\./i);
@@ -179,6 +186,18 @@ describe("MemoryView component", () => {
 
     // Now short session is visible
     expect(screen.getByText("Short session, 1 turn")).toBeInTheDocument();
+
+    // Toggle day collapse: clicking day header collapses its episodes
+    const dayHeaderBtn = screen.getByRole("button", { name: /2026-11-13/i });
+    expect(dayHeaderBtn).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(dayHeaderBtn);
+    expect(dayHeaderBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Discussed architecture redesign.")).not.toBeInTheDocument();
+
+    // Clicking again expands it
+    fireEvent.click(dayHeaderBtn);
+    expect(dayHeaderBtn).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Discussed architecture redesign.")).toBeInTheDocument();
   });
 
   it("switches to Consolidation Status view and displays pending and failed sessions", () => {
