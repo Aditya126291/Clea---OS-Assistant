@@ -239,6 +239,9 @@ class Win32API:
                 shc.SetProcessDpiAwareness.restype = ctypes.HRESULT
 
             # Window enumeration and inspection
+            u32.GetForegroundWindow.argtypes = []
+            u32.GetForegroundWindow.restype = wintypes.HWND
+
             WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
             u32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
             u32.EnumWindows.restype = wintypes.BOOL
