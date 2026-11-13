@@ -139,3 +139,86 @@ async def test_gemini_provider_extracts_and_sums_usage_across_hops(
     assert done.usage.thought_tokens == 5
     assert done.usage.cached_tokens == 10
     assert done.usage.total_tokens == 270
+
+
+async def test_gemini_provider_captures_thought_signature_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    attempts = 0
+
+    class _FakeFailingFirstStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise TimeoutError("First event timed out")
+
+    class _FakeSuccessStream:
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            yield SimpleNamespace(
+                event_type="step.start",
+                index=0,
+                step=SimpleNamespace(
+                    type="function_call",
+                    id="call_1",
+                    name="test_tool",
+                    arguments={"q": "clea"},
+                    thought_signature="sig_step_start_123",
+                ),
+            )
+            yield SimpleNamespace(
+                event_type="interaction.completed",
+                interaction=SimpleNamespace(
+                    status="completed",
+                    usage=None,
+                    steps=[
+                        SimpleNamespace(
+                            type="function_call",
+                            id="call_1",
+                            name="test_tool",
+                            arguments={"q": "clea"},
+                            thought_signature="sig_completed_456",
+                        )
+                    ],
+                ),
+            )
+
+    class _FakeInteractions:
+        async def create(self, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return _FakeFailingFirstStream()
+            return _FakeSuccessStream()
+
+    provider = GeminiProvider(
+        api_key="test-key",
+        model="gemini-3.5-flash-lite",
+        first_event_timeout_s=0.1,
+        max_retries=1,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        SimpleNamespace(aio=SimpleNamespace(interactions=_FakeInteractions())),
+    )
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_turn(
+            messages=[Message(role="user", content="hi")],
+            tools=[],
+            system_prompt="You are Clea.",
+        )
+    ]
+
+    assert attempts == 2
+    tool_chunk = next(c for c in chunks if c.type == "tool_call")
+    assert tool_chunk.thought_signature == "sig_completed_456"
+    done_chunk = next(c for c in chunks if c.type == "done")
+    assert done_chunk.thought_signature == "sig_completed_456"

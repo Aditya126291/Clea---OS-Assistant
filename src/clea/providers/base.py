@@ -28,6 +28,7 @@ class Message(BaseModel):
     tool_call_id: str | None = None
     tool_name: str | None = None
     is_error: bool = False
+    thought_signature: str | None = None
 
 
 class TokenUsage(BaseModel):
@@ -47,6 +48,7 @@ class StreamChunk(BaseModel):
     text: str = ""
     tool_call: ToolCall | None = None
     usage: TokenUsage | None = None
+    thought_signature: str | None = None
 
 
 class LLMProvider(ABC):

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import time
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 from google import genai
@@ -85,6 +89,33 @@ def _merge_token_usage(acc: TokenUsage | None, hop: TokenUsage) -> TokenUsage:
     )
 
 
+logger = logging.getLogger(__name__)
+
+DEFAULT_FIRST_EVENT_TIMEOUT = 7.0
+
+
+class _NullAsyncContext:
+    def __init__(self, val: Any) -> None:
+        self.val = val
+
+    async def __aenter__(self) -> Any:
+        return self.val
+
+    async def __aexit__(self, *args: Any) -> None:
+        pass
+
+
+def _extract_headers(stream_obj: Any) -> dict[str, str]:
+    for attr in ("headers", "_headers", "response", "_response", "raw_response"):
+        val = getattr(stream_obj, attr, None)
+        if val is not None:
+            if hasattr(val, "headers") and val.headers is not None:
+                return dict(val.headers)
+            if isinstance(val, dict):
+                return {str(k): str(v) for k, v in val.items()}
+    return {}
+
+
 class GeminiProvider(LLMProvider):
     """LLMProvider backed by Google's Gemini Interactions API."""
 
@@ -99,6 +130,8 @@ class GeminiProvider(LLMProvider):
         *,
         api_key: str | None = None,
         model: str | None = None,
+        first_event_timeout_s: float | None = None,
+        max_retries: int = 1,
     ) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not resolved_key:
@@ -106,6 +139,14 @@ class GeminiProvider(LLMProvider):
                 "GEMINI_API_KEY is not set. Add it to .env or your environment before starting."
             )
         self.model = model or os.environ.get("CLEA_MODEL", DEFAULT_GEMINI_MODEL)
+        if first_event_timeout_s is not None:
+            self.first_event_timeout_s = first_event_timeout_s
+        else:
+            env_timeout = os.environ.get("CLEA_FIRST_EVENT_TIMEOUT")
+            self.first_event_timeout_s = (
+                float(env_timeout) if env_timeout is not None else DEFAULT_FIRST_EVENT_TIMEOUT
+            )
+        self.max_retries = max_retries
         self._client = genai.Client(api_key=resolved_key)
 
     async def stream_turn(
@@ -126,13 +167,93 @@ class GeminiProvider(LLMProvider):
         if tools:
             kwargs["tools"] = _to_gemini_tools(tools)
 
-        stream = await self._client.aio.interactions.create(**kwargs)
+        max_attempts = 1 + max(0, self.max_retries)
+        stream_ctx = None
+        stream_iter = None
+        first_event = None
+        has_first_event = False
+
+        for attempt in range(1, max_attempts + 1):
+            attempt_start = time.perf_counter()
+            attempt_ctx = None
+            try:
+                raw_stream = await self._client.aio.interactions.create(**kwargs)
+                headers = _extract_headers(raw_stream)
+                gemini_headers = {
+                    k: v for k, v in headers.items() if k.lower().startswith("x-gemini-")
+                }
+                logger.info(
+                    "Gemini model response attempt=%d timestamp=%s headers=%s x_gemini_headers=%s",
+                    attempt,
+                    datetime.now().astimezone().isoformat(),
+                    headers,
+                    gemini_headers,
+                )
+
+                attempt_ctx = (
+                    raw_stream
+                    if hasattr(raw_stream, "__aenter__")
+                    else _NullAsyncContext(raw_stream)
+                )
+                stream_obj = await attempt_ctx.__aenter__()
+
+                if hasattr(stream_obj, "__aiter__"):
+                    aiter = stream_obj.__aiter__()
+                else:
+                    aiter = stream_obj
+
+                try:
+                    first_event = await asyncio.wait_for(
+                        aiter.__anext__(),
+                        timeout=self.first_event_timeout_s,
+                    )
+                    has_first_event = True
+                except StopAsyncIteration:
+                    has_first_event = False
+                    first_event = None
+
+                stream_ctx = attempt_ctx
+                stream_iter = aiter
+                break
+            except Exception as exc:
+                duration_s = time.perf_counter() - attempt_start
+                now_iso = datetime.now().astimezone().isoformat()
+                if attempt_ctx is not None:
+                    try:
+                        await attempt_ctx.__aexit__(type(exc), exc, None)
+                    except Exception:
+                        pass
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Gemini stream first-event failed on attempt %d/%d after %.2fs (%s). "
+                        "Retrying model call once... timestamp=%s",
+                        attempt,
+                        max_attempts,
+                        duration_s,
+                        exc or "timeout",
+                        now_iso,
+                    )
+                    continue
+                else:
+                    logger.error(
+                        "Gemini stream first-event failed on attempt %d/%d after %.2fs (%s). "
+                        "No more retries. timestamp=%s",
+                        attempt,
+                        max_attempts,
+                        duration_s,
+                        exc or "timeout",
+                        now_iso,
+                    )
+                    raise
 
         pending_calls: dict[int, dict[str, Any]] = {}
         final_tool_calls: list[ToolCall] = []
         final_usage: TokenUsage | None = None
+        captured_thought_signature: str | None = None
 
-        async for event in stream:
+        def _handle_event(event: Any) -> list[StreamChunk]:
+            nonlocal final_usage, captured_thought_signature
+            chunks_to_yield: list[StreamChunk] = []
             event_type = getattr(event, "event_type", None)
 
             if event_type == "interaction.created":
@@ -140,6 +261,9 @@ class GeminiProvider(LLMProvider):
 
             elif event_type == "step.start":
                 step = getattr(event, "step", None)
+                sig = getattr(step, "thought_signature", None) or getattr(step, "signature", None)
+                if sig:
+                    captured_thought_signature = sig
                 if getattr(step, "type", None) == "function_call":
                     pending_calls[event.index] = {
                         "id": step.id,
@@ -150,9 +274,19 @@ class GeminiProvider(LLMProvider):
 
             elif event_type == "step.delta":
                 delta = getattr(event, "delta", None)
+                sig = (
+                    getattr(delta, "thought_signature", None)
+                    or getattr(delta, "signature", None)
+                    or (
+                        getattr(delta, "thought", None)
+                        and getattr(delta.thought, "signature", None)
+                    )
+                )
+                if sig:
+                    captured_thought_signature = sig
                 delta_type = getattr(delta, "type", None)
                 if delta_type == "text" and getattr(delta, "text", ""):
-                    yield StreamChunk(type="text_delta", text=delta.text)
+                    chunks_to_yield.append(StreamChunk(type="text_delta", text=delta.text))
                 elif delta_type == "arguments_delta" and getattr(delta, "arguments", None):
                     entry = pending_calls.get(event.index)
                     if entry is not None:
@@ -172,6 +306,11 @@ class GeminiProvider(LLMProvider):
                     final_usage = _merge_token_usage(final_usage, hop_usage)
                 steps = getattr(interaction, "steps", None) or []
                 for step in steps:
+                    sig = getattr(step, "thought_signature", None) or getattr(
+                        step, "signature", None
+                    )
+                    if sig:
+                        captured_thought_signature = sig
                     if getattr(step, "type", None) == "function_call":
                         final_tool_calls.append(
                             ToolCall(
@@ -180,6 +319,23 @@ class GeminiProvider(LLMProvider):
                                 arguments=dict(step.arguments or {}),
                             )
                         )
+            return chunks_to_yield
+
+        try:
+            if has_first_event and first_event is not None:
+                for c in _handle_event(first_event):
+                    yield c
+
+            if stream_iter is not None:
+                async for event in stream_iter:
+                    for c in _handle_event(event):
+                        yield c
+        finally:
+            if stream_ctx is not None:
+                try:
+                    await stream_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
         if not final_tool_calls and pending_calls:
             for idx in sorted(pending_calls):
@@ -195,6 +351,14 @@ class GeminiProvider(LLMProvider):
                 )
 
         for call in final_tool_calls:
-            yield StreamChunk(type="tool_call", tool_call=call)
+            yield StreamChunk(
+                type="tool_call",
+                tool_call=call,
+                thought_signature=captured_thought_signature,
+            )
 
-        yield StreamChunk(type="done", usage=final_usage)
+        yield StreamChunk(
+            type="done",
+            usage=final_usage,
+            thought_signature=captured_thought_signature,
+        )
