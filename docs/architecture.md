@@ -85,7 +85,7 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
 - **History Cap**: Sliding window message buffer with older turns condensed to a brief summary.
 - **Conversation Resume & Management**:
   - `conversation.resume` reconstructs active sessions from transcripts. To ensure compatibility with Gemini 3 without HTTP 400 errors, past tool executions are replayed strictly as plain assistant text notes (`[used tool <name>: <args>]`) without fabricated `tool_calls` or `thought_signature`.
-  - Transcripts can be renamed, pinned to top, exported as Markdown, or deleted. Soft-delete places transcripts in `logs/transcripts_trash/` with a 10s undo window and auto-purge.
+  - Transcripts can be renamed, pinned to top, exported as Markdown, or deleted. Soft-delete places transcripts in `logs/transcripts_trash/` with a 10s undo window and auto-purge (see [ADR 0006](decisions/0006-conversation-resume-and-management.md)).
   - Concurrency control rejects overlapping turns with 409 Conflict. Broadcast events keep multi-window sessions in sync.
 
 ### 5. Desktop UI (`ui/`)
