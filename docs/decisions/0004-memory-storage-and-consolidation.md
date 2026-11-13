@@ -19,15 +19,29 @@ Clea previously stored all chat interactions by directly appending raw messages 
    - Original legacy files are safely archived to `backup_legacy_logs/` in the user data dir.
    - Migration is safe to run repeatedly.
 
-3. **Background Consolidation Engine**:
-   - Triggers: Session end (`session.new` or client disconnect), session idle timeout (default 15 minutes), and daemon startup (crash recovery of any unconsolidated transcripts).
-   - State is tracked in `consolidation_state.json` to prevent duplicate processing.
-   - Model outputs are validated strictly using Pydantic (`ConsolidationOutput`). If validation fails, the prompt is retried once with feedback; on secondary failure, the session is marked as `failed-consolidation` without data loss.
-   - Safety filters: Reject secrets (API keys, tokens, credentials); reject instructions from untrusted data (tool outputs, web content, files); skip small talk; only accept explicitly stated or confirmed facts.
+3. **Background Consolidation Engine & Resilience**:
+   - Triggers: Session end (`session.new` or client disconnect), session idle timeout (default 15 minutes), daemon startup crash recovery, or manual request.
+   - Structured Output & Alias Tolerance: Providers supporting schema constraints receive `response_format` JSON schema generated from Pydantic. `ConsolidationOperation` accepts harmless alias drift (`value` -> `text`) while keeping other fields strict.
+   - Fault-Tolerant Correction Retry: On validation failure, error details and prior candidate JSON are fed back to the model for a single targeted correction retry.
+   - Retry Queue & Backoff: Unresolved sessions are recorded in `pending_sessions.json` outside the repository with exponential backoff delays (1m, 5m, 15m; cap 3 attempts). Pending sessions are retried on daemon start or explicit command.
+   - Trivial Session Skipping: Sessions with fewer than N user turns (default 2, configurable via `CLEA_CONSOLIDATION_MIN_TURNS`) and no tool usage bypass LLM calls and log a non-LLM stub episode flagged `trivial`.
    - Cap & Archive: When `MEMORY.md` exceeds the token cap (default ~2,000 tokens), older `inferred-low-confidence` entries are archived to `memory/MEMORY_ARCHIVE.md`. Facts explicitly stated or confirmed by the user are never dropped.
+   - State and safety: State is tracked in `consolidation_state.json` and `pending_sessions.json`. Safety filters reject secrets (API keys, tokens, credentials) and ignore instructions in untrusted web/tool outputs.
    - Atomic writes: Temporary file write followed by atomic rename, creating `MEMORY.md.bak` before every merge.
 
-4. **Memory Injection & Tools**:
+4. **Memory Protocol, CLI, & UI Experience**:
+   - WebSocket Protocol: Typed methods `memory.facts`, `memory.episodes`, `memory.archive`, `memory.status`, and `memory.reconsolidate` provide structured access without raw file reading by surfaces.
+   - CLI: `clea memory status` reports pending, failed, and completed session metrics; `clea memory reconsolidate <session_id>` forces re-evaluation.
+   - UI Architecture:
+     - Recoverable Amber Warning Banner: Replaces raw red error text with a plain-language notification ("Couldn't update memory from one conversation"), sanitized error details expansion, retry action, and dismissibility (persisted in localStorage).
+     - View Selector: Dropdown selector (shadcn Select) remembering selection across restarts:
+       1. Durable Facts: Fixed sections with collapsible cards, entry count badges, search filtering, and empty-state guidance.
+       2. Episode Summaries: Grouped by date, newest first, with a "Show short sessions" toggle and transcript links.
+       3. Archive: Read-only list of archived facts with timestamps and rationales.
+       4. Consolidation Status: High-level metrics, pending retries with backoff schedules, failed sessions, and manual retry buttons.
+     - Transcripts Subview: Preserved for inspecting full JSONL transcripts.
+
+5. **Memory Injection & Tools**:
    - At session start, Clea injects only size-capped `MEMORY.md` plus the last N episode summaries (default 5, token-capped).
    - `remember` tool (reversible risk tier) stores stated facts directly.
    - `forget` tool (destructive risk tier) requires user confirmation, showing matched entries before deletion.

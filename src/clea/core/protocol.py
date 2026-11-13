@@ -156,6 +156,52 @@ class MemoryEpisodesRequest(_Request):
     params: MemoryEpisodesParams = Field(default_factory=MemoryEpisodesParams)
 
 
+class MemoryFactsRequest(_Request):
+    """Fetch structured durable facts parsed by section."""
+
+    method: Literal["memory.facts"] = "memory.facts"
+    params: _EmptyParams = Field(default_factory=_EmptyParams)
+
+
+class MemoryArchiveRequest(_Request):
+    """Fetch archived facts from MEMORY_ARCHIVE.md."""
+
+    method: Literal["memory.archive"] = "memory.archive"
+    params: _EmptyParams = Field(default_factory=_EmptyParams)
+
+
+class MemoryStatusRequest(_Request):
+    """Fetch consolidation status (pending, failed, last-success)."""
+
+    method: Literal["memory.status"] = "memory.status"
+    params: _EmptyParams = Field(default_factory=_EmptyParams)
+
+
+class MemoryReconsolidateParams(_Model):
+    session_id: str
+
+
+class MemoryReconsolidateRequest(_Request):
+    """Trigger manual reconsolidation of a session."""
+
+    method: Literal["memory.reconsolidate"] = "memory.reconsolidate"
+    params: MemoryReconsolidateParams
+
+
+class MemoryForgetParams(_Model):
+    id: str | None = Field(default=None, description="Entry ID of the fact to forget")
+    query: str | None = Field(
+        default=None, description="Keywords, text, or ID of the memory to forget"
+    )
+
+
+class MemoryForgetRequest(_Request):
+    """Forget durable facts or preferences matching an entry ID or query."""
+
+    method: Literal["memory.forget"] = "memory.forget"
+    params: MemoryForgetParams
+
+
 class TranscriptsListParams(_Model):
     limit: int = Field(default=50, ge=1, le=200)
 
@@ -267,6 +313,11 @@ RequestFrame = Annotated[
     | MemoryGetRequest
     | MemoryGetDailyRequest
     | MemoryEpisodesRequest
+    | MemoryFactsRequest
+    | MemoryArchiveRequest
+    | MemoryStatusRequest
+    | MemoryReconsolidateRequest
+    | MemoryForgetRequest
     | TranscriptsListRequest
     | TranscriptsGetRequest
     | DevEmitSampleTaskRequest
@@ -334,15 +385,77 @@ class MemoryGetResult(_Model):
     failed_consolidation: str | None = None
 
 
+class MemoryFactItem(_Model):
+    id: str
+    date: str
+    source: str
+    text: str
+
+
+class MemorySectionItem(_Model):
+    name: str
+    entries: list[MemoryFactItem] = Field(default_factory=list)
+
+
+class MemoryFactsResult(_Model):
+    sections: list[MemorySectionItem]
+    last_consolidated: str | None = None
+    failed_consolidation: str | None = None
+
+
 class EpisodeItem(_Model):
     date: str
     session_id: str
     time: str
     summary: str
+    trivial: bool = False
 
 
 class MemoryEpisodesResult(_Model):
     episodes: list[EpisodeItem]
+
+
+class MemoryArchiveItem(_Model):
+    id: str
+    date: str
+    source: str
+    text: str
+    archived_at: str | None = None
+    reason: str | None = None
+
+
+class MemoryArchiveResult(_Model):
+    entries: list[MemoryArchiveItem] = Field(default_factory=list)
+    raw: str = ""
+
+
+class ConsolidationSessionStatus(_Model):
+    session_id: str
+    status: str
+    retry_count: int
+    error: str | None = None
+    last_attempt_at: str | None = None
+    next_retry_at: str | None = None
+
+
+class MemoryStatusResult(_Model):
+    last_consolidated_at: str | None = None
+    pending: list[ConsolidationSessionStatus] = Field(default_factory=list)
+    failed: list[ConsolidationSessionStatus] = Field(default_factory=list)
+    completed_count: int = 0
+
+
+class MemoryReconsolidateResult(_Model):
+    session_id: str
+    ok: bool
+    status: str
+    error: str | None = None
+
+
+class MemoryForgetResult(_Model):
+    ok: bool = True
+    removed_count: int = 0
+    removed_ids: list[str] = Field(default_factory=list)
 
 
 class TranscriptSummaryItem(_Model):
@@ -510,6 +623,11 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "memory.get": MemoryGetResult,
     "memory.get_daily": MemoryGetDailyResult,
     "memory.episodes": MemoryEpisodesResult,
+    "memory.facts": MemoryFactsResult,
+    "memory.archive": MemoryArchiveResult,
+    "memory.status": MemoryStatusResult,
+    "memory.reconsolidate": MemoryReconsolidateResult,
+    "memory.forget": MemoryForgetResult,
     "transcripts.list": TranscriptsListResult,
     "transcripts.get": TranscriptsGetResult,
     "dev.emit_sample_task": DevEmitSampleTaskResult,

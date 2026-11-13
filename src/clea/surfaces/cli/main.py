@@ -26,6 +26,9 @@ from clea.core.protocol import (
     ChatSendParams,
     ChatSendRequest,
     ErrorEvent,
+    MemoryReconsolidateParams,
+    MemoryReconsolidateRequest,
+    MemoryStatusRequest,
     ResponseFrame,
     SessionNewRequest,
     ToolCallFinishedEvent,
@@ -182,6 +185,112 @@ async def _send_and_stream(ws_url: str, *, token: str | None = None) -> None:
         raise SystemExit(1) from exc
 
 
+async def _run_memory_status_cmd(ws_url: str | None = None, *, token: str | None = None) -> None:
+    host = os.environ.get("CLEA_HOST", DEFAULT_HOST)
+    port = int(os.environ.get("CLEA_PORT", DEFAULT_PORT))
+    resolved_url = ws_url or f"ws://{host}:{port}"
+    resolved_token = token or _load_token_or_exit()
+
+    try:
+        async with connect(
+            resolved_url,
+            subprotocols=auth.client_subprotocols(resolved_token),  # type: ignore[arg-type]
+        ) as ws:
+            req = MemoryStatusRequest()
+            await ws.send(req.model_dump_json())
+            raw = await ws.recv()
+            frame = parse_frame(raw)
+            if not isinstance(frame, ResponseFrame) or not frame.ok:
+                err = frame.error if isinstance(frame, ResponseFrame) else "Unknown error"
+                print(f"Error fetching memory status: {err}", file=sys.stderr)
+                raise SystemExit(1)
+
+            res = frame.result
+            print("Clea Memory Consolidation Status")
+            print("================================")
+            last_cons = res.get("last_consolidated_at")
+            print(f"Last successful run : {last_cons or 'Never'}")
+            print(f"Completed sessions  : {res.get('completed_count', 0)}")
+
+            pending = res.get("pending", [])
+            print(f"\nPending sessions ({len(pending)}):")
+            if not pending:
+                print("  None")
+            else:
+                for p in pending:
+                    sid = p.get("session_id", "")
+                    retries = p.get("retry_count", 0)
+                    next_retry = p.get("next_retry_at", "Soon")
+                    err = p.get("error", "Unknown error")
+                    print(
+                        f"  - Session {sid[:8]} (attempt {retries}/3, retry: {next_retry}): {err}"
+                    )
+
+            failed = res.get("failed", [])
+            print(f"\nFailed sessions ({len(failed)}):")
+            if not failed:
+                print("  None")
+            else:
+                for f in failed:
+                    sid = f.get("session_id", "")
+                    retries = f.get("retry_count", 3)
+                    err = f.get("error", "Unknown error")
+                    print(f"  - Session {sid[:8]} (failed after {retries} attempts): {err}")
+
+    except (OSError, WebSocketException) as exc:
+        print(
+            f"Could not connect to Clea daemon at {resolved_url} ({exc}).\n"
+            "Is 'clea daemon' running?",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+
+
+async def _run_memory_reconsolidate_cmd(
+    session_id: str, ws_url: str | None = None, *, token: str | None = None
+) -> None:
+    host = os.environ.get("CLEA_HOST", DEFAULT_HOST)
+    port = int(os.environ.get("CLEA_PORT", DEFAULT_PORT))
+    resolved_url = ws_url or f"ws://{host}:{port}"
+    resolved_token = token or _load_token_or_exit()
+
+    try:
+        async with connect(
+            resolved_url,
+            subprotocols=auth.client_subprotocols(resolved_token),  # type: ignore[arg-type]
+        ) as ws:
+            req = MemoryReconsolidateRequest(
+                params=MemoryReconsolidateParams(session_id=session_id)
+            )
+            await ws.send(req.model_dump_json())
+            raw = await ws.recv()
+            frame = parse_frame(raw)
+            if not isinstance(frame, ResponseFrame) or not frame.ok:
+                err = frame.error if isinstance(frame, ResponseFrame) else "Unknown error"
+                print(f"Reconsolidation failed for session {session_id}: {err}", file=sys.stderr)
+                raise SystemExit(1)
+
+            res = frame.result
+            if res.get("ok"):
+                print(f"Successfully reconsolidated session {session_id}.")
+            else:
+                err = res.get("error") or "Unknown failure"
+                status = res.get("status", "failed")
+                print(
+                    f"Reconsolidation ended with status '{status}' for session {session_id}: {err}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+
+    except (OSError, WebSocketException) as exc:
+        print(
+            f"Could not connect to Clea daemon at {resolved_url} ({exc}).\n"
+            "Is 'clea daemon' running?",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+
+
 def _run_daemon_cmd(host: str, port: int, *, background: bool = False) -> None:
     from clea.core.daemon import get_daemon_info, run_daemon
 
@@ -305,6 +414,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     voice_subparsers.add_parser("test", help="Test audio input/output and wake word detector")
+
+    memory_parser = subparsers.add_parser("memory", help="Inspect and manage memory consolidation")
+    memory_subparsers = memory_parser.add_subparsers(dest="memory_subcommand", required=True)
+
+    status_parser = memory_subparsers.add_parser(
+        "status", help="Show consolidation status (pending, failed, last-success)"
+    )
+    status_parser.add_argument("--url", default=None, help="Daemon WebSocket URL")
+
+    reconsolidate_parser = memory_subparsers.add_parser(
+        "reconsolidate", help="Re-attempt memory consolidation for a session"
+    )
+    reconsolidate_parser.add_argument("session_id", help="Session ID to reconsolidate")
+    reconsolidate_parser.add_argument("--url", default=None, help="Daemon WebSocket URL")
+
     return parser
 
 
@@ -323,6 +447,11 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_send_and_stream(ws_url))
     elif args.command == "autostart":
         _run_autostart_cmd(args.action)
+    elif args.command == "memory":
+        if args.memory_subcommand == "status":
+            asyncio.run(_run_memory_status_cmd(args.url))
+        elif args.memory_subcommand == "reconsolidate":
+            asyncio.run(_run_memory_reconsolidate_cmd(args.session_id, args.url))
     elif args.command == "voice":
         from clea.surfaces.cli.voice import run_voice_doctor, run_voice_service, run_voice_test
 

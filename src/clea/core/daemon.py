@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import logging.handlers
+import os
 import time
 from collections.abc import Awaitable, Iterable
 from datetime import UTC, datetime
@@ -36,6 +37,7 @@ from clea.core.protocol import (
     CallStartedData,
     CallStartedEvent,
     CallState,
+    ConsolidationSessionStatus,
     ConversationDeletedData,
     ConversationDeletedEvent,
     ConversationResumeMessage,
@@ -44,6 +46,9 @@ from clea.core.protocol import (
     EpisodeItem,
     ErrorData,
     ErrorEvent,
+    MemoryArchiveItem,
+    MemoryFactItem,
+    MemorySectionItem,
     PermissionTierInfo,
     ResponseFrame,
     ScreenCaptureTarget,
@@ -169,7 +174,11 @@ class CleaDaemon:
         self._voice_state: VoiceState = "idle"
         self._screen_capture_active: bool = False
         self._screen_capture_target: ScreenCaptureTarget | None = None
-        self.consolidation = ConsolidationManager(memory=agent.memory, provider=agent.provider)
+        self.consolidation = ConsolidationManager(
+            memory=agent.memory,
+            provider=agent.provider,
+            min_user_turns=int(os.environ.get("CLEA_CONSOLIDATION_MIN_TURNS", "2")),
+        )
         self.consolidation_idle_seconds = 900.0
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._startup_task: asyncio.Task[None] | None = None
@@ -333,6 +342,7 @@ class CleaDaemon:
                 await asyncio.sleep(self.consolidation_idle_seconds)
                 await self.consolidation.consolidate_session(
                     session_id,
+                    force=True,
                     on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
                         session_id, st, det
                     ),
@@ -355,6 +365,7 @@ class CleaDaemon:
             try:
                 await self.consolidation.consolidate_session(
                     session_id,
+                    force=True,
                     on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
                         session_id, st, det
                     ),
@@ -532,10 +543,125 @@ class CleaDaemon:
                     session_id=ep.get("session_id", ""),
                     time=ep.get("time", ""),
                     summary=ep.get("summary", ""),
+                    trivial=bool(ep.get("trivial", False)),
                 )
                 for ep in raw_eps
             ]
             await self._respond(ws, req, METHOD_RESULTS[method](episodes=episodes))
+        elif method == "memory.facts":
+            sections_dict = self.agent.memory.parse_sections()
+            sections = [
+                MemorySectionItem(
+                    name=sec_name,
+                    entries=[
+                        MemoryFactItem(
+                            id=e.id,
+                            date=e.date,
+                            source=e.source,
+                            text=e.text,
+                        )
+                        for e in entries
+                    ],
+                )
+                for sec_name, entries in sections_dict.items()
+            ]
+            last_cons, failed_cons = self.consolidation.get_status()
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    sections=sections,
+                    last_consolidated=last_cons,
+                    failed_consolidation=failed_cons,
+                ),
+            )
+        elif method == "memory.archive":
+            entries, raw = self.agent.memory.read_archive()
+            archive_items = [
+                MemoryArchiveItem(
+                    id=e.get("id", ""),
+                    date=e.get("date", ""),
+                    source=e.get("source", ""),
+                    text=e.get("text", ""),
+                    archived_at=e.get("archived_at"),
+                    reason=e.get("reason"),
+                )
+                for e in entries
+            ]
+            await self._respond(ws, req, METHOD_RESULTS[method](entries=archive_items, raw=raw))
+        elif method == "memory.status":
+            det = self.consolidation.get_detailed_status()
+            pending = [
+                ConsolidationSessionStatus(
+                    session_id=p["session_id"],
+                    status=p["status"],
+                    retry_count=p["retry_count"],
+                    error=p.get("error"),
+                    last_attempt_at=p.get("last_attempt_at"),
+                    next_retry_at=p.get("next_retry_at"),
+                )
+                for p in det.get("pending", [])
+            ]
+            failed = [
+                ConsolidationSessionStatus(
+                    session_id=f["session_id"],
+                    status=f["status"],
+                    retry_count=f["retry_count"],
+                    error=f.get("error"),
+                    last_attempt_at=f.get("last_attempt_at"),
+                    next_retry_at=f.get("next_retry_at"),
+                )
+                for f in det.get("failed", [])
+            ]
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    last_consolidated_at=det.get("last_consolidated_at"),
+                    pending=pending,
+                    failed=failed,
+                    completed_count=det.get("completed_count", 0),
+                ),
+            )
+        elif method == "memory.reconsolidate":
+            sid = req.params.session_id
+            resolved_sid = self.agent.memory.resolve_session_id(sid)
+
+            async def _on_reconsolidate_status(st: str, detail: str | None = None) -> None:
+                await self._emit_consolidation_task_status(resolved_sid, st, detail)
+
+            ok = await self.consolidation.reconsolidate_session(
+                sid, on_task_status=_on_reconsolidate_status
+            )
+            state_info = self.consolidation.load_state().get("sessions", {}).get(
+                resolved_sid
+            ) or self.consolidation.load_state().get("sessions", {}).get(sid, {})
+            current_status = state_info.get("status", "completed" if ok else "failed")
+            err = state_info.get("last_error") or state_info.get("error") if not ok else None
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    session_id=resolved_sid,
+                    ok=ok,
+                    status=current_status,
+                    error=err,
+                ),
+            )
+        elif method == "memory.forget":
+            target = req.params.id or req.params.query or ""
+            removed = self.agent.memory.remove_entries(target)
+            if not removed and req.params.id and req.params.query:
+                removed = self.agent.memory.remove_entries(req.params.query)
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    ok=True,
+                    removed_count=len(removed),
+                    removed_ids=[e.id for e in removed],
+                ),
+            )
         elif method == "transcripts.list":
             limit = getattr(req.params, "limit", 50)
             raw_trs = self.agent.memory.list_transcripts(limit=limit)
@@ -920,8 +1046,7 @@ class CleaDaemon:
             self._screen_capture_active = False
             self._screen_capture_target = None
 
-            # If transcript is provided in req.params, persist to logs/transcripts/
-            # and schedule consolidation
+            # Persist transcript to logs/transcripts/ and schedule consolidation if provided
             if getattr(req.params, "transcript", None):
                 for entry in req.params.transcript:
                     role = entry.get("role", "assistant")

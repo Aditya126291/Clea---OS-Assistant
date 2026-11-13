@@ -163,6 +163,7 @@ class GeminiProvider(LLMProvider):
         messages: list[Message],
         tools: list[ToolDefinition],
         system_prompt: str,
+        response_format: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream one model response turn, yielding text deltas and tool calls."""
         kwargs: dict[str, Any] = {
@@ -174,6 +175,8 @@ class GeminiProvider(LLMProvider):
         }
         if tools:
             kwargs["tools"] = _to_gemini_tools(tools)
+        if response_format:
+            kwargs["response_format"] = response_format
 
         max_attempts = 1 + max(0, self.max_retries)
         stream_ctx = None

@@ -39,7 +39,7 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
 
 ### 1. Typed WebSocket Protocol (`src/clea/core/protocol.py` & `scripts/gen_ts_types.py`)
 - Defines strict Pydantic v2 discriminated-union frames (`extra="forbid"`):
-  - **Requests** (`RequestFrame`, discriminated by `method`): `health.ping`, `session.new`, `chat.send`, `approval.respond`, `memory.get`, `memory.get_daily`, `memory.episodes`, `transcripts.list`, `transcripts.get`, `conversations.list`, `conversations.get`, `conversation.list`, `conversation.get`, `conversation.resume`, `conversation.rename`, `conversation.pin`, `conversation.export`, `conversation.delete`, `conversation.delete_all`, `conversation.undo_delete`, `settings.get`, `dev.emit_sample_task`.
+  - **Requests** (`RequestFrame`, discriminated by `method`): `health.ping`, `session.new`, `chat.send`, `approval.respond`, `memory.get`, `memory.get_daily`, `memory.episodes`, `memory.facts`, `memory.archive`, `memory.status`, `memory.reconsolidate`, `transcripts.list`, `transcripts.get`, `conversations.list`, `conversations.get`, `conversation.list`, `conversation.get`, `conversation.resume`, `conversation.rename`, `conversation.pin`, `conversation.export`, `conversation.delete`, `conversation.delete_all`, `conversation.undo_delete`, `settings.get`, `dev.emit_sample_task`.
   - **Responses** (`ResponseFrame`): paired by request `id`, carrying typed result models (`METHOD_RESULTS`).
   - **Events** (`EventFrame`, discriminated by `event`): `assistant_token`, `tool_call_started`, `tool_call_finished`, `approval_requested`, `approval_resolved`, `task_status` (annotated with `kind`, `next_run_at`, error summary), `voice_state` (`idle | listening | thinking | speaking`), `conversation_updated`, `conversation_deleted`, `error`.
 - `scripts/gen_ts_types.py` compiles the Pydantic JSON Schema into `ui/src/protocol/generated.ts` via `json-schema-to-typescript` (`--check` fails on drift).
@@ -74,10 +74,13 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
 - **Migration**: Automatic, idempotent migration from legacy daily logs into structured JSONL transcripts with backups in `backup_legacy_logs`.
 - **Consolidation**:
   - Triggers on session completion, 15-minute idle inactivity, or startup crash recovery for unconsolidated sessions.
-  - Evaluates transcripts via structured JSON schema (`ConsolidationPayload`), deduplicating or resolving contradictions against existing facts.
+  - Evaluates transcripts via structured JSON schema (`ConsolidationOutput`), deduplicating or resolving contradictions against existing facts. Supports provider-constrained `response_format` when available, and tolerates harmless aliases (`value` -> `text`).
   - Safety filters reject secrets/tokens, ignore instructions embedded in tool outputs or web data, and skip small talk.
+  - Trivial sessions with fewer than N user turns (default 2, configured via `CLEA_CONSOLIDATION_MIN_TURNS`) and no tool use bypass model calls and write non-LLM stub episodes.
+  - Validation failures trigger one correction retry with exact Pydantic error feedback and prior candidate text. Unresolved sessions are queued in `pending_sessions.json` with exponential backoff (1m, 5m, 15m; cap 3).
   - Enforces configurable size caps (~2,000 tokens); when exceeded, oldest `inferred-low-confidence` entries are archived to `memory/MEMORY_ARCHIVE.md` (stated and confirmed entries are never dropped).
   - Emits `background_task` status events visible in the Activity tab.
+  - CLI operations `clea memory status` and `clea memory reconsolidate <session_id>` allow inspection and manual retries.
 - **Context Injection**: At turn start, injects size-capped `MEMORY.md` and up to the last 5 episode summaries (capped by token count). Raw transcripts are never injected into context.
 - **History Cap**: Sliding window message buffer with older turns condensed to a brief summary.
 - **Conversation Resume & Management**:
@@ -91,10 +94,7 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
   - **Chat**: streaming Markdown (`react-markdown` + `remark-gfm`), collapsible tool cards, inline approval cards (two-click confirmation for `destructive`), `Enter` send / `Shift+Enter` newline, "Continuing earlier conversation" marker on resumed threads, and a "Still working…" indicator after ~3 s.
   - **Sidebar & Command Palette (`Ctrl/Cmd+K`)**: navigation to Chat, Activity, Memory, Settings; pinned conversation group above date groups; three-dots conversation menu (Rename, Pin/Unpin, Export Markdown, Delete with confirmation and 10s undo toast); History header Delete All with strong confirmation.
   - **Activity**: displays only `background_task`, `scheduled`, and `agent_run` tasks (chat turns are filtered out) divided into "Running and upcoming" and "Recent" (capped at 50) with expandable error summaries.
-  - **Memory**: displays `MEMORY.md` parsed by sections, recent episode summaries, consolidation status, and a subview for inspecting structured transcripts.
-  - **Settings**: non-secret daemon status, provider/model, permission tiers, registered tools.
-  - **Call Overlay**: floating glass orb driven by `voice_state` events (`prefers-reduced-motion` respected). Dev-only simulation panel (`DevVoiceMockPanel.tsx`) is dynamically imported only under `import.meta.env.DEV && VITE_CLEA_MOCKS === "true"` and excluded from production builds.
-  - **Daemon Offline Screen**: clear startup instructions (`uv run clea daemon`) and auto-reconnect.
+  - **Memory**: view selector for Durable facts (fixed sections, search filter), Episode summaries (date grouped, short-session toggle), Archive (read-only with reasons and dates), and Consolidation status (metrics, pending/failed queues, retry triggers), plus an amber recoverable warning banner and transcripts subview.
   - **Settings**: non-secret daemon status, provider/model, permission tiers, registered tools.
   - **Call Overlay**: floating glass orb driven by `voice_state` events (`prefers-reduced-motion` respected). Dev-only simulation panel (`DevVoiceMockPanel.tsx`) is dynamically imported only under `import.meta.env.DEV && VITE_CLEA_MOCKS === "true"` and excluded from production builds.
   - **Daemon Offline Screen**: clear startup instructions (`uv run clea daemon`) and auto-reconnect.
