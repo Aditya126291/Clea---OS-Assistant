@@ -73,7 +73,10 @@ def test_voice_doctor_with_download_models(
     assert "Downloading missing models" in captured
 
 
-def test_voice_test_runs_cleanly(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_voice_test_runs_cleanly(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     with (
         patch("clea.surfaces.cli.voice.AudioManager") as mock_audio_cls,

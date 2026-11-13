@@ -48,6 +48,9 @@ desktop.ini
 *.swo
 
 # Node / UI / Electron
+
+# Agent workspaces
+.agents/
 node_modules/
 ui/dist/
 ui/out/

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 from collections.abc import Callable
 from typing import Any
 
 import numpy as np
+import scipy.signal
 import sounddevice as sd
 
 from clea.surfaces.voice.backends.base import (
@@ -152,11 +154,126 @@ def resolve_audio_device(
     return matches[0]
 
 
-def compute_audio_rms(pcm_bytes: bytes) -> float:
+def negotiate_input_sample_rate(
+    device_idx: int | None,
+    default_samplerate: float | int | None = None,
+    candidate_rates: tuple[int, ...] = (16000, 48000, 44100),
+    preferred_channels: int = 1,
+) -> tuple[int, int]:
+    """Negotiate a supported hardware sample rate and channel count for audio input.
+
+    Probes candidate rates starting with `default_samplerate`, followed by
+    `candidate_rates`. Tests channels starting with `preferred_channels`, falling
+    back across channels (1 then 2) if necessary.
+    Returns (negotiated_sample_rate, negotiated_channels).
+    """
+    candidates: list[int] = []
+    if default_samplerate is not None and int(default_samplerate) > 0:
+        candidates.append(int(default_samplerate))
+    for r in candidate_rates:
+        if r not in candidates:
+            candidates.append(r)
+
+    # Alternate channel preference (e.g. 1 then 2, or 2 then 1)
+    ch_candidates = (preferred_channels, 2 if preferred_channels == 1 else 1)
+
+    for rate in candidates:
+        for ch in ch_candidates:
+            try:
+                sd.check_input_settings(
+                    device=device_idx,
+                    samplerate=rate,
+                    channels=ch,
+                    dtype="int16",
+                )
+                return rate, ch
+            except Exception:
+                continue
+
+    # Fallback default if probing raises exceptions on all candidates (e.g., test mocks)
+    return int(default_samplerate or 16000), preferred_channels
+
+
+def resample_to_16k_mono(
+    audio: np.ndarray,
+    orig_sr: int,
+    target_sr: int = 16000,
+) -> np.ndarray:
+    """Downmix to mono and resample audio to target sample rate (default: 16000 Hz) as np.int16.
+
+    Input audio can be a 1D or 2D array of numeric samples (int16, float32, etc.).
+    Returns a 1D np.int16 array with values clipped to [-32768, 32767].
+    """
+    if audio.size == 0:
+        return np.empty(0, dtype=np.int16)
+
+    # Downmix multi-channel to mono
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    else:
+        audio = audio.reshape(-1)
+
+    if orig_sr == target_sr:
+        if audio.dtype == np.int16:
+            return np.ascontiguousarray(audio)
+        return np.clip(np.round(audio), -32768, 32767).astype(np.int16)
+
+    g = math.gcd(orig_sr, target_sr)
+    up = target_sr // g
+    down = orig_sr // g
+
+    # Polyphase rational resampler with float32 computation
+    resampled = scipy.signal.resample_poly(audio.astype(np.float32), up, down)
+    return np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
+
+
+class AudioChunkBuffer:
+    """Thread-safe FIFO buffer accumulating 16 kHz int16 audio and yielding exact chunks."""
+
+    def __init__(self, chunk_size: int = 1280) -> None:
+        self.chunk_size = chunk_size
+        self._buffer = bytearray()
+        self._bytes_per_chunk = chunk_size * 2  # 16-bit PCM = 2 bytes/sample
+        self._lock = threading.Lock()
+
+    def extend(self, pcm_bytes: bytes | np.ndarray) -> None:
+        """Append PCM audio data (bytes or int16 numpy array) to the FIFO buffer."""
+        if isinstance(pcm_bytes, np.ndarray):
+            raw = pcm_bytes.astype(np.int16).tobytes()
+        else:
+            raw = pcm_bytes
+        if not raw:
+            return
+        with self._lock:
+            self._buffer.extend(raw)
+
+    def get_chunks(self) -> list[np.ndarray]:
+        """Pop all available non-overlapping 1280-sample 1D np.int16 chunks."""
+        chunks: list[np.ndarray] = []
+        with self._lock:
+            while len(self._buffer) >= self._bytes_per_chunk:
+                raw_chunk = bytes(self._buffer[: self._bytes_per_chunk])
+                del self._buffer[: self._bytes_per_chunk]
+                chunk_arr = np.frombuffer(raw_chunk, dtype=np.int16)
+                chunks.append(chunk_arr)
+        return chunks
+
+    def clear(self) -> None:
+        """Flush all pending samples from the buffer."""
+        with self._lock:
+            self._buffer.clear()
+
+
+def compute_audio_rms(pcm_bytes: bytes | np.ndarray) -> float:
     """Calculate RMS energy of 16-bit mono PCM audio chunk."""
-    if not pcm_bytes:
+    if pcm_bytes is None:
         return 0.0
-    arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if isinstance(pcm_bytes, np.ndarray):
+        arr = pcm_bytes.reshape(-1)
+    else:
+        if not pcm_bytes:
+            return 0.0
+        arr = np.frombuffer(pcm_bytes, dtype=np.int16)
     if len(arr) == 0:
         return 0.0
     return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))

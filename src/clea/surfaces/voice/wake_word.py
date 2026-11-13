@@ -158,6 +158,7 @@ class WakeWordDetector:
         model_instance: Any = None,
     ) -> None:
         self.model_name = model_name
+        self.model_key = BUILTIN_WAKEWORDS.get(model_name, {}).get("model_key", model_name)
         self.threshold = threshold
         self.data_dir = data_dir
         self._target_dir = wake_word_models_dir(data_dir)
@@ -189,24 +190,41 @@ class WakeWordDetector:
             inference_framework="onnx",
         )
 
-    def process_audio(self, pcm_bytes: bytes) -> tuple[bool, float, str]:
+    def process_audio(self, pcm_bytes: bytes | np.ndarray) -> tuple[bool, float, str]:
         """Process 16 kHz 16-bit mono audio chunk.
 
         Returns (detected: bool, score: float, model_key: str).
         """
-        if not pcm_bytes:
+        if pcm_bytes is None:
             return False, 0.0, ""
 
-        audio_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if isinstance(pcm_bytes, np.ndarray):
+            if pcm_bytes.size == 0:
+                return False, 0.0, ""
+            audio_arr = np.ascontiguousarray(pcm_bytes.reshape(-1), dtype=np.int16)
+        else:
+            if not pcm_bytes:
+                return False, 0.0, ""
+            audio_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+        if len(audio_arr) == 0:
+            return False, 0.0, ""
+
         predictions = self._model.predict(audio_arr)
 
-        best_score = 0.0
-        best_key = ""
-        for key, score in predictions.items():
-            s = float(score)
-            if s > best_score:
-                best_score = s
-                best_key = key
+        if predictions:
+            if self.model_key in predictions:
+                best_score = float(predictions[self.model_key])
+                best_key = self.model_key
+            elif self.model_name in predictions:
+                best_score = float(predictions[self.model_name])
+                best_key = self.model_name
+            else:
+                best_key, best_val = max(predictions.items(), key=lambda item: float(item[1]))
+                best_score = float(best_val)
+        else:
+            best_score = 0.0
+            best_key = self.model_key
 
         if best_score >= self.threshold:
             logger.info(
@@ -220,6 +238,12 @@ class WakeWordDetector:
         return False, best_score, best_key
 
     def reset(self) -> None:
-        """Reset internal prediction buffers."""
+        """Reset internal prediction buffers and preprocessor state."""
+        if hasattr(self._model, "reset"):
+            try:
+                self._model.reset()
+                return
+            except Exception as exc:
+                logger.debug("Failed calling model.reset(): %s", exc)
         if hasattr(self._model, "prediction_buffer"):
             self._model.prediction_buffer.clear()

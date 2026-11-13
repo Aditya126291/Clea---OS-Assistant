@@ -24,19 +24,15 @@ from typing import Any
 import numpy as np
 import sounddevice as sd
 
-from clea.surfaces.voice.audio import resolve_audio_device
+from clea.surfaces.voice.audio import (
+    AudioChunkBuffer,
+    compute_audio_rms,
+    negotiate_input_sample_rate,
+    resample_to_16k_mono,
+    resolve_audio_device,
+)
 from clea.surfaces.voice.config import load_voice_config
 from clea.surfaces.voice.wake_word import WakeWordDetector
-
-
-def compute_audio_rms(pcm_bytes: bytes) -> float:
-    """Calculate RMS energy of 16-bit mono PCM audio chunk."""
-    if not pcm_bytes:
-        return 0.0
-    arr = np.frombuffer(pcm_bytes, dtype=np.int16)
-    if len(arr) == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
 
 
 def main() -> None:
@@ -90,14 +86,23 @@ def main() -> None:
     host_api = device_info.get("hostapi_name", "Unknown")
     native_rate = int(device_info.get("default_samplerate", 16000))
 
+    # 2. Negotiate input sample rate and channels
+    sample_rate, channels = negotiate_input_sample_rate(
+        device_idx=dev_idx,
+        default_samplerate=native_rate,
+        preferred_channels=1,
+    )
+    blocksize = int(sample_rate * 0.08)
+
     print("=" * 65)
     print(" Clea Wake Word Diagnostic Probe")
     print("=" * 65)
     print(f"Device:       #{dev_idx} '{dev_name}'")
     print(f"Host API:     {host_api}")
-    print(f"Native Rate:  {native_rate} Hz (recording at 16000 Hz, 16-bit mono)")
+    print(f"Native Rate:  {native_rate} Hz (recording at {sample_rate} Hz, {channels} ch)")
+    print("Target Rate:  16000 Hz, 1 ch mono (polyphase resampled)")
     print(f"Model:        '{model_name}' (threshold: {threshold:.2f})")
-    print("Chunk Size:   1280 samples (80 ms)")
+    print(f"Block Size:   {blocksize} frames -> 1280 samples (80 ms)")
     print("=" * 65)
     print("Status: Initializing openWakeWord detector...")
 
@@ -116,20 +121,18 @@ def main() -> None:
     # 1 second trailing window = 1.0s / 0.08s = 12.5 chunks
     score_history: collections.deque[tuple[float, float]] = collections.deque(maxlen=15)
     last_print_time = 0.0
-    accumulated_bytes = bytearray()
-    CHUNK_BYTES = 1280 * 2  # 16-bit = 2 bytes per sample
+    chunk_buffer = AudioChunkBuffer(chunk_size=1280)
 
     def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         nonlocal last_print_time
         if status:
             print(f"[!] Stream status: {status}", file=sys.stderr)
 
-        accumulated_bytes.extend(indata.tobytes())
+        # Resample incoming hardware frames to 16 kHz mono int16
+        resampled_16k = resample_to_16k_mono(indata, orig_sr=sample_rate, target_sr=16000)
+        chunk_buffer.extend(resampled_16k)
 
-        while len(accumulated_bytes) >= CHUNK_BYTES:
-            chunk = bytes(accumulated_bytes[:CHUNK_BYTES])
-            del accumulated_bytes[:CHUNK_BYTES]
-
+        for chunk in chunk_buffer.get_chunks():
             now = time.monotonic()
             rms = compute_audio_rms(chunk)
             detected, score, key = detector.process_audio(chunk)
@@ -167,10 +170,10 @@ def main() -> None:
     try:
         with sd.InputStream(
             device=dev_idx,
-            samplerate=16000,
-            channels=1,
+            samplerate=sample_rate,
+            channels=channels,
             dtype="int16",
-            blocksize=1280,
+            blocksize=blocksize,
             extra_settings=extra_settings,
             callback=audio_callback,
         ):
