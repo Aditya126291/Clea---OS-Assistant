@@ -11,6 +11,23 @@ import type {
   ChatSendParams,
   ChatSendResult,
   ConversationGetParams,
+  ConversationResumeParams,
+  ConversationResumeResult,
+  ConversationRenameParams,
+  ConversationRenameResult,
+  ConversationPinParams,
+  ConversationPinResult,
+  ConversationExportParams,
+  ConversationExportResult,
+  ConversationDeleteParams,
+  ConversationDeleteResult,
+  ConversationDeleteAllParams,
+  ConversationDeleteAllResult,
+  ConversationUndoDeleteParams,
+  ConversationUndoDeleteResult,
+  ConversationResumeMessage,
+  ConversationUpdatedData,
+  ConversationDeletedData,
   ConversationsGetResult,
   ConversationsListResult,
   ConversationSummary,
@@ -71,6 +88,23 @@ export type {
   ChatSendParams,
   ChatSendResult,
   ConversationGetParams,
+  ConversationResumeParams,
+  ConversationResumeResult,
+  ConversationRenameParams,
+  ConversationRenameResult,
+  ConversationPinParams,
+  ConversationPinResult,
+  ConversationExportParams,
+  ConversationExportResult,
+  ConversationDeleteParams,
+  ConversationDeleteResult,
+  ConversationDeleteAllParams,
+  ConversationDeleteAllResult,
+  ConversationUndoDeleteParams,
+  ConversationUndoDeleteResult,
+  ConversationResumeMessage,
+  ConversationUpdatedData,
+  ConversationDeletedData,
   ConversationsGetResult,
   ConversationsListResult,
   ConversationSummary,
@@ -132,6 +166,15 @@ export interface MethodParamsMap {
   "transcripts.get": TranscriptsGetParams;
   "conversations.list": Record<string, never>;
   "conversations.get": ConversationGetParams;
+  "conversation.list": Record<string, never>;
+  "conversation.get": ConversationGetParams;
+  "conversation.resume": ConversationResumeParams;
+  "conversation.rename": ConversationRenameParams;
+  "conversation.pin": ConversationPinParams;
+  "conversation.export": ConversationExportParams;
+  "conversation.delete": ConversationDeleteParams;
+  "conversation.delete_all": ConversationDeleteAllParams;
+  "conversation.undo_delete": ConversationUndoDeleteParams;
   "settings.get": Record<string, never>;
   "dev.emit_sample_task": Record<string, never>;
   "voice.start_call": VoiceStartCallParams;
@@ -152,6 +195,15 @@ export interface MethodResultMap {
   "transcripts.get": TranscriptsGetResult;
   "conversations.list": ConversationsListResult;
   "conversations.get": ConversationsGetResult;
+  "conversation.list": ConversationsListResult;
+  "conversation.get": ConversationsGetResult;
+  "conversation.resume": ConversationResumeResult;
+  "conversation.rename": ConversationRenameResult;
+  "conversation.pin": ConversationPinResult;
+  "conversation.export": ConversationExportResult;
+  "conversation.delete": ConversationDeleteResult;
+  "conversation.delete_all": ConversationDeleteAllResult;
+  "conversation.undo_delete": ConversationUndoDeleteResult;
   "settings.get": SettingsGetResult;
   "dev.emit_sample_task": DevEmitSampleTaskResult;
   "voice.start_call": VoiceStartCallResult;
@@ -213,6 +265,7 @@ export interface CleaDesktopBridge {
   getAutoLaunch?: () => Promise<boolean>;
   setAutoLaunch?: (enabled: boolean) => Promise<boolean>;
   startDaemon?: () => Promise<StartDaemonResult>;
+  saveFile?: (defaultPath: string, content: string) => Promise<boolean>;
   onQuickAskFocus?: (cb: () => void) => () => void;
   closeQuickAsk?: () => void;
 }

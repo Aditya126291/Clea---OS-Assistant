@@ -28,8 +28,23 @@ from clea.core.protocol import (
     CallStartedEvent,
     CallState,
     ChatSendRequest,
+    ConversationDeleteAllRequest,
+    ConversationDeletedData,
+    ConversationDeletedEvent,
+    ConversationDeleteRequest,
+    ConversationExportRequest,
+    ConversationGetRequest,
+    ConversationListRequest,
+    ConversationPinRequest,
+    ConversationRenameRequest,
+    ConversationResumeMessage,
+    ConversationResumeRequest,
     ConversationsGetRequest,
     ConversationsListRequest,
+    ConversationSummary,
+    ConversationUndoDeleteRequest,
+    ConversationUpdatedData,
+    ConversationUpdatedEvent,
     DevEmitSampleTaskRequest,
     ErrorEvent,
     EventFrame,
@@ -108,6 +123,17 @@ def build_json_schema() -> dict[str, Any]:
         transcripts_get_request: TranscriptsGetRequest
         conversations_list_request: ConversationsListRequest
         conversations_get_request: ConversationsGetRequest
+        conversation_list_request: ConversationListRequest
+        conversation_get_request: ConversationGetRequest
+        conversation_resume_request: ConversationResumeRequest
+        conversation_rename_request: ConversationRenameRequest
+        conversation_pin_request: ConversationPinRequest
+        conversation_export_request: ConversationExportRequest
+        conversation_delete_request: ConversationDeleteRequest
+        conversation_delete_all_request: ConversationDeleteAllRequest
+        conversation_undo_delete_request: ConversationUndoDeleteRequest
+        conversation_summary: ConversationSummary
+        conversation_resume_message: ConversationResumeMessage
         settings_get_request: SettingsGetRequest
         dev_emit_sample_task_request: DevEmitSampleTaskRequest
         voice_start_call_request: VoiceStartCallRequest
@@ -127,6 +153,10 @@ def build_json_schema() -> dict[str, Any]:
         screen_capture_state_event: ScreenCaptureStateEvent
         usage_event: UsageEvent
         error_event: ErrorEvent
+        conversation_updated_event: ConversationUpdatedEvent
+        conversation_deleted_event: ConversationDeletedEvent
+        conversation_updated_data: ConversationUpdatedData
+        conversation_deleted_data: ConversationDeletedData
 
     return CleaProtocolSchema.model_json_schema(mode="serialization")
 

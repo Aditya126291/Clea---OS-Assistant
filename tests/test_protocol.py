@@ -112,6 +112,8 @@ def test_all_required_event_types_exist_and_roundtrip() -> None:
         "screen_capture_state",
         "usage",
         "error",
+        "conversation_updated",
+        "conversation_deleted",
     }
     assert set(EVENT_NAMES) == required
 
@@ -163,6 +165,15 @@ def test_every_method_has_a_result_model() -> None:
             ("memory.get_daily", {"date": "2026-01-01"}),
             ("conversations.list", {}),
             ("conversations.get", {"date": "2026-01-01", "session_id": "s"}),
+            ("conversation.list", {}),
+            ("conversation.get", {"session_id": "s"}),
+            ("conversation.resume", {"session_id": "s"}),
+            ("conversation.rename", {"session_id": "s", "title": "New Title"}),
+            ("conversation.pin", {"session_id": "s", "pinned": True}),
+            ("conversation.export", {"session_id": "s"}),
+            ("conversation.delete", {"session_id": "s"}),
+            ("conversation.delete_all", {"confirmation": "DELETE"}),
+            ("conversation.undo_delete", {}),
             ("settings.get", {}),
             ("memory.episodes", {}),
             ("transcripts.list", {}),

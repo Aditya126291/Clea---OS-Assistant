@@ -85,6 +85,7 @@ _ENTRY_STRICT_RE = re.compile(
 _ENTRY_FALLBACK_RE = re.compile(
     r"^-\s*(?:\[(?P<id>[^\]]+)\]\s*)?(?:[\(\[](?P<date>\d{4}-\d{2}-\d{2})?(?:,\s*|\s+)?(?P<source>stated|confirmed|inferred-low-confidence)?[\)\]]\s*)?(?P<text>.+)$"
 )
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def _format_time_local(dt: datetime) -> str:
@@ -100,6 +101,7 @@ class MemoryStore:
         self.memory_dir = self.base_dir / "memory"
         self.episodes_dir = self.memory_dir / "episodes"
         self.transcripts_dir = self.base_dir / "logs" / "transcripts"
+        self.trash_dir = self.base_dir / "logs" / "transcripts_trash"
         self.long_term_path = self.memory_dir / "MEMORY.md"
         self.archive_path = self.memory_dir / "MEMORY_ARCHIVE.md"
         self.backup_legacy_dir = self.memory_dir / "backup_legacy_logs"
@@ -110,6 +112,7 @@ class MemoryStore:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.episodes_dir.mkdir(parents=True, exist_ok=True)
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+        self.trash_dir.mkdir(parents=True, exist_ok=True)
 
         # Migrate legacy root MEMORY.md if present
         legacy_root_long_term = self.base_dir / "MEMORY.md"
@@ -557,7 +560,17 @@ class MemoryStore:
 
     # --- Structured Transcripts (logs/transcripts/*.jsonl) ---
 
+    def validate_session_id(self, session_id: str) -> str:
+        """Validate session_id format and ensure it stays inside transcripts directory."""
+        if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+            raise ValueError(f"Invalid session id format: {session_id!r}")
+        target = (self.transcripts_dir / f"{session_id}.jsonl").resolve()
+        if not target.is_relative_to(self.transcripts_dir.resolve()):
+            raise ValueError(f"Path traversal detected in session id: {session_id!r}")
+        return session_id
+
     def transcript_path(self, session_id: str) -> Path:
+        self.validate_session_id(session_id)
         return self.transcripts_dir / f"{session_id}.jsonl"
 
     def append_transcript_message(
@@ -580,6 +593,8 @@ class MemoryStore:
                 "session_id": session_id,
                 "started_at": dt.isoformat(),
                 "title": _truncate(title or text or "New conversation"),
+                "pinned": False,
+                "updated_at": dt.isoformat(),
             }
             with path.open("w", encoding="utf-8") as handle:
                 handle.write(json.dumps(header, ensure_ascii=False) + "\n")
@@ -620,6 +635,8 @@ class MemoryStore:
                             "session_id": header.get("session_id", f.stem),
                             "started_at": header.get("started_at", ""),
                             "title": header.get("title", "Conversation"),
+                            "pinned": bool(header.get("pinned", False)),
+                            "updated_at": header.get("updated_at", header.get("started_at", "")),
                             "message_count": line_count,
                         }
                     )
@@ -649,8 +666,180 @@ class MemoryStore:
             "session_id": header.get("session_id", session_id),
             "started_at": header.get("started_at", ""),
             "title": header.get("title", "Conversation"),
+            "pinned": bool(header.get("pinned", False)),
+            "updated_at": header.get("updated_at", header.get("started_at", "")),
             "messages": messages,
         }
+
+    def update_transcript_header(
+        self,
+        session_id: str,
+        *,
+        title: str | None = None,
+        pinned: bool | None = None,
+    ) -> dict[str, Any]:
+        """Atomically update header fields (title, pinned, updated_at) in a transcript file."""
+        self.validate_session_id(session_id)
+        path = self.transcript_path(session_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Transcript for session {session_id} not found.")
+
+        with path.open("r", encoding="utf-8") as handle:
+            first_line = handle.readline()
+            rest = handle.read()
+
+        header: dict[str, Any] = json.loads(first_line) if first_line else {}
+        if title is not None:
+            clean_title = re.sub(r"<[^>]*>", "", title).strip()
+            if not clean_title:
+                raise ValueError("Title cannot be empty or contain only HTML tags.")
+            if len(clean_title) > 100:
+                clean_title = clean_title[:100]
+            header["title"] = clean_title
+
+        if pinned is not None:
+            header["pinned"] = bool(pinned)
+
+        header["updated_at"] = datetime.now().astimezone().isoformat()
+
+        tmp = path.with_name(f"{session_id}.tmp.{uuid4().hex}")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(header, ensure_ascii=False) + "\n")
+            handle.write(rest)
+        tmp.replace(path)
+        return header
+
+    def delete_transcript(self, session_id: str, *, delete_episodes: bool = False) -> Path:
+        """Soft delete a transcript into the trash folder, optionally deleting episode summary."""
+        self.validate_session_id(session_id)
+        src_path = self.transcript_path(session_id)
+        if not src_path.exists():
+            raise FileNotFoundError(f"Transcript for session {session_id} not found.")
+
+        self.trash_dir.mkdir(parents=True, exist_ok=True)
+        dst_path = self.trash_dir / f"{session_id}.jsonl"
+        if dst_path.exists():
+            dst_path.unlink()
+        shutil.move(str(src_path), str(dst_path))
+
+        if delete_episodes:
+            self.delete_episode(session_id)
+
+        return dst_path
+
+    def delete_all_transcripts(self) -> int:
+        """Soft delete all transcripts into trash."""
+        self.trash_dir.mkdir(parents=True, exist_ok=True)
+        count = 0
+        if self.transcripts_dir.is_dir():
+            for p in self.transcripts_dir.glob("*.jsonl"):
+                dst = self.trash_dir / p.name
+                if dst.exists():
+                    dst.unlink()
+                shutil.move(str(p), str(dst))
+                count += 1
+        return count
+
+    def undo_delete_transcript(self, session_id: str | None = None) -> list[str]:
+        """Restore transcript(s) from trash back to transcripts directory."""
+        if not self.trash_dir.is_dir():
+            return []
+        restored: list[str] = []
+        if session_id:
+            self.validate_session_id(session_id)
+            src = self.trash_dir / f"{session_id}.jsonl"
+            if src.exists():
+                dst = self.transcript_path(session_id)
+                if dst.exists():
+                    dst.unlink()
+                shutil.move(str(src), str(dst))
+                restored.append(session_id)
+        else:
+            for p in list(self.trash_dir.glob("*.jsonl")):
+                sid = p.stem
+                try:
+                    self.validate_session_id(sid)
+                    dst = self.transcript_path(sid)
+                    if dst.exists():
+                        dst.unlink()
+                    shutil.move(str(p), str(dst))
+                    restored.append(sid)
+                except Exception:
+                    continue
+        return restored
+
+    def purge_trash(self) -> int:
+        """Permanently delete all files in the trash folder."""
+        if not self.trash_dir.is_dir():
+            return 0
+        count = 0
+        for p in list(self.trash_dir.glob("*.jsonl")):
+            try:
+                p.unlink()
+                count += 1
+            except Exception as exc:
+                logger.warning("Could not purge trash file %s: %s", p, exc)
+        return count
+
+    def delete_episode(self, session_id: str) -> bool:
+        """Remove session episode entry from memory/episodes/*.md."""
+        if not self.episodes_dir.is_dir():
+            return False
+        modified = False
+        pattern = re.compile(
+            rf"\n*### Session `{re.escape(session_id)}`[^\n]*\n.*?(?=\n###|\Z)",
+            re.DOTALL,
+        )
+        for f in self.episodes_dir.glob("*.md"):
+            try:
+                content = f.read_text(encoding="utf-8")
+                new_content = pattern.sub("", content).strip()
+                if new_content != content.strip():
+                    if new_content and new_content != f"# Episodes — {f.stem}".strip():
+                        f.write_text(new_content + "\n", encoding="utf-8")
+                    else:
+                        f.unlink()
+                    modified = True
+            except Exception as exc:
+                logger.warning("Error deleting episode for session %s: %s", session_id, exc)
+        return modified
+
+    def export_transcript_markdown(self, session_id: str) -> tuple[str, str]:
+        """Export a transcript as clean Markdown with short tool summaries."""
+        self.validate_session_id(session_id)
+        data = self.get_transcript(session_id)
+        if not data:
+            raise FileNotFoundError(f"Transcript for session {session_id} not found.")
+
+        title = data.get("title", "Conversation")
+        started_at = data.get("started_at", "")
+        lines: list[str] = [
+            f"# {title}",
+            f"**Date:** {started_at} | **Session:** `{session_id}`",
+            "",
+            "---",
+            "",
+        ]
+        for msg in data.get("messages", []):
+            role = msg.get("role")
+            text = msg.get("text", "")
+            tool_calls = msg.get("tool_calls", [])
+            if role == "user":
+                lines.append("### User\n")
+                lines.append(f"{text.strip()}\n")
+            elif role == "assistant":
+                lines.append("### Clea\n")
+                if tool_calls:
+                    for tc in tool_calls:
+                        name = tc.get("name", "tool")
+                        args = tc.get("arguments", {})
+                        arg_str = ", ".join(f"{k}={v!r}" for k, v in list(args.items())[:3])[:60]
+                        lines.append(f"> *Used tool `{name}` ({arg_str})*\n")
+                if text:
+                    lines.append(f"{text.strip()}\n")
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", title.lower()).strip("-")[:30] or "chat"
+        filename = f"conversation-{session_id[:8]}-{slug}.md"
+        return filename, "\n".join(lines)
 
     # --- Backward-Compatible Daily Turn Logging & Migration ---
 
@@ -754,9 +943,13 @@ class MemoryStore:
                         "title": item.get("title", "Conversation"),
                         "turns": (item.get("message_count", 0) + 1) // 2,
                         "last_time": last_time_str,
+                        "pinned": bool(item.get("pinned", False)),
+                        "updated_at": item.get("updated_at", started),
                     }
                 )
-            return conversations
+            pinned_list = [c for c in conversations if c.get("pinned")]
+            unpinned_list = [c for c in conversations if not c.get("pinned")]
+            return pinned_list + unpinned_list
 
         for day in self.list_days():
             by_session: dict[str, dict[str, str | int]] = {}
@@ -771,12 +964,16 @@ class MemoryStore:
                         "title": _truncate(user),
                         "turns": 0,
                         "last_time": fmt_time,
+                        "pinned": False,
+                        "updated_at": f"{day}T00:00:00",
                     }
                     by_session[sid] = entry
                 entry["turns"] = int(entry["turns"]) + 1
                 entry["last_time"] = fmt_time
             conversations.extend(reversed(by_session.values()))
-        return conversations
+        pinned_list = [c for c in conversations if c.get("pinned")]
+        unpinned_list = [c for c in conversations if not c.get("pinned")]
+        return pinned_list + unpinned_list
 
     def get_conversation(self, day: str, session_id: str) -> list[dict[str, str]]:
         """Return conversation turns for a session from transcripts or daily log."""
