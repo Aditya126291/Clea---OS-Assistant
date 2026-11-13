@@ -9,7 +9,7 @@ from typing import Any
 
 from google import genai
 
-from clea.providers.base import LLMProvider, Message, StreamChunk, ToolCall
+from clea.providers.base import LLMProvider, Message, StreamChunk, TokenUsage, ToolCall
 from clea.tools.registry import ToolDefinition
 
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
@@ -67,6 +67,24 @@ def _to_gemini_steps(messages: list[Message]) -> list[dict[str, Any]]:
     return steps
 
 
+def _merge_token_usage(acc: TokenUsage | None, hop: TokenUsage) -> TokenUsage:
+    if acc is None:
+        return hop
+
+    def _add(a: int | None, b: int | None) -> int | None:
+        if a is None and b is None:
+            return None
+        return (a or 0) + (b or 0)
+
+    return TokenUsage(
+        input_tokens=_add(acc.input_tokens, hop.input_tokens),
+        output_tokens=_add(acc.output_tokens, hop.output_tokens),
+        thought_tokens=_add(acc.thought_tokens, hop.thought_tokens),
+        cached_tokens=_add(acc.cached_tokens, hop.cached_tokens),
+        total_tokens=_add(acc.total_tokens, hop.total_tokens),
+    )
+
+
 class GeminiProvider(LLMProvider):
     """LLMProvider backed by Google's Gemini Interactions API."""
 
@@ -112,11 +130,15 @@ class GeminiProvider(LLMProvider):
 
         pending_calls: dict[int, dict[str, Any]] = {}
         final_tool_calls: list[ToolCall] = []
+        final_usage: TokenUsage | None = None
 
         async for event in stream:
             event_type = getattr(event, "event_type", None)
 
-            if event_type == "step.start":
+            if event_type == "interaction.created":
+                pending_calls.clear()
+
+            elif event_type == "step.start":
                 step = getattr(event, "step", None)
                 if getattr(step, "type", None) == "function_call":
                     pending_calls[event.index] = {
@@ -138,6 +160,16 @@ class GeminiProvider(LLMProvider):
 
             elif event_type == "interaction.completed":
                 interaction = getattr(event, "interaction", None)
+                usage_obj = getattr(interaction, "usage", None)
+                if usage_obj is not None:
+                    hop_usage = TokenUsage(
+                        input_tokens=getattr(usage_obj, "total_input_tokens", None),
+                        output_tokens=getattr(usage_obj, "total_output_tokens", None),
+                        thought_tokens=getattr(usage_obj, "total_thought_tokens", None),
+                        cached_tokens=getattr(usage_obj, "total_cached_tokens", None),
+                        total_tokens=getattr(usage_obj, "total_tokens", None),
+                    )
+                    final_usage = _merge_token_usage(final_usage, hop_usage)
                 steps = getattr(interaction, "steps", None) or []
                 for step in steps:
                     if getattr(step, "type", None) == "function_call":
@@ -165,4 +197,4 @@ class GeminiProvider(LLMProvider):
         for call in final_tool_calls:
             yield StreamChunk(type="tool_call", tool_call=call)
 
-        yield StreamChunk(type="done")
+        yield StreamChunk(type="done", usage=final_usage)

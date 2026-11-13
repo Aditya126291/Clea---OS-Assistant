@@ -30,12 +30,23 @@ class Message(BaseModel):
     is_error: bool = False
 
 
+class TokenUsage(BaseModel):
+    """Token counts reported by the LLM provider for a single model call."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    thought_tokens: int | None = None
+    cached_tokens: int | None = None
+    total_tokens: int | None = None
+
+
 class StreamChunk(BaseModel):
     """Incremental chunk emitted by an LLM provider during a streamed turn."""
 
     type: Literal["text_delta", "tool_call", "done"]
     text: str = ""
     tool_call: ToolCall | None = None
+    usage: TokenUsage | None = None
 
 
 class LLMProvider(ABC):
