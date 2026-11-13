@@ -638,6 +638,7 @@ class CleaDaemon:
                     ),
                 )
             )
+            memory_ctx = self.agent.memory.build_injected_context()
             await self._respond(
                 ws,
                 req,
@@ -645,6 +646,7 @@ class CleaDaemon:
                     call_id=call_id,
                     call_state=self._call_state,
                     voice_state=self._voice_state,
+                    memory_context=memory_ctx or None,
                 ),
             )
         elif method == "voice.end_call":
@@ -677,6 +679,20 @@ class CleaDaemon:
             self._voice_state = "idle"
             self._screen_capture_active = False
             self._screen_capture_target = None
+
+            # If transcript is provided in req.params, persist to logs/transcripts/ and schedule consolidation
+            if getattr(req.params, "transcript", None):
+                for entry in req.params.transcript:
+                    role = entry.get("role", "assistant")
+                    text = str(entry.get("text", "")).strip()
+                    if text:
+                        self.agent.memory.append_transcript_message(
+                            session_id=ended_id,
+                            role=role,
+                            text=text,
+                        )
+                self._schedule_consolidation_now(ended_id)
+
             await self._broadcast(
                 CallEndedEvent(
                     request_id=req.id,

@@ -69,6 +69,7 @@ class VoiceStartCallParams(_Model):
 class VoiceEndCallParams(_Model):
     call_id: str | None = None
     reason: str | None = None
+    transcript: list[dict[str, Any]] | None = None
 
 
 class VoiceDelegateTaskParams(_Model):
@@ -344,6 +345,7 @@ class VoiceStartCallResult(_Model):
     call_id: str
     call_state: CallState
     voice_state: VoiceState = "idle"
+    memory_context: str | None = None
 
 
 class VoiceEndCallResult(_Model):

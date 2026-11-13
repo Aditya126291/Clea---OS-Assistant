@@ -101,6 +101,11 @@ export type SessionId16 = string | null;
 export type Method14 = "voice.end_call";
 export type CallId = string | null;
 export type Reason = string | null;
+export type Transcript =
+  | {
+      [k: string]: unknown | undefined;
+    }[]
+  | null;
 export type FrameType15 = "request";
 export type Id15 = string;
 export type SessionId17 = string | null;
@@ -296,6 +301,7 @@ export type PermissionTiers = PermissionTierInfo[];
 export type CallId10 = string;
 export type CallState2 = "idle" | "connecting" | "active" | "ending";
 export type VoiceState = "idle" | "listening" | "thinking" | "speaking";
+export type MemoryContext = string | null;
 export type CallId11 = string | null;
 export type CallState3 = "idle" | "connecting" | "active" | "ending";
 export type VoiceState1 = "idle" | "listening" | "thinking" | "speaking";
@@ -502,6 +508,7 @@ export interface VoiceEndCallRequest {
 export interface VoiceEndCallParams {
   call_id?: CallId;
   reason?: Reason;
+  transcript?: Transcript;
 }
 export interface VoiceStatusRequest {
   frame_type?: FrameType15;
@@ -829,6 +836,7 @@ export interface VoiceStartCallResult {
   call_id: CallId10;
   call_state: CallState2;
   voice_state?: VoiceState;
+  memory_context?: MemoryContext;
 }
 export interface VoiceEndCallResult {
   call_id?: CallId11;
