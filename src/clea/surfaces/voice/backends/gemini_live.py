@@ -45,11 +45,20 @@ class GeminiLiveBackend(VoiceBackend):
         self,
         *,
         api_key: str | None = None,
-        model_name: str = DEFAULT_LIVE_MODEL,
+        model_name: str | None = None,
         client: Client | None = None,
     ) -> None:
-        self._api_key = api_key if api_key is not None else os.environ.get("GEMINI_API_KEY", "")
-        self._model_name = model_name
+        resolved_key = (
+            api_key
+            if api_key is not None
+            else (os.environ.get("GEMINI_LIVE_API_KEY") or os.environ.get("GEMINI_API_KEY", ""))
+        )
+        self._api_key = resolved_key
+        self._model_name = (
+            model_name
+            if model_name is not None
+            else os.environ.get("CLEA_LIVE_MODEL", DEFAULT_LIVE_MODEL)
+        )
         self._client = client
         self._session: Any = None
         self._session_ctx: Any = None
@@ -74,7 +83,8 @@ class GeminiLiveBackend(VoiceBackend):
         self._config = config
         if not self._api_key and self._client is None:
             raise ValueError(
-                "GEMINI_API_KEY is not set. Run 'clea voice doctor' to verify configuration."
+                "GEMINI_LIVE_API_KEY or GEMINI_API_KEY is not set. "
+                "Run 'clea voice doctor' to verify configuration."
             )
 
         if self._client is None:

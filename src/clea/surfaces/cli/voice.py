@@ -77,12 +77,18 @@ def run_voice_doctor(*, download_models: bool = False) -> None:
     print(f"Config: wake_word='{config.wake_word_model}', hotkey='{config.hotkey}'")
     print(f"        google_search_grounding={config.enable_web_search}")
 
-    # 1. Check GEMINI_API_KEY
+    # 1. Check GEMINI_LIVE_API_KEY / GEMINI_API_KEY
+    live_key = os.environ.get("GEMINI_LIVE_API_KEY", "").strip()
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if api_key:
-        print("[OK] GEMINI_API_KEY is configured.")
+    if live_key:
+        print("[OK] GEMINI_LIVE_API_KEY is configured for voice calls.")
+    elif api_key:
+        print("[OK] GEMINI_API_KEY is configured (used as fallback for voice calls).")
     else:
-        print("[!] GEMINI_API_KEY is not set. Live voice calls will fail without an API key.")
+        print(
+            "[!] Neither GEMINI_LIVE_API_KEY nor GEMINI_API_KEY is set. "
+            "Live voice calls will fail without an API key."
+        )
 
     # 2. Check Audio Devices
     devices = list_audio_devices()
