@@ -412,7 +412,7 @@ class CleaDaemon:
     def _schedule_trash_purge(self, delay_seconds: float = 15.0) -> None:
         async def _purge_after_delay() -> None:
             await asyncio.sleep(delay_seconds)
-            purged = self.agent.memory.purge_trash()
+            purged = self.agent.memory.purge_trash(min_age_seconds=10.0)
             if purged > 0:
                 logger.info("Purged %d transcripts from trash", purged)
 
@@ -426,9 +426,8 @@ class CleaDaemon:
 
     def _resume_session_from_transcript(self, session_id: str) -> Session:
         self.agent.memory.validate_session_id(session_id)
-        existing = self.sessions.get(session_id)
-        if existing is not None:
-            return existing
+        if session_id in self._busy_sessions:
+            raise ValueError("A turn is currently running for this session.")
 
         session = Session(id=session_id)
         transcript = self.agent.memory.get_transcript(session_id)
@@ -659,6 +658,9 @@ class CleaDaemon:
             )
         elif method == "conversation.resume":
             session_id = req.params.session_id
+            if session_id in self._busy_sessions:
+                await self._respond(ws, req, error="A turn is currently running for this session.")
+                return
             try:
                 self.agent.memory.validate_session_id(session_id)
                 session = self._resume_session_from_transcript(session_id)
@@ -756,6 +758,11 @@ class CleaDaemon:
             )
         elif method == "conversation.delete":
             session_id = req.params.session_id
+            if session_id in self._busy_sessions:
+                await self._respond(
+                    ws, req, error="Cannot delete conversation while a turn is running."
+                )
+                return
             delete_episodes = req.params.delete_episodes
             try:
                 self.agent.memory.delete_transcript(session_id, delete_episodes=delete_episodes)
@@ -768,6 +775,7 @@ class CleaDaemon:
                 session_id=session_id,
                 delete_episodes=delete_episodes,
             )
+            self.sessions._sessions.pop(session_id, None)
             for c in list(self._connections):
                 if c.current_session_id == session_id:
                     c.current_session_id = None
@@ -787,12 +795,18 @@ class CleaDaemon:
                 session_id=session_id,
             )
         elif method == "conversation.delete_all":
+            if self._busy_sessions:
+                await self._respond(
+                    ws, req, error="Cannot delete conversations while a turn is running."
+                )
+                return
             if req.params.confirmation != "DELETE":
                 await self._respond(ws, req, error="Confirmation string 'DELETE' required.")
                 return
 
             count = self.agent.memory.delete_all_transcripts()
             self._audit_log("conversation_delete_all", deleted_count=count)
+            self.sessions._sessions.clear()
             for c in list(self._connections):
                 c.current_session_id = None
 
@@ -810,6 +824,8 @@ class CleaDaemon:
             )
         elif method == "conversation.undo_delete":
             session_id = req.params.session_id
+            if session_id in ("", "*", "all"):
+                session_id = None
             try:
                 restored = self.agent.memory.undo_delete_transcript(session_id)
             except ValueError as exc:
@@ -976,6 +992,13 @@ class CleaDaemon:
     async def _chat_turn(self, conn: _Connection, req: Any, text: str) -> None:
         ws = conn.ws
         session_id = req.session_id
+        if session_id:
+            try:
+                self.agent.memory.validate_session_id(session_id)
+            except ValueError as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+
         if session_id and self.sessions.get(session_id) is None:
             try:
                 session = self._resume_session_from_transcript(session_id)

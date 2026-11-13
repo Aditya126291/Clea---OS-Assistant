@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -541,3 +542,216 @@ def test_audit_logs_record_deletions_without_content(tmp_path: Path) -> None:
         assert "text" not in line["details"]
         assert "content" not in line["details"]
         assert "messages" not in line["details"]
+
+
+async def test_undo_delete_all_with_wildcard_and_episode_restore(tmp_path: Path) -> None:
+    """Test that undo_delete with session_id='*' or None restores transcripts and episodes."""
+    memory = MemoryStore(base_dir=tmp_path)
+    registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=EchoProvider(),
+        memory=memory,
+        registry=registry,
+    )
+    await daemon.start()
+
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+            # Create session with transcript and episode
+            await ws.send(SessionNewRequest().model_dump_json())
+            sid = (parse_frame(await ws.recv())).session_id
+            req = ChatSendRequest(session_id=sid, params=ChatSendParams(text="Hello world"))
+            await ws.send(req.model_dump_json())
+            while True:
+                f = parse_frame(await ws.recv())
+                if isinstance(f, ResponseFrame) and f.id == req.id:
+                    break
+
+            memory.append_episode(session_id=sid, summary="Discussed hello world greetings.")
+
+            # Delete single with delete_episodes=True
+            del_req = ConversationDeleteRequest(
+                params=ConversationDeleteParams(session_id=sid, delete_episodes=True)
+            )
+            await ws.send(del_req.model_dump_json())
+            while True:
+                f = parse_frame(await ws.recv())
+                if isinstance(f, ResponseFrame) and f.id == del_req.id:
+                    break
+
+            # Confirm transcript and episode were removed from active dirs
+            assert not memory.transcript_path(sid).exists()
+            assert not any(sid in ep.get("session_id", "") for ep in memory.get_recent_episodes())
+
+            # Undo delete single
+            undo_req = ConversationUndoDeleteRequest(
+                params=ConversationUndoDeleteParams(session_id=sid)
+            )
+            await ws.send(undo_req.model_dump_json())
+            while True:
+                f = parse_frame(await ws.recv())
+                if isinstance(f, ResponseFrame) and f.id == undo_req.id:
+                    break
+
+            # Transcript and episode restored!
+            assert memory.transcript_path(sid).exists()
+            assert any(sid in ep.get("session_id", "") for ep in memory.get_recent_episodes())
+
+            # Now test delete_all and undo with wildcard '*'
+            del_all = ConversationDeleteAllRequest(
+                params=ConversationDeleteAllParams(confirmation="DELETE")
+            )
+            await ws.send(del_all.model_dump_json())
+            while True:
+                f = parse_frame(await ws.recv())
+                if isinstance(f, ResponseFrame) and f.id == del_all.id:
+                    break
+
+            assert len(list(memory.transcripts_dir.glob("*.jsonl"))) == 0
+
+            # Undo with wildcard '*' (as sent by UI toast)
+            undo_all_star = ConversationUndoDeleteRequest(
+                params=ConversationUndoDeleteParams(session_id="*")
+            )
+            await ws.send(undo_all_star.model_dump_json())
+            undo_star_resp = None
+            while undo_star_resp is None:
+                f = parse_frame(await ws.recv())
+                if isinstance(f, ResponseFrame) and f.id == undo_all_star.id:
+                    undo_star_resp = f
+            assert undo_star_resp.ok
+            assert undo_star_resp.result["restored_count"] == 1
+            assert memory.transcript_path(sid).exists()
+    finally:
+        await daemon.stop()
+
+
+def test_purge_trash_respects_min_age_window(tmp_path: Path) -> None:
+    """Verify that purge_trash(min_age_seconds) retains recently deleted files."""
+    memory = MemoryStore(base_dir=tmp_path)
+    memory.ensure_initialized()
+
+    # Create dummy transcripts
+    memory.append_transcript_message(session_id="old-sid", role="user", text="Old")
+    memory.append_transcript_message(session_id="young-sid", role="user", text="Young")
+
+    # Delete both
+    memory.delete_transcript("old-sid")
+    memory.delete_transcript("young-sid")
+
+    # Manually backdate old-sid meta to 20 seconds ago
+    old_meta = memory.trash_dir / "old-sid.meta.json"
+    old_data = json.loads(old_meta.read_text(encoding="utf-8"))
+    old_data["deleted_at"] = time.time() - 25.0
+    old_meta.write_text(json.dumps(old_data), encoding="utf-8")
+
+    # Purge with 10s retention window
+    purged_count = memory.purge_trash(min_age_seconds=10.0)
+    assert purged_count == 1
+    assert not (memory.trash_dir / "old-sid.jsonl").exists()
+    assert (memory.trash_dir / "young-sid.jsonl").exists()
+
+    # Purge without window (startup purge) cleans remaining
+    all_purged = memory.purge_trash(min_age_seconds=0.0)
+    assert all_purged == 1
+    assert not (memory.trash_dir / "young-sid.jsonl").exists()
+
+
+async def test_delete_during_running_turn_rejected(tmp_path: Path) -> None:
+    """Verify that deleting a conversation while a turn is running is rejected."""
+    gate = asyncio.Event()
+    provider = SlowGatedProvider(gate)
+    memory = MemoryStore(base_dir=tmp_path)
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=provider,
+        memory=memory,
+    )
+    await daemon.start()
+
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with (
+            connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws1,
+            connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws2,
+        ):
+            await ws1.send(SessionNewRequest().model_dump_json())
+            session_id = (parse_frame(await ws1.recv())).session_id
+
+            # Start Turn 1 on ws1 (blocks)
+            req1 = ChatSendRequest(session_id=session_id, params=ChatSendParams(text="Turn 1"))
+            await ws1.send(req1.model_dump_json())
+            await asyncio.sleep(0.05)
+
+            # Try deleting session from ws2 while turn 1 is active
+            del_req = ConversationDeleteRequest(
+                params=ConversationDeleteParams(session_id=session_id)
+            )
+            await ws2.send(del_req.model_dump_json())
+            del_resp = parse_frame(await ws2.recv())
+            assert isinstance(del_resp, ResponseFrame)
+            assert del_resp.ok is False
+            assert "Cannot delete conversation while a turn is running" in (del_resp.error or "")
+
+            # Unblock turn
+            gate.set()
+            while True:
+                f = parse_frame(await ws1.recv())
+                if isinstance(f, ResponseFrame) and f.id == req1.id:
+                    break
+    finally:
+        await daemon.stop()
+
+
+async def test_chat_send_rejects_path_traversal_session_id(tmp_path: Path) -> None:
+    """Verify that chat.send with path traversal session id is rejected early."""
+    memory = MemoryStore(base_dir=tmp_path)
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=EchoProvider(),
+        memory=memory,
+    )
+    await daemon.start()
+
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+            req = ChatSendRequest(
+                session_id="../../traversal_escape",
+                params=ChatSendParams(text="Evil turn"),
+            )
+            await ws.send(req.model_dump_json())
+            resp = parse_frame(await ws.recv())
+            assert isinstance(resp, ResponseFrame)
+            assert resp.ok is False
+            assert "Invalid session id format" in (resp.error or "")
+    finally:
+        await daemon.stop()
+
+
+def test_export_markdown_includes_tool_output_summary(tmp_path: Path) -> None:
+    """Verify that Markdown export includes short tool output summaries."""
+    memory = MemoryStore(base_dir=tmp_path)
+    memory.ensure_initialized()
+
+    memory.append_transcript_message(
+        session_id="export-test-sid",
+        role="assistant",
+        text="The weather is clear.",
+        tool_calls=[
+            {
+                "name": "check_weather",
+                "arguments": {"city": "Tokyo"},
+                "output": "Sunny, 22C",
+            }
+        ],
+    )
+
+    filename, content = memory.export_transcript_markdown("export-test-sid")
+    assert filename.endswith(".md")
+    assert "> *Used tool `check_weather` (city='Tokyo') -> Sunny, 22C*" in content

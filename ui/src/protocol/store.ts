@@ -206,11 +206,38 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     const client = new CleaClient({
       ...clientOptions,
       onConnected: () => {
-        set({ connectionState: "connected", reconnectAttempt: 0, lastError: null, sending: false });
+        set((state) => ({
+          connectionState: "connected",
+          reconnectAttempt: 0,
+          lastError: null,
+          sending: false,
+          messages: state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+        }));
         const currentSid = get().sessionId;
         if (currentSid) {
           void activeClient
             ?.request("conversation.resume", { session_id: currentSid })
+            .then((res) => {
+              if (get().messages.length === 0 && res.messages) {
+                set({
+                  messages: res.messages.map((m, idx) => ({
+                    id: `resumed-${res.session_id}-${idx}`,
+                    role: m.role as "user" | "assistant",
+                    content: m.text,
+                    streaming: false,
+                    toolCalls: (m.tool_calls || []).map((tc, tcIdx) => ({
+                      callId: `tc-${idx}-${tcIdx}`,
+                      name: (tc.name as string) || "tool",
+                      arguments: (tc.arguments as Record<string, unknown>) || {},
+                      riskLevel: "read_only" as const,
+                      status: "done" as const,
+                      output: typeof tc.output === "string" ? tc.output : undefined,
+                    })),
+                    approvals: [],
+                  })),
+                });
+              }
+            })
             .catch(() => {
               void get().newSession();
             });
@@ -427,7 +454,14 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         role: m.role as "user" | "assistant",
         content: m.text,
         streaming: false,
-        toolCalls: [],
+        toolCalls: (m.tool_calls || []).map((tc, tcIdx) => ({
+          callId: `tc-${idx}-${tcIdx}`,
+          name: (tc.name as string) || "tool",
+          arguments: (tc.arguments as Record<string, unknown>) || {},
+          riskLevel: "read_only" as const,
+          status: "done" as const,
+          output: typeof tc.output === "string" ? tc.output : undefined,
+        })),
         approvals: [],
       }));
       set({
@@ -460,7 +494,14 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         role: m.role as "user" | "assistant",
         content: m.text,
         streaming: false,
-        toolCalls: [],
+        toolCalls: (m.tool_calls || []).map((tc, tcIdx) => ({
+          callId: `tc-${idx}-${tcIdx}`,
+          name: (tc.name as string) || "tool",
+          arguments: (tc.arguments as Record<string, unknown>) || {},
+          riskLevel: "read_only" as const,
+          status: "done" as const,
+          output: typeof tc.output === "string" ? tc.output : undefined,
+        })),
         approvals: [],
       }));
       set({
@@ -483,13 +524,14 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     const trimmed = newTitle.trim();
     if (!trimmed) return;
     try {
-      await activeClient.request("conversation.rename", {
+      const res = await activeClient.request("conversation.rename", {
         session_id: sessionId,
         title: trimmed,
       });
+      const finalTitle = res.title || trimmed;
       set((state) => ({
         conversations: state.conversations.map((c) =>
-          c.session_id === sessionId ? { ...c, title: trimmed } : c,
+          c.session_id === sessionId ? { ...c, title: finalTitle } : c,
         ),
       }));
     } catch (err) {
@@ -613,7 +655,11 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     }
     set({ undoToast: null });
     try {
-      await activeClient.request("conversation.undo_delete", { session_id: target });
+      const paramSid = target === "*" ? undefined : target || undefined;
+      await activeClient.request(
+        "conversation.undo_delete",
+        paramSid ? { session_id: paramSid } : {},
+      );
       await get().loadConversations();
     } catch (err) {
       set({ lastError: err instanceof Error ? err.message : String(err) });
@@ -861,19 +907,57 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       }
       case "conversation_updated": {
         const d = event.data;
-        set((state) => ({
-          conversations: state.conversations.map((c) =>
-            c.session_id === d.session_id
-              ? {
-                  ...c,
-                  title: d.title ?? c.title,
-                  pinned: typeof d.pinned === "boolean" ? d.pinned : c.pinned,
-                  turns: d.turns ?? c.turns,
-                  updated_at: d.updated_at ?? c.updated_at,
-                }
-              : c,
-          ),
-        }));
+        set((state) => {
+          let nextMessages = state.messages;
+          if (state.sessionId && state.sessionId === d.session_id) {
+            if (d.user_message) {
+              const userMsgId = `user-${d.request_id || nextRequestId()}`;
+              const exists = state.messages.some((m) => m.id === userMsgId);
+              if (!exists) {
+                const userMsg: ChatMessage = {
+                  id: userMsgId,
+                  role: "user",
+                  content: d.user_message,
+                  streaming: false,
+                  toolCalls: [],
+                  approvals: [],
+                };
+                const assistantMsgId = d.request_id || nextRequestId();
+                const assistantMsg: ChatMessage = {
+                  id: assistantMsgId,
+                  role: "assistant",
+                  content: "",
+                  streaming: true,
+                  toolCalls: [],
+                  approvals: [],
+                };
+                nextMessages = [...state.messages, userMsg, assistantMsg];
+              }
+            }
+            if (d.assistant_message) {
+              nextMessages = updateAssistantByRequest(nextMessages, d.request_id, (m) => ({
+                ...m,
+                content: d.assistant_message || m.content,
+                streaming: false,
+              }));
+            }
+          }
+
+          return {
+            messages: nextMessages,
+            conversations: state.conversations.map((c) =>
+              c.session_id === d.session_id
+                ? {
+                    ...c,
+                    title: d.title ?? c.title,
+                    pinned: typeof d.pinned === "boolean" ? d.pinned : c.pinned,
+                    turns: d.turns ?? c.turns,
+                    updated_at: d.updated_at ?? c.updated_at,
+                  }
+                : c,
+            ),
+          };
+        });
         void get().loadConversations();
         break;
       }
@@ -898,7 +982,16 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         break;
       }
       case "error": {
-        set({ lastError: event.data.message });
+        set((state) => ({
+          lastError: event.data.message,
+          messages: event.request_id
+            ? updateAssistantByRequest(state.messages, event.request_id, (m) => ({
+                ...m,
+                streaming: false,
+                error: event.data.message,
+              }))
+            : state.messages,
+        }));
         break;
       }
     }

@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import shutil
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -722,21 +723,38 @@ class MemoryStore:
             dst_path.unlink()
         shutil.move(str(src_path), str(dst_path))
 
+        meta_path = self.trash_dir / f"{session_id}.meta.json"
+        meta_data = {
+            "session_id": session_id,
+            "deleted_at": time.time(),
+            "delete_episodes": delete_episodes,
+        }
+        meta_path.write_text(json.dumps(meta_data), encoding="utf-8")
+
         if delete_episodes:
-            self.delete_episode(session_id)
+            self.delete_episode(session_id, backup_in_trash=True)
 
         return dst_path
 
     def delete_all_transcripts(self) -> int:
         """Soft delete all transcripts into trash."""
         self.trash_dir.mkdir(parents=True, exist_ok=True)
+        now_ts = time.time()
         count = 0
         if self.transcripts_dir.is_dir():
             for p in self.transcripts_dir.glob("*.jsonl"):
+                sid = p.stem
                 dst = self.trash_dir / p.name
                 if dst.exists():
                     dst.unlink()
                 shutil.move(str(p), str(dst))
+                meta_path = self.trash_dir / f"{sid}.meta.json"
+                meta_data = {
+                    "session_id": sid,
+                    "deleted_at": now_ts,
+                    "delete_episodes": False,
+                }
+                meta_path.write_text(json.dumps(meta_data), encoding="utf-8")
                 count += 1
         return count
 
@@ -745,7 +763,10 @@ class MemoryStore:
         if not self.trash_dir.is_dir():
             return []
         restored: list[str] = []
-        if session_id:
+        is_restore_all = not session_id or session_id in ("*", "all")
+
+        if not is_restore_all:
+            assert session_id is not None
             self.validate_session_id(session_id)
             src = self.trash_dir / f"{session_id}.jsonl"
             if src.exists():
@@ -753,6 +774,8 @@ class MemoryStore:
                 if dst.exists():
                     dst.unlink()
                 shutil.move(str(src), str(dst))
+                self._restore_episode_from_trash(session_id)
+                (self.trash_dir / f"{session_id}.meta.json").unlink(missing_ok=True)
                 restored.append(session_id)
         else:
             for p in list(self.trash_dir.glob("*.jsonl")):
@@ -763,25 +786,40 @@ class MemoryStore:
                     if dst.exists():
                         dst.unlink()
                     shutil.move(str(p), str(dst))
+                    self._restore_episode_from_trash(sid)
+                    (self.trash_dir / f"{sid}.meta.json").unlink(missing_ok=True)
                     restored.append(sid)
                 except Exception:
                     continue
         return restored
 
-    def purge_trash(self) -> int:
-        """Permanently delete all files in the trash folder."""
+    def purge_trash(self, min_age_seconds: float = 0.0) -> int:
+        """Permanently delete files in the trash folder that exceed min_age_seconds."""
         if not self.trash_dir.is_dir():
             return 0
+        now = time.time()
         count = 0
         for p in list(self.trash_dir.glob("*.jsonl")):
-            try:
-                p.unlink()
-                count += 1
-            except Exception as exc:
-                logger.warning("Could not purge trash file %s: %s", p, exc)
+            sid = p.stem
+            meta_path = self.trash_dir / f"{sid}.meta.json"
+            deleted_at = p.stat().st_mtime
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    deleted_at = float(meta.get("deleted_at", deleted_at))
+                except Exception:
+                    pass
+            if min_age_seconds <= 0 or (now - deleted_at) >= min_age_seconds:
+                try:
+                    p.unlink(missing_ok=True)
+                    meta_path.unlink(missing_ok=True)
+                    (self.trash_dir / f"{sid}.episode.json").unlink(missing_ok=True)
+                    count += 1
+                except Exception as exc:
+                    logger.warning("Could not purge trash file %s: %s", p, exc)
         return count
 
-    def delete_episode(self, session_id: str) -> bool:
+    def delete_episode(self, session_id: str, *, backup_in_trash: bool = False) -> bool:
         """Remove session episode entry from memory/episodes/*.md."""
         if not self.episodes_dir.is_dir():
             return False
@@ -793,8 +831,18 @@ class MemoryStore:
         for f in self.episodes_dir.glob("*.md"):
             try:
                 content = f.read_text(encoding="utf-8")
-                new_content = pattern.sub("", content).strip()
-                if new_content != content.strip():
+                match = pattern.search(content)
+                if match:
+                    if backup_in_trash:
+                        self.trash_dir.mkdir(parents=True, exist_ok=True)
+                        ep_backup = self.trash_dir / f"{session_id}.episode.json"
+                        ep_data = {
+                            "session_id": session_id,
+                            "day": f.stem,
+                            "raw_entry": match.group(0),
+                        }
+                        ep_backup.write_text(json.dumps(ep_data), encoding="utf-8")
+                    new_content = pattern.sub("", content).strip()
                     if new_content and new_content != f"# Episodes — {f.stem}".strip():
                         f.write_text(new_content + "\n", encoding="utf-8")
                     else:
@@ -803,6 +851,32 @@ class MemoryStore:
             except Exception as exc:
                 logger.warning("Error deleting episode for session %s: %s", session_id, exc)
         return modified
+
+    def _restore_episode_from_trash(self, session_id: str) -> bool:
+        ep_backup = self.trash_dir / f"{session_id}.episode.json"
+        if not ep_backup.exists():
+            return False
+        try:
+            ep_data = json.loads(ep_backup.read_text(encoding="utf-8"))
+            day = ep_data.get("day")
+            raw_entry = ep_data.get("raw_entry", "")
+            if day and raw_entry:
+                day_path = self.episodes_dir / f"{day}.md"
+                if not day_path.exists():
+                    day_path.write_text(
+                        f"# Episodes — {day}\n\n{raw_entry.strip()}\n", encoding="utf-8"
+                    )
+                else:
+                    current_text = day_path.read_text(encoding="utf-8")
+                    if raw_entry.strip() not in current_text:
+                        day_path.write_text(
+                            f"{current_text.rstrip()}\n\n{raw_entry.strip()}\n", encoding="utf-8"
+                        )
+            ep_backup.unlink(missing_ok=True)
+            return True
+        except Exception as exc:
+            logger.warning("Could not restore episode for session %s: %s", session_id, exc)
+            return False
 
     def export_transcript_markdown(self, session_id: str) -> tuple[str, str]:
         """Export a transcript as clean Markdown with short tool summaries."""
@@ -834,7 +908,9 @@ class MemoryStore:
                         name = tc.get("name", "tool")
                         args = tc.get("arguments", {})
                         arg_str = ", ".join(f"{k}={v!r}" for k, v in list(args.items())[:3])[:60]
-                        lines.append(f"> *Used tool `{name}` ({arg_str})*\n")
+                        output = tc.get("output", "")
+                        out_summary = f" -> {str(output).strip()[:60]}" if output else ""
+                        lines.append(f"> *Used tool `{name}` ({arg_str}){out_summary}*\n")
                 if text:
                     lines.append(f"{text.strip()}\n")
         slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", title.lower()).strip("-")[:30] or "chat"

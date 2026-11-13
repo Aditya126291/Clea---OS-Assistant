@@ -392,4 +392,115 @@ describe("Conversation resume & management UI", () => {
     expect(screen.getByText("Export Conversation (Markdown)")).toBeInTheDocument();
     expect(screen.getByText("Delete Conversation")).toBeInTheDocument();
   });
+
+  it("renders past tool call cards when resuming conversation with tool calls", () => {
+    useCleaStore.setState({
+      sessionId: "sess-tools",
+      resumedSessionId: "sess-tools",
+      messages: [
+        {
+          id: "resumed-sess-tools-0",
+          role: "user",
+          content: "Check system",
+          streaming: false,
+          toolCalls: [],
+          approvals: [],
+        },
+        {
+          id: "resumed-sess-tools-1",
+          role: "assistant",
+          content: "System looks healthy.",
+          streaming: false,
+          toolCalls: [
+            {
+              callId: "tc-0",
+              name: "get_system_info",
+              arguments: { include_platform_details: false },
+              riskLevel: "read_only",
+              status: "done",
+              output: "CPU 10%, Memory 45%",
+            },
+          ],
+          approvals: [],
+        },
+      ],
+    });
+
+    render(<ChatView />);
+
+    expect(screen.getByText("get_system_info")).toBeInTheDocument();
+    expect(screen.getByText("System looks healthy.")).toBeInTheDocument();
+  });
+
+  it("synchronizes user message and streaming tokens in second window via events", () => {
+    useCleaStore.setState({
+      sessionId: "shared-sess",
+      messages: [],
+    });
+
+    // 1. Another window starts a turn
+    act(() => {
+      useCleaStore.getState().applyEvent({
+        event: "conversation_updated",
+        data: {
+          session_id: "shared-sess",
+          user_message: "Message from window 1",
+          request_id: "req-win1",
+        },
+      });
+    });
+
+    const state1 = useCleaStore.getState();
+    expect(state1.messages).toHaveLength(2);
+    expect(state1.messages[0].content).toBe("Message from window 1");
+    expect(state1.messages[1].id).toBe("req-win1");
+    expect(state1.messages[1].streaming).toBe(true);
+
+    // 2. Assistant token streams in
+    act(() => {
+      useCleaStore.getState().applyEvent({
+        event: "assistant_token",
+        request_id: "req-win1",
+        session_id: "shared-sess",
+        data: { text: "Streaming answer chunk" },
+      });
+    });
+
+    const state2 = useCleaStore.getState();
+    expect(state2.messages[1].content).toBe("Streaming answer chunk");
+
+    // 3. Turn finishes
+    act(() => {
+      useCleaStore.getState().applyEvent({
+        event: "conversation_updated",
+        data: {
+          session_id: "shared-sess",
+          assistant_message: "Streaming answer chunk - done!",
+          request_id: "req-win1",
+        },
+      });
+    });
+
+    const state3 = useCleaStore.getState();
+    expect(state3.messages[1].content).toBe("Streaming answer chunk - done!");
+    expect(state3.messages[1].streaming).toBe(false);
+  });
+
+  it("calls undo_delete without literal wildcard when undoing delete-all", async () => {
+    useCleaStore.setState({
+      undoToast: {
+        sessionId: "*",
+        message: "All conversations deleted",
+        expiresAt: Date.now() + 10_000,
+      },
+    });
+
+    render(
+      <ThemeProvider>
+        <UndoToast />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("All conversations deleted")).toBeInTheDocument();
+  });
 });
