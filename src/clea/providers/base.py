@@ -28,6 +28,18 @@ class Message(BaseModel):
     tool_call_id: str | None = None
     tool_name: str | None = None
     is_error: bool = False
+    thought_signature: str | None = None
+    thought_signature: str | None = None
+
+
+class TokenUsage(BaseModel):
+    """Token counts reported by the LLM provider for a single model call."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    thought_tokens: int | None = None
+    cached_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class StreamChunk(BaseModel):
@@ -36,6 +48,8 @@ class StreamChunk(BaseModel):
     type: Literal["text_delta", "tool_call", "done"]
     text: str = ""
     tool_call: ToolCall | None = None
+    usage: TokenUsage | None = None
+    thought_signature: str | None = None
 
 
 class LLMProvider(ABC):
