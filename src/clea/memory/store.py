@@ -595,6 +595,17 @@ class MemoryStore:
     def transcript_path(self, session_id: str) -> Path:
         return self.transcripts_dir / f"{session_id}.jsonl"
 
+    def resolve_session_id(self, session_id: str) -> str:
+        """Resolve an exact or prefix session_id to full session_id if unique."""
+        path = self.transcript_path(session_id)
+        if path.exists():
+            return session_id
+        if self.transcripts_dir.exists():
+            matches = list(self.transcripts_dir.glob(f"{session_id}*.jsonl"))
+            if len(matches) == 1:
+                return matches[0].stem
+        return session_id
+
     def append_transcript_message(
         self,
         *,
@@ -665,23 +676,34 @@ class MemoryStore:
 
     def get_transcript(self, session_id: str) -> dict[str, Any] | None:
         """Read full structured transcript for a session."""
-        path = self.transcript_path(session_id)
+        resolved_id = self.resolve_session_id(session_id)
+        path = self.transcript_path(resolved_id)
         if not path.exists():
             return None
 
         messages: list[dict[str, Any]] = []
         header: dict[str, Any] = {}
-        with path.open("r", encoding="utf-8") as handle:
-            first_line = handle.readline()
-            if first_line:
-                header = json.loads(first_line)
-            for line in handle:
-                line_str = line.strip()
-                if line_str:
-                    messages.append(json.loads(line_str))
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                first_line = handle.readline()
+                if first_line:
+                    try:
+                        header = json.loads(first_line)
+                    except json.JSONDecodeError:
+                        header = {}
+                for line in handle:
+                    line_str = line.strip()
+                    if line_str:
+                        try:
+                            messages.append(json.loads(line_str))
+                        except json.JSONDecodeError:
+                            logger.warning("Skipping corrupted transcript line in %s", path)
+        except Exception as exc:
+            logger.warning("Failed to read transcript for %s: %s", session_id, exc)
+            return None
 
         return {
-            "session_id": header.get("session_id", session_id),
+            "session_id": header.get("session_id", resolved_id),
             "started_at": header.get("started_at", ""),
             "title": header.get("title", "Conversation"),
             "messages": messages,
@@ -789,8 +811,12 @@ class MemoryStore:
                         "title": item.get("title", "Conversation"),
                         "turns": (item.get("message_count", 0) + 1) // 2,
                         "last_time": last_time_str,
+                        "_sort_key": f"{date_str} {started}",
                     }
                 )
+            conversations.sort(key=lambda c: str(c.get("_sort_key", "")), reverse=True)
+            for c in conversations:
+                c.pop("_sort_key", None)
             return conversations
 
         for day in self.list_days():

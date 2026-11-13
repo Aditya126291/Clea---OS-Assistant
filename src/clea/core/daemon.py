@@ -572,21 +572,25 @@ class CleaDaemon:
             )
         elif method == "memory.reconsolidate":
             sid = req.params.session_id
+            resolved_sid = self.agent.memory.resolve_session_id(sid)
 
             async def _on_reconsolidate_status(st: str, detail: str | None = None) -> None:
-                await self._emit_consolidation_task_status(sid, st, detail)
+                await self._emit_consolidation_task_status(resolved_sid, st, detail)
 
             ok = await self.consolidation.reconsolidate_session(
                 sid, on_task_status=_on_reconsolidate_status
             )
-            state_info = self.consolidation.load_state().get("sessions", {}).get(sid, {})
+            state_info = (
+                self.consolidation.load_state().get("sessions", {}).get(resolved_sid)
+                or self.consolidation.load_state().get("sessions", {}).get(sid, {})
+            )
             current_status = state_info.get("status", "completed" if ok else "failed")
             err = state_info.get("last_error") or state_info.get("error") if not ok else None
             await self._respond(
                 ws,
                 req,
                 METHOD_RESULTS[method](
-                    session_id=sid,
+                    session_id=resolved_sid,
                     ok=ok,
                     status=current_status,
                     error=err,

@@ -461,3 +461,109 @@ async def test_daemon_protocol_memory_status_and_reconsolidate(tmp_path: Path) -
             assert "User prefers dark mode." in store.read_long_term()
     finally:
         await daemon.stop()
+
+
+def test_default_min_user_turns_is_two_without_explicit_kwarg(tmp_path: Path) -> None:
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+    provider = _RecordingProvider([])
+    # Instantiate without min_user_turns argument
+    manager = ConsolidationManager(memory=store, provider=provider)
+    assert manager.min_user_turns == 2
+
+
+async def test_reconsolidate_resolves_short_session_id_prefix(tmp_path: Path) -> None:
+    """clea memory reconsolidate 67727ff3 succeeds even if the full ID is 32-hex characters."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    full_session_id = "67727ff3abcdef1234567890abcdef12"
+    store.append_transcript_message(
+        session_id=full_session_id,
+        role="user",
+        text="My desktop machine is lenovoloq.",
+    )
+    store.append_transcript_message(
+        session_id=full_session_id,
+        role="assistant",
+        text="Understood.",
+    )
+    store.append_transcript_message(
+        session_id=full_session_id,
+        role="user",
+        text="It runs Windows 11.",
+    )
+
+    valid_json = json.dumps(
+        {
+            "summary": "User desktop machine is lenovoloq on Windows 11.",
+            "operations": [
+                {
+                    "op": "add",
+                    "target_section": "Environment",
+                    "text": "Desktop machine is lenovoloq running Windows 11.",
+                }
+            ],
+        }
+    )
+    provider = _RecordingProvider([valid_json])
+    manager = ConsolidationManager(memory=store, provider=provider)
+
+    # Call with 8-character prefix as in user incident
+    ok = await manager.reconsolidate_session("67727ff3")
+    assert ok is True
+    assert provider.call_count == 1
+    assert "lenovoloq" in store.read_long_term()
+
+
+def test_get_transcript_handles_corrupted_lines_gracefully(tmp_path: Path) -> None:
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    sess_id = "sess-corrupted-jsonl"
+    path = store.transcript_path(sess_id)
+    # Write a valid header, a corrupted middle line, and a valid message
+    path.write_text(
+        json.dumps({"session_id": sess_id, "title": "Corrupted Session"})
+        + "\n"
+        + "{malformed json line that is incomplete\n"
+        + json.dumps({"role": "user", "text": "Valid message after corruption."})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    transcript = store.get_transcript(sess_id)
+    assert transcript is not None
+    assert transcript["title"] == "Corrupted Session"
+    assert len(transcript["messages"]) == 1
+    assert transcript["messages"][0]["text"] == "Valid message after corruption."
+
+
+def test_extract_json_block_handles_nested_code_fences_and_backticks() -> None:
+    from clea.memory.consolidation import _extract_json_block
+
+    # Markdown code fence with nested code block and backticks inside a fact string
+    raw_response = (
+        "Here is the requested consolidation JSON:\n"
+        "```json\n"
+        "{\n"
+        '  "summary": "Discussed code formatting.",\n'
+        '  "operations": [\n'
+        "    {\n"
+        '      "op": "add",\n'
+        '      "target_section": "Preferences",\n'
+        '      "text": "Prefers snippet: ```python\\nprint(\'hello\')\\n``` for python files",\n'
+        '      "source_tag": "stated",\n'
+        '      "reason": "Explicit preference"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "```\n"
+        "Hope this helps!"
+    )
+
+    extracted = _extract_json_block(raw_response)
+    parsed = json.loads(extracted)
+    assert parsed["summary"] == "Discussed code formatting."
+    assert "print('hello')" in parsed["operations"][0]["text"]
+

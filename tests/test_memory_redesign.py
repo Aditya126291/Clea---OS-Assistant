@@ -215,7 +215,7 @@ async def test_consolidation_success_and_crash_recovery(tmp_path: Path) -> None:
     store = MemoryStore(base_dir=tmp_path)
     store.ensure_initialized()
 
-    # Append a session transcript
+    # Append a session transcript (2 turns so not skipped as trivial)
     store.append_transcript_message(
         session_id="s-cons-1",
         role="user",
@@ -226,6 +226,16 @@ async def test_consolidation_success_and_crash_recovery(tmp_path: Path) -> None:
         session_id="s-cons-1",
         role="assistant",
         text="Understood, Clea is a local desktop assistant.",
+    )
+    store.append_transcript_message(
+        session_id="s-cons-1",
+        role="user",
+        text="Clea should store memory locally in markdown files.",
+    )
+    store.append_transcript_message(
+        session_id="s-cons-1",
+        role="assistant",
+        text="Got it, local markdown memory.",
     )
 
     valid_json = json.dumps(
@@ -292,6 +302,16 @@ async def test_consolidation_invalid_json_retries_once_then_marks_failed(tmp_pat
         session_id="s-bad-json",
         role="user",
         text="Hello world",
+    )
+    store.append_transcript_message(
+        session_id="s-bad-json",
+        role="assistant",
+        text="Hi there",
+    )
+    store.append_transcript_message(
+        session_id="s-bad-json",
+        role="user",
+        text="Please save that I like python",
     )
 
     # Provider returns invalid JSON both on attempt 1 and attempt 2 (retry)

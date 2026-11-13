@@ -129,10 +129,29 @@ def sanitize_error(error_str: str) -> str:
 def _extract_json_block(text: str) -> str:
     """Extract JSON from raw text or markdown code fence."""
     cleaned = text.strip()
+    # If the text is directly valid JSON, return it as-is
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        try:
+            json.loads(cleaned)
+            return cleaned
+        except Exception:
+            pass
+
+    # If the text is wrapped in code fences, extract the inner content
     if cleaned.startswith("```"):
-        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
-        if match:
-            return match.group(1).strip()
+        first_newline = cleaned.find("\n")
+        last_fence = cleaned.rfind("```")
+        if first_newline != -1 and last_fence > first_newline:
+            inner = cleaned[first_newline + 1 : last_fence].strip()
+            if inner.startswith("{") and inner.endswith("}"):
+                try:
+                    json.loads(inner)
+                    return inner
+                except Exception:
+                    pass
+            cleaned = inner
+
+    # Find the outermost matching braces { ... }
     first_brace = cleaned.find("{")
     last_brace = cleaned.rfind("}")
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
@@ -161,9 +180,9 @@ class ConsolidationManager:
             try:
                 self.min_user_turns = int(env_min_turns)
             except ValueError:
-                self.min_user_turns = 1
+                self.min_user_turns = DEFAULT_MIN_USER_TURNS
         else:
-            self.min_user_turns = 1
+            self.min_user_turns = DEFAULT_MIN_USER_TURNS
 
         self.state_file = self.memory.memory_dir / "consolidation_state.json"
         self.pending_file = self.memory.memory_dir / "pending_sessions.json"
@@ -202,12 +221,23 @@ class ConsolidationManager:
 
     def is_consolidated(self, session_id: str) -> bool:
         state = self.load_state()
-        entry = state.get("sessions", {}).get(session_id)
+        resolved_sid = self.memory.resolve_session_id(session_id)
+        sessions = state.get("sessions", {})
+        entry = sessions.get(resolved_sid) or sessions.get(session_id)
         return bool(entry and entry.get("status") == "completed")
 
     def _get_response_format_kwargs(self) -> dict[str, Any]:
         """Build schema-constrained response format if supported by provider."""
         schema = ConsolidationOutput.model_json_schema()
+        # Flatten $defs into inline schema for flat OpenAPI 3.0 / Gemini compatibility
+        defs = schema.pop("$defs", {})
+        if defs and "operations" in schema.get("properties", {}):
+            op_def = defs.get("ConsolidationOperation")
+            if op_def and schema["properties"]["operations"].get("items") == {
+                "$ref": "#/$defs/ConsolidationOperation"
+            }:
+                schema["properties"]["operations"]["items"] = op_def
+
         response_format = {
             "type": "text",
             "mime_type": "application/json",
@@ -495,15 +525,32 @@ class ConsolidationManager:
     ) -> bool:
         """Manually trigger reconsolidation for a session, bypassing backoff."""
         logger.info("Manual reconsolidation requested for session %s", session_id)
-        transcript = self.memory.get_transcript(session_id)
+        resolved_sid = self.memory.resolve_session_id(session_id)
+        if resolved_sid == session_id:
+            # Check state/pending for prefix match
+            state = self.load_state()
+            state_sessions = state.get("sessions", {})
+            matching = [k for k in state_sessions if k.startswith(session_id)]
+            if len(matching) == 1:
+                resolved_sid = matching[0]
+            else:
+                pending = self.load_pending().get("sessions", {})
+                p_matching = [k for k in pending if k.startswith(session_id)]
+                if len(p_matching) == 1:
+                    resolved_sid = p_matching[0]
+
+        transcript = self.memory.get_transcript(resolved_sid)
         if not transcript:
             logger.warning("Cannot reconsolidate session %s: transcript not found", session_id)
             return False
-        return await self.consolidate_session(session_id, force=True, on_task_status=on_task_status)
+        return await self.consolidate_session(
+            resolved_sid, force=True, on_task_status=on_task_status
+        )
 
     async def run_crash_recovery(
         self,
         *,
+        ignore_backoff: bool = True,
         on_task_status: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         task_callback: Any = None,
     ) -> int:
@@ -527,15 +574,18 @@ class ConsolidationManager:
                 p_info = pending_data[sid]
                 retries = int(p_info.get("retry_count", 0))
                 if retries < MAX_CONSOLIDATION_RETRIES:
-                    next_retry_str = p_info.get("next_retry_at")
-                    if next_retry_str:
-                        try:
-                            if now >= datetime.fromisoformat(next_retry_str):
-                                should_process = True
-                        except Exception:
-                            should_process = True
-                    else:
+                    if ignore_backoff:
                         should_process = True
+                    else:
+                        next_retry_str = p_info.get("next_retry_at")
+                        if next_retry_str:
+                            try:
+                                if now >= datetime.fromisoformat(next_retry_str):
+                                    should_process = True
+                            except Exception:
+                                should_process = True
+                        else:
+                            should_process = True
 
             if should_process:
                 logger.info(
