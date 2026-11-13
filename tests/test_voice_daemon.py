@@ -422,3 +422,68 @@ async def test_daemon_voice_start_call_rejects_ending_state(tmp_path: Path) -> N
             assert isinstance(resp, ResponseFrame) and not resp.ok
     finally:
         await daemon.stop()
+
+
+async def test_daemon_voice_start_call_returns_memory_context_and_end_call_persists_transcript(
+    tmp_path: Path,
+) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    mem.add_or_update_entry(
+        text="User lives in Bangalore.",
+        section="Environment",
+        source="stated",
+    )
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeVoiceTaskProvider(),
+        memory=mem,
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            # 1. Start call
+            await ws.send(VoiceStartCallRequest().model_dump_json())
+            # Consume broadcast event
+            ev = parse_frame(await ws.recv())
+            assert isinstance(ev, CallStartedEvent)
+            # ResponseFrame
+            resp = parse_frame(await ws.recv())
+            assert isinstance(resp, ResponseFrame) and resp.ok
+            assert resp.result.get("call_id") is not None
+            assert "User lives in Bangalore." in resp.result.get("memory_context", "")
+
+            call_id = resp.result["call_id"]
+
+            # 2. End call with transcript
+            transcript = [
+                {"role": "user", "text": "What is the capital of India?"},
+                {"role": "assistant", "text": "New Delhi."},
+            ]
+            end_req = VoiceEndCallRequest(
+                params=VoiceEndCallParams(
+                    call_id=call_id,
+                    reason="user_done",
+                    transcript=transcript,
+                )
+            )
+            await ws.send(end_req.model_dump_json())
+            ev_end = parse_frame(await ws.recv())
+            assert isinstance(ev_end, CallEndedEvent)
+            resp_end = parse_frame(await ws.recv())
+            assert isinstance(resp_end, ResponseFrame) and resp_end.ok
+
+            # 3. Check transcript was written to logs/transcripts/<call_id>.jsonl
+            tr = mem.get_transcript(call_id)
+            assert tr is not None
+            assert len(tr["messages"]) == 2
+            assert tr["messages"][0]["text"] == "What is the capital of India?"
+            assert tr["messages"][1]["text"] == "New Delhi."
+    finally:
+        await daemon.stop()

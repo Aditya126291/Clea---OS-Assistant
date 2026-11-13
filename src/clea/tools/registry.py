@@ -98,6 +98,22 @@ class AuditLogger:
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, default=str) + "\n")
 
+    def record_event(
+        self,
+        *,
+        action: str,
+        details: dict[str, Any],
+    ) -> None:
+        """Write an administrative event to audit.jsonl without logging conversation text."""
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "action": action,
+            "details": details,
+        }
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, default=str) + "\n")
+
 
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):

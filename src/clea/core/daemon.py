@@ -36,6 +36,11 @@ from clea.core.protocol import (
     CallStartedData,
     CallStartedEvent,
     CallState,
+    ConversationDeletedData,
+    ConversationDeletedEvent,
+    ConversationResumeMessage,
+    ConversationUpdatedData,
+    ConversationUpdatedEvent,
     EpisodeItem,
     ErrorData,
     ErrorEvent,
@@ -56,10 +61,10 @@ from clea.core.protocol import (
     new_id,
     parse_frame,
 )
-from clea.core.sessions import SessionManager
+from clea.core.sessions import Session, SessionManager
 from clea.memory.consolidation import ConsolidationManager
 from clea.memory.store import MemoryStore
-from clea.providers.base import LLMProvider, ToolCall
+from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
     RiskLevel,
@@ -180,6 +185,7 @@ class CleaDaemon:
         """Acquire single-instance lock, listen on localhost, and write the session token."""
         self.agent.memory.ensure_initialized()
         self.agent.memory.migrate_legacy_daily_logs()
+        self.agent.memory.purge_trash()
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
             self._server = await serve(
@@ -403,6 +409,53 @@ class CleaDaemon:
                 self._schedule_consolidation_now(conn.current_session_id)
             await conn.close()
 
+    def _schedule_trash_purge(self, delay_seconds: float = 15.0) -> None:
+        async def _purge_after_delay() -> None:
+            await asyncio.sleep(delay_seconds)
+            purged = self.agent.memory.purge_trash(min_age_seconds=10.0)
+            if purged > 0:
+                logger.info("Purged %d transcripts from trash", purged)
+
+        asyncio.create_task(_purge_after_delay())
+
+    def _audit_log(self, action: str, **details: Any) -> None:
+        try:
+            self.agent.registry._audit.record_event(action=action, details=details)
+        except Exception as exc:
+            logger.warning("Failed to record audit event %s: %s", action, exc)
+
+    def _resume_session_from_transcript(self, session_id: str) -> Session:
+        self.agent.memory.validate_session_id(session_id)
+        if session_id in self._busy_sessions:
+            raise ValueError("A turn is currently running for this session.")
+
+        session = Session(id=session_id)
+        transcript = self.agent.memory.get_transcript(session_id)
+        if transcript:
+            for msg in transcript.get("messages", []):
+                role = msg.get("role")
+                text = msg.get("text", "")
+                tool_calls = msg.get("tool_calls", [])
+                if role == "user":
+                    session.messages.append(Message(role="user", content=text))
+                elif role == "assistant":
+                    tool_notes: list[str] = []
+                    if tool_calls:
+                        for tc in tool_calls:
+                            tname = tc.get("name", "tool")
+                            targs = tc.get("arguments", {})
+                            items = list(targs.items())[:3]
+                            arg_summary = ", ".join(f"{k}={v!r}" for k, v in items)
+                            output = tc.get("output", "")
+                            out_summary = f": {str(output).strip()[:60]}" if output else ""
+                            tool_notes.append(f"[used tool {tname}: {arg_summary}{out_summary}]")
+                    notes_str = "\n".join(tool_notes)
+                    combined = f"{notes_str}\n\n{text}".strip() if notes_str else text
+                    session.messages.append(Message(role="assistant", content=combined))
+            self.agent._apply_history_cap(session)
+        self.sessions._sessions[session.id] = session
+        return session
+
     async def _respond(
         self,
         ws: ServerConnection,
@@ -583,15 +636,16 @@ class CleaDaemon:
             await self._respond(
                 ws, req, METHOD_RESULTS[method](date=req.params.date, content=content)
             )
-        elif method == "conversations.list":
+        elif method in ("conversations.list", "conversation.list"):
             await self._respond(
                 ws,
                 req,
                 METHOD_RESULTS[method](conversations=self.agent.memory.list_conversations()),
             )
-        elif method == "conversations.get":
+        elif method in ("conversations.get", "conversation.get"):
             try:
-                turns = self.agent.memory.get_conversation(req.params.date, req.params.session_id)
+                date_val = getattr(req.params, "date", "") or ""
+                turns = self.agent.memory.get_conversation(date_val, req.params.session_id)
             except ValueError as exc:
                 await self._respond(ws, req, error=str(exc))
                 return
@@ -599,8 +653,194 @@ class CleaDaemon:
                 ws,
                 req,
                 METHOD_RESULTS[method](
-                    date=req.params.date, session_id=req.params.session_id, turns=turns
+                    date=date_val, session_id=req.params.session_id, turns=turns
                 ),
+            )
+        elif method == "conversation.resume":
+            session_id = req.params.session_id
+            if session_id in self._busy_sessions:
+                await self._respond(ws, req, error="A turn is currently running for this session.")
+                return
+            try:
+                self.agent.memory.validate_session_id(session_id)
+                session = self._resume_session_from_transcript(session_id)
+                transcript = self.agent.memory.get_transcript(session_id)
+                if not transcript:
+                    await self._respond(ws, req, error=f"Conversation {session_id} not found.")
+                    return
+            except (ValueError, FileNotFoundError) as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+
+            conn.current_session_id = session.id
+            resume_messages = [
+                ConversationResumeMessage(
+                    role="user" if m.get("role") == "user" else "assistant",
+                    text=m.get("text", ""),
+                    timestamp=m.get("timestamp", ""),
+                    tool_calls=m.get("tool_calls", []) or [],
+                )
+                for m in transcript.get("messages", [])
+            ]
+            pinned = bool(transcript.get("pinned", False))
+            title = transcript.get("title", "Conversation")
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    session_id=session.id,
+                    title=title,
+                    pinned=pinned,
+                    messages=resume_messages,
+                ),
+                session_id=session.id,
+            )
+        elif method == "conversation.rename":
+            session_id = req.params.session_id
+            new_title = req.params.title
+            try:
+                header = self.agent.memory.update_transcript_header(session_id, title=new_title)
+            except (ValueError, FileNotFoundError) as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+            clean_title = header.get("title", new_title)
+            await self._broadcast(
+                ConversationUpdatedEvent(
+                    session_id=session_id,
+                    data=ConversationUpdatedData(session_id=session_id, title=clean_title),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](session_id=session_id, title=clean_title),
+                session_id=session_id,
+            )
+        elif method == "conversation.pin":
+            session_id = req.params.session_id
+            pinned = req.params.pinned
+            try:
+                header = self.agent.memory.update_transcript_header(session_id, pinned=pinned)
+            except (ValueError, FileNotFoundError) as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+            await self._broadcast(
+                ConversationUpdatedEvent(
+                    session_id=session_id,
+                    data=ConversationUpdatedData(session_id=session_id, pinned=pinned),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](session_id=session_id, pinned=pinned),
+                session_id=session_id,
+            )
+        elif method == "conversation.export":
+            session_id = req.params.session_id
+            try:
+                filename, content = self.agent.memory.export_transcript_markdown(session_id)
+                transcript = self.agent.memory.get_transcript(session_id)
+                title = transcript.get("title", "Conversation") if transcript else "Conversation"
+            except (ValueError, FileNotFoundError) as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    session_id=session_id,
+                    title=title,
+                    filename=filename,
+                    content=content,
+                ),
+                session_id=session_id,
+            )
+        elif method == "conversation.delete":
+            session_id = req.params.session_id
+            if session_id in self._busy_sessions:
+                await self._respond(
+                    ws, req, error="Cannot delete conversation while a turn is running."
+                )
+                return
+            delete_episodes = req.params.delete_episodes
+            try:
+                self.agent.memory.delete_transcript(session_id, delete_episodes=delete_episodes)
+            except (ValueError, FileNotFoundError) as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+
+            self._audit_log(
+                "conversation_delete",
+                session_id=session_id,
+                delete_episodes=delete_episodes,
+            )
+            self.sessions._sessions.pop(session_id, None)
+            for c in list(self._connections):
+                if c.current_session_id == session_id:
+                    c.current_session_id = None
+
+            self._schedule_trash_purge(delay_seconds=15.0)
+
+            await self._broadcast(
+                ConversationDeletedEvent(
+                    session_id=session_id,
+                    data=ConversationDeletedData(session_ids=[session_id], all=False),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](session_id=session_id, deleted=True, undo_window_seconds=10),
+                session_id=session_id,
+            )
+        elif method == "conversation.delete_all":
+            if self._busy_sessions:
+                await self._respond(
+                    ws, req, error="Cannot delete conversations while a turn is running."
+                )
+                return
+            if req.params.confirmation != "DELETE":
+                await self._respond(ws, req, error="Confirmation string 'DELETE' required.")
+                return
+
+            count = self.agent.memory.delete_all_transcripts()
+            self._audit_log("conversation_delete_all", deleted_count=count)
+            self.sessions._sessions.clear()
+            for c in list(self._connections):
+                c.current_session_id = None
+
+            self._schedule_trash_purge(delay_seconds=15.0)
+
+            await self._broadcast(
+                ConversationDeletedEvent(
+                    data=ConversationDeletedData(session_ids=[], all=True),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](deleted_count=count, undo_window_seconds=10),
+            )
+        elif method == "conversation.undo_delete":
+            session_id = req.params.session_id
+            if session_id in ("", "*", "all"):
+                session_id = None
+            try:
+                restored = self.agent.memory.undo_delete_transcript(session_id)
+            except ValueError as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+            self._audit_log("conversation_undo_delete", session_ids=restored)
+            await self._broadcast(
+                ConversationUpdatedEvent(
+                    data=ConversationUpdatedData(session_id=session_id or ""),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](restored_count=len(restored), session_ids=restored),
             )
         elif method == "settings.get":
             await self._respond(ws, req, self._settings())
@@ -638,6 +878,7 @@ class CleaDaemon:
                     ),
                 )
             )
+            memory_ctx = self.agent.memory.build_injected_context()
             await self._respond(
                 ws,
                 req,
@@ -645,6 +886,7 @@ class CleaDaemon:
                     call_id=call_id,
                     call_state=self._call_state,
                     voice_state=self._voice_state,
+                    memory_context=memory_ctx or None,
                 ),
             )
         elif method == "voice.end_call":
@@ -677,6 +919,21 @@ class CleaDaemon:
             self._voice_state = "idle"
             self._screen_capture_active = False
             self._screen_capture_target = None
+
+            # If transcript is provided in req.params, persist to logs/transcripts/
+            # and schedule consolidation
+            if getattr(req.params, "transcript", None):
+                for entry in req.params.transcript:
+                    role = entry.get("role", "assistant")
+                    text = str(entry.get("text", "")).strip()
+                    if text:
+                        self.agent.memory.append_transcript_message(
+                            session_id=ended_id,
+                            role=role,
+                            text=text,
+                        )
+                self._schedule_consolidation_now(ended_id)
+
             await self._broadcast(
                 CallEndedEvent(
                     request_id=req.id,
@@ -734,7 +991,22 @@ class CleaDaemon:
 
     async def _chat_turn(self, conn: _Connection, req: Any, text: str) -> None:
         ws = conn.ws
-        session = self.sessions.get_or_create(req.session_id)
+        session_id = req.session_id
+        if session_id:
+            try:
+                self.agent.memory.validate_session_id(session_id)
+            except ValueError as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+
+        if session_id and self.sessions.get(session_id) is None:
+            try:
+                session = self._resume_session_from_transcript(session_id)
+            except Exception:
+                session = self.sessions.get_or_create(session_id)
+        else:
+            session = self.sessions.get_or_create(session_id)
+
         conn.current_session_id = session.id
         if session.id in self._busy_sessions:
             await self._respond(
@@ -747,9 +1019,28 @@ class CleaDaemon:
         started_at = _now_iso()
         title = " ".join(text.split())[:80]
 
+        async def broadcast_session_event(event: Any) -> None:
+            for c in list(self._connections):
+                if c.current_session_id == session.id or c.ws == ws:
+                    await self._send(c.ws, event)
+
+        # Notify other connections of turn start
+        for c in list(self._connections):
+            if c.ws != ws and c.current_session_id == session.id:
+                await self._send(
+                    c.ws,
+                    ConversationUpdatedEvent(
+                        session_id=session.id,
+                        data=ConversationUpdatedData(
+                            session_id=session.id,
+                            user_message=text,
+                            request_id=req.id,
+                        ),
+                    ),
+                )
+
         async def task_status(status: str, detail: str | None = None) -> None:
-            await self._send(
-                ws,
+            await broadcast_session_event(
                 TaskStatusEvent(
                     request_id=req.id,
                     session_id=session.id,
@@ -766,8 +1057,7 @@ class CleaDaemon:
             )
 
         async def on_text_delta(delta: str) -> None:
-            await self._send(
-                ws,
+            await broadcast_session_event(
                 AssistantTokenEvent(
                     request_id=req.id, session_id=session.id, data=AssistantTokenData(text=delta)
                 ),
@@ -783,8 +1073,7 @@ class CleaDaemon:
             state.current_call_id = call.id
             state.started[call.id] = time.monotonic()
             state.approval_wait[call.id] = 0.0
-            await self._send(
-                ws,
+            await broadcast_session_event(
                 ToolCallStartedEvent(
                     request_id=req.id,
                     session_id=session.id,
@@ -800,8 +1089,7 @@ class CleaDaemon:
         async def on_tool_end(call: ToolCall, output: str, is_error: bool) -> None:
             elapsed = time.monotonic() - state.started.pop(call.id, time.monotonic())
             elapsed -= state.approval_wait.pop(call.id, 0.0)
-            await self._send(
-                ws,
+            await broadcast_session_event(
                 ToolCallFinishedEvent(
                     request_id=req.id,
                     session_id=session.id,
@@ -820,8 +1108,8 @@ class CleaDaemon:
             call_id = state.current_call_id
             future: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
             conn.approvals[approval_id] = future
-            await self._send(
-                ws,
+            self._shared_approvals[approval_id] = future
+            await broadcast_session_event(
                 ApprovalRequestedEvent(
                     request_id=req.id,
                     session_id=session.id,
@@ -844,12 +1132,12 @@ class CleaDaemon:
                 decision, reason = "deny", "timeout"
             finally:
                 conn.approvals.pop(approval_id, None)
+                self._shared_approvals.pop(approval_id, None)
                 if call_id is not None:
                     state.approval_wait[call_id] = state.approval_wait.get(call_id, 0.0) + (
                         time.monotonic() - waited_from
                     )
-            await self._send(
-                ws,
+            await broadcast_session_event(
                 ApprovalResolvedEvent(
                     request_id=req.id,
                     session_id=session.id,
@@ -878,8 +1166,7 @@ class CleaDaemon:
             except Exception as exc:
                 logger.exception("Error while running agent turn")
                 await task_status("failed", str(exc))
-                await self._send(
-                    ws,
+                await broadcast_session_event(
                     ErrorEvent(
                         request_id=req.id,
                         session_id=session.id,
@@ -890,6 +1177,20 @@ class CleaDaemon:
                 return
 
             await task_status("succeeded")
+            for c in list(self._connections):
+                if c.ws != ws:
+                    await self._send(
+                        c.ws,
+                        ConversationUpdatedEvent(
+                            session_id=session.id,
+                            data=ConversationUpdatedData(
+                                session_id=session.id,
+                                assistant_message=reply,
+                                turns=(len(session.messages) + 1) // 2,
+                                request_id=req.id,
+                            ),
+                        ),
+                    )
             await self._respond(
                 ws, req, METHOD_RESULTS["chat.send"](text=reply), session_id=session.id
             )

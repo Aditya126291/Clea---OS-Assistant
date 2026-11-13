@@ -58,8 +58,39 @@ class DailyParams(_Model):
 
 
 class ConversationGetParams(_Model):
-    date: str = Field(description="ISO date, YYYY-MM-DD")
     session_id: str
+    date: str = Field(default="", description="ISO date, YYYY-MM-DD")
+
+
+class ConversationResumeParams(_Model):
+    session_id: str
+
+
+class ConversationRenameParams(_Model):
+    session_id: str
+    title: str
+
+
+class ConversationPinParams(_Model):
+    session_id: str
+    pinned: bool
+
+
+class ConversationExportParams(_Model):
+    session_id: str
+
+
+class ConversationDeleteParams(_Model):
+    session_id: str
+    delete_episodes: bool = False
+
+
+class ConversationDeleteAllParams(_Model):
+    confirmation: str
+
+
+class ConversationUndoDeleteParams(_Model):
+    session_id: str | None = None
 
 
 class VoiceStartCallParams(_Model):
@@ -69,6 +100,7 @@ class VoiceStartCallParams(_Model):
 class VoiceEndCallParams(_Model):
     call_id: str | None = None
     reason: str | None = None
+    transcript: list[dict[str, Any]] | None = None
 
 
 class VoiceDelegateTaskParams(_Model):
@@ -157,6 +189,51 @@ class ConversationsGetRequest(_Request):
     params: ConversationGetParams
 
 
+class ConversationListRequest(_Request):
+    method: Literal["conversation.list"] = "conversation.list"
+    params: _EmptyParams = Field(default_factory=_EmptyParams)
+
+
+class ConversationGetRequest(_Request):
+    method: Literal["conversation.get"] = "conversation.get"
+    params: ConversationGetParams
+
+
+class ConversationResumeRequest(_Request):
+    method: Literal["conversation.resume"] = "conversation.resume"
+    params: ConversationResumeParams
+
+
+class ConversationRenameRequest(_Request):
+    method: Literal["conversation.rename"] = "conversation.rename"
+    params: ConversationRenameParams
+
+
+class ConversationPinRequest(_Request):
+    method: Literal["conversation.pin"] = "conversation.pin"
+    params: ConversationPinParams
+
+
+class ConversationExportRequest(_Request):
+    method: Literal["conversation.export"] = "conversation.export"
+    params: ConversationExportParams
+
+
+class ConversationDeleteRequest(_Request):
+    method: Literal["conversation.delete"] = "conversation.delete"
+    params: ConversationDeleteParams
+
+
+class ConversationDeleteAllRequest(_Request):
+    method: Literal["conversation.delete_all"] = "conversation.delete_all"
+    params: ConversationDeleteAllParams
+
+
+class ConversationUndoDeleteRequest(_Request):
+    method: Literal["conversation.undo_delete"] = "conversation.undo_delete"
+    params: ConversationUndoDeleteParams
+
+
 class SettingsGetRequest(_Request):
     method: Literal["settings.get"] = "settings.get"
     params: _EmptyParams = Field(default_factory=_EmptyParams)
@@ -195,6 +272,15 @@ RequestFrame = Annotated[
     | DevEmitSampleTaskRequest
     | ConversationsListRequest
     | ConversationsGetRequest
+    | ConversationListRequest
+    | ConversationGetRequest
+    | ConversationResumeRequest
+    | ConversationRenameRequest
+    | ConversationPinRequest
+    | ConversationExportRequest
+    | ConversationDeleteRequest
+    | ConversationDeleteAllRequest
+    | ConversationUndoDeleteRequest
     | SettingsGetRequest
     | VoiceStartCallRequest
     | VoiceEndCallRequest
@@ -299,6 +385,8 @@ class ConversationSummary(_Model):
     title: str
     turns: int
     last_time: str
+    pinned: bool = False
+    updated_at: str = ""
 
 
 class ConversationsListResult(_Model):
@@ -315,6 +403,53 @@ class ConversationsGetResult(_Model):
     date: str
     session_id: str
     turns: list[ConversationTurn]
+
+
+class ConversationResumeMessage(_Model):
+    role: Literal["user", "assistant"]
+    text: str
+    timestamp: str = ""
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ConversationResumeResult(_Model):
+    session_id: str
+    title: str
+    pinned: bool = False
+    messages: list[ConversationResumeMessage]
+
+
+class ConversationRenameResult(_Model):
+    session_id: str
+    title: str
+
+
+class ConversationPinResult(_Model):
+    session_id: str
+    pinned: bool
+
+
+class ConversationExportResult(_Model):
+    session_id: str
+    title: str
+    filename: str
+    content: str
+
+
+class ConversationDeleteResult(_Model):
+    session_id: str
+    deleted: bool
+    undo_window_seconds: int = 10
+
+
+class ConversationDeleteAllResult(_Model):
+    deleted_count: int
+    undo_window_seconds: int = 10
+
+
+class ConversationUndoDeleteResult(_Model):
+    restored_count: int
+    session_ids: list[str]
 
 
 class ToolInfo(_Model):
@@ -344,6 +479,7 @@ class VoiceStartCallResult(_Model):
     call_id: str
     call_state: CallState
     voice_state: VoiceState = "idle"
+    memory_context: str | None = None
 
 
 class VoiceEndCallResult(_Model):
@@ -379,6 +515,15 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "dev.emit_sample_task": DevEmitSampleTaskResult,
     "conversations.list": ConversationsListResult,
     "conversations.get": ConversationsGetResult,
+    "conversation.list": ConversationsListResult,
+    "conversation.get": ConversationsGetResult,
+    "conversation.resume": ConversationResumeResult,
+    "conversation.rename": ConversationRenameResult,
+    "conversation.pin": ConversationPinResult,
+    "conversation.export": ConversationExportResult,
+    "conversation.delete": ConversationDeleteResult,
+    "conversation.delete_all": ConversationDeleteAllResult,
+    "conversation.undo_delete": ConversationUndoDeleteResult,
     "settings.get": SettingsGetResult,
     "voice.start_call": VoiceStartCallResult,
     "voice.end_call": VoiceEndCallResult,
@@ -551,6 +696,32 @@ class ErrorEvent(_Event):
     data: ErrorData
 
 
+class ConversationUpdatedData(_Model):
+    session_id: str
+    title: str | None = None
+    pinned: bool | None = None
+    updated_at: str | None = None
+    user_message: str | None = None
+    assistant_message: str | None = None
+    turns: int | None = None
+    request_id: str | None = None
+
+
+class ConversationUpdatedEvent(_Event):
+    event: Literal["conversation_updated"] = "conversation_updated"
+    data: ConversationUpdatedData
+
+
+class ConversationDeletedData(_Model):
+    session_ids: list[str] = Field(default_factory=list)
+    all: bool = False
+
+
+class ConversationDeletedEvent(_Event):
+    event: Literal["conversation_deleted"] = "conversation_deleted"
+    data: ConversationDeletedData
+
+
 EventFrame = Annotated[
     AssistantTokenEvent
     | ToolCallStartedEvent
@@ -564,7 +735,9 @@ EventFrame = Annotated[
     | TranscriptEvent
     | ScreenCaptureStateEvent
     | UsageEvent
-    | ErrorEvent,
+    | ErrorEvent
+    | ConversationUpdatedEvent
+    | ConversationDeletedEvent,
     Field(discriminator="event"),
 ]
 """Any daemon-to-client event (discriminated by ``event``)."""
@@ -586,6 +759,8 @@ EVENT_NAMES: tuple[str, ...] = (
     "screen_capture_state",
     "usage",
     "error",
+    "conversation_updated",
+    "conversation_deleted",
 )
 
 

@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowUp, MessageSquarePlus, Sparkles } from "lucide-react";
+import { ArrowLeft, ArrowUp, MessageSquarePlus, RefreshCw, Sparkles } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,9 @@ export function ChatView() {
   const sending = useCleaStore((s) => s.sending);
   const sessionId = useCleaStore((s) => s.sessionId);
   const selectedConversation = useCleaStore((s) => s.selectedConversation);
+  const resumeLoading = useCleaStore((s) => s.resumeLoading);
+  const resumeError = useCleaStore((s) => s.resumeError);
+  const retryResume = useCleaStore((s) => s.retryResume);
   const sendMessage = useCleaStore((s) => s.sendMessage);
   const respondApproval = useCleaStore((s) => s.respondApproval);
   const exitReadOnlyConversation = useCleaStore((s) => s.exitReadOnlyConversation);
@@ -150,7 +153,28 @@ export function ChatView() {
 
       <div className="flex-1 overflow-y-auto px-6 py-6">
         <div className="mx-auto max-w-2xl space-y-6">
-          {messages.length === 0 ? (
+          {resumeLoading && messages.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-24 text-center">
+              <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--surface)] animate-spin">
+                <RefreshCw className="h-4 w-4 text-[var(--text-muted)]" aria-hidden="true" />
+              </div>
+              <h2 className="text-sm font-medium text-[var(--text)]">Loading conversation…</h2>
+            </div>
+          ) : resumeError ? (
+            <div className="flex flex-col items-center justify-center py-24 text-center">
+              <div
+                role="alert"
+                className="mb-4 rounded-lg border border-red-500/35 bg-red-500/10 px-4 py-3 text-sm text-[var(--danger)]"
+              >
+                <p className="font-medium">Couldn't load this conversation</p>
+                <p className="mt-1 text-xs opacity-80">{resumeError}</p>
+              </div>
+              <Button size="sm" variant="outline" onClick={() => void retryResume()}>
+                <RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                Retry
+              </Button>
+            </div>
+          ) : messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-24 text-center">
               <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--surface)]">
                 <Sparkles className="h-4 w-4 text-[var(--text-muted)]" aria-hidden="true" />
@@ -162,52 +186,74 @@ export function ChatView() {
               </p>
             </div>
           ) : (
-            messages.map((msg) =>
-              msg.role === "user" ? (
-                <div key={msg.id} className="flex justify-end">
-                  <div className="max-w-[82%] rounded-2xl border border-[var(--border)] bg-[var(--bg-subtle)] px-4 py-2.5 text-sm text-[var(--text)]">
-                    <p className="whitespace-pre-wrap break-words">{msg.content}</p>
-                  </div>
-                </div>
-              ) : (
-                <div key={msg.id} className="space-y-3">
-                  {msg.toolCalls.length > 0 && (
-                    <div className="space-y-2">
-                      {msg.toolCalls.map((call) => (
-                        <ToolCallCard key={call.callId} call={call} />
-                      ))}
+            messages.map((msg, idx) => {
+              const isJoinPoint =
+                msg.id.startsWith("resumed-") &&
+                messages[idx + 1] &&
+                !messages[idx + 1].id.startsWith("resumed-");
+
+              return (
+                <div key={msg.id} className="space-y-4">
+                  {msg.role === "user" ? (
+                    <div className="flex justify-end">
+                      <div className="max-w-[82%] rounded-2xl border border-[var(--border)] bg-[var(--bg-subtle)] px-4 py-2.5 text-sm text-[var(--text)]">
+                        <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {msg.toolCalls.length > 0 && (
+                        <div className="space-y-2">
+                          {msg.toolCalls.map((call) => (
+                            <ToolCallCard key={call.callId} call={call} />
+                          ))}
+                        </div>
+                      )}
+
+                      {msg.approvals.length > 0 && (
+                        <div className="space-y-2">
+                          {msg.approvals.map((approval) => (
+                            <ApprovalCard
+                              key={approval.approvalId}
+                              approval={approval}
+                              onRespond={(id, decision) => void respondApproval(id, decision)}
+                            />
+                          ))}
+                        </div>
+                      )}
+
+                      {msg.content ? (
+                        <MarkdownContent content={msg.content} />
+                      ) : msg.streaming ? (
+                        <StreamingIndicator />
+                      ) : null}
+
+                      {msg.error && (
+                        <div
+                          role="alert"
+                          className="rounded-lg border border-red-500/35 bg-red-500/10 px-3 py-2 text-xs text-[var(--danger)]"
+                        >
+                          {msg.error}
+                        </div>
+                      )}
                     </div>
                   )}
 
-                  {msg.approvals.length > 0 && (
-                    <div className="space-y-2">
-                      {msg.approvals.map((approval) => (
-                        <ApprovalCard
-                          key={approval.approvalId}
-                          approval={approval}
-                          onRespond={(id, decision) => void respondApproval(id, decision)}
-                        />
-                      ))}
-                    </div>
-                  )}
-
-                  {msg.content ? (
-                    <MarkdownContent content={msg.content} />
-                  ) : msg.streaming ? (
-                    <StreamingIndicator />
-                  ) : null}
-
-                  {msg.error && (
+                  {isJoinPoint && (
                     <div
-                      role="alert"
-                      className="rounded-lg border border-red-500/35 bg-red-500/10 px-3 py-2 text-xs text-[var(--danger)]"
+                      className="my-6 flex items-center gap-3"
+                      aria-label="Continuing earlier conversation"
                     >
-                      {msg.error}
+                      <div className="flex-1 border-t border-[var(--border)]" />
+                      <span className="text-xs font-medium text-[var(--text-subtle)]">
+                        Continuing earlier conversation
+                      </span>
+                      <div className="flex-1 border-t border-[var(--border)]" />
                     </div>
                   )}
                 </div>
-              ),
-            )
+              );
+            })
           )}
           <div ref={bottomRef} />
         </div>

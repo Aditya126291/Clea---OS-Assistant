@@ -8,6 +8,7 @@ import { MemoryView } from "@/features/memory/MemoryView";
 import { QuickAskWindow } from "@/features/quick-ask/QuickAskWindow";
 import { SettingsView } from "@/features/settings/SettingsView";
 import { Sidebar } from "@/features/sidebar/Sidebar";
+import { UndoToast } from "@/features/sidebar/UndoToast";
 import { CallOverlay } from "@/features/voice/CallOverlay";
 import { ThemeProvider } from "@/lib/theme";
 import { useCleaStore } from "@/protocol/store";
@@ -83,6 +84,7 @@ function CleaShell() {
       </main>
       <CallOverlay />
       <CommandPalette />
+      <UndoToast />
     </div>
   );
 }

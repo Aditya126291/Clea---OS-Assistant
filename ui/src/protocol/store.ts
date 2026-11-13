@@ -27,6 +27,12 @@ export interface SelectedConversation {
   turns: ConversationTurn[];
 }
 
+export interface UndoToastState {
+  message: string;
+  sessionId: string | null;
+  expiresAt: number;
+}
+
 export interface CleaStoreState {
   connectionState: ConnectionState;
   reconnectAttempt: number;
@@ -41,6 +47,10 @@ export interface CleaStoreState {
   conversations: ConversationSummary[];
   conversationsLoading: boolean;
   selectedConversation: SelectedConversation | null;
+  resumedSessionId: string | null;
+  resumeLoading: boolean;
+  resumeError: string | null;
+  undoToast: UndoToastState | null;
 
   tasks: TaskStatusData[];
 
@@ -84,6 +94,14 @@ export interface CleaStoreState {
   loadConversations: () => Promise<void>;
   openConversation: (summary: ConversationSummary) => Promise<void>;
   exitReadOnlyConversation: () => void;
+  renameConversation: (sessionId: string, newTitle: string) => Promise<void>;
+  pinConversation: (sessionId: string, pinned: boolean) => Promise<void>;
+  exportConversation: (sessionId: string) => Promise<void>;
+  deleteConversation: (sessionId: string, deleteEpisodes?: boolean) => Promise<void>;
+  deleteAllConversations: () => Promise<void>;
+  undoDelete: () => Promise<void>;
+  dismissUndoToast: () => void;
+  retryResume: () => Promise<void>;
 
   loadMemory: () => Promise<void>;
   loadDailyMemory: (day: string) => Promise<void>;
@@ -132,6 +150,8 @@ function updateAssistantByRequest(
   return messages;
 }
 
+let undoToastTimer: ReturnType<typeof setTimeout> | null = null;
+
 export const useCleaStore = create<CleaStoreState>((set, get) => ({
   connectionState: "idle",
   reconnectAttempt: 0,
@@ -146,6 +166,10 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   conversations: [],
   conversationsLoading: false,
   selectedConversation: null,
+  resumedSessionId: null,
+  resumeLoading: false,
+  resumeError: null,
+  undoToast: null,
 
   tasks: [],
 
@@ -182,8 +206,42 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     const client = new CleaClient({
       ...clientOptions,
       onConnected: () => {
-        set({ connectionState: "connected", reconnectAttempt: 0, lastError: null, sending: false });
-        if (!get().sessionId) {
+        set((state) => ({
+          connectionState: "connected",
+          reconnectAttempt: 0,
+          lastError: null,
+          sending: false,
+          messages: state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+        }));
+        const currentSid = get().sessionId;
+        if (currentSid) {
+          void activeClient
+            ?.request("conversation.resume", { session_id: currentSid })
+            .then((res) => {
+              if (get().messages.length === 0 && res.messages) {
+                set({
+                  messages: res.messages.map((m, idx) => ({
+                    id: `resumed-${res.session_id}-${idx}`,
+                    role: m.role as "user" | "assistant",
+                    content: m.text,
+                    streaming: false,
+                    toolCalls: (m.tool_calls || []).map((tc, tcIdx) => ({
+                      callId: `tc-${idx}-${tcIdx}`,
+                      name: (tc.name as string) || "tool",
+                      arguments: (tc.arguments as Record<string, unknown>) || {},
+                      riskLevel: "read_only" as const,
+                      status: "done" as const,
+                      output: typeof tc.output === "string" ? tc.output : undefined,
+                    })),
+                    approvals: [],
+                  })),
+                });
+              }
+            })
+            .catch(() => {
+              void get().newSession();
+            });
+        } else {
           void get().newSession();
         }
         void get().loadConversations();
@@ -235,6 +293,9 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       sessionId: null,
       messages: [],
       selectedConversation: null,
+      resumedSessionId: null,
+      resumeLoading: false,
+      resumeError: null,
       activeView: "chat",
       sending: false,
       lastError: null,
@@ -376,26 +437,242 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
 
   openConversation: async (summary) => {
     if (!activeClient?.isConnected) return;
+    set({
+      activeView: "chat",
+      sessionId: summary.session_id,
+      resumedSessionId: summary.session_id,
+      resumeLoading: true,
+      resumeError: null,
+      selectedConversation: null,
+    });
     try {
-      const res = await activeClient.request("conversations.get", {
-        date: summary.date,
+      const res = await activeClient.request("conversation.resume", {
         session_id: summary.session_id,
       });
+      const msgs: ChatMessage[] = res.messages.map((m, idx) => ({
+        id: `resumed-${res.session_id}-${idx}`,
+        role: m.role as "user" | "assistant",
+        content: m.text,
+        streaming: false,
+        toolCalls: (m.tool_calls || []).map((tc, tcIdx) => ({
+          callId: `tc-${idx}-${tcIdx}`,
+          name: (tc.name as string) || "tool",
+          arguments: (tc.arguments as Record<string, unknown>) || {},
+          riskLevel: "read_only" as const,
+          status: "done" as const,
+          output: typeof tc.output === "string" ? tc.output : undefined,
+        })),
+        approvals: [],
+      }));
       set({
-        activeView: "chat",
-        selectedConversation: {
-          date: summary.date,
-          sessionId: summary.session_id,
-          title: summary.title,
-          turns: res.turns,
-        },
+        sessionId: res.session_id,
+        resumedSessionId: res.session_id,
+        messages: msgs,
+        resumeLoading: false,
+        resumeError: null,
       });
+    } catch (err) {
+      set({
+        resumeLoading: false,
+        resumeError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  exitReadOnlyConversation: () => set({ selectedConversation: null, activeView: "chat" }),
+
+  retryResume: async () => {
+    const sid = get().resumedSessionId || get().sessionId;
+    if (!sid || !activeClient?.isConnected) return;
+    set({ resumeLoading: true, resumeError: null });
+    try {
+      const res = await activeClient.request("conversation.resume", {
+        session_id: sid,
+      });
+      const msgs: ChatMessage[] = res.messages.map((m, idx) => ({
+        id: `resumed-${res.session_id}-${idx}`,
+        role: m.role as "user" | "assistant",
+        content: m.text,
+        streaming: false,
+        toolCalls: (m.tool_calls || []).map((tc, tcIdx) => ({
+          callId: `tc-${idx}-${tcIdx}`,
+          name: (tc.name as string) || "tool",
+          arguments: (tc.arguments as Record<string, unknown>) || {},
+          riskLevel: "read_only" as const,
+          status: "done" as const,
+          output: typeof tc.output === "string" ? tc.output : undefined,
+        })),
+        approvals: [],
+      }));
+      set({
+        sessionId: res.session_id,
+        resumedSessionId: res.session_id,
+        messages: msgs,
+        resumeLoading: false,
+        resumeError: null,
+      });
+    } catch (err) {
+      set({
+        resumeLoading: false,
+        resumeError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  renameConversation: async (sessionId: string, newTitle: string) => {
+    if (!activeClient?.isConnected) return;
+    const trimmed = newTitle.trim();
+    if (!trimmed) return;
+    try {
+      const res = await activeClient.request("conversation.rename", {
+        session_id: sessionId,
+        title: trimmed,
+      });
+      const finalTitle = res.title || trimmed;
+      set((state) => ({
+        conversations: state.conversations.map((c) =>
+          c.session_id === sessionId ? { ...c, title: finalTitle } : c,
+        ),
+      }));
     } catch (err) {
       set({ lastError: err instanceof Error ? err.message : String(err) });
     }
   },
 
-  exitReadOnlyConversation: () => set({ selectedConversation: null, activeView: "chat" }),
+  pinConversation: async (sessionId: string, pinned: boolean) => {
+    if (!activeClient?.isConnected) return;
+    try {
+      await activeClient.request("conversation.pin", {
+        session_id: sessionId,
+        pinned,
+      });
+      set((state) => ({
+        conversations: state.conversations.map((c) =>
+          c.session_id === sessionId ? { ...c, pinned } : c,
+        ),
+      }));
+      void get().loadConversations();
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  exportConversation: async (sessionId: string) => {
+    if (!activeClient?.isConnected) return;
+    try {
+      const res = await activeClient.request("conversation.export", {
+        session_id: sessionId,
+      });
+      if (window.cleaDesktop?.saveFile) {
+        await window.cleaDesktop.saveFile(res.filename, res.content);
+      } else {
+        const blob = new Blob([res.content], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = res.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  deleteConversation: async (sessionId: string, deleteEpisodes?: boolean) => {
+    if (!activeClient?.isConnected) return;
+    try {
+      await activeClient.request("conversation.delete", {
+        session_id: sessionId,
+        delete_episodes: !!deleteEpisodes,
+      });
+
+      if (get().sessionId === sessionId || get().resumedSessionId === sessionId) {
+        void get().newSession();
+      }
+
+      if (undoToastTimer) {
+        clearTimeout(undoToastTimer);
+        undoToastTimer = null;
+      }
+      set({
+        undoToast: {
+          sessionId,
+          expiresAt: Date.now() + 10_000,
+          message: "Conversation deleted",
+        },
+      });
+      undoToastTimer = setTimeout(() => {
+        set((state) => (state.undoToast?.sessionId === sessionId ? { undoToast: null } : {}));
+        undoToastTimer = null;
+      }, 10_000);
+
+      void get().loadConversations();
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  deleteAllConversations: async () => {
+    if (!activeClient?.isConnected) return;
+    try {
+      await activeClient.request("conversation.delete_all", {
+        confirmation: "DELETE",
+      });
+      void get().newSession();
+
+      if (undoToastTimer) {
+        clearTimeout(undoToastTimer);
+        undoToastTimer = null;
+      }
+      set({
+        undoToast: {
+          sessionId: "*",
+          expiresAt: Date.now() + 10_000,
+          message: "All conversations deleted",
+        },
+      });
+      undoToastTimer = setTimeout(() => {
+        set((state) => (state.undoToast?.sessionId === "*" ? { undoToast: null } : {}));
+        undoToastTimer = null;
+      }, 10_000);
+
+      void get().loadConversations();
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  undoDelete: async () => {
+    const toast = get().undoToast;
+    if (!toast || !activeClient?.isConnected) return;
+    const target = toast.sessionId;
+    if (undoToastTimer) {
+      clearTimeout(undoToastTimer);
+      undoToastTimer = null;
+    }
+    set({ undoToast: null });
+    try {
+      const paramSid = target === "*" ? undefined : target || undefined;
+      await activeClient.request(
+        "conversation.undo_delete",
+        paramSid ? { session_id: paramSid } : {},
+      );
+      await get().loadConversations();
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  dismissUndoToast: () => {
+    if (undoToastTimer) {
+      clearTimeout(undoToastTimer);
+      undoToastTimer = null;
+    }
+    set({ undoToast: null });
+  },
 
   loadMemory: async () => {
     if (!activeClient?.isConnected) return;
@@ -628,8 +905,93 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         set({ lastCallUsage: event.data });
         break;
       }
+      case "conversation_updated": {
+        const d = event.data;
+        set((state) => {
+          let nextMessages = state.messages;
+          if (state.sessionId && state.sessionId === d.session_id) {
+            if (d.user_message) {
+              const userMsgId = `user-${d.request_id || nextRequestId()}`;
+              const exists = state.messages.some((m) => m.id === userMsgId);
+              if (!exists) {
+                const userMsg: ChatMessage = {
+                  id: userMsgId,
+                  role: "user",
+                  content: d.user_message,
+                  streaming: false,
+                  toolCalls: [],
+                  approvals: [],
+                };
+                const assistantMsgId = d.request_id || nextRequestId();
+                const assistantMsg: ChatMessage = {
+                  id: assistantMsgId,
+                  role: "assistant",
+                  content: "",
+                  streaming: true,
+                  toolCalls: [],
+                  approvals: [],
+                };
+                nextMessages = [...state.messages, userMsg, assistantMsg];
+              }
+            }
+            if (d.assistant_message) {
+              nextMessages = updateAssistantByRequest(nextMessages, d.request_id, (m) => ({
+                ...m,
+                content: d.assistant_message || m.content,
+                streaming: false,
+              }));
+            }
+          }
+
+          return {
+            messages: nextMessages,
+            conversations: state.conversations.map((c) =>
+              c.session_id === d.session_id
+                ? {
+                    ...c,
+                    title: d.title ?? c.title,
+                    pinned: typeof d.pinned === "boolean" ? d.pinned : c.pinned,
+                    turns: d.turns ?? c.turns,
+                    updated_at: d.updated_at ?? c.updated_at,
+                  }
+                : c,
+            ),
+          };
+        });
+        void get().loadConversations();
+        break;
+      }
+      case "conversation_deleted": {
+        const d = event.data;
+        if (d.all) {
+          set({ conversations: [] });
+          if (get().sessionId) {
+            void get().newSession();
+          }
+        } else if (d.session_ids && d.session_ids.length > 0) {
+          const idSet = new Set(d.session_ids);
+          set((state) => ({
+            conversations: state.conversations.filter((c) => !idSet.has(c.session_id)),
+          }));
+          const current = get().sessionId;
+          const resumed = get().resumedSessionId;
+          if ((current && idSet.has(current)) || (resumed && idSet.has(resumed))) {
+            void get().newSession();
+          }
+        }
+        break;
+      }
       case "error": {
-        set({ lastError: event.data.message });
+        set((state) => ({
+          lastError: event.data.message,
+          messages: event.request_id
+            ? updateAssistantByRequest(state.messages, event.request_id, (m) => ({
+                ...m,
+                streaming: false,
+                error: event.data.message,
+              }))
+            : state.messages,
+        }));
         break;
       }
     }

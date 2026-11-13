@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import {
   app,
   BrowserWindow,
+  dialog,
   globalShortcut,
   ipcMain,
   Menu,
@@ -360,6 +361,19 @@ app.whenReady().then(() => {
     setAutoLaunchEnabled(Boolean(enabled)),
   );
   ipcMain.handle("clea:start-daemon", () => startBackgroundDaemon());
+  ipcMain.handle(
+    "clea:save-file",
+    async (_event, { defaultPath, content }: { defaultPath: string; content: string }) => {
+      const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+      const { canceled, filePath } = await dialog.showSaveDialog(win as BrowserWindow, {
+        defaultPath,
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (canceled || !filePath) return false;
+      await fs.promises.writeFile(filePath, content, "utf-8");
+      return true;
+    },
+  );
   ipcMain.on("clea:close-quick-ask", () => {
     quickAskWindow?.hide();
   });
