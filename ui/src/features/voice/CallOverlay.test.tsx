@@ -127,11 +127,17 @@ describe("CallOverlay", () => {
     expect(store.callOverlayOpen).toBe(true);
     expect(store.voiceState).toBe("error");
     expect(store.voiceError).toBe("Voice process not running. Start it with 'clea voice'.");
-    expect(screen.getByText("Voice process not running. Start it with 'clea voice'.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Voice process not running. Start it with 'clea voice'."),
+    ).toBeInTheDocument();
   });
 
   it("retains error state in CallOverlay when call_ended occurs after error until dismissed", () => {
-    useCleaStore.setState({ callOverlayOpen: true, voiceState: "error", voiceError: "Voice stream failed: timeout" });
+    useCleaStore.setState({
+      callOverlayOpen: true,
+      voiceState: "error",
+      voiceError: "Voice stream failed: timeout",
+    });
     render(<CallOverlay />);
 
     act(() => {

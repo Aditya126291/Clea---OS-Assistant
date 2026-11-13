@@ -21,12 +21,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -709,7 +704,9 @@ export function MemoryView() {
                                           : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20",
                                     )}
                                   >
-                                    {entry.source.startsWith("inferred") ? "inferred" : entry.source}
+                                    {entry.source.startsWith("inferred")
+                                      ? "inferred"
+                                      : entry.source}
                                   </span>
                                   <button
                                     type="button"

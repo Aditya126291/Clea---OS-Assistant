@@ -1004,8 +1004,9 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       }
       case "voice_state": {
         const errorMsg =
-          ("error" in event.data && typeof event.data.error === "string" ? event.data.error : null) ??
-          (event.data.state === "error" ? "Voice error" : null);
+          ("error" in event.data && typeof event.data.error === "string"
+            ? event.data.error
+            : null) ?? (event.data.state === "error" ? "Voice error" : null);
         set((state) => ({
           voiceState: event.data.state,
           voiceError: errorMsg,
