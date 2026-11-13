@@ -61,7 +61,7 @@ class AudioManager:
         self._output_queue: queue.Queue[bytes] = queue.Queue()
         self._current_output_bytes = bytearray()
         self._is_speaking = threading.Event()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._running = False
 
     @property
@@ -116,23 +116,26 @@ class AudioManager:
         """Stop and close both audio streams."""
         with self._lock:
             self._running = False
-            self.stop_output()
+            inp = self._input_stream
+            out = self._output_stream
+            self._input_stream = None
+            self._output_stream = None
 
-            if self._input_stream is not None:
-                try:
-                    self._input_stream.stop()
-                    self._input_stream.close()
-                except Exception as exc:
-                    logger.debug("Error stopping input stream: %s", exc)
-                self._input_stream = None
+        self.stop_output()
 
-            if self._output_stream is not None:
-                try:
-                    self._output_stream.stop()
-                    self._output_stream.close()
-                except Exception as exc:
-                    logger.debug("Error stopping output stream: %s", exc)
-                self._output_stream = None
+        if inp is not None:
+            try:
+                inp.stop()
+                inp.close()
+            except Exception as exc:
+                logger.debug("Error stopping input stream: %s", exc)
+
+        if out is not None:
+            try:
+                out.stop()
+                out.close()
+            except Exception as exc:
+                logger.debug("Error stopping output stream: %s", exc)
 
     def play_audio(self, pcm_bytes: bytes) -> None:
         """Queue 24 kHz 16-bit mono PCM bytes for playback."""
