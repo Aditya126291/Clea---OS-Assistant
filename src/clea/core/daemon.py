@@ -31,10 +31,17 @@ from clea.core.protocol import (
     AssistantTokenData,
     AssistantTokenEvent,
     BaseRequest,
+    CallEndedData,
+    CallEndedEvent,
+    CallStartedData,
+    CallStartedEvent,
+    CallState,
+    EpisodeItem,
     ErrorData,
     ErrorEvent,
     PermissionTierInfo,
     ResponseFrame,
+    ScreenCaptureTarget,
     SettingsGetResult,
     TaskStatusData,
     TaskStatusEvent,
@@ -43,14 +50,24 @@ from clea.core.protocol import (
     ToolCallStartedData,
     ToolCallStartedEvent,
     ToolInfo,
+    TranscriptMessageItem,
+    TranscriptSummaryItem,
+    VoiceState,
     new_id,
     parse_frame,
 )
 from clea.core.sessions import SessionManager
+from clea.memory.consolidation import ConsolidationManager
 from clea.memory.store import MemoryStore
 from clea.providers.base import LLMProvider, ToolCall
 from clea.providers.gemini import GeminiProvider
-from clea.tools import RiskLevel, ToolRegistry, register_builtin_tools, requires_approval
+from clea.tools import (
+    RiskLevel,
+    ToolRegistry,
+    register_builtin_tools,
+    register_memory_tools,
+    requires_approval,
+)
 from clea.tools.registry import ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -82,6 +99,7 @@ class _Connection:
         self.ws = ws
         self.tasks: set[asyncio.Task[None]] = set()
         self.approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
+        self.current_session_id: str | None = None
 
     def spawn(self, coro: Awaitable[None]) -> None:
         task = asyncio.ensure_future(coro)
@@ -138,6 +156,18 @@ class CleaDaemon:
         self.approval_timeout = approval_timeout
         self._server: Server | None = None
         self._busy_sessions: set[str] = set()
+        self._connections: set[_Connection] = set()
+        self._shared_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
+        self._voice_call_id: str | None = None
+        self._call_state: CallState = "idle"
+        self._call_started_monotonic: float | None = None
+        self._voice_state: VoiceState = "idle"
+        self._screen_capture_active: bool = False
+        self._screen_capture_target: ScreenCaptureTarget | None = None
+        self.consolidation = ConsolidationManager(memory=agent.memory, provider=agent.provider)
+        self.consolidation_idle_seconds = 900.0
+        self._idle_tasks: dict[str, asyncio.Task[None]] = {}
+        self._startup_task: asyncio.Task[None] | None = None
 
     @property
     def bound_port(self) -> int:
@@ -149,6 +179,7 @@ class CleaDaemon:
     async def start(self) -> None:
         """Acquire single-instance lock, listen on localhost, and write the session token."""
         self.agent.memory.ensure_initialized()
+        self.agent.memory.migrate_legacy_daily_logs()
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
             self._server = await serve(
@@ -160,6 +191,7 @@ class CleaDaemon:
             )
             self._instance_lock.update_port(host=self.host, port=self.bound_port)
             auth.write_token(self.token, self.token_file)
+            self._startup_task = asyncio.create_task(self._run_startup_consolidation())
         except Exception:
             if self._server is not None:
                 self._server.close()
@@ -171,6 +203,15 @@ class CleaDaemon:
 
     async def stop(self) -> None:
         """Gracefully close the WebSocket server and remove the token and lock files."""
+        if self._startup_task is not None and not self._startup_task.done():
+            self._startup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._startup_task
+        for t in list(self._idle_tasks.values()):
+            if not t.done():
+                t.cancel()
+        self._idle_tasks.clear()
+
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -223,8 +264,103 @@ class CleaDaemon:
     async def _send(self, ws: ServerConnection, frame: ServerFrameOut) -> None:
         await ws.send(frame.model_dump_json())
 
+    async def _broadcast(self, frame: ServerFrameOut) -> None:
+        payload = frame.model_dump_json()
+        for conn in list(self._connections):
+            with contextlib.suppress(ConnectionClosed):
+                await conn.ws.send(payload)
+
+    def _format_session_consolidation_title(self, session_id: str) -> str:
+        """Generate title like 'Summarising session 18:11' based on session start time."""
+        time_str = ""
+        try:
+            tr = self.agent.memory.get_transcript(session_id)
+            if tr and tr.get("started_at"):
+                dt = datetime.fromisoformat(tr["started_at"])
+                time_str = dt.strftime("%H:%M")
+        except Exception:
+            pass
+        if not time_str:
+            time_str = datetime.now().astimezone().strftime("%H:%M")
+        return f"Summarising session {time_str}"
+
+    async def _emit_consolidation_task_status(
+        self,
+        session_id: str,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        title = self._format_session_consolidation_title(session_id)
+        now_iso = _now_iso()
+        finished_at = now_iso if status in ("succeeded", "failed") else None
+        await self._broadcast(
+            TaskStatusEvent(
+                data=TaskStatusData(
+                    task_id=f"cons-{session_id}",
+                    title=title,
+                    status=status,  # type: ignore[arg-type]
+                    started_at=now_iso,
+                    finished_at=finished_at,
+                    kind="background_task",
+                    detail=detail,
+                )
+            )
+        )
+
+    async def _run_startup_consolidation(self) -> None:
+        try:
+            await self.consolidation.run_crash_recovery(
+                on_task_status=lambda sid, st, det=None: self._emit_consolidation_task_status(
+                    sid, st, det
+                )
+            )
+        except Exception:
+            logger.exception("Error during startup memory consolidation crash recovery")
+
+    def _reset_session_idle_timer(self, session_id: str) -> None:
+        old_task = self._idle_tasks.pop(session_id, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+
+        async def _timer() -> None:
+            try:
+                await asyncio.sleep(self.consolidation_idle_seconds)
+                await self.consolidation.consolidate_session(
+                    session_id,
+                    on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
+                        session_id, st, det
+                    ),
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Error consolidating session %s after idle timeout", session_id)
+            finally:
+                self._idle_tasks.pop(session_id, None)
+
+        self._idle_tasks[session_id] = asyncio.create_task(_timer())
+
+    def _schedule_consolidation_now(self, session_id: str) -> None:
+        old_task = self._idle_tasks.pop(session_id, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+
+        async def _run() -> None:
+            try:
+                await self.consolidation.consolidate_session(
+                    session_id,
+                    on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
+                        session_id, st, det
+                    ),
+                )
+            except Exception:
+                logger.exception("Error consolidating session %s on end/switch", session_id)
+
+        asyncio.create_task(_run())
+
     async def _handle_connection(self, ws: ServerConnection) -> None:
         conn = _Connection(ws)
+        self._connections.add(conn)
         try:
             with contextlib.suppress(ConnectionClosed):
                 async for raw_message in ws:
@@ -260,6 +396,11 @@ class CleaDaemon:
 
                     await self._dispatch_request(conn, frame)
         finally:
+            self._connections.discard(conn)
+            for approval_id in list(conn.approvals):
+                self._shared_approvals.pop(approval_id, None)
+            if conn.current_session_id:
+                self._schedule_consolidation_now(conn.current_session_id)
             await conn.close()
 
     async def _respond(
@@ -288,7 +429,10 @@ class CleaDaemon:
         if method == "health.ping":
             await self._respond(ws, req, METHOD_RESULTS[method]())
         elif method == "session.new":
+            if conn.current_session_id:
+                self._schedule_consolidation_now(conn.current_session_id)
             session = self.sessions.create()
+            conn.current_session_id = session.id
             await self._respond(
                 ws, req, METHOD_RESULTS[method](session_id=session.id), session_id=session.id
             )
@@ -299,7 +443,9 @@ class CleaDaemon:
                 return
             conn.spawn(self._run_chat(conn, req, text))
         elif method == "approval.respond":
-            future = conn.approvals.get(req.params.approval_id)
+            future = conn.approvals.get(req.params.approval_id) or self._shared_approvals.get(
+                req.params.approval_id
+            )
             if future is None or future.done():
                 await self._respond(ws, req, error="Unknown or already resolved approval.")
                 return
@@ -313,11 +459,121 @@ class CleaDaemon:
             )
         elif method == "memory.get":
             memory = self.agent.memory
+            last_cons, failed_cons = self.consolidation.get_status()
             await self._respond(
                 ws,
                 req,
-                METHOD_RESULTS[method](long_term=memory.read_long_term(), days=memory.list_days()),
+                METHOD_RESULTS[method](
+                    long_term=memory.read_long_term(),
+                    days=memory.list_days(),
+                    last_consolidated=last_cons,
+                    failed_consolidation=failed_cons,
+                ),
             )
+        elif method == "memory.episodes":
+            limit = getattr(req.params, "limit", 20)
+            raw_eps = self.agent.memory.get_recent_episodes(limit=limit)
+            episodes = [
+                EpisodeItem(
+                    date=ep.get("date", ""),
+                    session_id=ep.get("session_id", ""),
+                    time=ep.get("time", ""),
+                    summary=ep.get("summary", ""),
+                )
+                for ep in raw_eps
+            ]
+            await self._respond(ws, req, METHOD_RESULTS[method](episodes=episodes))
+        elif method == "transcripts.list":
+            limit = getattr(req.params, "limit", 50)
+            raw_trs = self.agent.memory.list_transcripts(limit=limit)
+            transcripts = [
+                TranscriptSummaryItem(
+                    session_id=t.get("session_id", ""),
+                    started_at=t.get("started_at", ""),
+                    title=t.get("title", ""),
+                    message_count=t.get("message_count", 0),
+                )
+                for t in raw_trs
+            ]
+            await self._respond(ws, req, METHOD_RESULTS[method](transcripts=transcripts))
+        elif method == "transcripts.get":
+            transcript = self.agent.memory.get_transcript(req.params.session_id)
+            if transcript is None:
+                await self._respond(
+                    ws, req, error=f"Transcript not found for session {req.params.session_id}"
+                )
+                return
+            messages = [
+                TranscriptMessageItem(
+                    role=m.get("role", "unknown"),
+                    text=m.get("text", ""),
+                    timestamp=m.get("timestamp", ""),
+                    tool_calls=m.get("tool_calls", []),
+                )
+                for m in transcript.get("messages", [])
+            ]
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    session_id=transcript.get("session_id", req.params.session_id),
+                    started_at=transcript.get("started_at", ""),
+                    title=transcript.get("title", ""),
+                    messages=messages,
+                ),
+            )
+        elif method == "dev.emit_sample_task":
+            # Dev-only endpoint to emit sample tasks for Activity tab testing
+            now = _now_iso()
+            await self._broadcast(
+                TaskStatusEvent(
+                    data=TaskStatusData(
+                        task_id="dev-bg-1",
+                        kind="background_task",
+                        title="Summarising session 18:11",
+                        status="running",
+                        started_at=now,
+                    )
+                )
+            )
+            await self._broadcast(
+                TaskStatusEvent(
+                    data=TaskStatusData(
+                        task_id="dev-sched-1",
+                        kind="scheduled",
+                        title="Daily calendar sync",
+                        status="queued",
+                        started_at=now,
+                        next_run_at=_now_iso(),
+                    )
+                )
+            )
+            await self._broadcast(
+                TaskStatusEvent(
+                    data=TaskStatusData(
+                        task_id="dev-agent-1",
+                        kind="agent_run",
+                        title="Summarize desktop files",
+                        status="succeeded",
+                        started_at=now,
+                        finished_at=now,
+                    )
+                )
+            )
+            await self._broadcast(
+                TaskStatusEvent(
+                    data=TaskStatusData(
+                        task_id="dev-fail-1",
+                        kind="background_task",
+                        title="Sync workspace index",
+                        status="failed",
+                        started_at=now,
+                        finished_at=now,
+                        detail="Connection timed out after 30s. Host 127.0.0.1 unreachable.",
+                    )
+                )
+            )
+            await self._respond(ws, req, METHOD_RESULTS[method](status="ok"))
         elif method == "memory.get_daily":
             try:
                 content = self.agent.memory.read_daily_on(req.params.date)
@@ -348,6 +604,102 @@ class CleaDaemon:
             )
         elif method == "settings.get":
             await self._respond(ws, req, self._settings())
+        elif method == "voice.status":
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    call_id=self._voice_call_id,
+                    call_state=self._call_state,
+                    voice_state=self._voice_state,
+                    screen_capture_active=self._screen_capture_active,
+                    screen_capture_target=self._screen_capture_target,
+                ),
+            )
+        elif method == "voice.start_call":
+            if self._call_state != "idle":
+                await self._respond(ws, req, error="A voice call is already active.")
+                return
+            call_id = new_id()
+            self._voice_call_id = call_id
+            self._call_state = "active"
+            self._call_started_monotonic = time.monotonic()
+            self._voice_state = "idle"
+            self._screen_capture_active = False
+            self._screen_capture_target = None
+            await self._broadcast(
+                CallStartedEvent(
+                    request_id=req.id,
+                    session_id=req.session_id,
+                    data=CallStartedData(
+                        call_id=call_id,
+                        call_state=self._call_state,
+                        started_at=_now_iso(),
+                    ),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    call_id=call_id,
+                    call_state=self._call_state,
+                    voice_state=self._voice_state,
+                ),
+            )
+        elif method == "voice.end_call":
+            if (
+                req.params.call_id is not None
+                and self._voice_call_id is not None
+                and req.params.call_id != self._voice_call_id
+            ):
+                await self._respond(ws, req, error="Unknown call_id.")
+                return
+            if self._voice_call_id is None or self._call_state == "idle":
+                if req.params.call_id is not None:
+                    await self._respond(ws, req, error="Unknown call_id.")
+                    return
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS[method](call_id=None, call_state="idle", voice_state="idle"),
+                )
+                return
+            ended_id = self._voice_call_id
+            duration_seconds = (
+                round(max(0.0, time.monotonic() - self._call_started_monotonic), 3)
+                if self._call_started_monotonic is not None
+                else None
+            )
+            self._voice_call_id = None
+            self._call_state = "idle"
+            self._call_started_monotonic = None
+            self._voice_state = "idle"
+            self._screen_capture_active = False
+            self._screen_capture_target = None
+            await self._broadcast(
+                CallEndedEvent(
+                    request_id=req.id,
+                    session_id=req.session_id,
+                    data=CallEndedData(
+                        call_id=ended_id,
+                        call_state="idle",
+                        reason=req.params.reason,
+                        duration_seconds=duration_seconds,
+                    ),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](call_id=ended_id, call_state="idle", voice_state="idle"),
+            )
+        elif method == "voice.delegate_task":
+            description = req.params.description.strip()
+            if not description:
+                await self._respond(ws, req, error="Missing non-empty 'description' parameter.")
+                return
+            conn.spawn(self._run_delegated_task(conn, req, description))
 
     def _settings(self) -> SettingsGetResult:
         policies = {
@@ -383,6 +735,7 @@ class CleaDaemon:
     async def _chat_turn(self, conn: _Connection, req: Any, text: str) -> None:
         ws = conn.ws
         session = self.sessions.get_or_create(req.session_id)
+        conn.current_session_id = session.id
         if session.id in self._busy_sessions:
             await self._respond(
                 ws, req, error="A turn is already running for this session.", session_id=session.id
@@ -406,6 +759,7 @@ class CleaDaemon:
                         status=status,  # type: ignore[arg-type]
                         started_at=started_at,
                         finished_at=None if status == "running" else _now_iso(),
+                        kind="chat_turn",
                         detail=detail,
                     ),
                 ),
@@ -541,6 +895,207 @@ class CleaDaemon:
             )
         finally:
             self._busy_sessions.discard(session.id)
+            self._reset_session_idle_timer(session.id)
+
+    # ------------------------------------------------------------------ delegated voice tasks
+
+    async def _run_delegated_task(self, conn: _Connection, req: Any, description: str) -> None:
+        """Run a voice-delegated task via AgentLoop in the background."""
+        with contextlib.suppress(ConnectionClosed):
+            await self._delegated_task(conn, req, description)
+
+    async def _delegated_task(self, conn: _Connection, req: Any, description: str) -> None:
+        ws = conn.ws
+        session = (
+            self.sessions.get_or_create(req.session_id)
+            if req.session_id is not None
+            else self.sessions.create()
+        )
+        if session.id in self._busy_sessions:
+            await self._respond(
+                ws, req, error="A turn is already running for this session.", session_id=session.id
+            )
+            return
+        self._busy_sessions.add(session.id)
+
+        state = _TurnState()
+        started_at = _now_iso()
+        title = " ".join(description.split())[:80]
+        task_started = False
+        task_finished = False
+        pending_approval_id: str | None = None
+
+        async def task_status(status: str, detail: str | None = None) -> None:
+            await self._broadcast(
+                TaskStatusEvent(
+                    request_id=req.id,
+                    session_id=session.id,
+                    data=TaskStatusData(
+                        task_id=req.id,
+                        title=title,
+                        status=status,  # type: ignore[arg-type]
+                        started_at=started_at,
+                        finished_at=None if status == "running" else _now_iso(),
+                        kind="agent_run",
+                        detail=detail,
+                    ),
+                )
+            )
+
+        def risk_of(name: str) -> str:
+            try:
+                return self.agent.registry.get(name).risk_level.value
+            except KeyError:
+                return RiskLevel.REVERSIBLE.value
+
+        async def on_tool_start(call: ToolCall) -> None:
+            state.current_call_id = call.id
+            state.started[call.id] = time.monotonic()
+            state.approval_wait[call.id] = 0.0
+            with contextlib.suppress(ConnectionClosed):
+                await self._send(
+                    ws,
+                    ToolCallStartedEvent(
+                        request_id=req.id,
+                        session_id=session.id,
+                        data=ToolCallStartedData(
+                            call_id=call.id,
+                            name=call.name,
+                            arguments=call.arguments,
+                            risk_level=risk_of(call.name),  # type: ignore[arg-type]
+                        ),
+                    ),
+                )
+
+        async def on_tool_end(call: ToolCall, output: str, is_error: bool) -> None:
+            elapsed = time.monotonic() - state.started.pop(call.id, time.monotonic())
+            elapsed -= state.approval_wait.pop(call.id, 0.0)
+            with contextlib.suppress(ConnectionClosed):
+                await self._send(
+                    ws,
+                    ToolCallFinishedEvent(
+                        request_id=req.id,
+                        session_id=session.id,
+                        data=ToolCallFinishedData(
+                            call_id=call.id,
+                            name=call.name,
+                            is_error=is_error,
+                            output=output,
+                            duration_ms=max(0, round(elapsed * 1000)),
+                        ),
+                    ),
+                )
+
+        async def confirm(definition: ToolDefinition, arguments: dict[str, Any]) -> bool:
+            nonlocal pending_approval_id
+            approval_id = new_id()
+            call_id = state.current_call_id
+            future: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
+            conn.approvals[approval_id] = future
+            self._shared_approvals[approval_id] = future
+            pending_approval_id = approval_id
+            await self._broadcast(
+                ApprovalRequestedEvent(
+                    request_id=req.id,
+                    session_id=session.id,
+                    data=ApprovalRequestedData(
+                        approval_id=approval_id,
+                        call_id=call_id,
+                        tool=definition.name,
+                        arguments=arguments,
+                        risk_level=definition.risk_level.value,
+                        timeout_seconds=self.approval_timeout,
+                    ),
+                )
+            )
+            waited_from = time.monotonic()
+            decision: ApprovalDecision
+            try:
+                decision = await asyncio.wait_for(future, self.approval_timeout)
+                reason = "user"
+            except TimeoutError:
+                decision, reason = "deny", "timeout"
+            finally:
+                conn.approvals.pop(approval_id, None)
+                self._shared_approvals.pop(approval_id, None)
+                if call_id is not None:
+                    state.approval_wait[call_id] = state.approval_wait.get(call_id, 0.0) + (
+                        time.monotonic() - waited_from
+                    )
+            await self._broadcast(
+                ApprovalResolvedEvent(
+                    request_id=req.id,
+                    session_id=session.id,
+                    data=ApprovalResolvedData(
+                        approval_id=approval_id,
+                        decision=decision,
+                        reason=reason,  # type: ignore[arg-type]
+                    ),
+                ),
+            )
+            pending_approval_id = None
+            return decision == "allow"
+
+        try:
+            await task_status("running")
+            task_started = True
+            try:
+                reply = await self.agent.run_turn(
+                    session=session,
+                    user_text=description,
+                    on_tool_start=on_tool_start,
+                    on_tool_end=on_tool_end,
+                    confirm=confirm,
+                )
+            except (ConnectionClosed, asyncio.CancelledError):
+                if pending_approval_id is not None:
+                    with contextlib.suppress(Exception):
+                        await self._broadcast(
+                            ApprovalResolvedEvent(
+                                request_id=req.id,
+                                session_id=session.id,
+                                data=ApprovalResolvedData(
+                                    approval_id=pending_approval_id,
+                                    decision="deny",
+                                    reason="timeout",
+                                ),
+                            )
+                        )
+                    pending_approval_id = None
+                if task_started and not task_finished:
+                    task_finished = True
+                    with contextlib.suppress(Exception):
+                        await task_status("failed", "Cancelled")
+                raise
+            except Exception as exc:
+                logger.exception("Error while running delegated voice task")
+                task_finished = True
+                await task_status("failed", str(exc))
+                with contextlib.suppress(ConnectionClosed):
+                    await self._send(
+                        ws,
+                        ErrorEvent(
+                            request_id=req.id,
+                            session_id=session.id,
+                            data=ErrorData(message=str(exc), code="turn_failed"),
+                        ),
+                    )
+                    await self._respond(ws, req, error=str(exc), session_id=session.id)
+                return
+
+            task_finished = True
+            await task_status("succeeded")
+            with contextlib.suppress(ConnectionClosed):
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS["voice.delegate_task"](
+                        task_id=req.id, status="succeeded", output=reply
+                    ),
+                    session_id=session.id,
+                )
+        finally:
+            self._busy_sessions.discard(session.id)
 
 
 def build_daemon(
@@ -561,6 +1116,10 @@ def build_daemon(
     resolved_registry = registry or ToolRegistry()
     if not resolved_registry.list_definitions():
         register_builtin_tools(resolved_registry)
+    try:
+        resolved_registry.get("remember")
+    except KeyError:
+        register_memory_tools(resolved_registry, resolved_memory)
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,

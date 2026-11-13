@@ -27,18 +27,20 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
                                                 OS User Data Dir (platformdirs)
                                                 - session_token (per-run)
                                                 - desktop_config.json (optional)
-                                                - MEMORY.md
-                                                - memory/YYYY-MM-DD.md
+                                                - memory/MEMORY.md (+ .bak, MEMORY_ARCHIVE.md)
+                                                - memory/episodes/YYYY-MM-DD.md
+                                                - logs/transcripts/<session_id>.jsonl
                                                 - logs/audit.jsonl
+                                                - logs/daemon.log
 ```
 
 ## Components
 
 ### 1. Typed WebSocket Protocol (`src/clea/core/protocol.py` & `scripts/gen_ts_types.py`)
 - Defines strict Pydantic v2 discriminated-union frames (`extra="forbid"`):
-  - **Requests** (`RequestFrame`, discriminated by `method`): `health.ping`, `session.new`, `chat.send`, `approval.respond`, `memory.get`, `memory.get_daily`, `conversations.list`, `conversations.get`, `settings.get`.
+  - **Requests** (`RequestFrame`, discriminated by `method`): `health.ping`, `session.new`, `chat.send`, `approval.respond`, `memory.get`, `memory.get_daily`, `memory.episodes`, `transcripts.list`, `transcripts.get`, `conversations.list`, `conversations.get`, `settings.get`, `dev.emit_sample_task`.
   - **Responses** (`ResponseFrame`): paired by request `id`, carrying typed result models (`METHOD_RESULTS`).
-  - **Events** (`EventFrame`, discriminated by `event`): `assistant_token`, `tool_call_started`, `tool_call_finished`, `approval_requested`, `approval_resolved`, `task_status`, `voice_state` (`idle | listening | thinking | speaking`), `error`.
+  - **Events** (`EventFrame`, discriminated by `event`): `assistant_token`, `tool_call_started`, `tool_call_finished`, `approval_requested`, `approval_resolved`, `task_status` (annotated with `kind`, `next_run_at`, error summary), `voice_state` (`idle | listening | thinking | speaking`), `error`.
 - `scripts/gen_ts_types.py` compiles the Pydantic JSON Schema into `ui/src/protocol/generated.ts` via `json-schema-to-typescript` (`--check` fails on drift).
 
 ### 2. Core Daemon & Handshake Security (`src/clea/core/daemon.py`, `src/clea/core/auth.py`)
@@ -53,22 +55,41 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
 - **Concurrent Turns & Approvals**:
   - Each `chat.send` runs as an asyncio task so the connection receive loop stays live for `approval.respond`.
   - Pending approvals resolve on user response, timeout (defaults to `deny`), or disconnect (cancelled).
+- **Latency & Streaming Resilience**:
+  - Configurable pre-header first-event timeout (default 7.0 s, `CLEA_FIRST_EVENT_TIMEOUT`) with at most ONE retry before stream tokens arrive.
+  - Replays `thought_signature` before `function_call` steps to satisfy API contracts.
+  - Automatic rollback of failed turns so subsequent turns succeed without session corruption.
 
 ### 3. Tool Registry & Permissions (`src/clea/tools/registry.py`)
 - **`RiskLevel`**: `read_only` (auto-allowed), `reversible` (asks confirmation), `destructive` (asks confirmation + explicit second click in UI / explicit `yes` in CLI).
 - **`AuditLogger`**: Appends a JSONL record to `<user_data_dir>/logs/audit.jsonl` for every tool invocation (`ok`, `denied`, `error`).
+- **Memory Tools**: `remember` (`reversible`) writes explicit stated facts to `MEMORY.md`; `forget` (`destructive`) matches entries and shows matching facts before user confirmation.
 
-### 4. Memory Store (`src/clea/memory/store.py` & `src/clea/paths.py`)
-- Stores `MEMORY.md` and `memory/YYYY-MM-DD.md` outside the repo under `platformdirs.user_data_dir("clea", appauthor=False)` (or `CLEA_DATA_DIR`).
-- Provides read-only `list_days()`, `read_daily_on()` (with strict `YYYY-MM-DD` validation), `list_conversations()`, and `get_conversation()` exposed over the daemon protocol.
+### 4. Memory Store & Consolidation (`src/clea/memory/store.py`, `src/clea/memory/consolidation.py`)
+- **Three-Tier Storage** (all outside repo via `platformdirs`):
+  1. `memory/MEMORY.md`: Durable facts and preferences only, organized into fixed sections (`Profile`, `Preferences`, `Environment`, `Projects`, `Decisions`, `Open Threads`) formatted as `- [id] (YYYY-MM-DD, source) text`. Includes atomic replacement and `.bak` backups.
+  2. `memory/episodes/YYYY-MM-DD.md`: Per-session structured summaries (3-5 lines per session: session ID, start time, topics, outcomes, unresolved items).
+  3. `logs/transcripts/<session_id>.jsonl`: Complete, raw session transcripts with JSON metadata header and structured message lines.
+- **Migration**: Automatic, idempotent migration from legacy daily logs into structured JSONL transcripts with backups in `backup_legacy_logs`.
+- **Consolidation**:
+  - Triggers on session completion, 15-minute idle inactivity, or startup crash recovery for unconsolidated sessions.
+  - Evaluates transcripts via structured JSON schema (`ConsolidationPayload`), deduplicating or resolving contradictions against existing facts.
+  - Safety filters reject secrets/tokens, ignore instructions embedded in tool outputs or web data, and skip small talk.
+  - Enforces configurable size caps (~2,000 tokens); when exceeded, oldest `inferred-low-confidence` entries are archived to `memory/MEMORY_ARCHIVE.md` (stated and confirmed entries are never dropped).
+  - Emits `background_task` status events visible in the Activity tab.
+- **Context Injection**: At turn start, injects size-capped `MEMORY.md` and up to the last 5 episode summaries (capped by token count). Raw transcripts are never injected into context.
+- **History Cap**: Sliding window message buffer with older turns condensed to a brief summary.
 
 ### 5. Desktop UI (`ui/`)
 - **Pure Client**: React 19, TypeScript, Vite 8, Tailwind CSS v4, shadcn-style primitives + `cmdk`, Zustand (`ui/src/protocol/store.ts`), `CleaClient` with exponential backoff + jitter (`ui/src/protocol/client.ts`).
 - **Screens**:
-  - **Chat**: streaming Markdown (`react-markdown` + `remark-gfm`), collapsible tool cards, inline approval cards (two-click confirmation for `destructive`), `Enter` send / `Shift+Enter` newline.
+  - **Chat**: streaming Markdown (`react-markdown` + `remark-gfm`), collapsible tool cards, inline approval cards (two-click confirmation for `destructive`), `Enter` send / `Shift+Enter` newline, and a "Still working…" indicator after ~3 s.
   - **Sidebar & Command Palette (`Ctrl/Cmd+K`)**: navigation to Chat, Activity, Memory, Settings; read-only historical conversations grouped by date; system/dark/light theme toggle.
-  - **Activity**: live/completed `task_status` list.
-  - **Memory**: read-only `MEMORY.md` and daily logs fetched from the daemon.
+  - **Activity**: displays only `background_task`, `scheduled`, and `agent_run` tasks (chat turns are filtered out) divided into "Running and upcoming" and "Recent" (capped at 50) with expandable error summaries.
+  - **Memory**: displays `MEMORY.md` parsed by sections, recent episode summaries, consolidation status, and a subview for inspecting structured transcripts.
+  - **Settings**: non-secret daemon status, provider/model, permission tiers, registered tools.
+  - **Call Overlay**: floating glass orb driven by `voice_state` events (`prefers-reduced-motion` respected). Dev-only simulation panel (`DevVoiceMockPanel.tsx`) is dynamically imported only under `import.meta.env.DEV && VITE_CLEA_MOCKS === "true"` and excluded from production builds.
+  - **Daemon Offline Screen**: clear startup instructions (`uv run clea daemon`) and auto-reconnect.
   - **Settings**: non-secret daemon status, provider/model, permission tiers, registered tools.
   - **Call Overlay**: floating glass orb driven by `voice_state` events (`prefers-reduced-motion` respected). Dev-only simulation panel (`DevVoiceMockPanel.tsx`) is dynamically imported only under `import.meta.env.DEV && VITE_CLEA_MOCKS === "true"` and excluded from production builds.
   - **Daemon Offline Screen**: clear startup instructions (`uv run clea daemon`) and auto-reconnect.

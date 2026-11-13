@@ -24,24 +24,43 @@ from clea.core.protocol import (
     ApprovalResolvedEvent,
     ApprovalRespondRequest,
     AssistantTokenEvent,
+    CallEndedEvent,
+    CallStartedEvent,
+    CallState,
     ChatSendRequest,
     ConversationsGetRequest,
     ConversationsListRequest,
+    DevEmitSampleTaskRequest,
     ErrorEvent,
     EventFrame,
     HealthPingRequest,
+    MemoryEpisodesRequest,
     MemoryGetDailyRequest,
     MemoryGetRequest,
     RequestFrame,
     ResponseFrame,
     RiskTier,
+    ScreenCaptureStateEvent,
+    ScreenCaptureTarget,
     SessionNewRequest,
     SettingsGetRequest,
+    TaskKind,
     TaskState,
     TaskStatusEvent,
     ToolCallFinishedEvent,
     ToolCallStartedEvent,
+    TranscriptEvent,
+    TranscriptRole,
+    TranscriptsGetRequest,
+    TranscriptsListRequest,
+    UsageEvent,
+    VoiceDelegateTaskRequest,
+    VoiceEndCallRequest,
+    VoiceStartCallRequest,
     VoiceState,
+    VoiceStateEvent,
+    VoiceStatusRequest,
+    VoiceTrigger,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,7 +90,12 @@ def build_json_schema() -> dict[str, Any]:
         approval_decision: ApprovalDecision
         approval_reason: ApprovalReason
         task_state: TaskState
+        task_kind: TaskKind
         voice_state: VoiceState
+        call_state: CallState
+        transcript_role: TranscriptRole
+        screen_capture_target: ScreenCaptureTarget
+        voice_trigger: VoiceTrigger
         # Keep individual members explicit so json2ts always emits named interfaces
         health_ping_request: HealthPingRequest
         session_new_request: SessionNewRequest
@@ -79,15 +103,29 @@ def build_json_schema() -> dict[str, Any]:
         approval_respond_request: ApprovalRespondRequest
         memory_get_request: MemoryGetRequest
         memory_get_daily_request: MemoryGetDailyRequest
+        memory_episodes_request: MemoryEpisodesRequest
+        transcripts_list_request: TranscriptsListRequest
+        transcripts_get_request: TranscriptsGetRequest
         conversations_list_request: ConversationsListRequest
         conversations_get_request: ConversationsGetRequest
         settings_get_request: SettingsGetRequest
+        dev_emit_sample_task_request: DevEmitSampleTaskRequest
+        voice_start_call_request: VoiceStartCallRequest
+        voice_end_call_request: VoiceEndCallRequest
+        voice_status_request: VoiceStatusRequest
+        voice_delegate_task_request: VoiceDelegateTaskRequest
         assistant_token_event: AssistantTokenEvent
         tool_call_started_event: ToolCallStartedEvent
         tool_call_finished_event: ToolCallFinishedEvent
         approval_requested_event: ApprovalRequestedEvent
         approval_resolved_event: ApprovalResolvedEvent
         task_status_event: TaskStatusEvent
+        voice_state_event: VoiceStateEvent
+        call_started_event: CallStartedEvent
+        call_ended_event: CallEndedEvent
+        transcript_event: TranscriptEvent
+        screen_capture_state_event: ScreenCaptureStateEvent
+        usage_event: UsageEvent
         error_event: ErrorEvent
 
     return CleaProtocolSchema.model_json_schema(mode="serialization")

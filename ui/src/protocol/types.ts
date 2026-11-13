@@ -5,6 +5,9 @@ import type {
   ApprovalResolvedData,
   ApprovalRespondParams,
   ApprovalRespondResult,
+  CallEndedData,
+  CallStartedData,
+  CallState,
   ChatSendParams,
   ChatSendResult,
   ConversationGetParams,
@@ -13,22 +16,46 @@ import type {
   ConversationSummary,
   ConversationTurn,
   DailyParams,
+  DevEmitSampleTaskResult,
+  EpisodeItem,
   Event,
   HealthPingResult,
+  MemoryEpisodesParams,
+  MemoryEpisodesResult,
   MemoryGetDailyResult,
   MemoryGetResult,
   PermissionTierInfo,
   Request,
   ResponseFrame,
   RiskTier,
+  ScreenCaptureStateData,
+  ScreenCaptureTarget1 as ScreenCaptureTarget,
   SessionNewResult,
   SettingsGetResult,
+  TaskKind,
   TaskState,
   TaskStatusData,
   ToolCallFinishedData,
   ToolCallStartedData,
   ToolInfo,
+  TranscriptData,
+  TranscriptMessageItem,
+  TranscriptRole,
+  TranscriptSummaryItem,
+  TranscriptsGetParams,
+  TranscriptsGetResult,
+  TranscriptsListParams,
+  TranscriptsListResult,
+  UsageData,
+  VoiceDelegateTaskParams,
+  VoiceDelegateTaskResult,
+  VoiceEndCallParams,
+  VoiceEndCallResult,
+  VoiceStartCallParams,
+  VoiceStartCallResult,
   VoiceState,
+  VoiceStatusResult,
+  VoiceTrigger,
 } from "./generated";
 
 export type {
@@ -38,6 +65,9 @@ export type {
   ApprovalResolvedData,
   ApprovalRespondParams,
   ApprovalRespondResult,
+  CallEndedData,
+  CallStartedData,
+  CallState,
   ChatSendParams,
   ChatSendResult,
   ConversationGetParams,
@@ -46,22 +76,46 @@ export type {
   ConversationSummary,
   ConversationTurn,
   DailyParams,
+  DevEmitSampleTaskResult,
+  EpisodeItem,
   Event as CleaEvent,
   HealthPingResult,
+  MemoryEpisodesParams,
+  MemoryEpisodesResult,
   MemoryGetDailyResult,
   MemoryGetResult,
   PermissionTierInfo,
   Request as CleaRequest,
   ResponseFrame,
   RiskTier,
+  ScreenCaptureStateData,
+  ScreenCaptureTarget,
   SessionNewResult,
   SettingsGetResult,
+  TaskKind,
   TaskState,
   TaskStatusData,
   ToolCallFinishedData,
   ToolCallStartedData,
   ToolInfo,
+  TranscriptData,
+  TranscriptMessageItem,
+  TranscriptRole,
+  TranscriptSummaryItem,
+  TranscriptsGetParams,
+  TranscriptsGetResult,
+  TranscriptsListParams,
+  TranscriptsListResult,
+  UsageData,
+  VoiceDelegateTaskParams,
+  VoiceDelegateTaskResult,
+  VoiceEndCallParams,
+  VoiceEndCallResult,
+  VoiceStartCallParams,
+  VoiceStartCallResult,
   VoiceState,
+  VoiceStatusResult,
+  VoiceTrigger,
 };
 
 export type CleaMethod = NonNullable<Request["method"]>;
@@ -73,9 +127,17 @@ export interface MethodParamsMap {
   "approval.respond": ApprovalRespondParams;
   "memory.get": Record<string, never>;
   "memory.get_daily": DailyParams;
+  "memory.episodes": MemoryEpisodesParams;
+  "transcripts.list": TranscriptsListParams;
+  "transcripts.get": TranscriptsGetParams;
   "conversations.list": Record<string, never>;
   "conversations.get": ConversationGetParams;
   "settings.get": Record<string, never>;
+  "dev.emit_sample_task": Record<string, never>;
+  "voice.start_call": VoiceStartCallParams;
+  "voice.end_call": VoiceEndCallParams;
+  "voice.status": Record<string, never>;
+  "voice.delegate_task": VoiceDelegateTaskParams;
 }
 
 export interface MethodResultMap {
@@ -85,9 +147,17 @@ export interface MethodResultMap {
   "approval.respond": ApprovalRespondResult;
   "memory.get": MemoryGetResult;
   "memory.get_daily": MemoryGetDailyResult;
+  "memory.episodes": MemoryEpisodesResult;
+  "transcripts.list": TranscriptsListResult;
+  "transcripts.get": TranscriptsGetResult;
   "conversations.list": ConversationsListResult;
   "conversations.get": ConversationsGetResult;
   "settings.get": SettingsGetResult;
+  "dev.emit_sample_task": DevEmitSampleTaskResult;
+  "voice.start_call": VoiceStartCallResult;
+  "voice.end_call": VoiceEndCallResult;
+  "voice.status": VoiceStatusResult;
+  "voice.delegate_task": VoiceDelegateTaskResult;
 }
 
 export type ConnectionState =

@@ -7,6 +7,27 @@ import { useCleaStore } from "@/protocol/store";
 import { MarkdownContent } from "./MarkdownContent";
 import { ToolCallCard } from "./ToolCallCard";
 
+function StreamingIndicator() {
+  const [stillWorking, setStillWorking] = useState(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setStillWorking(true);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 text-xs text-[var(--text-subtle)]"
+      aria-live="polite"
+    >
+      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--text-muted)]" />
+      {stillWorking ? "Still working…" : "Thinking…"}
+    </span>
+  );
+}
+
 export function ChatView() {
   const messages = useCleaStore((s) => s.messages);
   const sending = useCleaStore((s) => s.sending);
@@ -173,12 +194,7 @@ export function ChatView() {
                   {msg.content ? (
                     <MarkdownContent content={msg.content} />
                   ) : msg.streaming ? (
-                    <span
-                      className="inline-block text-xs text-[var(--text-subtle)]"
-                      aria-live="polite"
-                    >
-                      Thinking…
-                    </span>
+                    <StreamingIndicator />
                   ) : null}
 
                   {msg.error && (

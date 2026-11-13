@@ -21,10 +21,13 @@ This file defines the non-negotiable rules for working in the Clea repository.
    - Every tool invocation MUST be logged to `<user_data_dir>/logs/audit.jsonl`.
    - Future tool preference order: APIs/MCP/CLIs -> direct OS calls -> accessibility-tree UI automation -> screenshots as last resort.
 5. **Memory outside the repo**:
-   - `MEMORY.md` and `memory/YYYY-MM-DD.md` MUST be stored in `platformdirs.user_data_dir("clea", appauthor=False)` (or `CLEA_DATA_DIR` in tests/dev), never inside the repo.
-6. **Provider abstraction**:
+   - Three storage tiers: `memory/MEMORY.md` (durable facts with fixed sections), `memory/episodes/` (session summaries), and `logs/transcripts/` (structured JSONL transcripts) MUST be stored in `platformdirs.user_data_dir("clea", appauthor=False)` (or `CLEA_DATA_DIR` in tests/dev), never inside the repo.
+   - Consolidation runs as a background task on session completion, 15m idle, or startup crash recovery. Over-cap entries are archived to `memory/MEMORY_ARCHIVE.md`.
+6. **Activity semantics**:
+   - `task_status` events carry `kind` (`chat_turn`, `background_task`, `scheduled`, `agent_run`). Chat turns are excluded from the Activity tab, which shows only real background, scheduled, and agent work.
+7. **Provider abstraction**:
    - Core code depends only on `LLMProvider` in `src/clea/providers/base.py`, never directly on a vendor SDK.
-7. **Dev mocks stay out of production**:
+8. **Dev mocks stay out of production**:
    - Any UI mock panels or dev-server helpers MUST be gated behind `import.meta.env.DEV` (and `VITE_CLEA_MOCKS` where applicable) so they are dead-code-eliminated from production builds.
 
 ## Development Workflow

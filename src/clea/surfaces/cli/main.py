@@ -291,6 +291,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["install", "uninstall", "status"],
         help="Install, uninstall, or inspect the Task Scheduler logon task",
     )
+
+    voice_parser = subparsers.add_parser("voice", help="Run or inspect the Clea live voice surface")
+    voice_subparsers = voice_parser.add_subparsers(dest="voice_subcommand")
+
+    voice_doctor = voice_subparsers.add_parser(
+        "doctor", help="Check audio, models, and voice setup"
+    )
+    voice_doctor.add_argument(
+        "--download-models",
+        action="store_true",
+        help="Download missing wake word models from official releases to <user_data_dir>/models/",
+    )
+
+    voice_subparsers.add_parser("test", help="Test audio input/output and wake word detector")
     return parser
 
 
@@ -309,3 +323,14 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_send_and_stream(ws_url))
     elif args.command == "autostart":
         _run_autostart_cmd(args.action)
+    elif args.command == "voice":
+        from clea.surfaces.cli.voice import run_voice_doctor, run_voice_service, run_voice_test
+
+        if args.voice_subcommand == "doctor":
+            run_voice_doctor(download_models=args.download_models)
+        elif args.voice_subcommand == "test":
+            run_voice_test()
+        else:
+            host = os.environ.get("CLEA_HOST", DEFAULT_HOST)
+            port = int(os.environ.get("CLEA_PORT", DEFAULT_PORT))
+            run_voice_service(host=host, port=port)

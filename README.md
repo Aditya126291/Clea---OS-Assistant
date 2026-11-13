@@ -5,8 +5,10 @@ Clea is a local-first, hub-and-spoke personal AI assistant for the desktop.
 Milestone 1 provides the text-only foundation:
 - A localhost-only WebSocket daemon (`clea daemon`) owning the agent loop, sessions, tools, permissions, and memory.
 - A terminal chat client (`clea chat`) that streams replies over the typed protocol.
-- Human-readable Markdown memory (`MEMORY.md` and `memory/YYYY-MM-DD.md`) and JSONL tool audit logs stored outside the repo in your OS user data directory.
-- A swappable `LLMProvider` interface with `GeminiProvider` (`google-genai`, `gemini-3.8-flash`).
+- Three-tier memory stored in your OS user data directory: durable facts in `memory/MEMORY.md`, per-session summaries in `memory/episodes/`, and structured transcripts in `logs/transcripts/`, with automated background consolidation, safety filtering, and size-cap archiving.
+- Activity task semantics tracking real background tasks, scheduled jobs, and agent runs (filtering out chat turns).
+- Low-latency streaming with pre-header timeout retry, thought-signature replay, turn rollback on error, and UI progress feedback.
+- A swappable `LLMProvider` interface with `GeminiProvider` (`google-genai`).
 
 ## Setup
 
