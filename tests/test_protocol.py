@@ -25,6 +25,7 @@ from clea.core.protocol import (
     ChatSendRequest,
     DevEmitSampleTaskRequest,
     MemoryEpisodesRequest,
+    MemoryForgetRequest,
     ResponseFrame,
     ScreenCaptureStateData,
     ScreenCaptureStateEvent,
@@ -169,6 +170,7 @@ def test_every_method_has_a_result_model() -> None:
             ("memory.archive", {}),
             ("memory.status", {}),
             ("memory.reconsolidate", {"session_id": "s1"}),
+            ("memory.forget", {"id": "x"}),
             ("transcripts.list", {}),
             ("transcripts.get", {"session_id": "s1"}),
             ("dev.emit_sample_task", {}),
@@ -356,3 +358,20 @@ def test_new_memory_and_transcript_requests() -> None:
         '{"frame_type": "request", "method": "dev.emit_sample_task", "params": {}}'
     )
     assert isinstance(dev_req, DevEmitSampleTaskRequest)
+
+
+def test_memory_forget_request_and_result() -> None:
+    raw = (
+        '{"frame_type": "request", "method": "memory.forget", '
+        '"params": {"id": "pref-1", "query": "dark mode"}}'
+    )
+    req = parse_frame(raw)
+    assert isinstance(req, MemoryForgetRequest)
+    assert req.params.id == "pref-1"
+    assert req.params.query == "dark mode"
+
+    assert "memory.forget" in METHOD_RESULTS
+    res = METHOD_RESULTS["memory.forget"](ok=True, removed_count=1, removed_ids=["pref-1"])
+    assert res.ok is True
+    assert res.removed_count == 1
+    assert res.removed_ids == ["pref-1"]

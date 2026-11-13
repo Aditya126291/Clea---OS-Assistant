@@ -27,6 +27,9 @@ import type {
   MemoryEpisodesResult,
   MemoryFactItem,
   MemoryFactsResult,
+  MemoryForgetParams,
+  MemoryForgetRequest,
+  MemoryForgetResult,
   MemoryGetDailyResult,
   MemoryGetResult,
   MemoryReconsolidateParams,
@@ -96,6 +99,9 @@ export type {
   MemoryEpisodesResult,
   MemoryFactItem,
   MemoryFactsResult,
+  MemoryForgetParams,
+  MemoryForgetRequest,
+  MemoryForgetResult,
   MemoryGetDailyResult,
   MemoryGetResult,
   MemoryReconsolidateParams,
@@ -150,6 +156,7 @@ export interface MethodParamsMap {
   "memory.archive": Record<string, never>;
   "memory.status": Record<string, never>;
   "memory.reconsolidate": MemoryReconsolidateParams;
+  "memory.forget": MemoryForgetParams;
   "transcripts.list": TranscriptsListParams;
   "transcripts.get": TranscriptsGetParams;
   "conversations.list": Record<string, never>;
@@ -174,6 +181,7 @@ export interface MethodResultMap {
   "memory.archive": MemoryArchiveResult;
   "memory.status": MemoryStatusResult;
   "memory.reconsolidate": MemoryReconsolidateResult;
+  "memory.forget": MemoryForgetResult;
   "transcripts.list": TranscriptsListResult;
   "transcripts.get": TranscriptsGetResult;
   "conversations.list": ConversationsListResult;

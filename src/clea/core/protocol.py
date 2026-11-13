@@ -157,6 +157,20 @@ class MemoryReconsolidateRequest(_Request):
     params: MemoryReconsolidateParams
 
 
+class MemoryForgetParams(_Model):
+    id: str | None = Field(default=None, description="Entry ID of the fact to forget")
+    query: str | None = Field(
+        default=None, description="Keywords, text, or ID of the memory to forget"
+    )
+
+
+class MemoryForgetRequest(_Request):
+    """Forget durable facts or preferences matching an entry ID or query."""
+
+    method: Literal["memory.forget"] = "memory.forget"
+    params: MemoryForgetParams
+
+
 class TranscriptsListParams(_Model):
     limit: int = Field(default=50, ge=1, le=200)
 
@@ -227,6 +241,7 @@ RequestFrame = Annotated[
     | MemoryArchiveRequest
     | MemoryStatusRequest
     | MemoryReconsolidateRequest
+    | MemoryForgetRequest
     | TranscriptsListRequest
     | TranscriptsGetRequest
     | DevEmitSampleTaskRequest
@@ -352,6 +367,12 @@ class MemoryReconsolidateResult(_Model):
     error: str | None = None
 
 
+class MemoryForgetResult(_Model):
+    ok: bool = True
+    removed_count: int = 0
+    removed_ids: list[str] = Field(default_factory=list)
+
+
 class TranscriptSummaryItem(_Model):
     session_id: str
     started_at: str
@@ -472,6 +493,7 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "memory.archive": MemoryArchiveResult,
     "memory.status": MemoryStatusResult,
     "memory.reconsolidate": MemoryReconsolidateResult,
+    "memory.forget": MemoryForgetResult,
     "transcripts.list": TranscriptsListResult,
     "transcripts.get": TranscriptsGetResult,
     "dev.emit_sample_task": DevEmitSampleTaskResult,

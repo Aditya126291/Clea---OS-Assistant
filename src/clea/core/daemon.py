@@ -580,10 +580,9 @@ class CleaDaemon:
             ok = await self.consolidation.reconsolidate_session(
                 sid, on_task_status=_on_reconsolidate_status
             )
-            state_info = (
-                self.consolidation.load_state().get("sessions", {}).get(resolved_sid)
-                or self.consolidation.load_state().get("sessions", {}).get(sid, {})
-            )
+            state_info = self.consolidation.load_state().get("sessions", {}).get(
+                resolved_sid
+            ) or self.consolidation.load_state().get("sessions", {}).get(sid, {})
             current_status = state_info.get("status", "completed" if ok else "failed")
             err = state_info.get("last_error") or state_info.get("error") if not ok else None
             await self._respond(
@@ -594,6 +593,18 @@ class CleaDaemon:
                     ok=ok,
                     status=current_status,
                     error=err,
+                ),
+            )
+        elif method == "memory.forget":
+            target = req.params.id or req.params.query or ""
+            removed = self.agent.memory.remove_entries(target)
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    ok=True,
+                    removed_count=len(removed),
+                    removed_ids=[e.id for e in removed],
                 ),
             )
         elif method == "transcripts.list":

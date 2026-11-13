@@ -100,6 +100,7 @@ export interface CleaStoreState {
   loadMemoryArchive: () => Promise<void>;
   loadMemoryStatus: () => Promise<void>;
   reconsolidate: (sessionId: string) => Promise<boolean>;
+  forgetFact: (id: string, query?: string) => Promise<boolean>;
   loadTranscripts: () => Promise<void>;
   openTranscript: (sessionId: string) => Promise<void>;
   emitDevSampleTask: () => Promise<void>;
@@ -522,6 +523,18 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         delete next[sessionId];
         return { reconsolidating: next };
       });
+    }
+  },
+
+  forgetFact: async (id: string, query?: string) => {
+    if (!activeClient?.isConnected) return false;
+    try {
+      const res = await activeClient.request("memory.forget", { id, query: query ?? id });
+      void get().loadMemoryFacts();
+      void get().loadMemory();
+      return res.ok ?? true;
+    } catch {
+      return false;
     }
   },
 

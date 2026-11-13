@@ -14,12 +14,19 @@ import {
   RotateCw,
   Search,
   Sparkles,
+  Trash2,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -133,6 +140,7 @@ export function MemoryView() {
   const loadMemoryArchive = useCleaStore((s) => s.loadMemoryArchive);
   const loadMemoryStatus = useCleaStore((s) => s.loadMemoryStatus);
   const reconsolidate = useCleaStore((s) => s.reconsolidate);
+  const forgetFact = useCleaStore((s) => s.forgetFact);
   const loadTranscripts = useCleaStore((s) => s.loadTranscripts);
   const openTranscript = useCleaStore((s) => s.openTranscript);
   const setSubView = useCleaStore((s) => s.setMemorySubView);
@@ -161,6 +169,10 @@ export function MemoryView() {
 
   // Facts search filter
   const [factsFilter, setFactsFilter] = useState("");
+
+  // Per-fact forget confirmation dialog state
+  const [factToForget, setFactToForget] = useState<MemoryFactItem | null>(null);
+  const [isDeletingFact, setIsDeletingFact] = useState(false);
 
   // Episodes: show short sessions toggle
   const [showShortSessions, setShowShortSessions] = useState(false);
@@ -686,18 +698,29 @@ export function MemoryView() {
                                     <span>{entry.date}</span>
                                   </div>
                                 </div>
-                                <span
-                                  className={cn(
-                                    "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase",
-                                    entry.source === "stated"
-                                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
-                                      : entry.source === "confirmed"
-                                        ? "bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20"
-                                        : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20",
-                                  )}
-                                >
-                                  {entry.source.startsWith("inferred") ? "inferred" : entry.source}
-                                </span>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <span
+                                    className={cn(
+                                      "rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase",
+                                      entry.source === "stated"
+                                        ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                                        : entry.source === "confirmed"
+                                          ? "bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20"
+                                          : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20",
+                                    )}
+                                  >
+                                    {entry.source.startsWith("inferred") ? "inferred" : entry.source}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setFactToForget(entry)}
+                                    className="p-1 text-[var(--text-subtle)] hover:text-red-500 hover:bg-red-500/10 rounded transition-colors cursor-pointer"
+                                    aria-label={`Forget fact: ${entry.text}`}
+                                    title="Forget this fact"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                                  </button>
+                                </div>
                               </div>
                             ))
                           )}
@@ -1146,6 +1169,65 @@ export function MemoryView() {
           </div>
         )}
       </div>
+
+      {/* Confirmation dialog for forgetting a fact */}
+      <Dialog
+        open={factToForget !== null}
+        onOpenChange={(open) => {
+          if (!open && !isDeletingFact) {
+            setFactToForget(null);
+          }
+        }}
+      >
+        <DialogContent aria-label="Confirm forgetting fact" className="p-5 max-w-md">
+          <DialogTitle className="text-sm font-semibold text-[var(--text)]">
+            Forget this fact?
+          </DialogTitle>
+          <DialogDescription className="text-xs text-[var(--text-subtle)] mt-1.5">
+            This will permanently remove this fact from Clea&apos;s long-term memory.
+          </DialogDescription>
+
+          {factToForget && (
+            <div className="mt-4 rounded-md border border-[var(--border)] bg-[var(--bg-subtle)] p-3">
+              <p className="text-xs text-[var(--text)] leading-relaxed italic font-medium">
+                &ldquo;{factToForget.text}&rdquo;
+              </p>
+              <div className="mt-2 flex items-center gap-2 font-mono text-[10px] text-[var(--text-subtle)]">
+                <span>[{factToForget.id}]</span>
+                <span>{factToForget.date}</span>
+              </div>
+            </div>
+          )}
+
+          <div className="mt-5 flex items-center justify-end gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={isDeletingFact}
+              onClick={() => setFactToForget(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={isDeletingFact}
+              onClick={async () => {
+                if (!factToForget) return;
+                setIsDeletingFact(true);
+                try {
+                  await forgetFact(factToForget.id, factToForget.text);
+                } finally {
+                  setIsDeletingFact(false);
+                  setFactToForget(null);
+                }
+              }}
+            >
+              {isDeletingFact ? "Forgetting..." : "Forget fact"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

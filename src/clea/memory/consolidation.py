@@ -224,7 +224,18 @@ class ConsolidationManager:
         resolved_sid = self.memory.resolve_session_id(session_id)
         sessions = state.get("sessions", {})
         entry = sessions.get(resolved_sid) or sessions.get(session_id)
-        return bool(entry and entry.get("status") == "completed")
+        if not entry or entry.get("status") != "completed":
+            return False
+
+        last_turn = entry.get("last_consolidated_turn")
+        if last_turn is None:
+            return True
+
+        transcript = self.memory.get_transcript(resolved_sid)
+        if not transcript:
+            return True
+        messages = transcript.get("messages", [])
+        return len(messages) <= last_turn
 
     def _get_response_format_kwargs(self) -> dict[str, Any]:
         """Build schema-constrained response format if supported by provider."""
@@ -347,14 +358,21 @@ class ConsolidationManager:
             # Empty session: mark completed without calling model
             state = self.load_state()
             now_iso = datetime.now().astimezone().isoformat()
-            state.setdefault("sessions", {})[session_id] = {
+            resolved_sid = self.memory.resolve_session_id(session_id)
+            sess_data = {
                 "status": "completed",
                 "consolidated_at": now_iso,
                 "trivial": True,
+                "last_consolidated_turn": 0,
             }
+            state.setdefault("sessions", {})[session_id] = sess_data
+            if resolved_sid and resolved_sid != session_id:
+                state["sessions"][resolved_sid] = sess_data
             state["last_consolidated_at"] = now_iso
             self.save_state(state)
             return True
+
+        turn_count = len(transcript.get("messages", []))
 
         # Trivial session check: fewer than N user turns and no tool use
         is_trivial, user_turns = self.is_trivial_session(transcript)
@@ -373,11 +391,16 @@ class ConsolidationManager:
             )
             state = self.load_state()
             now_iso = datetime.now().astimezone().isoformat()
-            state.setdefault("sessions", {})[session_id] = {
+            resolved_sid = self.memory.resolve_session_id(session_id)
+            sess_data = {
                 "status": "completed",
                 "consolidated_at": now_iso,
                 "trivial": True,
+                "last_consolidated_turn": turn_count,
             }
+            state.setdefault("sessions", {})[session_id] = sess_data
+            if resolved_sid and resolved_sid != session_id:
+                state["sessions"][resolved_sid] = sess_data
             state["last_consolidated_at"] = now_iso
             self.save_state(state)
             if effective_status_cb is not None:
@@ -504,11 +527,16 @@ class ConsolidationManager:
                 logger.warning("Could not apply memory operation (%s): %s", op, op_err)
 
         # 3. Mark completed
-        state.setdefault("sessions", {})[session_id] = {
+        resolved_sid = self.memory.resolve_session_id(session_id)
+        sess_data = {
             "status": "completed",
             "consolidated_at": now_iso,
             "retry_count": sess_info.get("retry_count", 0),
+            "last_consolidated_turn": turn_count,
         }
+        state.setdefault("sessions", {})[session_id] = sess_data
+        if resolved_sid and resolved_sid != session_id:
+            state["sessions"][resolved_sid] = sess_data
         state["last_consolidated_at"] = now_iso
         self.save_state(state)
 
@@ -586,6 +614,11 @@ class ConsolidationManager:
                                 should_process = True
                         else:
                             should_process = True
+            elif session_state.get("status") == "completed":
+                last_turn = session_state.get("last_consolidated_turn")
+                msg_count = t.get("message_count", 0)
+                if last_turn is not None and msg_count > last_turn:
+                    should_process = True
 
             if should_process:
                 logger.info(

@@ -487,4 +487,3 @@ async def test_daemon_voice_start_call_returns_memory_context_and_end_call_persi
             assert tr["messages"][1]["text"] == "New Delhi."
     finally:
         await daemon.stop()
-

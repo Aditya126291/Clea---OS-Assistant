@@ -136,6 +136,65 @@ describe("MemoryView component", () => {
     expect(screen.getByText(/No facts match "nonexistent query xyz"/i)).toBeInTheDocument();
   });
 
+  it("opens confirmation dialog with exact fact text and allows forgetting a fact", async () => {
+    const forgetFact = vi.fn().mockResolvedValue(true);
+    useCleaStore.setState({
+      forgetFact,
+      memoryFacts: [
+        {
+          name: "Preferences",
+          entries: [
+            {
+              id: "pref-1",
+              date: "2026-11-13",
+              source: "stated",
+              text: "Prefers Python over Node.",
+            },
+          ],
+        },
+      ],
+    });
+
+    render(<MemoryView />);
+
+    // Small trash/forget button is present on the fact row
+    const forgetBtn = screen.getByRole("button", {
+      name: /Forget fact: Prefers Python over Node\./i,
+    });
+    expect(forgetBtn).toBeInTheDocument();
+
+    // Click trash button to open confirmation dialog
+    fireEvent.click(forgetBtn);
+
+    // Confirmation dialog is shown with exact fact text
+    expect(screen.getByRole("heading", { name: "Forget this fact?" })).toBeInTheDocument();
+    expect(
+      screen.getByText(/This will permanently remove this fact from Clea's long-term memory\./i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/“Prefers Python over Node\.”/i)).toBeInTheDocument();
+
+    // Clicking Cancel closes the dialog without calling forgetFact
+    const cancelBtn = screen.getByRole("button", { name: "Cancel" });
+    fireEvent.click(cancelBtn);
+    expect(forgetFact).not.toHaveBeenCalled();
+
+    await waitFor(() => {
+      expect(screen.queryByRole("heading", { name: "Forget this fact?" })).not.toBeInTheDocument();
+    });
+
+    // Reopen dialog and confirm deletion
+    fireEvent.click(forgetBtn);
+    const confirmDeleteBtn = screen.getByRole("button", { name: "Forget fact" });
+    fireEvent.click(confirmDeleteBtn);
+
+    expect(forgetFact).toHaveBeenCalledWith("pref-1", "Prefers Python over Node.");
+
+    // Dialog closes after deletion
+    await waitFor(() => {
+      expect(screen.queryByRole("heading", { name: "Forget this fact?" })).not.toBeInTheDocument();
+    });
+  });
+
   it("renders empty state in Durable Facts when no facts are remembered", () => {
     useCleaStore.setState({
       memoryFacts: [],

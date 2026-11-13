@@ -475,18 +475,40 @@ class MemoryStore:
         now: datetime | None = None,
         trivial: bool = False,
     ) -> Path:
-        """Append an episode summary (3-5 lines) to memory/episodes/YYYY-MM-DD.md."""
+        """Append or update an episode summary (3-5 lines) in memory/episodes/."""
         self.ensure_initialized()
         dt = now or datetime.now().astimezone()
         date_str = dt.date().isoformat()
         time_str = _format_time_local(dt)
+        trivial_suffix = " [trivial]" if trivial else ""
+
+        resolved_sid = self.resolve_session_id(session_id)
+        # Check if an episode for this session already exists in any episode file
+        if self.episodes_dir.is_dir():
+            sids = [session_id]
+            if resolved_sid and resolved_sid != session_id:
+                sids.append(resolved_sid)
+            for ep_file in sorted(self.episodes_dir.glob("*.md"), reverse=True):
+                content = ep_file.read_text(encoding="utf-8")
+                for s in sids:
+                    pattern = re.compile(
+                        rf"(?ms)^### Session `{re.escape(s)}`[^\n]*\n.*?(?=(?:\n### |\Z))"
+                    )
+                    if pattern.search(content):
+                        new_block = (
+                            f"### Session `{session_id}` ({time_str}){trivial_suffix}\n\n"
+                            f"{summary.strip()}\n"
+                        )
+                        updated_content = pattern.sub(lambda _, b=new_block: b, content, count=1)
+                        ep_file.write_text(updated_content, encoding="utf-8")
+                        return ep_file
+
         path = self.episodes_dir / f"{date_str}.md"
 
         chunks: list[str] = []
         if not path.exists():
             chunks.append(f"# Episodes — {date_str}\n")
 
-        trivial_suffix = " [trivial]" if trivial else ""
         header = f"\n### Session `{session_id}` ({time_str}){trivial_suffix}\n\n"
         chunks.append(f"{header}{summary.strip()}\n")
 

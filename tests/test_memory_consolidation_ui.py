@@ -567,3 +567,235 @@ def test_extract_json_block_handles_nested_code_fences_and_backticks() -> None:
     assert parsed["summary"] == "Discussed code formatting."
     assert "print('hello')" in parsed["operations"][0]["text"]
 
+
+async def test_daemon_protocol_memory_forget(tmp_path: Path) -> None:
+    """Test memory.forget removes facts via daemon WebSocket."""
+    from websockets.asyncio.client import connect
+
+    from clea.core import auth
+    from clea.core.agent import AgentLoop
+    from clea.core.daemon import CleaDaemon
+    from clea.core.protocol import (
+        MemoryForgetParams,
+        MemoryForgetRequest,
+        ResponseFrame,
+        parse_frame,
+    )
+    from clea.tools.registry import ToolRegistry
+
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    entry = store.add_or_update_entry(text="Prefers Vim keybindings.", section="Preferences")
+    assert "Prefers Vim keybindings." in store.read_long_term()
+
+    provider = _RecordingProvider([])
+    agent = AgentLoop(provider=provider, registry=ToolRegistry(), memory=store)
+    daemon = CleaDaemon(agent=agent, host="127.0.0.1", port=0)
+    await daemon.start()
+
+    token = auth.read_token(daemon.token_file)
+    assert token is not None
+
+    ws_url = f"ws://127.0.0.1:{daemon.bound_port}"
+
+    async def recv_resp(ws_conn) -> ResponseFrame:
+        while True:
+            frame = parse_frame(await ws_conn.recv())
+            if isinstance(frame, ResponseFrame):
+                return frame
+
+    try:
+        async with connect(ws_url, subprotocols=auth.client_subprotocols(token)) as ws:
+            # Forget by entry ID
+            req = MemoryForgetRequest(params=MemoryForgetParams(id=entry.id))
+            await ws.send(req.model_dump_json())
+            resp = await recv_resp(ws)
+            assert resp.ok
+            assert resp.result.get("ok") is True
+            assert resp.result.get("removed_count") == 1
+            assert resp.result.get("removed_ids") == [entry.id]
+            assert "Prefers Vim keybindings." not in store.read_long_term()
+    finally:
+        await daemon.stop()
+
+
+async def test_resumed_conversation_re_runs_consolidation_and_updates_episode(
+    tmp_path: Path,
+) -> None:
+    """Test that resuming conversation with more turns triggers consolidation and updates."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    session_id = "sess-resumed-conversation"
+
+    # Turn 1 & 2
+    store.append_transcript_message(session_id=session_id, role="user", text="I work at Acme Corp.")
+    store.append_transcript_message(
+        session_id=session_id, role="assistant", text="Noted Acme Corp."
+    )
+
+    # Turn 3 & 4 (2 user turns total)
+    store.append_transcript_message(
+        session_id=session_id, role="user", text="My primary stack is TypeScript."
+    )
+    store.append_transcript_message(
+        session_id=session_id, role="assistant", text="Got it, TypeScript stack."
+    )
+
+    json_1 = json.dumps(
+        {
+            "summary": "Initial discussion about company and stack.",
+            "operations": [
+                {
+                    "op": "add",
+                    "target_section": "Profile",
+                    "text": "Works at Acme Corp.",
+                },
+                {
+                    "op": "add",
+                    "target_section": "Preferences",
+                    "text": "Primary stack is TypeScript.",
+                },
+            ],
+        }
+    )
+
+    json_2 = json.dumps(
+        {
+            "summary": "Updated discussion: now also uses Rust for services.",
+            "operations": [
+                {
+                    "op": "add",
+                    "target_section": "Preferences",
+                    "text": "Uses Rust for microservices.",
+                },
+            ],
+        }
+    )
+
+    provider = _RecordingProvider([json_1, json_2])
+    manager = ConsolidationManager(memory=store, provider=provider)
+
+    # First consolidation
+    ok1 = await manager.consolidate_session(session_id)
+    assert ok1 is True
+    assert provider.call_count == 1
+
+    # Check state has last_consolidated_turn == 4
+    state1 = manager.load_state()
+    sess_entry1 = state1["sessions"][session_id]
+    assert sess_entry1["status"] == "completed"
+    assert sess_entry1["last_consolidated_turn"] == 4
+
+    # Episode summary exists
+    episodes1 = store.get_recent_episodes()
+    assert len(episodes1) == 1
+    assert episodes1[0]["summary"] == "Initial discussion about company and stack."
+    assert "Works at Acme Corp." in store.read_long_term()
+    assert "Primary stack is TypeScript." in store.read_long_term()
+
+    # Calling consolidate again without new turns should no-op
+    assert manager.is_consolidated(session_id) is True
+    ok_noop = await manager.consolidate_session(session_id)
+    assert ok_noop is True
+    assert provider.call_count == 1  # No new model calls!
+
+    # Now resume the conversation: add turns 5 & 6
+    store.append_transcript_message(
+        session_id=session_id, role="user", text="We are rewriting the backend in Rust."
+    )
+    store.append_transcript_message(
+        session_id=session_id, role="assistant", text="Noted Rust backend rewrite."
+    )
+
+    # is_consolidated should now return False because message count (6) > last_consolidated_turn (4)
+    assert manager.is_consolidated(session_id) is False
+
+    # Consolidate again
+    ok2 = await manager.consolidate_session(session_id)
+    assert ok2 is True
+    assert provider.call_count == 2
+
+    # Verify state was updated to last_consolidated_turn == 6
+    state2 = manager.load_state()
+    sess_entry2 = state2["sessions"][session_id]
+    assert sess_entry2["last_consolidated_turn"] == 6
+
+    # Verify episode was UPDATED, NOT DUPLICATED!
+    episodes2 = store.get_recent_episodes()
+    assert len(episodes2) == 1  # STILL EXACTLY ONE EPISODE!
+    assert episodes2[0]["summary"] == "Updated discussion: now also uses Rust for services."
+
+    # Verify new fact was added to MEMORY.md
+    long_term = store.read_long_term()
+    assert "Works at Acme Corp." in long_term
+    assert "Primary stack is TypeScript." in long_term
+    assert "Uses Rust for microservices." in long_term
+
+
+async def test_resumed_trivial_session_upgrades_to_full_consolidation(tmp_path: Path) -> None:
+    """Test that resuming trivial session upgrades stub episode and extracts facts."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    session_id = "sess-trivial-then-resumed"
+
+    # Only 1 user turn (trivial)
+    store.append_transcript_message(session_id=session_id, role="user", text="Hi Clea!")
+    store.append_transcript_message(session_id=session_id, role="assistant", text="Hello!")
+
+    valid_json = json.dumps(
+        {
+            "summary": "User introduced their name as Alex and setup.",
+            "operations": [
+                {
+                    "op": "add",
+                    "target_section": "Profile",
+                    "text": "User name is Alex.",
+                }
+            ],
+        }
+    )
+
+    provider = _RecordingProvider([valid_json])
+    manager = ConsolidationManager(memory=store, provider=provider)
+
+    # First consolidation: trivial session skipped
+    ok1 = await manager.consolidate_session(session_id)
+    assert ok1 is True
+    assert provider.call_count == 0  # no model call
+
+    # State records trivial and last_consolidated_turn == 2
+    state1 = manager.load_state()
+    assert state1["sessions"][session_id]["trivial"] is True
+    assert state1["sessions"][session_id]["last_consolidated_turn"] == 2
+
+    episodes1 = store.get_recent_episodes()
+    assert len(episodes1) == 1
+    assert episodes1[0]["trivial"] is True
+    assert "Short session" in episodes1[0]["summary"]
+
+    # Resume session with substantive turns
+    store.append_transcript_message(
+        session_id=session_id, role="user", text="My name is Alex and I use macOS."
+    )
+    store.append_transcript_message(
+        session_id=session_id, role="assistant", text="Nice to meet you, Alex."
+    )
+
+    assert manager.is_consolidated(session_id) is False
+
+    # Second consolidation: now non-trivial (2 user turns)
+    ok2 = await manager.consolidate_session(session_id)
+    assert ok2 is True
+    assert provider.call_count == 1
+
+    state2 = manager.load_state()
+    assert state2["sessions"][session_id]["last_consolidated_turn"] == 4
+
+    episodes2 = store.get_recent_episodes()
+    assert len(episodes2) == 1  # Still exactly one episode!
+    assert episodes2[0]["trivial"] is False
+    assert episodes2[0]["summary"] == "User introduced their name as Alex and setup."
+    assert "User name is Alex." in store.read_long_term()
