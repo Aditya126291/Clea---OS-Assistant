@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -30,9 +31,14 @@ from clea.surfaces.voice.backends import (
     default_voice_tools,
 )
 from clea.surfaces.voice.memory_hooks import (
+    BASE_VOICE_SYSTEM_INSTRUCTION,
     build_voice_system_instruction,
     consolidate_voice_call,
     load_voice_memory_context,
+    resolve_voice_system_instruction,
+    safe_consolidate_voice_call,
+    safe_load_voice_memory_context,
+    safe_store_voice_transcript,
     store_voice_transcript,
 )
 
@@ -200,6 +206,88 @@ async def test_deferred_memory_hooks_are_explicitly_stubbed() -> None:
         await store_voice_transcript(call_id="c1", entries=[])
     with pytest.raises(NotImplementedError, match="deferred"):
         await consolidate_voice_call(call_id="c1")
+
+
+async def test_resolve_voice_system_instruction_falls_back_on_unimplemented_hook(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="clea.surfaces.voice.memory_hooks")
+
+    # Both direct safe loader and full resolver gracefully return None/fallback
+    assert await safe_load_voice_memory_context() is None
+
+    instruction = await resolve_voice_system_instruction()
+    assert instruction == BASE_VOICE_SYSTEM_INSTRUCTION
+    assert "## Memory Context" not in instruction
+
+    warning_records = [
+        rec
+        for rec in caplog.records
+        if rec.name == "clea.surfaces.voice.memory_hooks" and rec.levelno == logging.WARNING
+    ]
+    assert len(warning_records) == 2
+    for r in warning_records:
+        assert "Voice memory context hook is not implemented" in r.getMessage()
+
+
+async def test_resolve_voice_system_instruction_falls_back_on_arbitrary_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="clea.surfaces.voice.memory_hooks")
+
+    async def _failing_loader() -> str:
+        raise RuntimeError("database unreachable")
+
+    instruction = await resolve_voice_system_instruction(memory_loader=_failing_loader)
+    assert instruction == BASE_VOICE_SYSTEM_INSTRUCTION
+    assert "## Memory Context" not in instruction
+
+    warning_records = [
+        rec
+        for rec in caplog.records
+        if rec.name == "clea.surfaces.voice.memory_hooks" and rec.levelno == logging.WARNING
+    ]
+    assert len(warning_records) == 1
+    assert "Failed loading voice memory context" in warning_records[0].getMessage()
+
+
+async def test_resolve_voice_system_instruction_includes_context_when_provided(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="clea.surfaces.voice.memory_hooks")
+
+    async def _success_loader() -> str:
+        return "User prefers short answers in Hindi."
+
+    instruction = await resolve_voice_system_instruction(memory_loader=_success_loader)
+    assert "## Memory Context" in instruction
+    assert "User prefers short answers in Hindi." in instruction
+
+    warning_records = [
+        rec
+        for rec in caplog.records
+        if rec.name == "clea.surfaces.voice.memory_hooks" and rec.levelno == logging.WARNING
+    ]
+    assert len(warning_records) == 0
+
+
+async def test_safe_transcript_and_consolidation_do_not_crash_active_calls(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="clea.surfaces.voice.memory_hooks")
+
+    # Call path invoking stubs directly must not raise
+    await safe_store_voice_transcript(call_id="call-42", entries=[{"role": "user", "text": "hi"}])
+    await safe_consolidate_voice_call(call_id="call-42")
+
+    warning_records = [
+        rec
+        for rec in caplog.records
+        if rec.name == "clea.surfaces.voice.memory_hooks" and rec.levelno == logging.WARNING
+    ]
+    assert len(warning_records) == 2
+    assert "Voice transcript hook not implemented" in warning_records[0].getMessage()
+    assert "Voice consolidation hook not implemented" in warning_records[1].getMessage()
 
 
 def test_voice_surface_respects_architecture_and_vendor_isolation_boundaries() -> None:
