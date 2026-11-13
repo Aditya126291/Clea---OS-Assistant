@@ -30,6 +30,7 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
                                                 - memory/MEMORY.md (+ .bak, MEMORY_ARCHIVE.md)
                                                 - memory/episodes/YYYY-MM-DD.md
                                                 - logs/transcripts/<session_id>.jsonl
+                                                - logs/transcripts_trash/
                                                 - logs/audit.jsonl
                                                 - logs/daemon.log
 ```
@@ -38,9 +39,9 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
 
 ### 1. Typed WebSocket Protocol (`src/clea/core/protocol.py` & `scripts/gen_ts_types.py`)
 - Defines strict Pydantic v2 discriminated-union frames (`extra="forbid"`):
-  - **Requests** (`RequestFrame`, discriminated by `method`): `health.ping`, `session.new`, `chat.send`, `approval.respond`, `memory.get`, `memory.get_daily`, `memory.episodes`, `transcripts.list`, `transcripts.get`, `conversations.list`, `conversations.get`, `settings.get`, `dev.emit_sample_task`.
+  - **Requests** (`RequestFrame`, discriminated by `method`): `health.ping`, `session.new`, `chat.send`, `approval.respond`, `memory.get`, `memory.get_daily`, `memory.episodes`, `transcripts.list`, `transcripts.get`, `conversations.list`, `conversations.get`, `conversation.list`, `conversation.get`, `conversation.resume`, `conversation.rename`, `conversation.pin`, `conversation.export`, `conversation.delete`, `conversation.delete_all`, `conversation.undo_delete`, `settings.get`, `dev.emit_sample_task`.
   - **Responses** (`ResponseFrame`): paired by request `id`, carrying typed result models (`METHOD_RESULTS`).
-  - **Events** (`EventFrame`, discriminated by `event`): `assistant_token`, `tool_call_started`, `tool_call_finished`, `approval_requested`, `approval_resolved`, `task_status` (annotated with `kind`, `next_run_at`, error summary), `voice_state` (`idle | listening | thinking | speaking`), `error`.
+  - **Events** (`EventFrame`, discriminated by `event`): `assistant_token`, `tool_call_started`, `tool_call_finished`, `approval_requested`, `approval_resolved`, `task_status` (annotated with `kind`, `next_run_at`, error summary), `voice_state` (`idle | listening | thinking | speaking`), `conversation_updated`, `conversation_deleted`, `error`.
 - `scripts/gen_ts_types.py` compiles the Pydantic JSON Schema into `ui/src/protocol/generated.ts` via `json-schema-to-typescript` (`--check` fails on drift).
 
 ### 2. Core Daemon & Handshake Security (`src/clea/core/daemon.py`, `src/clea/core/auth.py`)
@@ -79,12 +80,16 @@ Clea uses a **hub-and-spoke** architecture designed for a local, voice-first per
   - Emits `background_task` status events visible in the Activity tab.
 - **Context Injection**: At turn start, injects size-capped `MEMORY.md` and up to the last 5 episode summaries (capped by token count). Raw transcripts are never injected into context.
 - **History Cap**: Sliding window message buffer with older turns condensed to a brief summary.
+- **Conversation Resume & Management**:
+  - `conversation.resume` reconstructs active sessions from transcripts. To ensure compatibility with Gemini 3 without HTTP 400 errors, past tool executions are replayed strictly as plain assistant text notes (`[used tool <name>: <args>]`) without fabricated `tool_calls` or `thought_signature`.
+  - Transcripts can be renamed, pinned to top, exported as Markdown, or deleted. Soft-delete places transcripts in `logs/transcripts_trash/` with a 10s undo window and auto-purge.
+  - Concurrency control rejects overlapping turns with 409 Conflict. Broadcast events keep multi-window sessions in sync.
 
 ### 5. Desktop UI (`ui/`)
 - **Pure Client**: React 19, TypeScript, Vite 8, Tailwind CSS v4, shadcn-style primitives + `cmdk`, Zustand (`ui/src/protocol/store.ts`), `CleaClient` with exponential backoff + jitter (`ui/src/protocol/client.ts`).
 - **Screens**:
-  - **Chat**: streaming Markdown (`react-markdown` + `remark-gfm`), collapsible tool cards, inline approval cards (two-click confirmation for `destructive`), `Enter` send / `Shift+Enter` newline, and a "Still working…" indicator after ~3 s.
-  - **Sidebar & Command Palette (`Ctrl/Cmd+K`)**: navigation to Chat, Activity, Memory, Settings; read-only historical conversations grouped by date; system/dark/light theme toggle.
+  - **Chat**: streaming Markdown (`react-markdown` + `remark-gfm`), collapsible tool cards, inline approval cards (two-click confirmation for `destructive`), `Enter` send / `Shift+Enter` newline, "Continuing earlier conversation" marker on resumed threads, and a "Still working…" indicator after ~3 s.
+  - **Sidebar & Command Palette (`Ctrl/Cmd+K`)**: navigation to Chat, Activity, Memory, Settings; pinned conversation group above date groups; three-dots conversation menu (Rename, Pin/Unpin, Export Markdown, Delete with confirmation and 10s undo toast); History header Delete All with strong confirmation.
   - **Activity**: displays only `background_task`, `scheduled`, and `agent_run` tasks (chat turns are filtered out) divided into "Running and upcoming" and "Recent" (capped at 50) with expandable error summaries.
   - **Memory**: displays `MEMORY.md` parsed by sections, recent episode summaries, consolidation status, and a subview for inspecting structured transcripts.
   - **Settings**: non-secret daemon status, provider/model, permission tiers, registered tools.

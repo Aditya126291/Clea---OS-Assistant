@@ -29,6 +29,9 @@ This file defines the non-negotiable rules for working in the Clea repository.
    - Core code depends only on `LLMProvider` in `src/clea/providers/base.py`, never directly on a vendor SDK.
 8. **Dev mocks stay out of production**:
    - Any UI mock panels or dev-server helpers MUST be gated behind `import.meta.env.DEV` (and `VITE_CLEA_MOCKS` where applicable) so they are dead-code-eliminated from production builds.
+9. **Conversation resume and management**:
+   - Past conversations resume from transcripts (`conversation.resume`) surviving daemon restarts and navigation. Replaying past turns formats tool steps as plain assistant text notes without fabricating `tool_calls` or `thought_signature`.
+   - Transcripts can be renamed, pinned, exported (Markdown), and soft-deleted into `<user_data_dir>/logs/transcripts_trash/` with a 10s undo window before permanent purge. Deletions are audit-logged and never exposed to model tools. Strict regex (`^[a-zA-Z0-9_-]{1,64}$`) and path containment prevent path traversal.
 
 ## Development Workflow
 
