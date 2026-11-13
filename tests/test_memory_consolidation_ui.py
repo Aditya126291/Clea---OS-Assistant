@@ -616,6 +616,19 @@ async def test_daemon_protocol_memory_forget(tmp_path: Path) -> None:
             assert resp.result.get("removed_count") == 1
             assert resp.result.get("removed_ids") == [entry.id]
             assert "Prefers Vim keybindings." not in store.read_long_term()
+
+            # Add another entry and test fallback from unknown id to query
+            store.add_or_update_entry(
+                text="Enjoys green tea in the morning.", section="Preferences"
+            )
+            req2 = MemoryForgetRequest(
+                params=MemoryForgetParams(id="nonexistent-id", query="green tea")
+            )
+            await ws.send(req2.model_dump_json())
+            resp2 = await recv_resp(ws)
+            assert resp2.ok
+            assert resp2.result.get("removed_count") == 1
+            assert "green tea" not in store.read_long_term()
     finally:
         await daemon.stop()
 
@@ -799,3 +812,84 @@ async def test_resumed_trivial_session_upgrades_to_full_consolidation(tmp_path: 
     assert episodes2[0]["trivial"] is False
     assert episodes2[0]["summary"] == "User introduced their name as Alex and setup."
     assert "User name is Alex." in store.read_long_term()
+
+
+def test_remove_entries_with_bracketed_and_unbracketed_ids(tmp_path: Path) -> None:
+    """Test memory store remove_entries matches entry IDs both with and without brackets."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    entry1 = store.add_or_update_entry(text="Prefers pytest for testing.", section="Preferences")
+    entry2 = store.add_or_update_entry(text="Uses PostgreSQL for databases.", section="Environment")
+
+    # Match by unbracketed ID
+    matches_unbracketed = store.find_matches(entry1.id)
+    assert len(matches_unbracketed) == 1
+    assert matches_unbracketed[0].id == entry1.id
+
+    # Match by bracketed ID [id]
+    matches_bracketed = store.find_matches(f"[{entry2.id}]")
+    assert len(matches_bracketed) == 1
+    assert matches_bracketed[0].id == entry2.id
+
+    # Remove with bracketed query
+    removed = store.remove_entries(f"[{entry2.id}]")
+    assert len(removed) == 1
+    assert removed[0].id == entry2.id
+    assert "PostgreSQL" not in store.read_long_term()
+    assert "pytest" in store.read_long_term()
+
+
+async def test_legacy_consolidation_state_migrates_and_triggers_on_resumption(
+    tmp_path: Path,
+) -> None:
+    """Test that a legacy session in state without last_consolidated_turn triggers when resumed."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+
+    session_id = "sess-legacy-upgrade"
+    store.append_transcript_message(session_id=session_id, role="user", text="I write Python.")
+    store.append_transcript_message(session_id=session_id, role="assistant", text="Noted Python.")
+
+    json_resumed = json.dumps(
+        {
+            "summary": "User writes Python and Go.",
+            "operations": [
+                {
+                    "op": "add",
+                    "target_section": "Preferences",
+                    "text": "Writes Python and Go.",
+                }
+            ],
+        }
+    )
+
+    provider = _RecordingProvider([json_resumed])
+    manager = ConsolidationManager(memory=store, provider=provider)
+
+    # Simulate legacy state entry WITHOUT last_consolidated_turn
+    state = manager.load_state()
+    state.setdefault("sessions", {})[session_id] = {
+        "status": "completed",
+        "consolidated_at": "2026-11-12T10:00:00Z",
+    }
+    manager.save_state(state)
+
+    # Initial check should identify as consolidated and populate last_consolidated_turn == 2
+    assert manager.is_consolidated(session_id) is True
+    updated_state = manager.load_state()
+    assert updated_state["sessions"][session_id]["last_consolidated_turn"] == 2
+
+    # Now user resumes conversation
+    store.append_transcript_message(session_id=session_id, role="user", text="I also write Go.")
+    store.append_transcript_message(session_id=session_id, role="assistant", text="Noted Go.")
+
+    # Should detect new turns and re-consolidate
+    assert manager.is_consolidated(session_id) is False
+    ok = await manager.consolidate_session(session_id)
+    assert ok is True
+    assert provider.call_count == 1
+
+    final_state = manager.load_state()
+    assert final_state["sessions"][session_id]["last_consolidated_turn"] == 4
+    assert "Writes Python and Go." in store.read_long_term()

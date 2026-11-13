@@ -314,10 +314,11 @@ class MemoryStore:
         if not norm_q:
             return []
 
+        norm_id = norm_q.strip("[]")
         matches: list[MemoryEntry] = []
         for entries in sections.values():
             for e in entries:
-                if norm_q in e.text.lower() or norm_q == e.id.lower():
+                if norm_q in e.text.lower() or norm_q == e.id.lower() or norm_id == e.id.lower():
                     matches.append(e)
         return matches
 
@@ -329,11 +330,12 @@ class MemoryStore:
         if not norm_q:
             return []
 
+        norm_id = norm_q.strip("[]")
         removed: list[MemoryEntry] = []
         for sec_name, entries in sections.items():
             kept: list[MemoryEntry] = []
             for e in entries:
-                if norm_q in e.text.lower() or norm_q == e.id.lower():
+                if norm_q in e.text.lower() or norm_q == e.id.lower() or norm_id == e.id.lower():
                     removed.append(e)
                 else:
                     kept.append(e)
@@ -496,8 +498,7 @@ class MemoryStore:
                     )
                     if pattern.search(content):
                         new_block = (
-                            f"### Session `{session_id}` ({time_str}){trivial_suffix}\n\n"
-                            f"{summary.strip()}\n"
+                            f"### Session `{s}` ({time_str}){trivial_suffix}\n\n{summary.strip()}\n"
                         )
                         updated_content = pattern.sub(lambda _, b=new_block: b, content, count=1)
                         ep_file.write_text(updated_content, encoding="utf-8")

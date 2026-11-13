@@ -686,9 +686,9 @@ export function MemoryView() {
                               No entries in this section.
                             </p>
                           ) : (
-                            sec.entries.map((entry) => (
+                            sec.entries.map((entry, idx) => (
                               <div
-                                key={entry.id}
+                                key={`${sec.name}-${entry.id}-${idx}`}
                                 className="flex items-start justify-between gap-3 text-xs border-b border-[var(--border)] pb-2.5 last:border-b-0 last:pb-0"
                               >
                                 <div className="space-y-1">

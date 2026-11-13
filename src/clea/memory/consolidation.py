@@ -228,13 +228,21 @@ class ConsolidationManager:
             return False
 
         last_turn = entry.get("last_consolidated_turn")
-        if last_turn is None:
-            return True
-
         transcript = self.memory.get_transcript(resolved_sid)
         if not transcript:
             return True
+
         messages = transcript.get("messages", [])
+        if last_turn is None:
+            # Backward compatibility: for legacy state entries without turn count,
+            # record current transcript turns so future resumed messages trigger consolidation.
+            entry["last_consolidated_turn"] = len(messages)
+            sessions[resolved_sid] = entry
+            if session_id != resolved_sid:
+                sessions[session_id] = entry
+            self.save_state(state)
+            return True
+
         return len(messages) <= last_turn
 
     def _get_response_format_kwargs(self) -> dict[str, Any]:
@@ -347,6 +355,7 @@ class ConsolidationManager:
     ) -> bool:
         """Consolidate a completed or idle session into episodes and MEMORY.md."""
         effective_status_cb = on_task_status or task_callback
+        resolved_sid = self.memory.resolve_session_id(session_id)
         if not force and self.is_consolidated(session_id):
             return True
 
@@ -358,7 +367,6 @@ class ConsolidationManager:
             # Empty session: mark completed without calling model
             state = self.load_state()
             now_iso = datetime.now().astimezone().isoformat()
-            resolved_sid = self.memory.resolve_session_id(session_id)
             sess_data = {
                 "status": "completed",
                 "consolidated_at": now_iso,
@@ -472,7 +480,7 @@ class ConsolidationManager:
 
             self.save_pending(pending_state)
 
-            state.setdefault("sessions", {})[session_id] = {
+            fail_data = {
                 "status": "failed",
                 "pending": is_pending,
                 "retry_count": current_retries,
@@ -481,6 +489,9 @@ class ConsolidationManager:
                 "last_attempt_at": now_iso,
                 "next_retry_at": next_retry_iso,
             }
+            state.setdefault("sessions", {})[session_id] = fail_data
+            if resolved_sid and resolved_sid != session_id:
+                state["sessions"][resolved_sid] = fail_data
             self.save_state(state)
             if effective_status_cb is not None:
                 await effective_status_cb("failed", sanitized_err)
@@ -490,7 +501,9 @@ class ConsolidationManager:
         pending_state = self.load_pending()
         if session_id in pending_state.get("sessions", {}):
             pending_state["sessions"].pop(session_id, None)
-            self.save_pending(pending_state)
+        if resolved_sid and resolved_sid in pending_state.get("sessions", {}):
+            pending_state["sessions"].pop(resolved_sid, None)
+        self.save_pending(pending_state)
 
         # 1. Append episode summary
         self.memory.append_episode(
@@ -592,8 +605,13 @@ class ConsolidationManager:
 
         for t in transcripts:
             sid = t["session_id"]
-            session_state = state.get("sessions", {}).get(sid)
-            is_in_pending = sid in pending_data
+            resolved_sid = self.memory.resolve_session_id(sid)
+            session_state = state.get("sessions", {}).get(sid) or (
+                state.get("sessions", {}).get(resolved_sid) if resolved_sid else None
+            )
+            is_in_pending = sid in pending_data or (
+                resolved_sid in pending_data if resolved_sid else False
+            )
 
             should_process = False
             if not session_state or session_state.get("status") == "running":

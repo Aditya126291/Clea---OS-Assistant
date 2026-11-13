@@ -598,6 +598,8 @@ class CleaDaemon:
         elif method == "memory.forget":
             target = req.params.id or req.params.query or ""
             removed = self.agent.memory.remove_entries(target)
+            if not removed and req.params.id and req.params.query:
+                removed = self.agent.memory.remove_entries(req.params.query)
             await self._respond(
                 ws,
                 req,
