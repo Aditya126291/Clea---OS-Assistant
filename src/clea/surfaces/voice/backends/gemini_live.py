@@ -126,7 +126,10 @@ class GeminiLiveBackend(VoiceBackend):
 
         # Context compression
         compression_cfg = None
-        if config.context_compression.enabled:
+        if (
+            config.context_compression.enabled
+            and config.context_compression.trigger_tokens is not None
+        ):
             sliding = None
             if config.context_compression.target_tokens is not None:
                 sliding = types.SlidingWindow(
@@ -364,8 +367,7 @@ class GeminiLiveBackend(VoiceBackend):
         """Send a text prompt or system notification to the live session."""
         if self._session is None or self._closed:
             return
-        turns = [types.Content(parts=[types.Part(text=text)], role="user")]
-        await self._session.send_client_content(turns=turns, turn_complete=end_of_turn)
+        await self._session.send_realtime_input(text=text)
 
     async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
         """Send tool execution responses back to the Live model."""
