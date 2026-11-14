@@ -6,6 +6,7 @@ JSON schemas, enforcing safety filters, and maintaining consolidation state.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 MAX_CONSOLIDATION_RETRIES = 3
 BACKOFF_DELAYS = [60, 300, 900]  # Backoff in seconds: 1m, 5m, 15m
 DEFAULT_MIN_USER_TURNS = 2
+DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS = 60.0
 
 MemorySection = Literal[
     "Profile",
@@ -169,10 +171,23 @@ class ConsolidationManager:
         provider: LLMProvider,
         idle_seconds: float = 900.0,
         min_user_turns: int | None = None,
+        llm_timeout_seconds: float | None = None,
     ) -> None:
         self.memory = memory
         self.provider = provider
         self.idle_seconds = idle_seconds
+        if llm_timeout_seconds is not None:
+            resolved_timeout = float(llm_timeout_seconds)
+        else:
+            env_timeout = os.environ.get("CLEA_CONSOLIDATION_TIMEOUT_SECONDS")
+            if env_timeout is not None and env_timeout.strip():
+                try:
+                    resolved_timeout = float(env_timeout)
+                except ValueError:
+                    resolved_timeout = DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS
+            else:
+                resolved_timeout = DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS
+        self.llm_timeout_seconds = max(0.01, resolved_timeout)
         env_min_turns = os.environ.get("CLEA_CONSOLIDATION_MIN_TURNS")
         if min_user_turns is not None:
             self.min_user_turns = min_user_turns
@@ -269,26 +284,43 @@ class ConsolidationManager:
             return {"response_format": response_format}
         return {}
 
+    async def _collect_stream_text(
+        self,
+        messages: list[Message],
+        call_kwargs: dict[str, Any],
+    ) -> str:
+        """Consume a provider stream_turn and return concatenated text."""
+        parts: list[str] = []
+        async for chunk in self.provider.stream_turn(
+            messages=messages,
+            tools=[],
+            system_prompt=CONSOLIDATION_SYSTEM_PROMPT,
+            **call_kwargs,
+        ):
+            if chunk.type == "text_delta" and chunk.text:
+                parts.append(chunk.text)
+        return "".join(parts)
+
     async def _call_model_for_json(self, prompt: str) -> tuple[ConsolidationOutput | None, str]:
-        """Query LLM for consolidation JSON with one retry on validation error."""
+        """Query LLM for consolidation JSON with timeout and one retry on validation error."""
         messages = [Message(role="user", content=prompt)]
         call_kwargs = self._get_response_format_kwargs()
 
         # Attempt 1
-        raw_text_parts: list[str] = []
         try:
-            async for chunk in self.provider.stream_turn(
-                messages=messages,
-                tools=[],
-                system_prompt=CONSOLIDATION_SYSTEM_PROMPT,
-                **call_kwargs,
-            ):
-                if chunk.type == "text_delta" and chunk.text:
-                    raw_text_parts.append(chunk.text)
+            raw_output = await asyncio.wait_for(
+                self._collect_stream_text(messages, call_kwargs),
+                timeout=self.llm_timeout_seconds,
+            )
+        except TimeoutError:
+            return (
+                None,
+                f"Consolidation LLM call timed out after {self.llm_timeout_seconds:g}s "
+                "on attempt 1",
+            )
         except Exception as exc:
             return None, f"Provider error on attempt 1: {exc}"
 
-        raw_output = "".join(raw_text_parts)
         json_candidate = _extract_json_block(raw_output)
 
         err_msg = ""
@@ -314,20 +346,20 @@ class ConsolidationManager:
             "Please respond with valid JSON ONLY conforming to the schema."
         )
         messages_retry = [Message(role="user", content=retry_prompt)]
-        raw_text_parts_2: list[str] = []
         try:
-            async for chunk in self.provider.stream_turn(
-                messages=messages_retry,
-                tools=[],
-                system_prompt=CONSOLIDATION_SYSTEM_PROMPT,
-                **call_kwargs,
-            ):
-                if chunk.type == "text_delta" and chunk.text:
-                    raw_text_parts_2.append(chunk.text)
+            raw_output_2 = await asyncio.wait_for(
+                self._collect_stream_text(messages_retry, call_kwargs),
+                timeout=self.llm_timeout_seconds,
+            )
+        except TimeoutError:
+            return (
+                None,
+                f"Consolidation LLM call timed out after {self.llm_timeout_seconds:g}s "
+                "on retry attempt",
+            )
         except Exception as exc:
             return None, f"Provider error on retry attempt: {exc}"
 
-        raw_output_2 = "".join(raw_text_parts_2)
         json_candidate_2 = _extract_json_block(raw_output_2)
 
         try:
@@ -359,51 +391,213 @@ class ConsolidationManager:
         if not force and self.is_consolidated(session_id):
             return True
 
-        if effective_status_cb is not None:
-            await effective_status_cb("running", None)
-
-        transcript = self.memory.get_transcript(session_id)
-        if not transcript or not transcript.get("messages"):
-            # Empty session: mark completed without calling model
-            state = self.load_state()
-            now_iso = datetime.now().astimezone().isoformat()
-            sess_data = {
-                "status": "completed",
-                "consolidated_at": now_iso,
-                "trivial": True,
-                "last_consolidated_turn": 0,
+        terminal_emitted = False
+        try:
+            if effective_status_cb is not None:
+                await effective_status_cb("running", None)
+            # Record in-flight running state on disk so unexpected crashes/restarts can recover.
+            running_state = self.load_state()
+            prev_sess_info = running_state.get("sessions", {}).get(session_id, {})
+            running_data = {
+                **prev_sess_info,
+                "status": "running",
+                "started_at": datetime.now().astimezone().isoformat(),
             }
-            state.setdefault("sessions", {})[session_id] = sess_data
+            running_state.setdefault("sessions", {})[session_id] = running_data
             if resolved_sid and resolved_sid != session_id:
-                state["sessions"][resolved_sid] = sess_data
-            state["last_consolidated_at"] = now_iso
-            self.save_state(state)
-            return True
+                running_state["sessions"][resolved_sid] = running_data
+            self.save_state(running_state)
 
-        turn_count = len(transcript.get("messages", []))
+            transcript = self.memory.get_transcript(session_id)
+            if not transcript or not transcript.get("messages"):
+                # Empty session: mark completed without calling model
+                state = self.load_state()
+                now_iso = datetime.now().astimezone().isoformat()
+                sess_data = {
+                    "status": "completed",
+                    "consolidated_at": now_iso,
+                    "trivial": True,
+                    "last_consolidated_turn": 0,
+                }
+                state.setdefault("sessions", {})[session_id] = sess_data
+                if resolved_sid and resolved_sid != session_id:
+                    state["sessions"][resolved_sid] = sess_data
+                state["last_consolidated_at"] = now_iso
+                self.save_state(state)
+                if effective_status_cb is not None:
+                    await effective_status_cb("succeeded", None)
+                terminal_emitted = True
+                return True
 
-        # Trivial session check: fewer than N user turns and no tool use
-        is_trivial, user_turns = self.is_trivial_session(transcript)
-        if is_trivial:
-            logger.info(
-                "Skipping LLM consolidation for trivial session %s (%d user turn(s), no tool use)",
-                session_id,
-                user_turns,
-            )
-            turn_str = f"{user_turns} turn{'s' if user_turns != 1 else ''}"
-            summary = f"Short session, {turn_str}"
+            turn_count = len(transcript.get("messages", []))
+
+            # Trivial session check: fewer than N user turns and no tool use
+            is_trivial, user_turns = self.is_trivial_session(transcript)
+            if is_trivial:
+                logger.info(
+                    "Skipping LLM consolidation for trivial session %s "
+                    "(%d user turn(s), no tool use)",
+                    session_id,
+                    user_turns,
+                )
+                turn_str = f"{user_turns} turn{'s' if user_turns != 1 else ''}"
+                summary = f"Short session, {turn_str}"
+                self.memory.append_episode(
+                    session_id=session_id,
+                    summary=summary,
+                    trivial=True,
+                )
+                state = self.load_state()
+                now_iso = datetime.now().astimezone().isoformat()
+                resolved_sid = self.memory.resolve_session_id(session_id)
+                sess_data = {
+                    "status": "completed",
+                    "consolidated_at": now_iso,
+                    "trivial": True,
+                    "last_consolidated_turn": turn_count,
+                }
+                state.setdefault("sessions", {})[session_id] = sess_data
+                if resolved_sid and resolved_sid != session_id:
+                    state["sessions"][resolved_sid] = sess_data
+                state["last_consolidated_at"] = now_iso
+                self.save_state(state)
+                if effective_status_cb is not None:
+                    await effective_status_cb("succeeded", None)
+                terminal_emitted = True
+                return True
+
+            # Build prompt from transcript
+            t_lines = [f"Session ID: {session_id}"]
+            started_at = transcript.get("started_at", "")
+            if started_at:
+                t_lines.append(f"Started at: {started_at}")
+            t_lines.append("\nConversation:")
+
+            for msg in transcript["messages"]:
+                role = msg.get("role", "unknown")
+                text = msg.get("text", "").strip()
+                tool_calls = msg.get("tool_calls", [])
+                if role == "user":
+                    t_lines.append(f"User: {text}")
+                elif role == "assistant":
+                    t_lines.append(f"Clea: {text}")
+                elif role == "tool":
+                    t_lines.append(f"[Tool Output - Untrusted Data]: {text[:300]}")
+                if tool_calls:
+                    t_lines.append(f"[Tool Calls]: {json.dumps(tool_calls)}")
+
+            prompt = "\n".join(t_lines)
+            parsed_output, error_msg = await self._call_model_for_json(prompt)
+
+            state = self.load_state()
+            now = datetime.now().astimezone()
+            now_iso = now.isoformat()
+            sess_info = state.setdefault("sessions", {}).get(session_id, {})
+
+            if parsed_output is None:
+                current_retries = int(sess_info.get("retry_count", 0)) + 1
+                sanitized_err = sanitize_error(error_msg)
+                pending_state = self.load_pending()
+                is_pending = current_retries < MAX_CONSOLIDATION_RETRIES
+
+                if is_pending:
+                    delay_sec = BACKOFF_DELAYS[min(current_retries - 1, len(BACKOFF_DELAYS) - 1)]
+                    next_retry = now + timedelta(seconds=delay_sec)
+                    next_retry_iso = next_retry.isoformat()
+                    logger.warning(
+                        "Session %s consolidation attempt %d/%d failed: %s. "
+                        "Pending, next retry: %s",
+                        session_id,
+                        current_retries,
+                        MAX_CONSOLIDATION_RETRIES,
+                        sanitized_err,
+                        next_retry_iso,
+                    )
+                    pending_state.setdefault("sessions", {})[session_id] = {
+                        "status": "pending",
+                        "retry_count": current_retries,
+                        "last_error": sanitized_err,
+                        "last_attempt_at": now_iso,
+                        "next_retry_at": next_retry_iso,
+                    }
+                else:
+                    next_retry_iso = None
+                    logger.error(
+                        "Session %s consolidation failed after %d attempts (retry cap reached): %s",
+                        session_id,
+                        current_retries,
+                        sanitized_err,
+                    )
+                    pending_state.setdefault("sessions", {}).pop(session_id, None)
+
+                self.save_pending(pending_state)
+
+                fail_data = {
+                    "status": "failed",
+                    "pending": is_pending,
+                    "retry_count": current_retries,
+                    "error": sanitized_err,
+                    "last_error": sanitized_err,
+                    "last_attempt_at": now_iso,
+                    "next_retry_at": next_retry_iso,
+                }
+                state.setdefault("sessions", {})[session_id] = fail_data
+                if resolved_sid and resolved_sid != session_id:
+                    state["sessions"][resolved_sid] = fail_data
+                self.save_state(state)
+                if effective_status_cb is not None:
+                    await effective_status_cb("failed", sanitized_err)
+                terminal_emitted = True
+                return False
+
+            # Clear from pending on successful consolidation
+            pending_state = self.load_pending()
+            if session_id in pending_state.get("sessions", {}):
+                pending_state["sessions"].pop(session_id, None)
+            if resolved_sid and resolved_sid in pending_state.get("sessions", {}):
+                pending_state["sessions"].pop(resolved_sid, None)
+            self.save_pending(pending_state)
+
+            # 1. Append episode summary
             self.memory.append_episode(
                 session_id=session_id,
-                summary=summary,
-                trivial=True,
+                summary=parsed_output.summary,
+                trivial=False,
             )
-            state = self.load_state()
-            now_iso = datetime.now().astimezone().isoformat()
+
+            # 2. Apply operations with safety rules
+            for op in parsed_output.operations:
+                if is_secret_or_sensitive(op.text):
+                    logger.warning(
+                        "Rejected memory operation containing secret pattern: %s (reason: %s)",
+                        op.text,
+                        op.reason,
+                    )
+                    continue
+
+                if op.target_section not in FIXED_SECTIONS:
+                    logger.warning("Ignored operation for unknown section: %s", op.target_section)
+                    continue
+
+                try:
+                    if op.op == "remove":
+                        self.memory.remove_entries(op.entry_id or op.text)
+                    else:
+                        self.memory.add_or_update_entry(
+                            text=op.text,
+                            section=op.target_section,
+                            source=op.source_tag,
+                            entry_id=op.entry_id,
+                        )
+                except Exception as op_err:
+                    logger.warning("Could not apply memory operation (%s): %s", op, op_err)
+
+            # 3. Mark completed
             resolved_sid = self.memory.resolve_session_id(session_id)
             sess_data = {
                 "status": "completed",
                 "consolidated_at": now_iso,
-                "trivial": True,
+                "retry_count": sess_info.get("retry_count", 0),
                 "last_consolidated_turn": turn_count,
             }
             state.setdefault("sessions", {})[session_id] = sess_data
@@ -411,152 +605,70 @@ class ConsolidationManager:
                 state["sessions"][resolved_sid] = sess_data
             state["last_consolidated_at"] = now_iso
             self.save_state(state)
+
+            logger.info("Successfully consolidated session %s", session_id)
             if effective_status_cb is not None:
                 await effective_status_cb("succeeded", None)
+            terminal_emitted = True
             return True
-
-        # Build prompt from transcript
-        t_lines = [f"Session ID: {session_id}"]
-        started_at = transcript.get("started_at", "")
-        if started_at:
-            t_lines.append(f"Started at: {started_at}")
-        t_lines.append("\nConversation:")
-
-        for msg in transcript["messages"]:
-            role = msg.get("role", "unknown")
-            text = msg.get("text", "").strip()
-            tool_calls = msg.get("tool_calls", [])
-            if role == "user":
-                t_lines.append(f"User: {text}")
-            elif role == "assistant":
-                t_lines.append(f"Clea: {text}")
-            elif role == "tool":
-                t_lines.append(f"[Tool Output - Untrusted Data]: {text[:300]}")
-            if tool_calls:
-                t_lines.append(f"[Tool Calls]: {json.dumps(tool_calls)}")
-
-        prompt = "\n".join(t_lines)
-        parsed_output, error_msg = await self._call_model_for_json(prompt)
-
-        state = self.load_state()
-        now = datetime.now().astimezone()
-        now_iso = now.isoformat()
-        sess_info = state.setdefault("sessions", {}).get(session_id, {})
-
-        if parsed_output is None:
-            current_retries = int(sess_info.get("retry_count", 0)) + 1
-            sanitized_err = sanitize_error(error_msg)
-            pending_state = self.load_pending()
-            is_pending = current_retries < MAX_CONSOLIDATION_RETRIES
-
-            if is_pending:
-                delay_sec = BACKOFF_DELAYS[min(current_retries - 1, len(BACKOFF_DELAYS) - 1)]
-                next_retry = now + timedelta(seconds=delay_sec)
-                next_retry_iso = next_retry.isoformat()
-                logger.warning(
-                    "Session %s consolidation attempt %d/%d failed: %s. Pending, next retry: %s",
-                    session_id,
-                    current_retries,
-                    MAX_CONSOLIDATION_RETRIES,
-                    sanitized_err,
-                    next_retry_iso,
-                )
-                pending_state.setdefault("sessions", {})[session_id] = {
-                    "status": "pending",
-                    "retry_count": current_retries,
+        except asyncio.CancelledError:
+            try:
+                now_iso = datetime.now().astimezone().isoformat()
+                state = self.load_state()
+                prev = state.get("sessions", {}).get(session_id, {})
+                fail_data = {
+                    **prev,
+                    "status": "failed",
+                    "error": "Cancelled",
+                    "last_error": "Cancelled",
+                    "last_attempt_at": now_iso,
+                }
+                state.setdefault("sessions", {})[session_id] = fail_data
+                if resolved_sid and resolved_sid != session_id:
+                    state["sessions"][resolved_sid] = fail_data
+                self.save_state(state)
+            except Exception:
+                pass
+            if effective_status_cb is not None and not terminal_emitted:
+                terminal_emitted = True
+                try:
+                    await effective_status_cb("failed", "Cancelled")
+                except BaseException:
+                    pass
+            raise
+        except Exception as exc:
+            sanitized_err = sanitize_error(str(exc) or type(exc).__name__)
+            logger.exception("Unexpected error consolidating session %s", session_id)
+            try:
+                now_iso = datetime.now().astimezone().isoformat()
+                state = self.load_state()
+                prev = state.get("sessions", {}).get(session_id, {})
+                fail_data = {
+                    **prev,
+                    "status": "failed",
+                    "error": sanitized_err,
                     "last_error": sanitized_err,
                     "last_attempt_at": now_iso,
-                    "next_retry_at": next_retry_iso,
                 }
-            else:
-                next_retry_iso = None
-                logger.error(
-                    "Session %s consolidation failed after %d attempts (retry cap reached): %s",
-                    session_id,
-                    current_retries,
-                    sanitized_err,
-                )
-                pending_state.setdefault("sessions", {}).pop(session_id, None)
-
-            self.save_pending(pending_state)
-
-            fail_data = {
-                "status": "failed",
-                "pending": is_pending,
-                "retry_count": current_retries,
-                "error": sanitized_err,
-                "last_error": sanitized_err,
-                "last_attempt_at": now_iso,
-                "next_retry_at": next_retry_iso,
-            }
-            state.setdefault("sessions", {})[session_id] = fail_data
-            if resolved_sid and resolved_sid != session_id:
-                state["sessions"][resolved_sid] = fail_data
-            self.save_state(state)
-            if effective_status_cb is not None:
-                await effective_status_cb("failed", sanitized_err)
+                state.setdefault("sessions", {})[session_id] = fail_data
+                if resolved_sid and resolved_sid != session_id:
+                    state["sessions"][resolved_sid] = fail_data
+                self.save_state(state)
+            except Exception:
+                pass
+            if effective_status_cb is not None and not terminal_emitted:
+                terminal_emitted = True
+                try:
+                    await effective_status_cb("failed", sanitized_err)
+                except Exception:
+                    logger.warning("Failed to emit failed status for session %s", session_id)
             return False
-
-        # Clear from pending on successful consolidation
-        pending_state = self.load_pending()
-        if session_id in pending_state.get("sessions", {}):
-            pending_state["sessions"].pop(session_id, None)
-        if resolved_sid and resolved_sid in pending_state.get("sessions", {}):
-            pending_state["sessions"].pop(resolved_sid, None)
-        self.save_pending(pending_state)
-
-        # 1. Append episode summary
-        self.memory.append_episode(
-            session_id=session_id,
-            summary=parsed_output.summary,
-            trivial=False,
-        )
-
-        # 2. Apply operations with safety rules
-        for op in parsed_output.operations:
-            if is_secret_or_sensitive(op.text):
-                logger.warning(
-                    "Rejected memory operation containing secret pattern: %s (reason: %s)",
-                    op.text,
-                    op.reason,
-                )
-                continue
-
-            if op.target_section not in FIXED_SECTIONS:
-                logger.warning("Ignored operation for unknown section: %s", op.target_section)
-                continue
-
-            try:
-                if op.op == "remove":
-                    self.memory.remove_entries(op.entry_id or op.text)
-                else:
-                    self.memory.add_or_update_entry(
-                        text=op.text,
-                        section=op.target_section,
-                        source=op.source_tag,
-                        entry_id=op.entry_id,
-                    )
-            except Exception as op_err:
-                logger.warning("Could not apply memory operation (%s): %s", op, op_err)
-
-        # 3. Mark completed
-        resolved_sid = self.memory.resolve_session_id(session_id)
-        sess_data = {
-            "status": "completed",
-            "consolidated_at": now_iso,
-            "retry_count": sess_info.get("retry_count", 0),
-            "last_consolidated_turn": turn_count,
-        }
-        state.setdefault("sessions", {})[session_id] = sess_data
-        if resolved_sid and resolved_sid != session_id:
-            state["sessions"][resolved_sid] = sess_data
-        state["last_consolidated_at"] = now_iso
-        self.save_state(state)
-
-        logger.info("Successfully consolidated session %s", session_id)
-        if effective_status_cb is not None:
-            await effective_status_cb("succeeded", None)
-        return True
+        finally:
+            if effective_status_cb is not None and not terminal_emitted:
+                try:
+                    await effective_status_cb("failed", "Consolidation did not complete cleanly")
+                except BaseException:
+                    pass
 
     async def reconsolidate_session(
         self,
@@ -588,6 +700,47 @@ class ConsolidationManager:
             resolved_sid, force=True, on_task_status=on_task_status
         )
 
+    def reconcile_orphaned_running(
+        self,
+        reason: str = "Interrupted by daemon restart",
+    ) -> list[str]:
+        """Mark any consolidation_state sessions stuck in 'running' as 'failed'."""
+        state = self.load_state()
+        sessions = state.get("sessions")
+        if not isinstance(sessions, dict) or not sessions:
+            return []
+
+        now_iso = datetime.now().astimezone().isoformat()
+        pending_state = self.load_pending()
+        pending_sessions = pending_state.setdefault("sessions", {})
+        reconciled_ids: list[str] = []
+
+        for sid, info in list(sessions.items()):
+            if isinstance(info, dict) and info.get("status") == "running":
+                retries = int(info.get("retry_count", 0))
+                can_retry = retries < MAX_CONSOLIDATION_RETRIES
+                sessions[sid] = {
+                    **info,
+                    "status": "failed",
+                    "pending": can_retry,
+                    "error": reason,
+                    "last_error": reason,
+                    "last_attempt_at": now_iso,
+                }
+                if can_retry and sid not in pending_sessions:
+                    pending_sessions[sid] = {
+                        "status": "pending",
+                        "retry_count": retries,
+                        "last_error": reason,
+                        "last_attempt_at": now_iso,
+                    }
+                reconciled_ids.append(sid)
+
+        if reconciled_ids:
+            self.save_state(state)
+            self.save_pending(pending_state)
+        return reconciled_ids
+
     async def run_crash_recovery(
         self,
         *,
@@ -609,15 +762,15 @@ class ConsolidationManager:
             session_state = state.get("sessions", {}).get(sid) or (
                 state.get("sessions", {}).get(resolved_sid) if resolved_sid else None
             )
-            is_in_pending = sid in pending_data or (
-                resolved_sid in pending_data if resolved_sid else False
+            p_info = pending_data.get(sid) or (
+                pending_data.get(resolved_sid) if resolved_sid else None
             )
+            is_in_pending = p_info is not None
 
             should_process = False
             if not session_state or session_state.get("status") == "running":
                 should_process = True
-            elif is_in_pending:
-                p_info = pending_data[sid]
+            elif is_in_pending and p_info is not None:
                 retries = int(p_info.get("retry_count", 0))
                 if retries < MAX_CONSOLIDATION_RETRIES:
                     if ignore_backoff:

@@ -106,6 +106,7 @@ class MemoryStore:
         self.long_term_path = self.memory_dir / "MEMORY.md"
         self.archive_path = self.memory_dir / "MEMORY_ARCHIVE.md"
         self.backup_legacy_dir = self.memory_dir / "backup_legacy_logs"
+        self.background_tasks_path = self.memory_dir / "background_tasks.json"
         self.token_cap = token_cap
 
     def ensure_initialized(self) -> None:
@@ -1153,6 +1154,14 @@ class MemoryStore:
                     time_fmt = ts_str
 
                 if role == "user":
+                    if user_msg:
+                        turns.append(
+                            {
+                                "time": user_time or time_fmt,
+                                "user": user_msg,
+                                "assistant": "",
+                            }
+                        )
                     user_msg = text
                     user_time = time_fmt
                 elif role == "assistant":
@@ -1164,6 +1173,15 @@ class MemoryStore:
                         }
                     )
                     user_msg = ""
+                    user_time = ""
+            if user_msg:
+                turns.append(
+                    {
+                        "time": user_time,
+                        "user": user_msg,
+                        "assistant": "",
+                    }
+                )
             return turns
 
         return [
@@ -1284,6 +1302,109 @@ class MemoryStore:
             migrated_files,
         )
         return {"migrated_sessions": migrated_sessions, "migrated_files": migrated_files}
+
+    # --- Background / Activity Task Persistence & Recovery ---
+
+    def load_background_tasks(self) -> dict[str, dict[str, Any]]:
+        """Load persisted Activity/background task records keyed by task_id."""
+        if not self.background_tasks_path.exists():
+            return {}
+        try:
+            data = json.loads(self.background_tasks_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load background_tasks.json: %s", exc)
+            return {}
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, dict):
+            return {}
+        return {
+            str(k): dict(v) for k, v in tasks.items() if isinstance(k, str) and isinstance(v, dict)
+        }
+
+    def save_background_tasks(self, tasks: dict[str, dict[str, Any]]) -> None:
+        """Atomically persist Activity/background task records."""
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        # Keep all active tasks plus up to 200 most recent finished tasks
+        active = {k: v for k, v in tasks.items() if v.get("status") in ("queued", "running")}
+        terminal = [
+            (k, v) for k, v in tasks.items() if v.get("status") not in ("queued", "running")
+        ]
+        if len(terminal) > 200:
+            terminal.sort(
+                key=lambda item: str(item[1].get("finished_at") or item[1].get("started_at") or ""),
+                reverse=True,
+            )
+            terminal = terminal[:200]
+        bounded = {**dict(terminal), **active}
+        tmp = self.background_tasks_path.with_suffix(f".json.{uuid4().hex[:8]}.tmp")
+        tmp.write_text(
+            json.dumps({"tasks": bounded}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(self.background_tasks_path)
+
+    def record_background_task(
+        self,
+        *,
+        task_id: str,
+        title: str,
+        status: str,
+        started_at: str,
+        finished_at: str | None = None,
+        kind: str = "background_task",
+        detail: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert or update a background task record on disk."""
+        tasks = self.load_background_tasks()
+        prev = tasks.get(task_id)
+        effective_started_at = started_at
+        if (
+            prev
+            and prev.get("status") in ("queued", "running")
+            and isinstance(prev.get("started_at"), str)
+            and prev["started_at"]
+        ):
+            effective_started_at = prev["started_at"]
+        record: dict[str, Any] = {
+            "task_id": task_id,
+            "title": title,
+            "status": status,
+            "kind": kind,
+            "started_at": effective_started_at,
+            "finished_at": finished_at,
+            "detail": detail,
+            "session_id": session_id if session_id is not None else (prev or {}).get("session_id"),
+        }
+        tasks[task_id] = record
+        self.save_background_tasks(tasks)
+        return record
+
+    def reconcile_orphaned_background_tasks(
+        self,
+        reason: str = "Interrupted by daemon restart",
+        *,
+        finished_at: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Mark any orphaned running/queued background tasks as failed on startup."""
+        tasks = self.load_background_tasks()
+        if not tasks:
+            return []
+        now_iso = finished_at or datetime.now().astimezone().isoformat(timespec="seconds")
+        reconciled: list[dict[str, Any]] = []
+        for task_id, record in list(tasks.items()):
+            if record.get("status") in ("queued", "running"):
+                updated = {
+                    **record,
+                    "status": "failed",
+                    "finished_at": now_iso,
+                    "detail": reason,
+                }
+                tasks[task_id] = updated
+                reconciled.append(updated)
+        if reconciled:
+            self.save_background_tasks(tasks)
+        return reconciled
 
 
 _DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")

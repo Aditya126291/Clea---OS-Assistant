@@ -9,7 +9,7 @@ import logging
 import logging.handlers
 import sys
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ from websockets.exceptions import InvalidURI, WebSocketException
 from clea.core import auth
 from clea.core.protocol import (
     BaseEvent,
+    BaseRequest,
     CallEndedData,
     CallEndedEvent,
     CallStartedData,
@@ -69,6 +70,7 @@ from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
 from clea.surfaces.voice.config import VoiceConfig, load_voice_config
 from clea.surfaces.voice.lock import VoiceInstanceLock
 from clea.surfaces.voice.memory_hooks import (
+    normalize_voice_transcript,
     resolve_voice_system_instruction,
     safe_consolidate_voice_call,
     safe_store_voice_transcript,
@@ -178,6 +180,8 @@ class VoiceRunner:
 
         self._events_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
         self._daemon_ws: ClientConnection | None = None
+        self._daemon_listener_active: bool = False
+        self._daemon_task_refs: set[asyncio.Task[Any]] = set()
         self._active_backend: VoiceBackend | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
@@ -237,6 +241,45 @@ class VoiceRunner:
             await ws.send(payload)
         except (OSError, WebSocketException) as exc:
             logger.debug("Could not send VoiceStateEvent to daemon: %s", exc)
+
+    def _spawn_daemon_callback_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        *,
+        name: str,
+    ) -> asyncio.Task[Any]:
+        """Spawn a daemon-triggered lifecycle task with a strong reference."""
+        task = asyncio.create_task(coro, name=name)
+        self._daemon_task_refs.add(task)
+
+        def _done(done_task: asyncio.Task[Any]) -> None:
+            self._daemon_task_refs.discard(done_task)
+            if not done_task.cancelled():
+                exc = done_task.exception()
+                if exc is not None:
+                    logger.warning("Daemon callback task %s failed: %s", name, exc)
+
+        task.add_done_callback(_done)
+        return task
+
+    async def _request_daemon(
+        self,
+        req: BaseRequest,
+        *,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Send an RPC request over the active daemon listener connection."""
+        ws = self._daemon_ws
+        if ws is None or not self._daemon_listener_active:
+            raise RuntimeError("No active daemon listener connection.")
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending_tasks[req.id] = fut
+        try:
+            await ws.send(req.model_dump_json())
+            return dict(await asyncio.wait_for(fut, timeout=timeout) or {})
+        finally:
+            self._pending_tasks.pop(req.id, None)
 
     def _set_voice_state(self, state: VoiceState, error: str | None = None) -> None:
         """Update voice state and emit a typed VoiceStateEvent."""
@@ -431,6 +474,13 @@ class VoiceRunner:
         if self._call_state in ("connecting", "active"):
             await self.end_call(reason="shutdown")
 
+        for task in list(self._daemon_task_refs):
+            if not task.done():
+                task.cancel()
+        if self._daemon_task_refs:
+            await asyncio.gather(*list(self._daemon_task_refs), return_exceptions=True)
+            self._daemon_task_refs.clear()
+
         with contextlib.suppress(Exception):
             self._screen_indicator.stop()
 
@@ -544,17 +594,32 @@ class VoiceRunner:
 
         try:
             # 1. Start call in daemon if connected
+            memory_context: str | None = None
             if self._daemon_ws is not None and trigger != "daemon_event":
                 start_req = VoiceStartCallRequest(
                     params=VoiceStartCallParams(trigger=trigger)  # type: ignore[arg-type]
                 )
                 try:
-                    await self._daemon_ws.send(start_req.model_dump_json())
-                except (OSError, WebSocketException) as exc:
+                    if self._daemon_listener_active:
+                        res = await self._request_daemon(start_req)
+                        if isinstance(res.get("call_id"), str) and res["call_id"]:
+                            self._call_id = res["call_id"]
+                        if isinstance(res.get("memory_context"), str):
+                            memory_context = res["memory_context"]
+                    else:
+                        await self._daemon_ws.send(start_req.model_dump_json())
+                except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
                     logger.warning("Could not notify daemon of call start: %s", exc)
 
             # 2. Resolve system instruction safely
-            system_instruction = await resolve_voice_system_instruction()
+            request_fn = self._request_daemon if self._daemon_listener_active else None
+            system_instruction = await resolve_voice_system_instruction(
+                memory_context=memory_context,
+                daemon_url=self.daemon_url,
+                token=self.token,
+                data_dir=self.data_dir,
+                request_fn=request_fn,
+            )
 
             # 3. Create backend and connect with latency measurement
             session_cfg = VoiceSessionConfig(
@@ -623,13 +688,20 @@ class VoiceRunner:
             print(f"\n[ERROR] Voice call failed to start: {exc}", file=sys.stderr, flush=True)
             await self.end_call(reason=f"start_failed: {exc}", error=f"Voice call failed: {exc}")
 
-    async def end_call(self, *, reason: str = "user_done", error: str | None = None) -> None:
+    async def end_call(
+        self,
+        *,
+        reason: str = "user_done",
+        error: str | None = None,
+        from_daemon: bool = False,
+    ) -> None:
         """End the active call and transition back to IDLE."""
-        if self._call_state == "idle":
+        if self._call_state in ("idle", "ending"):
             return
 
         self._call_state = "ending"
         ended_call_id = self._call_id or new_id()
+        transcript_snapshot = list(self._transcript_history)
         duration = time.monotonic() - self._call_start_time if self._call_start_time > 0 else 0.0
         logger.info(
             "Ending call (call_id=%s, reason=%s, duration=%.2fs)...",
@@ -677,7 +749,7 @@ class VoiceRunner:
                 with contextlib.suppress(asyncio.CancelledError):
                     await consume_task
 
-        # Reset call and voice state
+        # Reset call and voice state immediately so hooks cannot block or corrupt IDLE/new calls
         self._call_state = "idle"
         self._stall_timer_armed = False
         self._stall_accumulated_seconds = 0.0
@@ -687,24 +759,9 @@ class VoiceRunner:
         else:
             self._set_voice_state("idle")
         self._call_id = None
+        self._transcript_history.clear()
         if self._wake_word is not None:
             self._wake_word.reset()
-
-        # Notify daemon if connected and we initiated the end (not already from daemon)
-        if self._daemon_ws is not None and reason != "daemon_event":
-            with contextlib.suppress(Exception):
-                end_req = VoiceEndCallRequest(
-                    params=VoiceEndCallParams(call_id=ended_call_id, reason=reason)
-                )
-                await self._daemon_ws.send(end_req.model_dump_json())
-
-        # Safely invoke deferred transcript persistence and consolidation hooks
-        await safe_store_voice_transcript(
-            call_id=ended_call_id,
-            entries=list(self._transcript_history),
-        )
-        await safe_consolidate_voice_call(call_id=ended_call_id)
-        self._transcript_history.clear()
 
         # Write usage & metrics record
         self._write_metrics_record(
@@ -713,7 +770,7 @@ class VoiceRunner:
             duration_seconds=duration,
         )
 
-        # Emit typed CallEndedEvent
+        # Emit typed CallEndedEvent immediately on transition to IDLE
         self._emit_event(
             CallEndedEvent(
                 data=CallEndedData(
@@ -724,6 +781,37 @@ class VoiceRunner:
                 )
             )
         )
+
+        # Notify daemon if connected and we initiated the end (not already from daemon)
+        if self._daemon_ws is not None and not from_daemon and reason != "daemon_event":
+            with contextlib.suppress(Exception):
+                end_req = VoiceEndCallRequest(
+                    params=VoiceEndCallParams(call_id=ended_call_id, reason=reason)
+                )
+                if self._daemon_listener_active:
+                    await self._request_daemon(end_req, timeout=2.0)
+                else:
+                    await self._daemon_ws.send(end_req.model_dump_json())
+
+        # Safely persist non-empty transcript and trigger asynchronous call-end consolidation
+        request_fn = self._request_daemon if self._daemon_listener_active else None
+        await safe_store_voice_transcript(
+            call_id=ended_call_id,
+            entries=transcript_snapshot,
+            daemon_url=self.daemon_url,
+            token=self.token,
+            data_dir=self.data_dir,
+            request_fn=request_fn,
+        )
+        if normalize_voice_transcript(transcript_snapshot):
+            await safe_consolidate_voice_call(
+                call_id=ended_call_id,
+                entries=transcript_snapshot,
+                daemon_url=self.daemon_url,
+                token=self.token,
+                data_dir=self.data_dir,
+                request_fn=request_fn,
+            )
 
         logger.info("Call %s ended. Runner is now IDLE.", ended_call_id)
 
@@ -861,9 +949,8 @@ class VoiceRunner:
                 self._stall_reconnected_once = False
 
                 # Clear transient error or reconnecting state if backend recovered and returned data
-                if (
-                    self._state in ("error", "reconnecting")
-                    and not isinstance(event, BackendErrorEvent)
+                if self._state in ("error", "reconnecting") and not isinstance(
+                    event, BackendErrorEvent
                 ):
                     self._set_voice_state("listening")
 
@@ -891,6 +978,8 @@ class VoiceRunner:
                         self._audio_manager.stop_output()
                     self._set_voice_state("listening")
                 elif isinstance(event, TurnCompleteEvent):
+                    if self._transcript_history:
+                        self._transcript_history[-1]["final"] = True
                     self._set_voice_state("listening")
                 elif isinstance(event, TranscriptOutputEvent):
                     if event.role == "user":
@@ -900,7 +989,7 @@ class VoiceRunner:
                             "role": event.role,
                             "text": event.text,
                             "final": event.final,
-                            "timestamp": time.monotonic(),
+                            "timestamp": datetime.now().astimezone().isoformat(),
                         }
                     )
                     self._emit_event(
@@ -1381,6 +1470,7 @@ class VoiceRunner:
                 subprotocols=auth.client_subprotocols(token),  # type: ignore[arg-type]
             ) as ws:
                 self._daemon_ws = ws
+                self._daemon_listener_active = True
                 self._daemon_ever_connected = True
                 logger.info("Connected to daemon at %s.", self.daemon_url)
                 # Notify daemon that voice process is connected and register state
@@ -1413,12 +1503,21 @@ class VoiceRunner:
                         self._call_id = frame.data.call_id
                         if self._call_state == "idle":
                             # Daemon started call (e.g. from UI)
-                            await self.start_call(trigger="daemon_event")
+                            self._spawn_daemon_callback_task(
+                                self.start_call(trigger="daemon_event"),
+                                name=f"daemon-start-call-{self._call_id}",
+                            )
                     elif isinstance(frame, CallEndedEvent):
                         if self._call_state in ("connecting", "active"):
-                            await self.end_call(reason=frame.data.reason or "daemon_event")
+                            self._spawn_daemon_callback_task(
+                                self.end_call(
+                                    reason=frame.data.reason or "daemon_event",
+                                    from_daemon=True,
+                                ),
+                                name=f"daemon-end-call-{frame.data.call_id}",
+                            )
                     elif isinstance(frame, ResponseFrame):
-                        # Check if this resolves a delegated task
+                        # Check if this resolves a delegated task or RPC request
                         fut = self._pending_tasks.get(frame.id)
                         if fut and not fut.done():
                             if frame.ok:
@@ -1426,4 +1525,5 @@ class VoiceRunner:
                             else:
                                 fut.set_exception(RuntimeError(frame.error or "Task failed"))
         finally:
+            self._daemon_listener_active = False
             self._daemon_ws = None

@@ -221,35 +221,58 @@ def test_voice_backend_model_validation_rejects_invalid_bounds() -> None:
     assert resp.media_parts[0].data == b"\x89PNG\r\n"
 
 
-async def test_deferred_memory_hooks_are_explicitly_stubbed() -> None:
-    with pytest.raises(NotImplementedError, match="deferred"):
-        await load_voice_memory_context()
-    with pytest.raises(NotImplementedError, match="deferred"):
-        await store_voice_transcript(call_id="c1", entries=[])
-    with pytest.raises(NotImplementedError, match="deferred"):
-        await consolidate_voice_call(call_id="c1")
+async def test_memory_hooks_skip_empty_and_use_request_fn() -> None:
+    calls: list[str] = []
+
+    async def _fake_request(req):  # type: ignore[no-untyped-def]
+        calls.append(req.method)
+        if req.method == "memory.get":
+            return {"long_term": "User lives in Pune."}
+        if req.method == "memory.episodes":
+            return {"episodes": [{"date": "2026-11-14", "summary": "Tested voice"}]}
+        return {"ok": True}
+
+    ctx = await load_voice_memory_context(request_fn=_fake_request)
+    assert "User lives in Pune." in ctx
+    assert "Tested voice" in ctx
+    assert calls == ["memory.get", "memory.episodes"]
+
+    # Empty calls are skipped without making any daemon RPCs
+    calls.clear()
+    assert await store_voice_transcript(call_id="c1", entries=[], request_fn=_fake_request) is False
+    assert await consolidate_voice_call(call_id="c1", entries=[], request_fn=_fake_request) is False
+    assert calls == []
 
 
 async def test_resolve_voice_system_instruction_falls_back_on_unimplemented_hook(
+    tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="clea.surfaces.voice.memory_hooks")
 
-    # Both direct safe loader and full resolver gracefully return None/fallback
-    assert await safe_load_voice_memory_context() is None
+    async def _unimplemented_loader() -> str:
+        raise NotImplementedError("custom stub")
 
-    instruction = await resolve_voice_system_instruction()
+    # Safe loader and resolver gracefully return None/fallback
+    assert await safe_load_voice_memory_context(loader=_unimplemented_loader) is None
+
+    instruction = await resolve_voice_system_instruction(memory_loader=_unimplemented_loader)
     assert instruction == BASE_VOICE_SYSTEM_INSTRUCTION
     assert "## Memory Context" not in instruction
+
+    # Also verifies offline daemon fallback when no token/lock exists
+    offline_instruction = await resolve_voice_system_instruction(data_dir=tmp_path)
+    assert offline_instruction == BASE_VOICE_SYSTEM_INSTRUCTION
 
     warning_records = [
         rec
         for rec in caplog.records
         if rec.name == "clea.surfaces.voice.memory_hooks" and rec.levelno == logging.WARNING
     ]
-    assert len(warning_records) == 2
-    for r in warning_records:
-        assert "Voice memory context hook is not implemented" in r.getMessage()
+    assert len(warning_records) == 3
+    assert "Voice memory context hook is not implemented" in warning_records[0].getMessage()
+    assert "Voice memory context hook is not implemented" in warning_records[1].getMessage()
+    assert "Failed loading voice memory context" in warning_records[2].getMessage()
 
 
 async def test_resolve_voice_system_instruction_falls_back_on_arbitrary_error(
@@ -294,22 +317,47 @@ async def test_resolve_voice_system_instruction_includes_context_when_provided(
 
 
 async def test_safe_transcript_and_consolidation_do_not_crash_active_calls(
+    tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="clea.surfaces.voice.memory_hooks")
 
-    # Call path invoking stubs directly must not raise
-    await safe_store_voice_transcript(call_id="call-42", entries=[{"role": "user", "text": "hi"}])
-    await safe_consolidate_voice_call(call_id="call-42")
+    async def _unimplemented_store(*, call_id: str, entries: object) -> None:
+        raise NotImplementedError("store stub")
+
+    async def _unimplemented_consolidate(*, call_id: str) -> None:
+        raise NotImplementedError("consolidate stub")
+
+    # Custom NotImplementedError handlers must not raise
+    await safe_store_voice_transcript(
+        call_id="call-42",
+        entries=[{"role": "user", "text": "hi"}],
+        handler=_unimplemented_store,
+    )
+    await safe_consolidate_voice_call(call_id="call-42", handler=_unimplemented_consolidate)
+
+    # Offline daemon calls (no token/lock in tmp_path) must also fail safely without raising
+    await safe_store_voice_transcript(
+        call_id="call-43",
+        entries=[{"role": "user", "text": "hi"}],
+        data_dir=tmp_path,
+    )
+    await safe_consolidate_voice_call(
+        call_id="call-43",
+        entries=[{"role": "user", "text": "hi"}],
+        data_dir=tmp_path,
+    )
 
     warning_records = [
         rec
         for rec in caplog.records
         if rec.name == "clea.surfaces.voice.memory_hooks" and rec.levelno == logging.WARNING
     ]
-    assert len(warning_records) == 2
+    assert len(warning_records) == 4
     assert "Voice transcript hook not implemented" in warning_records[0].getMessage()
     assert "Voice consolidation hook not implemented" in warning_records[1].getMessage()
+    assert "Failed storing voice transcript" in warning_records[2].getMessage()
+    assert "Failed consolidating voice call" in warning_records[3].getMessage()
 
 
 def test_voice_surface_respects_architecture_and_vendor_isolation_boundaries() -> None:

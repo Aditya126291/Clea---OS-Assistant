@@ -228,12 +228,23 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     const client = new CleaClient({
       ...clientOptions,
       onConnected: () => {
+        const disconnectedAt = new Date().toISOString();
         set((state) => ({
           connectionState: "connected",
           reconnectAttempt: 0,
           lastError: null,
           sending: false,
           messages: state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+          tasks: state.tasks.map((t) =>
+            t.status === "running" || t.status === "queued"
+              ? {
+                  ...t,
+                  status: "failed",
+                  detail: t.detail ?? "Interrupted by daemon restart",
+                  finished_at: t.finished_at ?? disconnectedAt,
+                }
+              : t,
+          ),
         }));
         const currentSid = get().sessionId;
         if (currentSid) {
