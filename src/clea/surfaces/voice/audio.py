@@ -507,10 +507,13 @@ class AudioManager:
 
     def play_audio(self, pcm_bytes: bytes) -> None:
         """Queue 24 kHz 16-bit mono PCM bytes for playback."""
-        if not pcm_bytes or not self._running:
+        if not pcm_bytes:
             return
-        self._output_queue.put(pcm_bytes)
-        self._is_speaking.set()
+        with self._lock:
+            if not self._running:
+                return
+            self._output_queue.put(pcm_bytes)
+            self._is_speaking.set()
 
     def stop_output(self) -> None:
         """Immediately drop all buffered output audio on barge-in."""
@@ -603,8 +606,11 @@ class AudioManager:
             outdata[:got_frames] = arr
             if got_frames < frames:
                 outdata[got_frames:] = 0
-                if self._output_queue.empty() and not self._current_output_bytes:
-                    self._is_speaking.clear()
+                with self._lock:
+                    if self._output_queue.empty() and not self._current_output_bytes:
+                        self._is_speaking.clear()
         else:
             outdata[:] = 0
-            self._is_speaking.clear()
+            with self._lock:
+                if self._output_queue.empty() and not self._current_output_bytes:
+                    self._is_speaking.clear()

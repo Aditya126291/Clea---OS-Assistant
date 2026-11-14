@@ -1156,3 +1156,159 @@ async def test_voice_runner_connects_to_late_starting_real_daemon(tmp_path: Path
             await asyncio.wait_for(runner_task, timeout=3.0)
 
     assert not (tmp_path / "voice.lock").exists()
+
+
+async def test_voice_runner_multi_turn_with_gemini_backend_and_audio_manager(
+    tmp_path: Path,
+) -> None:
+    """Verify Turn 1 and Turn 2 both send user audio and receive/play server audio."""
+    from google.genai import types
+
+    from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
+
+    turn_call_count = 0
+    sent_audio_chunks: list[bytes] = []
+    turn1_user_audio_seen = asyncio.Event()
+    turn2_user_audio_seen = asyncio.Event()
+
+    async def fake_send_realtime_input(*, audio: Any = None, **_kwargs: Any) -> None:
+        if audio is not None and audio.data:
+            sent_audio_chunks.append(audio.data)
+            if audio.data[:2] == b"\x10\x00":
+                turn1_user_audio_seen.set()
+            elif audio.data[:2] == b"\x20\x00":
+                turn2_user_audio_seen.set()
+
+    async def multi_turn_receive() -> Any:
+        nonlocal turn_call_count
+        turn_call_count += 1
+        current = turn_call_count
+        if current == 1:
+            await turn1_user_audio_seen.wait()
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\xaa\x00" * 120, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        if current == 2:
+            await turn2_user_audio_seen.wait()
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\xbb\x00" * 120, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        await asyncio.sleep(10.0)
+
+    mock_session = MagicMock()
+    mock_session.receive.side_effect = multi_turn_receive
+    mock_session.send_realtime_input = AsyncMock(side_effect=fake_send_realtime_input)
+
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    audio = AudioManager(mic_mute_while_speaking=True, chunk_size=1280)
+    audio.input_sample_rate = 16000
+    audio.input_channels = 1
+
+    def fake_audio_start() -> None:
+        audio._running = True
+
+    def fake_audio_stop() -> None:
+        audio._running = False
+        audio.stop_output()
+
+    audio.start = MagicMock(side_effect=fake_audio_start)  # type: ignore[method-assign]
+    audio.stop = MagicMock(side_effect=fake_audio_stop)  # type: ignore[method-assign]
+
+    states_seen: list[str] = []
+
+    def on_event(evt: BaseEvent) -> None:
+        if isinstance(evt, VoiceStateEvent):
+            states_seen.append(evt.data.state)
+
+    cfg = VoiceConfig(silence_timeout_seconds=60.0, mic_mute_while_speaking=True)
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: GeminiLiveBackend(api_key="test-key", client=mock_client),
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        on_event=on_event,
+    )
+
+    await runner.start()
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "active"
+    assert runner.voice_state == "listening"
+
+    # Turn 1: mic captures 16 kHz user PCM -> backend sends -> server sends audio + turn_complete
+    turn1_mic = np.full((1280, 1), 16, dtype=np.int16)  # 0x0010 little-endian -> b"\x10\x00"
+    audio._input_stream_callback(turn1_mic, 1280, None, 0)  # type: ignore[arg-type]
+
+    for _ in range(40):
+        if audio.is_speaking and runner.voice_state == "listening":
+            break
+        await asyncio.sleep(0.02)
+    assert audio.is_speaking is True
+    assert runner.voice_state == "listening"
+
+    # Drain output playback via _output_stream_callback (more frames than 120 samples)
+    out_buf = np.empty((256, 1), dtype=np.int16)
+    audio._output_stream_callback(out_buf, 256, None, 0)  # type: ignore[arg-type]
+    assert np.array_equal(out_buf[:120, 0], np.full(120, 0x00AA, dtype=np.int16))
+    assert np.all(out_buf[120:] == 0)
+    assert audio.is_speaking is False
+
+    # Turn 2: mic captures 16 kHz user PCM -> must still forward & receive Turn 2 response
+    turn2_mic = np.full((1280, 1), 32, dtype=np.int16)  # 0x0020 little-endian -> b"\x20\x00"
+    audio._input_stream_callback(turn2_mic, 1280, None, 0)  # type: ignore[arg-type]
+
+    for _ in range(40):
+        if audio.is_speaking and len(sent_audio_chunks) >= 2 and runner.voice_state == "listening":
+            break
+        await asyncio.sleep(0.02)
+
+    assert len(sent_audio_chunks) >= 2
+    assert any(c[:2] == b"\x10\x00" for c in sent_audio_chunks)
+    assert any(c[:2] == b"\x20\x00" for c in sent_audio_chunks)
+    assert audio.is_speaking is True
+    assert runner.call_state == "active"
+    assert runner.voice_state == "listening"
+
+    # Drain Turn 2 output playback
+    out_buf2 = np.empty((256, 1), dtype=np.int16)
+    audio._output_stream_callback(out_buf2, 256, None, 0)  # type: ignore[arg-type]
+    assert np.array_equal(out_buf2[:120, 0], np.full(120, 0x00BB, dtype=np.int16))
+    assert audio.is_speaking is False
+    assert states_seen.count("speaking") >= 2
+
+    await runner.end_call(reason="test_done")
+    await runner.stop()

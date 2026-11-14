@@ -203,9 +203,20 @@ class GeminiLiveBackend(VoiceBackend):
 
     async def _receive_loop(self) -> None:
         try:
-            assert self._session is not None
-            async for msg in self._session.receive():
-                await self._handle_server_message(msg)
+            while not self._closed and self._session is not None:
+                # google-genai's session.receive() stops at the end of each model turn
+                # (turn_complete / interaction_status == IDLE), so loop across turns
+                # while the session remains open.
+                received_any = False
+                async for msg in self._session.receive():
+                    received_any = True
+                    await self._handle_server_message(msg)
+                    if self._closed:
+                        break
+                if not received_any:
+                    break
+                # Yield to the event loop between turns so synchronous mocks cannot starve it.
+                await asyncio.sleep(0)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -243,11 +254,16 @@ class GeminiLiveBackend(VoiceBackend):
         await self._reconnect()
 
     async def _reconnect(self) -> None:
-        if self._receive_task is not None and not self._receive_task.done():
+        current = asyncio.current_task()
+        if (
+            self._receive_task is not None
+            and not self._receive_task.done()
+            and self._receive_task is not current
+        ):
             self._receive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._receive_task
-            self._receive_task = None
+        self._receive_task = None
         if self._session_ctx is not None:
             with contextlib.suppress(Exception):
                 await self._session_ctx.__aexit__(None, None, None)

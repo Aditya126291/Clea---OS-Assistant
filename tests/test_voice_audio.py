@@ -626,3 +626,36 @@ def test_refresh_audio_devices_reinitializes_portaudio() -> None:
         refresh_audio_devices()
         assert mock_term.called
         assert mock_init.called
+
+
+def test_audio_manager_resumes_capture_after_output_drains() -> None:
+    """After Turn 1 output finishes draining, is_speaking resets and Turn 2 mic flows."""
+    received: list[bytes] = []
+    manager = AudioManager(
+        mic_mute_while_speaking=True,
+        on_audio_input=received.append,
+        chunk_size=1280,
+    )
+    manager.input_sample_rate = 16000
+    manager.input_channels = 1
+    manager._running = True
+
+    # Turn 1 playback: exact frame boundary (200 samples = 400 bytes)
+    manager.play_audio(b"\x01\x00" * 200)
+    assert manager.is_speaking is True
+
+    # While speaking, mic input is muted
+    mic_block = np.ones((1280, 1), dtype=np.int16)
+    manager._input_stream_callback(mic_block, 1280, None, 0)  # type: ignore[arg-type]
+    assert len(received) == 0
+
+    # Drain exact 200 frames, then next callback sees empty queue -> clears is_speaking
+    out = np.empty((200, 1), dtype=np.int16)
+    manager._output_stream_callback(out, 200, None, 0)  # type: ignore[arg-type]
+    manager._output_stream_callback(out, 200, None, 0)  # type: ignore[arg-type]
+    assert manager.is_speaking is False
+
+    # Turn 2 mic input must now be captured and forwarded
+    manager._input_stream_callback(mic_block, 1280, None, 0)  # type: ignore[arg-type]
+    assert len(received) == 1
+    assert len(received[0]) == 2560

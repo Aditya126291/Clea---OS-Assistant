@@ -152,9 +152,16 @@ async def test_gemini_backend_maps_all_server_messages_to_normalized_events() ->
         )
     )
 
+    delivered = False
+
     async def fake_stream() -> Any:
-        for m in [msg1, msg2, msg3, msg4, msg5, msg6, msg7]:
-            yield m
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            for m in [msg1, msg2, msg3, msg4, msg5, msg6, msg7]:
+                yield m
+        else:
+            await asyncio.sleep(10.0)
 
     mock_session = MagicMock()
     mock_session.receive.side_effect = fake_stream
@@ -319,5 +326,133 @@ async def test_gemini_backend_reconnect_cancels_existing_receive_task() -> None:
     assert second_task is not None
     assert second_task is not first_task
     assert first_task.cancelled() or first_task.done()
+
+    await backend.close()
+
+
+async def test_gemini_backend_receives_across_multiple_turns() -> None:
+    """Backend must keep calling session.receive() after Turn 1 turn_complete."""
+    turn_index = 0
+    turn2_audio_sent = asyncio.Event()
+    turn3_audio_sent = asyncio.Event()
+    sent_blobs: list[Any] = []
+
+    async def fake_send_realtime_input(*, audio: Any = None, **_kwargs: Any) -> None:
+        if audio is not None:
+            sent_blobs.append(audio)
+            if len(sent_blobs) == 2:
+                turn2_audio_sent.set()
+            elif len(sent_blobs) >= 3:
+                turn3_audio_sent.set()
+
+    async def multi_turn_receive() -> Any:
+        nonlocal turn_index
+        turn_index += 1
+        current_turn = turn_index
+        if current_turn == 1:
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\x11\x00" * 120, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        if current_turn == 2:
+            await turn2_audio_sent.wait()
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\x22\x00" * 120, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        if current_turn == 3:
+            await turn3_audio_sent.wait()
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\x33\x00" * 120, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        await asyncio.sleep(10.0)
+
+    mock_session = MagicMock()
+    mock_session.receive.side_effect = multi_turn_receive
+    mock_session.send_realtime_input = AsyncMock(side_effect=fake_send_realtime_input)
+
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys"))
+
+    collected: list[Any] = []
+
+    async def collect_six() -> None:
+        async for evt in backend.events():
+            collected.append(evt)
+            if len(collected) == 6:
+                break
+
+    collector = asyncio.create_task(collect_six())
+
+    # Turn 1 audio -> receive Turn 1 audio + turn_complete
+    await backend.send_audio(b"\x01\x00" * 320)
+    await asyncio.sleep(0.05)
+
+    # Turn 2 audio -> receive Turn 2 audio + turn_complete
+    await backend.send_audio(b"\x02\x00" * 320)
+    await asyncio.sleep(0.05)
+
+    # Turn 3 audio -> receive Turn 3 audio + turn_complete
+    await backend.send_audio(b"\x03\x00" * 320)
+    await asyncio.wait_for(collector, timeout=2.0)
+
+    assert len(sent_blobs) == 3
+    assert [type(e) for e in collected] == [
+        AudioOutputEvent,
+        TurnCompleteEvent,
+        AudioOutputEvent,
+        TurnCompleteEvent,
+        AudioOutputEvent,
+        TurnCompleteEvent,
+    ]
+    assert collected[0].pcm_bytes == b"\x11\x00" * 120
+    assert collected[2].pcm_bytes == b"\x22\x00" * 120
+    assert collected[4].pcm_bytes == b"\x33\x00" * 120
 
     await backend.close()
