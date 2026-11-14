@@ -676,3 +676,33 @@ async def test_gemini_backend_close_while_reconnecting_does_not_leak_session() -
 
     assert ctx2_exited.is_set()
     assert backend._session is None
+
+
+async def test_gemini_backend_defaults_to_high_media_resolution_and_handles_missing_enum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import google.genai.types as real_types
+
+    mock_session = MagicMock()
+
+    async def empty_recv() -> Any:
+        if False:
+            yield None
+
+    mock_session.receive.side_effect = empty_recv
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys"))
+    live_cfg: types.LiveConnectConfig = mock_client.aio.live.connect.call_args.kwargs["config"]
+    assert live_cfg.media_resolution == types.MediaResolution.MEDIA_RESOLUTION_HIGH
+    await backend.close()
+
+    # Guarded attribute lookup cleanly tolerates an SDK lacking MediaResolution
+    monkeypatch.delattr(real_types, "MediaResolution")
+    built = backend._build_live_config(VoiceSessionConfig(system_instruction="sys"))
+    assert built.media_resolution is None

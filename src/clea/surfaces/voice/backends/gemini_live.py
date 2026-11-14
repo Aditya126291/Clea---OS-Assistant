@@ -149,15 +149,18 @@ class GeminiLiveBackend(VoiceBackend):
                 )
             )
 
-        # Media resolution
-        res_map = {
-            "low": types.MediaResolution.MEDIA_RESOLUTION_LOW,
-            "medium": types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
-            "high": types.MediaResolution.MEDIA_RESOLUTION_HIGH,
-        }
-        media_res = res_map.get(
-            config.media_resolution, types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
-        )
+        # Media resolution (guarded cleanly across google-genai versions)
+        media_res = None
+        media_enum = getattr(types, "MediaResolution", None)
+        if media_enum is not None:
+            res_map = {
+                "low": getattr(media_enum, "MEDIA_RESOLUTION_LOW", None),
+                "medium": getattr(media_enum, "MEDIA_RESOLUTION_MEDIUM", None),
+                "high": getattr(media_enum, "MEDIA_RESOLUTION_HIGH", None),
+            }
+            media_res = res_map.get(config.media_resolution) or getattr(
+                media_enum, "MEDIA_RESOLUTION_HIGH", None
+            )
 
         # VAD configuration
         realtime_input_cfg = None

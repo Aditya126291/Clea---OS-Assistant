@@ -63,8 +63,13 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="look_at_screen",
             description=(
-                "Capture a single screenshot of the active window or full screen so you can "
-                "see what is on the user's display."
+                "Capture a fresh live screenshot RIGHT NOW along with ground-truth active "
+                "application name, process executable, and window title metadata. Always call "
+                "this again on every user question about the screen, active app, code, errors, "
+                "or UI rather than relying on earlier screenshots in the conversation. Use "
+                "target='active_window' (1:1 native resolution) whenever reading code, tabs, "
+                "menus, or small UI text, and target='full_screen' when whole-monitor context "
+                "is needed."
             ),
             parameters_schema={
                 "type": "object",
@@ -72,11 +77,14 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     "target": {
                         "type": "string",
                         "enum": ["active_window", "full_screen"],
-                        "description": "Capture only the active window or the full screen.",
+                        "description": (
+                            "Capture only the active foreground window at 1:1 native resolution "
+                            "(best for reading code/text/UI) or the active display monitor."
+                        ),
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Brief explanation of why screen context is needed.",
+                        "description": "Brief explanation of why fresh screen context is needed.",
                     },
                     "monitor": {
                         "type": "integer",
@@ -91,8 +99,8 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="watch_screen",
             description=(
-                "Stream periodic screen frames for a bounded duration while guiding the user "
-                "live through an on-screen workflow."
+                "Stream fresh periodic screen frames for a bounded duration while guiding the "
+                "user live through an on-screen workflow."
             ),
             parameters_schema={
                 "type": "object",
@@ -105,6 +113,14 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     "reason": {
                         "type": "string",
                         "description": "Brief explanation of why continuous viewing is needed.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["active_window", "full_screen"],
+                        "description": (
+                            "Optional target ('active_window' or 'full_screen', defaults to "
+                            "'full_screen')."
+                        ),
                     },
                 },
                 "required": ["seconds", "reason"],
@@ -160,7 +176,7 @@ class VoiceSessionConfig(_StrictModel):
     system_instruction: str
     tools: list[VoiceToolDeclaration] = Field(default_factory=default_voice_tools)
     enable_web_search: bool = False
-    media_resolution: MediaResolution = "medium"
+    media_resolution: MediaResolution = "high"
     input_sample_rate_hz: int = Field(default=INPUT_AUDIO_SAMPLE_RATE_HZ, gt=0)
     output_sample_rate_hz: int = Field(default=OUTPUT_AUDIO_SAMPLE_RATE_HZ, gt=0)
     session_resumption: SessionResumptionConfig = Field(default_factory=SessionResumptionConfig)

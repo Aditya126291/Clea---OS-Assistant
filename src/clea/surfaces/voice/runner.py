@@ -73,8 +73,14 @@ from clea.surfaces.voice.memory_hooks import (
     safe_store_voice_transcript,
 )
 from clea.surfaces.voice.screen import ScreenCaptureService
+from clea.surfaces.voice.screen_indicator import ScreenIndicator
 from clea.surfaces.voice.wake_word import WakeWordDetector, WakeWordModelNotFoundError
-from clea.surfaces.voice.win32 import HotKeyManager, enable_per_monitor_dpi_awareness
+from clea.surfaces.voice.win32 import (
+    HotKeyManager,
+    enable_per_monitor_dpi_awareness,
+    get_target_monitor,
+    resolve_app_display_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +126,7 @@ class VoiceRunner:
         enable_hotkey: bool = True,
         on_event: Callable[[BaseEvent], None] | None = None,
         screen_service: ScreenCaptureService | None = None,
+        screen_indicator: ScreenIndicator | None = None,
         debug_audio: bool = False,
         audio_init_retries: int = 8,
         audio_init_retry_delay: float = 1.5,
@@ -144,6 +151,10 @@ class VoiceRunner:
         self._screen_service = screen_service or ScreenCaptureService(
             blocklist=self.config.blocklist,
             image_max_side=self.config.image_max_side,
+        )
+        self._screen_indicator = screen_indicator or ScreenIndicator(
+            enabled=self.config.screen_indicator_enabled,
+            height_px=self.config.screen_indicator_height_px,
         )
         self._watch_screen_task: asyncio.Task[None] | None = None
 
@@ -363,8 +374,16 @@ class VoiceRunner:
                 except Exception as exc:
                     logger.warning("Could not register hotkey '%s': %s", self.config.hotkey, exc)
 
+            # 4. Initialize top-edge screen-monitoring overlay thread (if enabled & supported)
+            try:
+                self._screen_indicator.start()
+            except Exception as exc:
+                logger.warning("Could not start screen monitoring indicator: %s", exc)
+
             logger.info("VoiceRunner started in state: IDLE (hotkey=%s).", self.config.hotkey)
         except Exception:
+            with contextlib.suppress(Exception):
+                self._screen_indicator.stop()
             if self._audio_manager is not None:
                 with contextlib.suppress(Exception):
                     self._audio_manager.stop()
@@ -410,6 +429,9 @@ class VoiceRunner:
 
         if self._call_state in ("connecting", "active"):
             await self.end_call(reason="shutdown")
+
+        with contextlib.suppress(Exception):
+            self._screen_indicator.stop()
 
         if self._hotkey_manager is not None:
             self._hotkey_manager.stop()
@@ -625,8 +647,15 @@ class VoiceRunner:
             self._stall_watchdog_task = None
 
         if self._watch_screen_task is not None:
-            self._watch_screen_task.cancel()
+            watch_task = self._watch_screen_task
             self._watch_screen_task = None
+            watch_task.cancel()
+            if watch_task is not asyncio.current_task():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watch_task
+
+        with contextlib.suppress(Exception):
+            self._screen_indicator.hide()
 
         # Stop audio playback and clear output buffer immediately
         if self._audio_manager is not None:
@@ -1019,10 +1048,33 @@ class VoiceRunner:
                 return
 
             target = str(event.arguments.get("target", "full_screen"))
-            monitor = event.arguments.get("monitor")
+            if target not in ("active_window", "full_screen"):
+                target = "full_screen"
+
+            raw_monitor = event.arguments.get("monitor")
+            monitor: int | None = None
+            if raw_monitor is not None and not isinstance(raw_monitor, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    monitor = int(raw_monitor)
+
+            initial_bounds: tuple[int, int, int, int] | None = None
+            if sys.platform == "win32" or getattr(self._screen_service, "_api", None) is not None:
+                with contextlib.suppress(Exception):
+                    mon = get_target_monitor(
+                        monitor=monitor,
+                        api=getattr(self._screen_service, "_api", None),
+                    )
+                    if mon is not None:
+                        initial_bounds = mon.bounds
+
+            # Show red bar when capture begins (excluded from capture via WDA_EXCLUDEFROMCAPTURE).
+            self._screen_indicator.pulse(initial_bounds, duration_seconds=1.5)
+
             res = self._screen_service.capture(target=target, monitor=monitor)
 
             if res.blocked:
+                if not self._screen_indicator.is_watching:
+                    self._screen_indicator.hide()
                 resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
@@ -1032,6 +1084,9 @@ class VoiceRunner:
                             f"Active window '{res.window_title}' ({res.process_name}) "
                             "is protected by privacy blocklist."
                         ),
+                        "active_window_title": res.window_title,
+                        "active_process_name": res.process_name,
+                        "active_app_name": res.app_name,
                     },
                     is_error=True,
                     scheduling="when_idle",
@@ -1040,20 +1095,34 @@ class VoiceRunner:
                 return
 
             if res.image_bytes is not None:
-                await backend.send_video_frame(res.image_bytes, mime_type="image/jpeg")
+                if res.monitor_bounds is not None and res.monitor_bounds != initial_bounds:
+                    self._screen_indicator.pulse(res.monitor_bounds, duration_seconds=1.5)
+
+                await backend.send_video_frame(res.image_bytes, mime_type=res.mime_type)
                 resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
                     response={
                         "status": "success",
                         "target": target,
+                        "mime_type": res.mime_type,
                         "width": res.width,
                         "height": res.height,
+                        "capture_seq": res.capture_seq,
+                        "captured_at": res.captured_at,
                         "window_title": res.window_title,
+                        "active_window_title": res.window_title,
+                        "active_process_name": res.process_name,
+                        "active_app_name": res.app_name,
+                        "window_bounds": list(res.window_bounds) if res.window_bounds else None,
+                        "monitor_index": res.monitor_index,
+                        "monitor_bounds": list(res.monitor_bounds) if res.monitor_bounds else None,
                     },
                     scheduling="when_idle",
                 )
             else:
+                if not self._screen_indicator.is_watching:
+                    self._screen_indicator.hide()
                 resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
@@ -1090,12 +1159,35 @@ class VoiceRunner:
 
             burst_seconds = max(1.0, min(req_seconds, self.config.max_burst_seconds))
             reason = str(event.arguments.get("reason", "Continuous workflow guidance"))
+            target = str(event.arguments.get("target", "full_screen"))
+            if target not in ("active_window", "full_screen"):
+                target = "full_screen"
 
             if self._watch_screen_task is not None and not self._watch_screen_task.done():
-                self._watch_screen_task.cancel()
+                prev_task = self._watch_screen_task
+                self._watch_screen_task = None
+                prev_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await prev_task
+
+            initial_bounds: tuple[int, int, int, int] | None = None
+            win_info = self._screen_service.get_active_window_info()
+            if win_info is not None and win_info.monitor_bounds is not None:
+                initial_bounds = win_info.monitor_bounds
+            elif sys.platform == "win32" or getattr(self._screen_service, "_api", None) is not None:
+                with contextlib.suppress(Exception):
+                    mon = get_target_monitor(api=getattr(self._screen_service, "_api", None))
+                    if mon is not None:
+                        initial_bounds = mon.bounds
+
+            self._screen_indicator.start_watching(initial_bounds)
 
             self._watch_screen_task = asyncio.create_task(
-                self._stream_screen_burst(burst_seconds=burst_seconds, backend=backend),
+                self._stream_screen_burst(
+                    burst_seconds=burst_seconds,
+                    backend=backend,
+                    target=target,
+                ),
                 name="VoiceRunnerScreenBurst",
             )
             resp = VoiceToolResponse(
@@ -1105,6 +1197,15 @@ class VoiceRunner:
                     "status": "watching",
                     "duration_seconds": burst_seconds,
                     "reason": reason,
+                    "target": target,
+                    "active_window_title": win_info.title if win_info else None,
+                    "active_process_name": win_info.process_name if win_info else None,
+                    "active_app_name": (
+                        resolve_app_display_name(win_info.process_name, win_info.title)
+                        if win_info
+                        else None
+                    ),
+                    "monitor_index": win_info.monitor_index if win_info else None,
                 },
                 scheduling="when_idle",
             )
@@ -1116,22 +1217,33 @@ class VoiceRunner:
         *,
         burst_seconds: float,
         backend: VoiceBackend,
+        target: str = "full_screen",
         interval: float = 1.0,
     ) -> None:
         """Stream periodic screen frames for a bounded burst duration."""
         t_end = time.monotonic() + burst_seconds
-        logger.info("Starting screen watch burst for %.1f seconds.", burst_seconds)
+        current_task = asyncio.current_task()
+        logger.info(
+            "Starting screen watch burst for %.1f seconds (target=%s).",
+            burst_seconds,
+            target,
+        )
         try:
             while time.monotonic() < t_end and self._call_state == "active":
-                res = self._screen_service.capture(target="full_screen")
+                res = self._screen_service.capture(target=target)
+                if res.monitor_bounds is not None:
+                    self._screen_indicator.update_watch_bounds(res.monitor_bounds)
                 if res.image_bytes is not None and not res.blocked:
-                    await backend.send_video_frame(res.image_bytes, mime_type="image/jpeg")
+                    await backend.send_video_frame(res.image_bytes, mime_type=res.mime_type)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             logger.warning("Error during screen stream burst: %s", exc)
         finally:
+            if self._watch_screen_task is current_task:
+                self._watch_screen_task = None
+                self._screen_indicator.stop_watching()
             logger.debug("Screen watch burst ended.")
 
     async def _connect_daemon_and_listen(self) -> None:

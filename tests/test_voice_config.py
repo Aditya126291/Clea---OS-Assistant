@@ -31,8 +31,10 @@ def test_default_toml_contains_comments_and_roundtrips_to_defaults() -> None:
     assert "mic_mute_while_speaking = false" in toml_text
     assert 'wake_word_model = "hey_jarvis"' in toml_text
     assert 'hotkey = "Ctrl+Alt+V"' in toml_text
-    assert 'media_resolution = "medium"' in toml_text
+    assert 'media_resolution = "high"' in toml_text
     assert 'consent_mode = "ask"' in toml_text
+    assert "screen_indicator_enabled = true" in toml_text
+    assert "screen_indicator_height_px = 3" in toml_text
 
     parsed = tomllib.loads(toml_text)
     cfg = VoiceConfig.model_validate(parsed)
@@ -46,8 +48,10 @@ def test_default_toml_contains_comments_and_roundtrips_to_defaults() -> None:
     assert cfg.silence_timeout_seconds == 60.0
     assert cfg.hotkey == "Ctrl+Alt+V"
     assert cfg.max_burst_seconds == 30.0
-    assert cfg.image_max_side == 768
-    assert cfg.media_resolution == "medium"
+    assert cfg.image_max_side == 1920
+    assert cfg.media_resolution == "high"
+    assert cfg.screen_indicator_enabled is True
+    assert cfg.screen_indicator_height_px == 3
     assert cfg.blocklist.window_titles == []
     assert cfg.blocklist.processes == []
     assert cfg.consent_mode == "ask"
@@ -137,6 +141,9 @@ def test_empty_device_string_normalizes_to_none(tmp_path: Path) -> None:
         "max_burst_seconds = -5\n",
         "max_burst_seconds = inf\n",
         "image_max_side = 16\n",
+        "screen_indicator_height_px = 0\n",
+        "screen_indicator_height_px = 64\n",
+        "screen_indicator_height_px = true\n",
         "reconnect_limit = -1\n",
         "reconnect_limit = true\n",
         "input_device = true\n",

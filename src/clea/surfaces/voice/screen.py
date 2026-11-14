@@ -1,25 +1,43 @@
-"""Screen capture and frame encoding service for live voice vision (Slice 2).
+"""Screen capture and frame encoding service for live voice vision.
 
-Provides DPI-aware full-screen and active-window capture using Pillow and Win32,
-checks window titles and process names against ScreenBlocklistConfig, resizes frames
-to image_max_side, and encodes them to JPEG for live streaming to Gemini Live API.
+Provides per-monitor DPI-aware capture of the active window (1:1 native pixel
+resolution) and active display monitor using ``mss`` / Pillow and Win32,
+enriches every frame with ground-truth foreground window and process metadata,
+enforces ScreenBlocklistConfig, and encodes frames without stale frame caching.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import io
 import logging
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from PIL import Image
 
 from clea.surfaces.voice.config import ScreenBlocklistConfig
-from clea.surfaces.voice.win32 import Win32API, WindowInfo, enable_per_monitor_dpi_awareness
+from clea.surfaces.voice.win32 import (
+    MonitorInfo,
+    Win32API,
+    WindowInfo,
+    enable_per_monitor_dpi_awareness,
+    enumerate_monitors,
+    get_monitor_for_window,
+    get_target_monitor,
+    get_window_bounds,
+    get_window_process_name,
+    get_window_title,
+    resolve_app_display_name,
+)
 
 logger = logging.getLogger(__name__)
+
+NATIVE_PNG_MAX_BYTES = 2_500_000
 
 
 @dataclass(frozen=True)
@@ -34,6 +52,13 @@ class ScreenCaptureResult:
     process_name: str | None = None
     blocked: bool = False
     error: str | None = None
+    mime_type: str = "image/jpeg"
+    app_name: str | None = None
+    window_bounds: tuple[int, int, int, int] | None = None
+    monitor_index: int | None = None
+    monitor_bounds: tuple[int, int, int, int] | None = None
+    captured_at: str | None = None
+    capture_seq: int = 0
 
 
 def is_window_blocked(
@@ -61,38 +86,69 @@ def is_window_blocked(
 def encode_frame(
     image: Image.Image,
     *,
-    max_side: int = 768,
-    quality: int = 80,
+    max_side: int | None = 1920,
+    quality: int = 90,
 ) -> bytes:
-    """Convert image to RGB, proportionally downscale to max_side, and encode to JPEG bytes."""
+    """Convert image to RGB, optionally downscale to max_side, and encode to JPEG bytes."""
     img = image
     if img.mode != "RGB":
         img = img.convert("RGB")
 
     w, h = img.size
     longest = max(w, h)
-    if longest > max_side and longest > 0:
+    if max_side is not None and max_side > 0 and longest > max_side and longest > 0:
         scale = max_side / float(longest)
         new_w = max(1, int(round(w * scale)))
         new_h = max(1, int(round(h * scale)))
-        # Resampling.LANCZOS or Image.LANCZOS
         resample = getattr(Image, "Resampling", Image).LANCZOS
         img = img.resize((new_w, new_h), resample=resample)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    save_kwargs: dict[str, object] = {"format": "JPEG", "quality": quality, "optimize": True}
+    if quality >= 90:
+        # Disable chroma subsampling so fine colored IDE text and borders stay crisp.
+        save_kwargs["subsampling"] = 0
+    img.save(buf, **save_kwargs)
     return buf.getvalue()
 
 
+def encode_native_frame(
+    image: Image.Image,
+    *,
+    fallback_jpeg_quality: int = 94,
+    max_png_bytes: int = NATIVE_PNG_MAX_BYTES,
+) -> tuple[bytes, str]:
+    """Encode an un-downscaled 1:1 native frame as lossless PNG (with JPEG fallback if huge)."""
+    img = image
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    png_buf = io.BytesIO()
+    img.save(png_buf, format="PNG", compress_level=1)
+    png_bytes = png_buf.getvalue()
+    if len(png_bytes) <= max_png_bytes:
+        return png_bytes, "image/png"
+
+    jpeg_buf = io.BytesIO()
+    img.save(
+        jpeg_buf,
+        format="JPEG",
+        quality=fallback_jpeg_quality,
+        subsampling=0,
+        optimize=True,
+    )
+    return jpeg_buf.getvalue(), "image/jpeg"
+
+
 class ScreenCaptureService:
-    """Service capturing display frames with DPI awareness and blocklist enforcement."""
+    """Service capturing fresh display frames with DPI awareness and blocklist enforcement."""
 
     def __init__(
         self,
         *,
         blocklist: ScreenBlocklistConfig | None = None,
-        image_max_side: int = 768,
-        jpeg_quality: int = 80,
+        image_max_side: int = 1920,
+        jpeg_quality: int = 90,
         api: Win32API | None = None,
         grabber: Callable[..., Image.Image] | None = None,
     ) -> None:
@@ -101,6 +157,8 @@ class ScreenCaptureService:
         self.jpeg_quality = jpeg_quality
         self._api = api
         self._grabber = grabber
+        self._capture_seq = 0
+        self._seq_lock = threading.Lock()
 
     def _get_api(self) -> Win32API:
         if self._api is None:
@@ -108,29 +166,96 @@ class ScreenCaptureService:
         return self._api
 
     def get_active_window_info(self) -> WindowInfo | None:
-        """Inspect the current foreground window on Windows."""
+        """Inspect the current foreground window and its bounds/monitor on Windows."""
         if sys.platform != "win32" and self._api is None:
             return None
 
         try:
             api = self._get_api()
             hwnd = api.user32.GetForegroundWindow()
-            if not hwnd:
+            if not isinstance(hwnd, int) or not hwnd:
                 return None
-
-            from clea.surfaces.voice.win32 import get_window_process_name, get_window_title
 
             title = get_window_title(hwnd, api)
             proc_name = get_window_process_name(hwnd, api)
+            mon = get_monitor_for_window(hwnd, api)
+            bounds = get_window_bounds(hwnd, api, clamp_to_monitor=mon)
             return WindowInfo(
                 hwnd=hwnd,
                 title=title,
                 process_name=proc_name,
                 is_visible=True,
+                bounds=bounds,
+                monitor_index=mon.index if mon is not None else None,
+                monitor_bounds=mon.bounds if mon is not None else None,
             )
         except Exception as exc:
             logger.debug("Failed getting active window info: %s", exc)
             return None
+
+    def _grab_screen_region(
+        self,
+        bounds: tuple[int, int, int, int] | None,
+        *,
+        virtual_origin: tuple[int, int] = (0, 0),
+    ) -> Image.Image:
+        """Capture physical screen bounds (mss -> ImageGrab fallback) or injected grabber."""
+        if self._grabber is not None:
+            if bounds is not None:
+                try:
+                    img = self._grabber(bbox=bounds, all_screens=True)
+                except TypeError:
+                    img = self._grabber(all_screens=True)
+                target_w = bounds[2] - bounds[0]
+                target_h = bounds[3] - bounds[1]
+                if (
+                    self._api is not None
+                    and target_w > 0
+                    and target_h > 0
+                    and img.size != (target_w, target_h)
+                ):
+                    ox, oy = virtual_origin
+                    crop_left = max(0, bounds[0] - ox)
+                    crop_top = max(0, bounds[1] - oy)
+                    crop_right = min(img.width, bounds[2] - ox)
+                    crop_bottom = min(img.height, bounds[3] - oy)
+                    if crop_right > crop_left and crop_bottom > crop_top:
+                        img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+                return img
+            return self._grabber(all_screens=True)
+
+        # Fresh mss capture per call (GDI HDC is not safe to cache across threads).
+        try:
+            import mss
+
+            mss_cls = getattr(mss, "MSS", mss.mss)
+            with mss_cls() as sct:
+                if bounds is not None and bounds[2] > bounds[0] and bounds[3] > bounds[1]:
+                    mon_rect = {
+                        "left": bounds[0],
+                        "top": bounds[1],
+                        "width": bounds[2] - bounds[0],
+                        "height": bounds[3] - bounds[1],
+                    }
+                else:
+                    mon_rect = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                shot = sct.grab(mon_rect)
+                return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        except Exception as mss_exc:
+            logger.debug("mss capture failed, falling back to ImageGrab: %s", mss_exc)
+
+        from PIL import ImageGrab
+
+        if bounds is not None and bounds[2] > bounds[0] and bounds[3] > bounds[1]:
+            try:
+                return ImageGrab.grab(bbox=bounds, all_screens=True)
+            except Exception:
+                return ImageGrab.grab(bbox=bounds)
+
+        try:
+            return ImageGrab.grab(all_screens=True)
+        except Exception:
+            return ImageGrab.grab()
 
     def capture(
         self,
@@ -138,58 +263,120 @@ class ScreenCaptureService:
         target: str = "full_screen",
         monitor: int | None = None,
     ) -> ScreenCaptureResult:
-        """Capture screen or active window, checking privacy blocklist."""
-        win_info: WindowInfo | None = None
+        """Capture a fresh active-window or active-monitor frame with blocklist & metadata."""
+        with self._seq_lock:
+            self._capture_seq += 1
+            seq = self._capture_seq
+        captured_at = datetime.now(UTC).isoformat()
 
-        if target == "active_window":
-            win_info = self.get_active_window_info()
-            if win_info is not None and is_window_blocked(
-                win_info.title, win_info.process_name, self.blocklist
-            ):
-                logger.warning(
-                    "Screen capture blocked for active window '%s' (%s) by blocklist.",
-                    win_info.title,
-                    win_info.process_name,
-                )
-                return ScreenCaptureResult(
-                    image_bytes=None,
-                    target=target,
-                    width=0,
-                    height=0,
-                    window_title=win_info.title,
-                    process_name=win_info.process_name,
-                    blocked=True,
-                )
-
-        try:
+        # Enable Per-Monitor V2 DPI awareness BEFORE querying window/monitor bounds.
+        with contextlib.suppress(Exception):
             enable_per_monitor_dpi_awareness(self._api)
-        except Exception as exc:
-            logger.debug("DPI awareness setup error: %s", exc)
 
-        try:
-            if self._grabber is not None:
-                img = self._grabber(all_screens=True)
-            else:
-                from PIL import ImageGrab
+        win_info = self.get_active_window_info()
+        app_name = (
+            resolve_app_display_name(win_info.process_name, win_info.title)
+            if win_info is not None
+            else None
+        )
 
-                try:
-                    img = ImageGrab.grab(all_screens=True)
-                except Exception:
-                    img = ImageGrab.grab()
-
-            jpeg_bytes = encode_frame(
-                img,
-                max_side=self.image_max_side,
-                quality=self.jpeg_quality,
+        if win_info is not None and is_window_blocked(
+            win_info.title, win_info.process_name, self.blocklist
+        ):
+            logger.warning(
+                "Screen capture blocked for window '%s' (%s) by blocklist.",
+                win_info.title,
+                win_info.process_name,
             )
             return ScreenCaptureResult(
-                image_bytes=jpeg_bytes,
+                image_bytes=None,
+                target=target,
+                width=0,
+                height=0,
+                window_title=win_info.title,
+                process_name=win_info.process_name,
+                blocked=True,
+                app_name=app_name,
+                window_bounds=win_info.bounds,
+                monitor_index=win_info.monitor_index,
+                monitor_bounds=win_info.monitor_bounds,
+                captured_at=captured_at,
+                capture_seq=seq,
+            )
+
+        target_mon: MonitorInfo | None = None
+        virtual_origin = (0, 0)
+        if sys.platform == "win32" or self._api is not None:
+            with contextlib.suppress(Exception):
+                api = self._get_api()
+                monitors = enumerate_monitors(api)
+                if monitors:
+                    virtual_origin = (
+                        min(m.left for m in monitors),
+                        min(m.top for m in monitors),
+                    )
+                target_mon = get_target_monitor(
+                    hwnd=win_info.hwnd if win_info is not None else None,
+                    monitor=monitor,
+                    api=api,
+                )
+                if not monitors and target_mon is not None:
+                    virtual_origin = (min(0, target_mon.left), min(0, target_mon.top))
+
+        effective_monitor_index = (
+            target_mon.index
+            if target_mon is not None
+            else (win_info.monitor_index if win_info is not None else None)
+        )
+        effective_monitor_bounds = (
+            target_mon.bounds
+            if target_mon is not None
+            else (win_info.monitor_bounds if win_info is not None else None)
+        )
+
+        # Preserve simple test grabbers when no Win32API mock was injected.
+        capture_bounds: tuple[int, int, int, int] | None = None
+        if self._grabber is None or self._api is not None:
+            if target == "active_window":
+                win_bounds = win_info.bounds if win_info is not None else None
+                if (
+                    win_bounds is not None
+                    and win_bounds[2] > win_bounds[0]
+                    and win_bounds[3] > win_bounds[1]
+                ):
+                    capture_bounds = win_bounds
+                elif effective_monitor_bounds is not None:
+                    capture_bounds = effective_monitor_bounds
+            else:
+                capture_bounds = effective_monitor_bounds
+
+        try:
+            img = self._grab_screen_region(capture_bounds, virtual_origin=virtual_origin)
+            if target == "active_window":
+                frame_bytes, mime_type = encode_native_frame(img)
+            else:
+                frame_bytes = encode_frame(
+                    img,
+                    max_side=self.image_max_side,
+                    quality=self.jpeg_quality,
+                )
+                mime_type = "image/jpeg"
+
+            return ScreenCaptureResult(
+                image_bytes=frame_bytes,
                 target=target,
                 width=img.width,
                 height=img.height,
                 window_title=win_info.title if win_info else None,
                 process_name=win_info.process_name if win_info else None,
                 blocked=False,
+                mime_type=mime_type,
+                app_name=app_name,
+                window_bounds=win_info.bounds if win_info else None,
+                monitor_index=effective_monitor_index,
+                monitor_bounds=effective_monitor_bounds,
+                captured_at=captured_at,
+                capture_seq=seq,
             )
         except Exception as exc:
             logger.warning("Screen capture failed: %s", exc)
@@ -202,4 +389,10 @@ class ScreenCaptureService:
                 process_name=win_info.process_name if win_info else None,
                 blocked=False,
                 error=str(exc),
+                app_name=app_name,
+                window_bounds=win_info.bounds if win_info else None,
+                monitor_index=effective_monitor_index,
+                monitor_bounds=effective_monitor_bounds,
+                captured_at=captured_at,
+                capture_seq=seq,
             )

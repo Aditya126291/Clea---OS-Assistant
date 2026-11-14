@@ -67,6 +67,7 @@ def test_default_voice_tools_cover_required_four_non_blocking_tools() -> None:
 
     watch_props = by_name["watch_screen"].parameters_schema["properties"]
     assert "seconds" in watch_props
+    assert watch_props["target"]["enum"] == ["active_window", "full_screen"]
     assert by_name["watch_screen"].parameters_schema["required"] == ["seconds", "reason"]
 
     assert by_name["end_call"].parameters_schema["required"] == ["reason"]
@@ -77,12 +78,15 @@ def test_voice_session_config_defaults_and_language_code_omitted() -> None:
     assert "English" in instruction
     assert "Hindi" in instruction
     assert "Hinglish" in instruction
+    assert "look_at_screen" in instruction
+    assert "active_app_name" in instruction
+    assert "NEVER answer questions about what is currently on the screen" in instruction
 
     cfg = VoiceSessionConfig(system_instruction=instruction)
     assert cfg.language_code is None
     assert cfg.input_sample_rate_hz == INPUT_AUDIO_SAMPLE_RATE_HZ == 16_000
     assert cfg.output_sample_rate_hz == OUTPUT_AUDIO_SAMPLE_RATE_HZ == 24_000
-    assert cfg.media_resolution == "medium"
+    assert cfg.media_resolution == "high"
     assert cfg.enable_web_search is False
     assert cfg.session_resumption == SessionResumptionConfig(enabled=True, handle=None)
     assert cfg.context_compression == ContextCompressionConfig(enabled=True)

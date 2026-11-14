@@ -10,21 +10,29 @@ import pytest
 
 from clea.surfaces.voice.win32 import (
     DEFAULT_DPI,
+    DWMWA_EXTENDED_FRAME_BOUNDS,
     MOD_ALT,
     MOD_CONTROL,
     MOD_NOREPEAT,
     MOD_SHIFT,
+    MONITORINFOF_PRIMARY,
     PROCESS_PER_MONITOR_DPI_AWARE,
     WM_HOTKEY,
     HotKeyManager,
+    MonitorInfo,
     Win32API,
     WindowInfo,
     dpi_to_scale_factor,
     enable_per_monitor_dpi_awareness,
+    enumerate_monitors,
     enumerate_visible_windows,
+    get_monitor_for_window,
+    get_target_monitor,
+    get_window_bounds,
     get_window_process_name,
     get_window_title,
     parse_hotkey,
+    resolve_app_display_name,
     scale_coordinate,
     scale_point,
     scale_rect,
@@ -363,3 +371,117 @@ def test_enumerate_visible_windows_with_mocked_api() -> None:
     assert windows[1] == WindowInfo(
         hwnd=102, title="Win B", process_name="<unknown>", is_visible=True
     )
+
+
+def test_enable_per_monitor_dpi_awareness_already_set_via_e_accessdenied() -> None:
+    mock_u32 = MagicMock()
+    mock_k32 = MagicMock()
+    mock_shc = MagicMock()
+    mock_u32.SetProcessDpiAwarenessContext.return_value = 0
+    err = OSError("already set")
+    err.winerror = -2147024891
+    mock_shc.SetProcessDpiAwareness.side_effect = err
+
+    api = Win32API(user32=mock_u32, kernel32=mock_k32, shcore=mock_shc)
+    assert enable_per_monitor_dpi_awareness(api=api) is True
+    assert not mock_u32.SetProcessDPIAware.called
+
+
+def test_enumerate_monitors_and_monitor_from_window_multi_display() -> None:
+    mock_u32 = MagicMock()
+    mock_k32 = MagicMock()
+
+    mon_specs = {
+        1001: (0, 0, 1920, 1080, 0, 0, 1920, 1032, MONITORINFOF_PRIMARY, r"\\.\DISPLAY1"),
+        1002: (-1920, 0, 0, 1080, -1920, 0, 0, 1040, 0, r"\\.\DISPLAY2"),
+    }
+
+    def fake_enum_monitors(_hdc: object, _clip: object, cb: object, _lparam: int) -> int:
+        cb(1001, 0, None, 0)
+        cb(1002, 0, None, 0)
+        return 1
+
+    def fake_get_mon_info(hmon: int, mi_ptr: object) -> int:
+        spec = mon_specs.get(hmon)
+        if spec is None:
+            return 0
+        mi = mi_ptr._obj  # type: ignore[attr-defined]
+        mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom = spec[0:4]
+        mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom = spec[4:8]
+        mi.dwFlags = spec[8]
+        mi.szDevice = spec[9]
+        return 1
+
+    mock_u32.EnumDisplayMonitors.side_effect = fake_enum_monitors
+    mock_u32.GetMonitorInfoW.side_effect = fake_get_mon_info
+    mock_u32.MonitorFromWindow.side_effect = lambda hwnd, _flags: 1002 if hwnd == 42 else 1001
+    mock_u32.GetForegroundWindow.return_value = 42
+
+    api = Win32API(user32=mock_u32, kernel32=mock_k32)
+    monitors = enumerate_monitors(api=api)
+    assert len(monitors) == 2
+    assert monitors[0].index == 1 and monitors[0].is_primary is True
+    assert monitors[1].index == 2 and monitors[1].bounds == (-1920, 0, 0, 1080)
+
+    fg_mon = get_target_monitor(api=api)
+    assert fg_mon is not None
+    assert fg_mon.index == 2
+    assert fg_mon.bounds == (-1920, 0, 0, 1080)
+
+    explicit_mon = get_target_monitor(monitor=1, api=api)
+    assert explicit_mon is not None
+    assert explicit_mon.index == 1
+
+    # Explicit window handle overrides foreground window
+    win_mon = get_monitor_for_window(99, api=api)
+    assert win_mon is not None
+    assert win_mon.index == 1
+
+
+def test_get_window_bounds_dwm_fallback_minimized_and_maximized() -> None:
+    mock_u32 = MagicMock()
+    mock_k32 = MagicMock()
+    mock_dwm = MagicMock()
+    mock_u32.IsIconic.return_value = 0
+    mock_u32.IsZoomed.return_value = 0
+
+    def fake_dwm(hwnd: int, attr: int, rect_ptr: object, _size: int) -> int:
+        assert attr == DWMWA_EXTENDED_FRAME_BOUNDS
+        r = rect_ptr._obj  # type: ignore[attr-defined]
+        r.left, r.top, r.right, r.bottom = (100, 50, 1500, 950)
+        return 0
+
+    mock_dwm.DwmGetWindowAttribute.side_effect = fake_dwm
+    api = Win32API(user32=mock_u32, kernel32=mock_k32, dwmapi=mock_dwm)
+
+    assert get_window_bounds(55, api=api) == (100, 50, 1500, 950)
+
+    # DWM failure -> falls back to GetWindowRect, and IsZoomed clamps overhang to monitor
+    mock_dwm.DwmGetWindowAttribute.side_effect = None
+    mock_dwm.DwmGetWindowAttribute.return_value = -1
+
+    def fake_rect(hwnd: int, rect_ptr: object) -> int:
+        r = rect_ptr._obj  # type: ignore[attr-defined]
+        r.left, r.top, r.right, r.bottom = (-8, -8, 1928, 1048)
+        return 1
+
+    mock_u32.GetWindowRect.side_effect = fake_rect
+    mock_u32.IsZoomed.return_value = 1
+    mon = MonitorInfo(1, 0, 0, 1920, 1080, 0, 0, 1920, 1040, is_primary=True)
+    assert get_window_bounds(55, api=api, clamp_to_monitor=mon) == (0, 0, 1920, 1048)
+
+    # Minimized window returns None
+    mock_u32.IsIconic.return_value = 1
+    assert get_window_bounds(55, api=api) is None
+
+
+def test_resolve_app_display_name() -> None:
+    assert resolve_app_display_name("Antigravity.exe") == "Google Antigravity"
+    assert resolve_app_display_name("Code.exe") == "Visual Studio Code"
+    assert resolve_app_display_name("WindowsTerminal.exe") == "Windows Terminal"
+    assert resolve_app_display_name("MyCustomTool.exe") == "MyCustomTool"
+    assert (
+        resolve_app_display_name("<unknown>", "runner.py - Clea - Antigravity")
+        == "Google Antigravity"
+    )
+    assert resolve_app_display_name("<unknown>", "Untitled") == "Unknown application"

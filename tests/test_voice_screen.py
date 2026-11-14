@@ -23,10 +23,15 @@ from clea.surfaces.voice.runner import VoiceRunner
 from clea.surfaces.voice.screen import (
     ScreenCaptureService,
     encode_frame,
+    encode_native_frame,
     is_window_blocked,
 )
 from clea.surfaces.voice.wake_word import WakeWordDetector
-from clea.surfaces.voice.win32 import WindowInfo
+from clea.surfaces.voice.win32 import (
+    MONITORINFOF_PRIMARY,
+    Win32API,
+    WindowInfo,
+)
 
 
 class FakeLiveBackend(VoiceBackend):
@@ -40,6 +45,7 @@ class FakeLiveBackend(VoiceBackend):
         self.sent_audio: list[bytes] = []
         self.sent_tool_responses: list[VoiceToolResponse] = []
         self.sent_video_frames: list[bytes] = []
+        self.sent_video_mime_types: list[str] = []
         self.event_queue: asyncio.Queue[VoiceBackendEvent | None] = asyncio.Queue()
 
     @property
@@ -59,6 +65,7 @@ class FakeLiveBackend(VoiceBackend):
 
     async def send_video_frame(self, image_bytes: bytes, *, mime_type: str = "image/jpeg") -> None:
         self.sent_video_frames.append(image_bytes)
+        self.sent_video_mime_types.append(mime_type)
 
     async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
         pass
@@ -276,4 +283,280 @@ async def test_voice_runner_watch_screen_burst(tmp_path: Path) -> None:
     assert len(backend.sent_video_frames) >= 1
 
     await runner.end_call(reason="done")
+    await runner.stop()
+
+
+def _make_dual_monitor_mock_api(
+    *,
+    fg_hwnd: int = 777,
+    title: str = "runner.py - Clea - Antigravity",
+    exe_path: str = r"C:\Users\test\AppData\Local\Programs\Antigravity\Antigravity.exe",
+    win_bounds: tuple[int, int, int, int] = (2100, 120, 3600, 960),
+    minimized: bool = False,
+) -> Win32API:
+    import ctypes
+
+    mock_u32 = MagicMock()
+    mock_k32 = MagicMock()
+    mock_dwm = MagicMock()
+
+    state = {
+        "hwnd": fg_hwnd,
+        "title": title,
+        "exe": exe_path,
+        "bounds": win_bounds,
+        "minimized": minimized,
+    }
+
+    mon_specs = {
+        101: (0, 0, 1920, 1080, 0, 0, 1920, 1032, MONITORINFOF_PRIMARY, r"\\.\DISPLAY1"),
+        102: (1920, 0, 3840, 1080, 1920, 0, 3840, 1040, 0, r"\\.\DISPLAY2"),
+    }
+
+    mock_u32.SetProcessDpiAwarenessContext.return_value = 1
+    mock_u32.GetForegroundWindow.side_effect = lambda: state["hwnd"]
+    mock_u32.IsIconic.side_effect = lambda _h: 1 if state["minimized"] else 0
+    mock_u32.IsZoomed.return_value = 0
+    mock_u32.GetWindowTextLengthW.side_effect = lambda _h: len(state["title"])
+
+    def fake_get_text(_hwnd: int, buf: object, max_len: int) -> int:
+        t = str(state["title"])
+        ctypes.memmove(buf, ctypes.create_unicode_buffer(t, max_len), len(t) * 2)  # type: ignore[arg-type]
+        return len(t)
+
+    mock_u32.GetWindowTextW.side_effect = fake_get_text
+
+    def fake_get_pid(_hwnd: int, pid_ptr: object) -> int:
+        pid_ptr._obj.value = 8888  # type: ignore[attr-defined]
+        return 1
+
+    mock_u32.GetWindowThreadProcessId.side_effect = fake_get_pid
+    mock_k32.OpenProcess.return_value = 5555
+    mock_k32.CloseHandle.return_value = 1
+
+    def fake_query_name(_h: int, _f: int, buf: object, _s: object) -> int:
+        exe = str(state["exe"])
+        ctypes.memmove(buf, ctypes.create_unicode_buffer(exe, 1024), (len(exe) + 1) * 2)  # type: ignore[arg-type]
+        return 1
+
+    mock_k32.QueryFullProcessImageNameW.side_effect = fake_query_name
+
+    def fake_enum_monitors(_hdc: object, _clip: object, cb: object, _lparam: int) -> int:
+        cb(101, 0, None, 0)
+        cb(102, 0, None, 0)
+        return 1
+
+    def fake_get_mon_info(hmon: int, mi_ptr: object) -> int:
+        spec = mon_specs[hmon]
+        mi = mi_ptr._obj  # type: ignore[attr-defined]
+        mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom = spec[0:4]
+        mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom = spec[4:8]
+        mi.dwFlags = spec[8]
+        mi.szDevice = spec[9]
+        return 1
+
+    mock_u32.EnumDisplayMonitors.side_effect = fake_enum_monitors
+    mock_u32.GetMonitorInfoW.side_effect = fake_get_mon_info
+    mock_u32.MonitorFromWindow.side_effect = lambda _h, _f: (
+        102 if state["bounds"][0] >= 1920 else 101
+    )
+
+    def fake_dwm(_h: int, _attr: int, rect_ptr: object, _sz: int) -> int:
+        r = rect_ptr._obj  # type: ignore[attr-defined]
+        r.left, r.top, r.right, r.bottom = state["bounds"]
+        return 0
+
+    mock_dwm.DwmGetWindowAttribute.side_effect = fake_dwm
+
+    api = Win32API(user32=mock_u32, kernel32=mock_k32, dwmapi=mock_dwm)
+    api._test_state = state  # type: ignore[attr-defined]
+    return api
+
+
+def test_encode_native_frame_zero_downscale_and_jpeg_fallback() -> None:
+    img = Image.new("RGB", (1720, 980), color=(25, 35, 45))
+    png_bytes, mime = encode_native_frame(img)
+    assert mime == "image/png"
+    decoded = Image.open(io.BytesIO(png_bytes))
+    assert decoded.format == "PNG"
+    assert decoded.size == (1720, 980)
+
+    # Tiny threshold triggers quality=94 JPEG fallback while keeping 1:1 pixel dimensions
+    jpeg_bytes, fallback_mime = encode_native_frame(img, max_png_bytes=10)
+    assert fallback_mime == "image/jpeg"
+    decoded_fb = Image.open(io.BytesIO(jpeg_bytes))
+    assert decoded_fb.format == "JPEG"
+    assert decoded_fb.size == (1720, 980)
+
+
+def test_screen_capture_un_downscaled_active_window_multi_monitor_and_no_cache() -> None:
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), color=(10, 10, 10))
+    # Monitor 1 = green, Monitor 2 = blue, active window on Monitor 2 = bright orange
+    canvas.paste(Image.new("RGB", (1920, 1080), (0, 180, 0)), (0, 0))
+    canvas.paste(Image.new("RGB", (1920, 1080), (0, 60, 200)), (1920, 0))
+    canvas.paste(Image.new("RGB", (1500, 840), (240, 120, 20)), (2100, 120))
+
+    svc = ScreenCaptureService(
+        api=api,
+        grabber=lambda *a, **k: canvas.copy(),
+    )
+
+    # 1. active_window captures ONLY the 1500x840 window at 1:1 native resolution as PNG
+    res1 = svc.capture(target="active_window")
+    assert res1.blocked is False
+    assert res1.mime_type == "image/png"
+    assert res1.width == 1500
+    assert res1.height == 840
+    assert res1.process_name == "Antigravity.exe"
+    assert res1.app_name == "Google Antigravity"
+    assert res1.window_title == "runner.py - Clea - Antigravity"
+    assert res1.window_bounds == (2100, 120, 3600, 960)
+    assert res1.monitor_index == 2
+    assert res1.monitor_bounds == (1920, 0, 3840, 1080)
+    assert res1.capture_seq == 1
+    assert res1.captured_at is not None
+
+    decoded1 = Image.open(io.BytesIO(res1.image_bytes))  # type: ignore[arg-type]
+    assert decoded1.size == (1500, 840)
+    r, g, b = decoded1.getpixel((10, 10))
+    assert r > 200 and g < 160 and b < 60
+
+    # 2. full_screen captures ONLY Monitor 2 (active window's monitor), NOT Monitor 1
+    res2 = svc.capture(target="full_screen")
+    assert res2.blocked is False
+    assert res2.mime_type == "image/jpeg"
+    assert res2.width == 1920
+    assert res2.height == 1080
+    assert res2.monitor_index == 2
+    assert res2.monitor_bounds == (1920, 0, 3840, 1080)
+    assert res2.process_name == "Antigravity.exe"
+    assert res2.app_name == "Google Antigravity"
+    assert res2.capture_seq == 2
+
+    decoded2 = Image.open(io.BytesIO(res2.image_bytes))  # type: ignore[arg-type]
+    assert decoded2.size == (1920, 1080)
+    # Corner pixel (10, 10) is blue (Monitor 2), NOT green (Monitor 1)
+    r2, g2, b2 = decoded2.getpixel((10, 10))
+    assert b2 > 150 and g2 < 100
+
+    # 3. Consecutive capture after changing desktop reflects new pixels & new app (no caching)
+    api._test_state["title"] = "PowerShell 7"  # type: ignore[attr-defined]
+    api._test_state["exe"] = r"C:\Program Files\PowerShell\7\pwsh.exe"  # type: ignore[attr-defined]
+    api._test_state["bounds"] = (100, 100, 900, 700)  # type: ignore[attr-defined]
+    canvas.paste(Image.new("RGB", (800, 600), (220, 20, 220)), (100, 100))
+
+    res3 = svc.capture(target="active_window")
+    assert res3.capture_seq == 3
+    assert res3.width == 800
+    assert res3.height == 600
+    assert res3.monitor_index == 1
+    assert res3.process_name == "pwsh.exe"
+    assert res3.app_name == "PowerShell"
+    decoded3 = Image.open(io.BytesIO(res3.image_bytes))  # type: ignore[arg-type]
+    r3, g3, b3 = decoded3.getpixel((20, 20))
+    assert r3 > 180 and b3 > 180 and g3 < 60
+
+
+def test_screen_capture_minimized_active_window_falls_back_to_monitor() -> None:
+    api = _make_dual_monitor_mock_api(minimized=True)
+    canvas = Image.new("RGB", (3840, 1080), (0, 60, 200))
+    svc = ScreenCaptureService(api=api, grabber=lambda *a, **k: canvas.copy())
+
+    res = svc.capture(target="active_window")
+    assert res.blocked is False
+    assert res.window_bounds is None
+    assert res.width == 1920
+    assert res.height == 1080
+
+
+async def test_voice_runner_look_at_screen_sends_ground_truth_and_pulses_indicator(
+    tmp_path: Path,
+) -> None:
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(api=api, grabber=lambda *a, **k: canvas.copy())
+    backend = FakeLiveBackend()
+    fake_indicator = MagicMock()
+    fake_indicator.enabled = True
+    fake_indicator.is_watching = False
+
+    cfg = VoiceConfig(consent_mode="auto_allow")
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        screen_indicator=fake_indicator,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    call_ev = ToolCallEvent(
+        call_id="call-native-1",
+        name="look_at_screen",
+        arguments={"target": "active_window", "reason": "read code in Antigravity"},
+    )
+    await runner._handle_tool_call(call_ev, backend)
+
+    assert len(backend.sent_video_frames) == 1
+    assert backend.sent_video_mime_types == ["image/png"]
+    resp = backend.sent_tool_responses[0]
+    assert resp.response["status"] == "success"
+    assert resp.response["target"] == "active_window"
+    assert resp.response["mime_type"] == "image/png"
+    assert resp.response["active_app_name"] == "Google Antigravity"
+    assert resp.response["active_process_name"] == "Antigravity.exe"
+    assert resp.response["active_window_title"] == "runner.py - Clea - Antigravity"
+    assert resp.response["capture_seq"] == 1
+    assert resp.response["captured_at"] is not None
+    assert fake_indicator.pulse.called
+
+    await runner.end_call(reason="done")
+    assert fake_indicator.hide.called
+    await runner.stop()
+    assert fake_indicator.stop.called
+
+
+async def test_voice_runner_watch_screen_starts_updates_and_stops_indicator(
+    tmp_path: Path,
+) -> None:
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(api=api, grabber=lambda *a, **k: canvas.copy())
+    backend = FakeLiveBackend()
+    fake_indicator = MagicMock()
+    fake_indicator.enabled = True
+    fake_indicator.is_watching = False
+
+    cfg = VoiceConfig(consent_mode="auto_allow", max_burst_seconds=5.0)
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        screen_indicator=fake_indicator,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    call_ev = ToolCallEvent(
+        call_id="call-watch-native",
+        name="watch_screen",
+        arguments={"seconds": 2.0, "reason": "watch Antigravity"},
+    )
+    await runner._handle_tool_call(call_ev, backend)
+
+    assert fake_indicator.start_watching.called
+    await asyncio.sleep(0.05)
+    assert fake_indicator.update_watch_bounds.called
+
+    await runner.end_call(reason="done")
+    assert fake_indicator.hide.called
     await runner.stop()

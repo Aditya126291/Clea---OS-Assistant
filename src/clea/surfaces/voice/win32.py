@@ -34,9 +34,130 @@ HOTKEY_ID = 0x0001
 DEFAULT_DPI: int = 96
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: int = -4
 PROCESS_PER_MONITOR_DPI_AWARE: int = 2
+MDT_EFFECTIVE_DPI: int = 0
+ERROR_ACCESS_DENIED: int = 5
 
 # Process Access Rights
 PROCESS_QUERY_LIMITED_INFORMATION: int = 0x1000
+
+# Monitor & Window Bounds Constants
+MONITOR_DEFAULTTOPRIMARY: int = 0x00000001
+MONITOR_DEFAULTTONEAREST: int = 0x00000002
+MONITORINFOF_PRIMARY: int = 0x00000001
+DWMWA_EXTENDED_FRAME_BOUNDS: int = 9
+SM_CXSCREEN: int = 0
+SM_CYSCREEN: int = 1
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", ctypes.c_uint32),
+        ("szDevice", ctypes.c_wchar * 32),
+    ]
+
+
+APP_DISPLAY_NAMES: dict[str, str] = {
+    "antigravity.exe": "Google Antigravity",
+    "code.exe": "Visual Studio Code",
+    "code - insiders.exe": "Visual Studio Code Insiders",
+    "cursor.exe": "Cursor",
+    "windsurf.exe": "Windsurf",
+    "windowsterminal.exe": "Windows Terminal",
+    "wt.exe": "Windows Terminal",
+    "pwsh.exe": "PowerShell",
+    "powershell.exe": "Windows PowerShell",
+    "cmd.exe": "Command Prompt",
+    "chrome.exe": "Google Chrome",
+    "msedge.exe": "Microsoft Edge",
+    "firefox.exe": "Mozilla Firefox",
+    "brave.exe": "Brave",
+    "arc.exe": "Arc",
+    "explorer.exe": "File Explorer",
+    "slack.exe": "Slack",
+    "discord.exe": "Discord",
+    "notion.exe": "Notion",
+    "obsidian.exe": "Obsidian",
+    "pycharm64.exe": "PyCharm",
+    "idea64.exe": "IntelliJ IDEA",
+    "devenv.exe": "Visual Studio",
+    "notepad++.exe": "Notepad++",
+    "notepad.exe": "Notepad",
+    "spotify.exe": "Spotify",
+    "teams.exe": "Microsoft Teams",
+    "ms-teams.exe": "Microsoft Teams",
+    "zoom.exe": "Zoom",
+}
+
+
+def resolve_app_display_name(process_name: str, window_title: str = "") -> str:
+    """Resolve a friendly application display name from a process executable name."""
+    cleaned = (process_name or "").strip()
+    lower = cleaned.lower()
+    if lower in APP_DISPLAY_NAMES:
+        return APP_DISPLAY_NAMES[lower]
+
+    if cleaned and cleaned != "<unknown>":
+        stem = cleaned[:-4] if lower.endswith(".exe") else cleaned
+        if stem:
+            return stem
+
+    title = (window_title or "").strip()
+    if title:
+        for suffix, name in (
+            (" - Antigravity", "Google Antigravity"),
+            (" - Visual Studio Code", "Visual Studio Code"),
+            (" - Cursor", "Cursor"),
+            (" - Windsurf", "Windsurf"),
+        ):
+            if title.endswith(suffix):
+                return name
+    return "Unknown application"
+
+
+@dataclass(frozen=True)
+class MonitorInfo:
+    """Geometry and identity for a display monitor in physical virtual-screen pixels."""
+
+    index: int
+    left: int
+    top: int
+    right: int
+    bottom: int
+    work_left: int
+    work_top: int
+    work_right: int
+    work_bottom: int
+    is_primary: bool = False
+    device_name: str = ""
+    hmonitor: int = 0
+
+    @property
+    def width(self) -> int:
+        return max(0, self.right - self.left)
+
+    @property
+    def height(self) -> int:
+        return max(0, self.bottom - self.top)
+
+    @property
+    def bounds(self) -> tuple[int, int, int, int]:
+        return (self.left, self.top, self.right, self.bottom)
+
+    @property
+    def work_bounds(self) -> tuple[int, int, int, int]:
+        return (self.work_left, self.work_top, self.work_right, self.work_bottom)
 
 
 @dataclass(frozen=True)
@@ -47,6 +168,9 @@ class WindowInfo:
     title: str
     process_name: str
     is_visible: bool
+    bounds: tuple[int, int, int, int] | None = None
+    monitor_index: int | None = None
+    monitor_bounds: tuple[int, int, int, int] | None = None
 
 
 def parse_hotkey(hotkey_str: str) -> tuple[int, int]:
@@ -164,13 +288,14 @@ def unscale_rect(
 
 
 class Win32API:
-    """Wrapper around user32, kernel32, and shcore DLLs with strict ctypes argtypes and restype."""
+    """Wrapper around user32, kernel32, shcore, and dwmapi DLLs with strict ctypes signatures."""
 
     def __init__(
         self,
         user32: Any = None,
         kernel32: Any = None,
         shcore: Any = None,
+        dwmapi: Any = None,
     ) -> None:
         if user32 is None or kernel32 is None:
             if sys.platform != "win32":
@@ -183,6 +308,10 @@ class Win32API:
                 shc = ctypes.WinDLL("shcore", use_last_error=True)
             except OSError:
                 shc = None
+            try:
+                dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
+            except OSError:
+                dwm = None
 
             # Hotkeys and message pump
             u32.RegisterHotKey.argtypes = [
@@ -237,10 +366,21 @@ class Win32API:
             if shc is not None and hasattr(shc, "SetProcessDpiAwareness"):
                 shc.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
                 shc.SetProcessDpiAwareness.restype = ctypes.HRESULT
+            if shc is not None and hasattr(shc, "GetDpiForMonitor"):
+                shc.GetDpiForMonitor.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.c_int,
+                    ctypes.POINTER(wintypes.UINT),
+                    ctypes.POINTER(wintypes.UINT),
+                ]
+                shc.GetDpiForMonitor.restype = ctypes.HRESULT
 
             # Window enumeration and inspection
             u32.GetForegroundWindow.argtypes = []
             u32.GetForegroundWindow.restype = wintypes.HWND
+
+            u32.GetDesktopWindow.argtypes = []
+            u32.GetDesktopWindow.restype = wintypes.HWND
 
             WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
             u32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
@@ -248,6 +388,12 @@ class Win32API:
 
             u32.IsWindowVisible.argtypes = [wintypes.HWND]
             u32.IsWindowVisible.restype = wintypes.BOOL
+
+            u32.IsIconic.argtypes = [wintypes.HWND]
+            u32.IsIconic.restype = wintypes.BOOL
+
+            u32.IsZoomed.argtypes = [wintypes.HWND]
+            u32.IsZoomed.restype = wintypes.BOOL
 
             u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
             u32.GetWindowTextLengthW.restype = ctypes.c_int
@@ -257,6 +403,33 @@ class Win32API:
 
             u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
             u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+            u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+            u32.GetWindowRect.restype = wintypes.BOOL
+
+            u32.GetSystemMetrics.argtypes = [ctypes.c_int]
+            u32.GetSystemMetrics.restype = ctypes.c_int
+
+            u32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+            u32.MonitorFromWindow.restype = wintypes.HANDLE
+
+            u32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            u32.GetMonitorInfoW.restype = wintypes.BOOL
+
+            MONITORENUMPROC = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                wintypes.HANDLE,
+                wintypes.HDC,
+                ctypes.POINTER(_RECT),
+                wintypes.LPARAM,
+            )
+            u32.EnumDisplayMonitors.argtypes = [
+                wintypes.HDC,
+                ctypes.c_void_p,
+                MONITORENUMPROC,
+                wintypes.LPARAM,
+            ]
+            u32.EnumDisplayMonitors.restype = wintypes.BOOL
 
             k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
             k32.OpenProcess.restype = wintypes.HANDLE
@@ -273,13 +446,24 @@ class Win32API:
                 ]
                 k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 
+            if dwm is not None and hasattr(dwm, "DwmGetWindowAttribute"):
+                dwm.DwmGetWindowAttribute.argtypes = [
+                    wintypes.HWND,
+                    wintypes.DWORD,
+                    ctypes.c_void_p,
+                    wintypes.DWORD,
+                ]
+                dwm.DwmGetWindowAttribute.restype = ctypes.HRESULT
+
             self.user32 = u32
             self.kernel32 = k32
             self.shcore = shc
+            self.dwmapi = dwm
         else:
             self.user32 = user32
             self.kernel32 = kernel32
             self.shcore = shcore
+            self.dwmapi = dwmapi
 
 
 def enable_per_monitor_dpi_awareness(api: Win32API | None = None) -> bool:
@@ -287,7 +471,7 @@ def enable_per_monitor_dpi_awareness(api: Win32API | None = None) -> bool:
 
     Tries SetProcessDpiAwarenessContext (v2) -> SetProcessDpiAwareness (shcore)
     -> SetProcessDPIAware.
-    Returns True if successfully set, False otherwise.
+    Returns True if successfully set (or already set), False otherwise.
     """
     if api is None:
         if sys.platform != "win32":
@@ -316,10 +500,15 @@ def enable_per_monitor_dpi_awareness(api: Win32API | None = None) -> bool:
     if api.shcore is not None and hasattr(api.shcore, "SetProcessDpiAwareness"):
         try:
             hr = api.shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
-            # S_OK = 0, E_ACCESSDENIED / already set = 0x80070005
-            if hr == 0:
+            # S_OK = 0, E_ACCESSDENIED / already set = 0x80070005 (-2147024891)
+            if hr in (0, 0x80070005, -2147024891):
                 logger.debug("Enabled Per-Monitor DPI awareness via shcore.SetProcessDpiAwareness.")
                 return True
+        except OSError as exc:
+            if getattr(exc, "winerror", None) in (-2147024891, 0x80070005):
+                logger.debug("Per-Monitor DPI awareness already set (E_ACCESSDENIED).")
+                return True
+            logger.debug("shcore.SetProcessDpiAwareness failed: %s", exc)
         except Exception as exc:
             logger.debug("shcore.SetProcessDpiAwareness failed: %s", exc)
 
@@ -417,6 +606,242 @@ def enumerate_visible_windows(api: Win32API | None = None) -> list[WindowInfo]:
     cb = WNDENUMPROC(enum_proc)
     api.user32.EnumWindows(cb, 0)
     return results
+
+
+def _read_monitor_info(hmonitor: int, index: int, api: Win32API) -> MonitorInfo | None:
+    """Query MONITORINFOEXW for a given HMONITOR handle."""
+    if not hmonitor or not hasattr(api.user32, "GetMonitorInfoW"):
+        return None
+    mi = _MONITORINFOEXW()
+    mi.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+    try:
+        ok = api.user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi))
+    except Exception:
+        return None
+    if not ok:
+        return None
+    if mi.rcMonitor.right <= mi.rcMonitor.left or mi.rcMonitor.bottom <= mi.rcMonitor.top:
+        return None
+    return MonitorInfo(
+        index=index,
+        left=int(mi.rcMonitor.left),
+        top=int(mi.rcMonitor.top),
+        right=int(mi.rcMonitor.right),
+        bottom=int(mi.rcMonitor.bottom),
+        work_left=int(mi.rcWork.left),
+        work_top=int(mi.rcWork.top),
+        work_right=int(mi.rcWork.right),
+        work_bottom=int(mi.rcWork.bottom),
+        is_primary=bool(mi.dwFlags & MONITORINFOF_PRIMARY),
+        device_name=str(mi.szDevice or ""),
+        hmonitor=int(hmonitor),
+    )
+
+
+def enumerate_monitors(api: Win32API | None = None) -> list[MonitorInfo]:
+    """Enumerate display monitors in physical virtual-screen coordinates (1-based index)."""
+    if api is None:
+        api = Win32API()
+
+    monitors: list[MonitorInfo] = []
+    if hasattr(api.user32, "EnumDisplayMonitors"):
+        hmonitors: list[int] = []
+        win_functype = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+        monitor_enum_proc = win_functype(
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(_RECT),
+            ctypes.c_ssize_t,
+        )
+
+        def _on_monitor(hmon: int, _hdc: int, _rect: Any, _lparam: int) -> int:
+            if hmon:
+                hmonitors.append(int(hmon))
+            return 1
+
+        cb = monitor_enum_proc(_on_monitor)
+        with contextlib.suppress(Exception):
+            api.user32.EnumDisplayMonitors(None, None, cb, 0)
+
+        for idx, hmon in enumerate(hmonitors, start=1):
+            info = _read_monitor_info(hmon, idx, api)
+            if info is not None:
+                monitors.append(info)
+
+    if not monitors and hasattr(api.user32, "GetSystemMetrics"):
+        with contextlib.suppress(Exception):
+            width = api.user32.GetSystemMetrics(SM_CXSCREEN)
+            height = api.user32.GetSystemMetrics(SM_CYSCREEN)
+            if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+                monitors.append(
+                    MonitorInfo(
+                        index=1,
+                        left=0,
+                        top=0,
+                        right=width,
+                        bottom=height,
+                        work_left=0,
+                        work_top=0,
+                        work_right=width,
+                        work_bottom=height,
+                        is_primary=True,
+                    )
+                )
+
+    return monitors
+
+
+def get_monitor_for_window(
+    hwnd: int,
+    api: Win32API | None = None,
+    *,
+    monitors: list[MonitorInfo] | None = None,
+) -> MonitorInfo | None:
+    """Resolve the display monitor hosting *hwnd* using MonitorFromWindow."""
+    if api is None:
+        api = Win32API()
+
+    target_hwnd = int(hwnd) if isinstance(hwnd, int) and hwnd else 0
+    if target_hwnd == 0 and hasattr(api.user32, "GetDesktopWindow"):
+        with contextlib.suppress(Exception):
+            desk = api.user32.GetDesktopWindow()
+            if isinstance(desk, int) and desk:
+                target_hwnd = desk
+
+    if monitors is None:
+        monitors = enumerate_monitors(api)
+
+    if hasattr(api.user32, "MonitorFromWindow"):
+        with contextlib.suppress(Exception):
+            hmon = api.user32.MonitorFromWindow(target_hwnd, MONITOR_DEFAULTTONEAREST)
+            hmon_int = int(hmon) if isinstance(hmon, int) and hmon else 0
+            if hmon_int:
+                for mon in monitors:
+                    if mon.hmonitor == hmon_int:
+                        return mon
+                queried = _read_monitor_info(hmon_int, 1, api)
+                if queried is not None:
+                    for mon in monitors:
+                        if mon.bounds == queried.bounds:
+                            return mon
+                    return queried
+
+    if monitors:
+        return next((m for m in monitors if m.is_primary), monitors[0])
+    return None
+
+
+def get_target_monitor(
+    hwnd: int | None = None,
+    *,
+    monitor: int | None = None,
+    api: Win32API | None = None,
+) -> MonitorInfo | None:
+    """Resolve the monitor to capture/indicate.
+
+    If *monitor* (1-based) is provided and valid, selects that monitor; otherwise
+    selects the monitor containing *hwnd* (or the current foreground window).
+    """
+    if api is None:
+        api = Win32API()
+
+    monitors = enumerate_monitors(api)
+    if monitor is not None:
+        if 1 <= monitor <= len(monitors):
+            return monitors[monitor - 1]
+        if monitors:
+            logger.warning(
+                "Requested monitor index %s out of range (1..%d); falling back to active monitor.",
+                monitor,
+                len(monitors),
+            )
+
+    target_hwnd = int(hwnd) if isinstance(hwnd, int) and hwnd else 0
+    if target_hwnd == 0 and hasattr(api.user32, "GetForegroundWindow"):
+        with contextlib.suppress(Exception):
+            fg = api.user32.GetForegroundWindow()
+            if isinstance(fg, int) and fg:
+                target_hwnd = fg
+
+    if target_hwnd:
+        resolved = get_monitor_for_window(target_hwnd, api=api, monitors=monitors)
+        if resolved is not None:
+            return resolved
+
+    if monitors:
+        return next((m for m in monitors if m.is_primary), monitors[0])
+    return None
+
+
+def get_window_bounds(
+    hwnd: int,
+    api: Win32API | None = None,
+    *,
+    clamp_to_monitor: MonitorInfo | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Return physical (left, top, right, bottom) bounds for *hwnd*, or None if minimized/invalid.
+
+    Prefers DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) to exclude invisible
+    DWM drop-shadow margins and falls back to GetWindowRect.
+    """
+    if not hwnd:
+        return None
+    if api is None:
+        api = Win32API()
+
+    if hasattr(api.user32, "IsIconic"):
+        with contextlib.suppress(Exception):
+            iconic = api.user32.IsIconic(hwnd)
+            if iconic is True or (isinstance(iconic, int) and iconic != 0):
+                return None
+
+    rect = _RECT()
+    obtained = False
+
+    if api.dwmapi is not None and hasattr(api.dwmapi, "DwmGetWindowAttribute"):
+        with contextlib.suppress(Exception):
+            hr = api.dwmapi.DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                ctypes.byref(rect),
+                ctypes.sizeof(rect),
+            )
+            if hr == 0 and rect.right > rect.left and rect.bottom > rect.top:
+                obtained = True
+
+    if not obtained and hasattr(api.user32, "GetWindowRect"):
+        with contextlib.suppress(Exception):
+            res = api.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            if (
+                (res is True or (isinstance(res, int) and res != 0))
+                and rect.right > rect.left
+                and rect.bottom > rect.top
+            ):
+                obtained = True
+
+    if not obtained:
+        return None
+
+    left, top, right, bottom = (
+        int(rect.left),
+        int(rect.top),
+        int(rect.right),
+        int(rect.bottom),
+    )
+
+    if clamp_to_monitor is not None and hasattr(api.user32, "IsZoomed"):
+        with contextlib.suppress(Exception):
+            zoomed = api.user32.IsZoomed(hwnd)
+            if zoomed is True or (isinstance(zoomed, int) and zoomed != 0):
+                c_left = max(left, clamp_to_monitor.left)
+                c_top = max(top, clamp_to_monitor.top)
+                c_right = min(right, clamp_to_monitor.right)
+                c_bottom = min(bottom, clamp_to_monitor.bottom)
+                if c_right > c_left and c_bottom > c_top:
+                    left, top, right, bottom = c_left, c_top, c_right, c_bottom
+
+    return (left, top, right, bottom)
 
 
 # --------------------------------------------------------------------------- Global HotKey Manager

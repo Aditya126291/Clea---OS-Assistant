@@ -46,8 +46,10 @@ class VoiceConfig(BaseModel):
     silence_timeout_seconds: float = Field(default=60.0, gt=0.0)
     hotkey: str = Field(default="Ctrl+Alt+V", min_length=1)
     max_burst_seconds: float = Field(default=30.0, gt=0.0)
-    image_max_side: int = Field(default=768, ge=64)
-    media_resolution: MediaResolution = "medium"
+    image_max_side: int = Field(default=1920, ge=64)
+    media_resolution: MediaResolution = "high"
+    screen_indicator_enabled: bool = True
+    screen_indicator_height_px: int = Field(default=3, ge=1, le=32)
     blocklist: ScreenBlocklistConfig = Field(default_factory=ScreenBlocklistConfig)
     consent_mode: ConsentMode = "ask"
     reconnect_limit: int = Field(default=3, ge=0)
@@ -63,6 +65,7 @@ class VoiceConfig(BaseModel):
         "stall_speech_rms_threshold",
         "max_burst_seconds",
         "image_max_side",
+        "screen_indicator_height_px",
         "reconnect_limit",
         mode="before",
     )
@@ -150,10 +153,15 @@ enable_web_search = false
 consent_mode = "ask"
 # Maximum continuous watch_screen burst duration in seconds.
 max_burst_seconds = 30
-# Resize captured images so their longest side is at most this many pixels.
-image_max_side = 768
+# Resize full_screen captures so their longest side is at most this many pixels
+# (active_window captures stay 1:1 native pixel resolution).
+image_max_side = 1920
 # Live vision media resolution: "low", "medium", or "high".
-media_resolution = "medium"
+media_resolution = "high"
+# Show a thin click-through red top-edge bar while screen vision is active.
+screen_indicator_enabled = true
+# Height in pixels of the top-edge screen-monitoring bar.
+screen_indicator_height_px = 3
 
 [blocklist]
 # Window title and process patterns (glob or substring) that must never be captured.
