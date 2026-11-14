@@ -442,13 +442,25 @@ class CleaDaemon:
             with contextlib.suppress(ConnectionClosed):
                 await conn.ws.send(payload)
 
+    def _canonical_consolidation_session_id(self, session_id: str) -> str:
+        """Canonicalize voice call IDs to VOICE_COMPANION_SESSION_ID for Activity & deltas."""
+        resolved = self.agent.memory.resolve_session_id(session_id)
+        if resolved == VOICE_COMPANION_SESSION_ID:
+            return VOICE_COMPANION_SESSION_ID
+        if not self.agent.memory.transcript_path(resolved).exists():
+            tr = self.agent.memory.get_transcript(session_id)
+            if tr and tr.get("is_voice_call"):
+                return VOICE_COMPANION_SESSION_ID
+        return session_id
+
     def _format_session_consolidation_title(self, session_id: str) -> str:
         """Generate Activity task title for session consolidation."""
-        if session_id == VOICE_COMPANION_SESSION_ID:
+        canonical_sid = self._canonical_consolidation_session_id(session_id)
+        if canonical_sid == VOICE_COMPANION_SESSION_ID:
             return "Consolidating voice memory"
         time_str = ""
         try:
-            tr = self.agent.memory.get_transcript(session_id)
+            tr = self.agent.memory.get_transcript(canonical_sid)
             if tr and tr.get("started_at"):
                 dt = datetime.fromisoformat(tr["started_at"])
                 time_str = dt.strftime("%H:%M")
@@ -464,8 +476,9 @@ class CleaDaemon:
         status: str,
         detail: str | None = None,
     ) -> None:
-        task_id = f"cons-{session_id}"
-        title = self._format_session_consolidation_title(session_id)
+        canonical_sid = self._canonical_consolidation_session_id(session_id)
+        task_id = f"cons-{canonical_sid}"
+        title = self._format_session_consolidation_title(canonical_sid)
         now_iso = _now_iso()
         if status == "running":
             self._task_started_at[task_id] = now_iso
@@ -484,7 +497,7 @@ class CleaDaemon:
                 finished_at=finished_at,
                 kind="background_task",
                 detail=detail,
-                session_id=session_id,
+                session_id=canonical_sid,
             )
         await self._broadcast(
             TaskStatusEvent(
@@ -520,20 +533,21 @@ class CleaDaemon:
         log_context: str,
     ) -> None:
         """Run consolidation for session_id with safe per-invocation terminal status handling."""
-        resolved_sid = self.agent.memory.resolve_session_id(session_id)
-        keys_to_mark = {session_id, resolved_sid}
+        canonical_sid = self._canonical_consolidation_session_id(session_id)
+        resolved_sid = self.agent.memory.resolve_session_id(canonical_sid)
+        keys_to_mark = {session_id, canonical_sid, resolved_sid}
         self._consolidation_in_flight.update(keys_to_mark)
-        task_id = f"cons-{session_id}"
+        task_id = f"cons-{canonical_sid}"
         current = asyncio.current_task()
         if current is not None:
             self._active_task_handles.setdefault(task_id, current)
             self._task_metadata.setdefault(
                 task_id,
                 {
-                    "title": self._format_session_consolidation_title(session_id),
+                    "title": self._format_session_consolidation_title(canonical_sid),
                     "kind": "background_task",
                     "started_at": _now_iso(),
-                    "session_id": session_id,
+                    "session_id": canonical_sid,
                 },
             )
         local_started = False
@@ -545,11 +559,11 @@ class CleaDaemon:
                 local_started = True
             else:
                 local_terminal = True
-            await self._emit_consolidation_task_status(session_id, st, det)
+            await self._emit_consolidation_task_status(canonical_sid, st, det)
 
         try:
             await self.consolidation.consolidate_session(
-                session_id,
+                canonical_sid,
                 force=force,
                 on_task_status=_on_status,
             )
@@ -562,19 +576,19 @@ class CleaDaemon:
                 was_cancelled = task_id in self._cancelled_task_ids
                 with contextlib.suppress(Exception):
                     await self._emit_consolidation_task_status(
-                        session_id,
+                        canonical_sid,
                         "cancelled" if was_cancelled else "failed",
                         "Cancelled by user" if was_cancelled else "Cancelled",
                     )
         except Exception as exc:
-            logger.exception("Error consolidating session %s %s", session_id, log_context)
+            logger.exception("Error consolidating session %s %s", canonical_sid, log_context)
             if (
                 (local_started and not local_terminal)
                 or self._consolidation_task_terminal.get(task_id) is False
             ):
                 local_terminal = True
                 with contextlib.suppress(Exception):
-                    await self._emit_consolidation_task_status(session_id, "failed", str(exc))
+                    await self._emit_consolidation_task_status(canonical_sid, "failed", str(exc))
         finally:
             if (
                 (local_started and not local_terminal)
@@ -582,7 +596,7 @@ class CleaDaemon:
             ):
                 with contextlib.suppress(Exception):
                     await self._emit_consolidation_task_status(
-                        session_id, "failed", "Consolidation did not complete cleanly"
+                        canonical_sid, "failed", "Consolidation did not complete cleanly"
                     )
             if self._active_task_handles.get(task_id) is current:
                 self._active_task_handles.pop(task_id, None)
@@ -601,23 +615,27 @@ class CleaDaemon:
         async def _timer() -> None:
             try:
                 await asyncio.sleep(self.consolidation_idle_seconds)
-                resolved_sid = self.agent.memory.resolve_session_id(session_id)
+                if self._idle_tasks.get(session_id) is asyncio.current_task():
+                    self._idle_tasks.pop(session_id, None)
+                canonical_sid = self._canonical_consolidation_session_id(session_id)
+                resolved_sid = self.agent.memory.resolve_session_id(canonical_sid)
                 if (
                     session_id in self._consolidation_in_flight
+                    or canonical_sid in self._consolidation_in_flight
                     or resolved_sid in self._consolidation_in_flight
-                    or self.consolidation.is_in_flight(session_id)
+                    or self.consolidation.is_in_flight(canonical_sid)
                 ):
                     return
-                idle_force = session_id != VOICE_COMPANION_SESSION_ID
-                if not self.consolidation.should_consolidate(session_id, force=idle_force):
+                idle_force = canonical_sid != VOICE_COMPANION_SESSION_ID
+                if not self.consolidation.should_consolidate(canonical_sid, force=idle_force):
                     return
                 current = asyncio.current_task()
                 if current is not None:
-                    self._consolidation_tasks.setdefault(session_id, current)
-                    if resolved_sid and resolved_sid != session_id:
+                    self._consolidation_tasks.setdefault(canonical_sid, current)
+                    if resolved_sid and resolved_sid != canonical_sid:
                         self._consolidation_tasks.setdefault(resolved_sid, current)
                 await self._execute_consolidation(
-                    session_id,
+                    canonical_sid,
                     force=idle_force,
                     log_context="after idle timeout",
                 )
@@ -638,9 +656,11 @@ class CleaDaemon:
         *,
         force: bool = False,
     ) -> asyncio.Task[None] | None:
-        resolved_sid = self.agent.memory.resolve_session_id(session_id)
+        canonical_sid = self._canonical_consolidation_session_id(session_id)
+        resolved_sid = self.agent.memory.resolve_session_id(canonical_sid)
         existing_now = (
             self._consolidation_tasks.get(session_id)
+            or self._consolidation_tasks.get(canonical_sid)
             or self._consolidation_tasks.get(resolved_sid)
         )
         if existing_now is not None and not existing_now.done():
@@ -648,39 +668,43 @@ class CleaDaemon:
 
         if (
             session_id in self._consolidation_in_flight
+            or canonical_sid in self._consolidation_in_flight
             or resolved_sid in self._consolidation_in_flight
-            or self.consolidation.is_in_flight(session_id)
+            or self.consolidation.is_in_flight(canonical_sid)
         ):
             return None
 
-        if not force and not self.consolidation.should_consolidate(session_id, force=False):
+        if not force and not self.consolidation.should_consolidate(canonical_sid, force=False):
             return None
 
-        old_task = self._idle_tasks.pop(session_id, None)
-        if old_task is not None and not old_task.done():
-            old_task.cancel()
+        for idle_key in {session_id, canonical_sid}:
+            old_task = self._idle_tasks.pop(idle_key, None)
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
 
-        keys_to_mark = {session_id, resolved_sid}
+        keys_to_mark = {session_id, canonical_sid, resolved_sid}
         self._consolidation_in_flight.update(keys_to_mark)
-        task_id = f"cons-{session_id}"
+        task_id = f"cons-{canonical_sid}"
 
         task = self._spawn_background_task(
             self._execute_consolidation(
-                session_id,
+                canonical_sid,
                 force=force,
                 log_context="on end/switch",
             ),
-            name=f"cons-now-{session_id}",
+            name=f"cons-now-{canonical_sid}",
         )
-        self._consolidation_tasks[session_id] = task
-        if resolved_sid and resolved_sid != session_id:
+        self._consolidation_tasks[canonical_sid] = task
+        if session_id and session_id != canonical_sid:
+            self._consolidation_tasks[session_id] = task
+        if resolved_sid and resolved_sid != canonical_sid:
             self._consolidation_tasks[resolved_sid] = task
         self._active_task_handles[task_id] = task
         self._task_metadata[task_id] = {
-            "title": self._format_session_consolidation_title(session_id),
+            "title": self._format_session_consolidation_title(canonical_sid),
             "kind": "background_task",
             "started_at": _now_iso(),
-            "session_id": session_id,
+            "session_id": canonical_sid,
         }
 
         def _cleanup_in_flight(done_task: asyncio.Task[None]) -> None:
@@ -740,8 +764,18 @@ class CleaDaemon:
         finally:
             self._connections.discard(conn)
             if conn.is_voice and self._call_state != "idle":
+                ended_call_id = self._voice_call_id or ""
+                duration_seconds = (
+                    round(max(0.0, time.monotonic() - self._call_started_monotonic), 3)
+                    if self._call_started_monotonic is not None
+                    else None
+                )
+                self._voice_call_id = None
                 self._call_state = "idle"
+                self._call_started_monotonic = None
                 self._voice_state = "idle"
+                self._screen_capture_active = False
+                self._screen_capture_target = None
                 await self._broadcast(
                     VoiceStateEvent(
                         data=VoiceStateData(state="error", error="Voice process disconnected.")
@@ -750,10 +784,10 @@ class CleaDaemon:
                 await self._broadcast(
                     CallEndedEvent(
                         data=CallEndedData(
-                            call_id=self._voice_call_id or "",
+                            call_id=ended_call_id,
                             call_state="idle",
                             reason="voice_process_disconnected",
-                            ended_at=_now_iso(),
+                            duration_seconds=duration_seconds,
                         )
                     )
                 )

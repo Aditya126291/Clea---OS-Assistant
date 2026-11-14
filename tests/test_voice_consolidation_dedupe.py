@@ -12,7 +12,14 @@ from websockets.asyncio.client import connect
 
 from clea.core import auth
 from clea.core.daemon import CleaDaemon, build_daemon
-from clea.core.protocol import TaskStatusEvent, parse_frame
+from clea.core.protocol import (
+    TaskStatusEvent,
+    VoiceEndCallParams,
+    VoiceEndCallRequest,
+    VoiceStartCallParams,
+    VoiceStartCallRequest,
+    parse_frame,
+)
 from clea.memory.consolidation import ConsolidationManager
 from clea.memory.store import VOICE_COMPANION_SESSION_ID, MemoryStore
 from clea.providers.base import LLMProvider, Message, StreamChunk
@@ -368,3 +375,169 @@ async def test_activity_title_differentiates_voice_companion_from_chat_sessions(
         daemon._format_session_consolidation_title("chat-title-test")
         == "Summarising session 15:42"
     )
+
+
+async def test_voice_end_call_canonicalizes_activity_and_accumulates_short_call_deltas(
+    tmp_path: Path,
+) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    provider = _SlowSpyProvider()
+    daemon: CleaDaemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=provider,
+        memory=mem,
+        token_file=auth.token_path(tmp_path),
+        lock_file=auth.lock_path(tmp_path),
+    )
+    daemon.consolidation.min_user_turns = 2
+    await daemon.start()
+
+    async def _rpc(ws: Any, req: Any) -> Any:
+        await ws.send(req.model_dump_json())
+        while True:
+            frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            if getattr(frame, "frame_type", None) == "response" and frame.id == req.id:
+                return frame
+
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+            # Seed Call 1 and consolidate it so debounce window is active (< 300s)
+            s1 = await _rpc(
+                ws, VoiceStartCallRequest(params=VoiceStartCallParams(trigger="manual"))
+            )
+            c1 = s1.result["call_id"]
+            now = datetime.now().astimezone()
+            e1 = await _rpc(
+                ws,
+                VoiceEndCallRequest(
+                    params=VoiceEndCallParams(
+                        call_id=c1,
+                        reason="user_done",
+                        transcript=[
+                            {"role": "user", "text": "Seed turn 1", "timestamp": now.isoformat()},
+                            {
+                                "role": "assistant",
+                                "text": "Seed reply 1",
+                                "timestamp": (now + timedelta(seconds=1)).isoformat(),
+                            },
+                            {
+                                "role": "user",
+                                "text": "Seed turn 2",
+                                "timestamp": (now + timedelta(seconds=2)).isoformat(),
+                            },
+                            {
+                                "role": "assistant",
+                                "text": "Seed reply 2",
+                                "timestamp": (now + timedelta(seconds=3)).isoformat(),
+                            },
+                        ],
+                    )
+                ),
+            )
+            assert e1.ok
+            t1 = daemon._consolidation_tasks.get(VOICE_COMPANION_SESSION_ID)
+            if t1 is not None:
+                await asyncio.wait_for(t1, timeout=2.0)
+            assert provider.call_count == 1
+
+            # Call 2: 4 messages (delta=4 < 6) -> skipped during call-end
+            s2 = await _rpc(
+                ws, VoiceStartCallRequest(params=VoiceStartCallParams(trigger="manual"))
+            )
+            c2 = s2.result["call_id"]
+            e2 = await _rpc(
+                ws,
+                VoiceEndCallRequest(
+                    params=VoiceEndCallParams(
+                        call_id=c2,
+                        reason="user_done",
+                        transcript=[
+                            {"role": "user", "text": "Carryover topic alpha"},
+                            {"role": "assistant", "text": "Noted alpha"},
+                            {"role": "user", "text": "Carryover topic beta"},
+                            {"role": "assistant", "text": "Noted beta"},
+                        ],
+                    )
+                ),
+            )
+            assert e2.ok
+            await asyncio.sleep(0.05)
+            assert provider.call_count == 1
+
+            # Call 3: 2 messages (delta=6 >= 6) -> MUST trigger across Call 2 + Call 3 combined!
+            s3 = await _rpc(
+                ws, VoiceStartCallRequest(params=VoiceStartCallParams(trigger="manual"))
+            )
+            c3 = s3.result["call_id"]
+            e3 = await _rpc(
+                ws,
+                VoiceEndCallRequest(
+                    params=VoiceEndCallParams(
+                        call_id=c3,
+                        reason="user_done",
+                        transcript=[
+                            {"role": "user", "text": "Trigger topic gamma"},
+                            {"role": "assistant", "text": "Noted gamma"},
+                        ],
+                    )
+                ),
+            )
+            assert e3.ok
+            t3 = daemon._consolidation_tasks.get(VOICE_COMPANION_SESSION_ID)
+            assert t3 is not None
+            await asyncio.wait_for(t3, timeout=2.0)
+
+        assert provider.call_count == 2
+        latest_prompt = provider.prompts_received[-1]
+        assert "Carryover topic alpha" in latest_prompt
+        assert "Carryover topic beta" in latest_prompt
+        assert "Trigger topic gamma" in latest_prompt
+        assert "Seed turn 1" not in latest_prompt
+
+        bg_tasks = mem.load_background_tasks()
+        assert list(bg_tasks.keys()) == ["cons-voice_companion"]
+        assert bg_tasks["cons-voice_companion"]["title"] == "Consolidating voice memory"
+        assert bg_tasks["cons-voice_companion"]["status"] == "succeeded"
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_stop_shields_already_running_idle_consolidation(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    release = asyncio.Event()
+    provider = _SlowSpyProvider(release_event=release)
+    daemon: CleaDaemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=provider,
+        memory=mem,
+        token_file=auth.token_path(tmp_path),
+        lock_file=auth.lock_path(tmp_path),
+    )
+    daemon.consolidation.min_user_turns = 1
+    daemon.consolidation_idle_seconds = 0.02
+    await daemon.start()
+    if daemon._startup_task is not None:
+        await asyncio.wait_for(daemon._startup_task, timeout=2.0)
+
+    _append_voice_turns(mem, call_id="vc-idle-stop", pairs=3, prefix="IdleShield")
+    daemon._reset_session_idle_timer(VOICE_COMPANION_SESSION_ID)
+    await asyncio.wait_for(provider.entered_event.wait(), timeout=2.0)
+    assert VOICE_COMPANION_SESSION_ID not in daemon._idle_tasks
+
+    async def _release_soon() -> None:
+        await asyncio.sleep(0.05)
+        release.set()
+
+    releaser = asyncio.create_task(_release_soon())
+    await daemon.stop()
+    await releaser
+
+    state = daemon.consolidation.load_state()["sessions"][VOICE_COMPANION_SESSION_ID]
+    assert state["status"] == "completed"
+    assert state["last_consolidated_message_idx"] == 6
+

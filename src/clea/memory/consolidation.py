@@ -362,12 +362,51 @@ class ConsolidationManager:
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
         tmp.replace(self.state_file)
 
+    def _is_voice_call_covered_by_companion(
+        self,
+        session_id: str,
+        resolved_sid: str,
+        sessions: dict[str, Any],
+    ) -> bool:
+        vc_entry = sessions.get(VOICE_COMPANION_SESSION_ID)
+        if not vc_entry or vc_entry.get("status") != "completed":
+            return False
+        has_checkpoint = any(
+            vc_entry.get(k) is not None
+            for k in (
+                "last_consolidated_message_idx",
+                "last_consolidated_turn_count",
+                "last_consolidated_turn",
+            )
+        )
+        if not has_checkpoint:
+            return True
+        vc_last_turn, _ = self._get_session_checkpoint(vc_entry)
+        vc_transcript = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+        if not vc_transcript:
+            return True
+        vc_messages = vc_transcript.get("messages", [])
+        last_call_pos = 0
+        for idx, msg in enumerate(vc_messages):
+            if isinstance(msg, dict) and msg.get("call_id") in (session_id, resolved_sid):
+                last_call_pos = idx + 1
+        if last_call_pos > 0:
+            return vc_last_turn >= last_call_pos
+        return False
+
     def is_consolidated(self, session_id: str) -> bool:
         state = self.load_state()
         resolved_sid = self.memory.resolve_session_id(session_id)
         sessions = state.get("sessions", {})
         entry = sessions.get(resolved_sid) or sessions.get(session_id)
         if not entry or entry.get("status") != "completed":
+            vc_entry = sessions.get(VOICE_COMPANION_SESSION_ID)
+            if vc_entry and vc_entry.get("status") == "completed":
+                transcript = self.memory.get_transcript(resolved_sid)
+                if transcript and transcript.get("is_voice_call"):
+                    return self._is_voice_call_covered_by_companion(
+                        session_id, resolved_sid, sessions
+                    )
             return False
 
         last_turn = entry.get("last_consolidated_message_idx")
@@ -392,7 +431,11 @@ class ConsolidationManager:
             self.save_state(state)
             return True
 
-        return len(messages) <= last_turn
+        if len(messages) <= last_turn:
+            return True
+        if transcript.get("is_voice_call"):
+            return self._is_voice_call_covered_by_companion(session_id, resolved_sid, sessions)
+        return False
 
     def _get_response_format_kwargs(self) -> dict[str, Any]:
         """Build schema-constrained response format if supported by provider."""

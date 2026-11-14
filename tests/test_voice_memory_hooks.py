@@ -823,7 +823,12 @@ async def test_voice_transcript_sync_succeeds_during_subsequent_call_and_rejects
                             "role": "user",
                             "text": "User only voice question",
                             "timestamp": "2026-11-14T10:00:00+00:00",
-                        }
+                        },
+                        {
+                            "role": "assistant",
+                            "text": "Clea short voice answer",
+                            "timestamp": "2026-11-14T10:00:02+00:00",
+                        },
                     ],
                 )
             )
