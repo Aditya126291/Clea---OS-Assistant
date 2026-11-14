@@ -748,7 +748,7 @@ class VoiceRunner:
                 with contextlib.suppress(asyncio.CancelledError):
                     await consume_task
 
-        # Reset call and voice state
+        # Reset call and voice state immediately so hooks cannot block or corrupt IDLE/new calls
         self._call_state = "idle"
         self._stall_timer_armed = False
         self._stall_accumulated_seconds = 0.0
@@ -758,8 +758,28 @@ class VoiceRunner:
         else:
             self._set_voice_state("idle")
         self._call_id = None
+        self._transcript_history.clear()
         if self._wake_word is not None:
             self._wake_word.reset()
+
+        # Write usage & metrics record
+        self._write_metrics_record(
+            call_id=ended_call_id,
+            reason=reason,
+            duration_seconds=duration,
+        )
+
+        # Emit typed CallEndedEvent immediately on transition to IDLE
+        self._emit_event(
+            CallEndedEvent(
+                data=CallEndedData(
+                    call_id=ended_call_id,
+                    call_state="idle",
+                    reason=reason,
+                    duration_seconds=round(duration, 3),
+                )
+            )
+        )
 
         # Notify daemon if connected and we initiated the end (not already from daemon)
         if self._daemon_ws is not None and not from_daemon and reason != "daemon_event":
@@ -791,26 +811,6 @@ class VoiceRunner:
                 data_dir=self.data_dir,
                 request_fn=request_fn,
             )
-        self._transcript_history.clear()
-
-        # Write usage & metrics record
-        self._write_metrics_record(
-            call_id=ended_call_id,
-            reason=reason,
-            duration_seconds=duration,
-        )
-
-        # Emit typed CallEndedEvent
-        self._emit_event(
-            CallEndedEvent(
-                data=CallEndedData(
-                    call_id=ended_call_id,
-                    call_state="idle",
-                    reason=reason,
-                    duration_seconds=round(duration, 3),
-                )
-            )
-        )
 
         logger.info("Call %s ended. Runner is now IDLE.", ended_call_id)
 

@@ -171,12 +171,23 @@ class ConsolidationManager:
         provider: LLMProvider,
         idle_seconds: float = 900.0,
         min_user_turns: int | None = None,
-        llm_timeout_seconds: float = DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS,
+        llm_timeout_seconds: float | None = None,
     ) -> None:
         self.memory = memory
         self.provider = provider
         self.idle_seconds = idle_seconds
-        self.llm_timeout_seconds = max(0.01, float(llm_timeout_seconds))
+        if llm_timeout_seconds is not None:
+            resolved_timeout = float(llm_timeout_seconds)
+        else:
+            env_timeout = os.environ.get("CLEA_CONSOLIDATION_TIMEOUT_SECONDS")
+            if env_timeout is not None and env_timeout.strip():
+                try:
+                    resolved_timeout = float(env_timeout)
+                except ValueError:
+                    resolved_timeout = DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS
+            else:
+                resolved_timeout = DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS
+        self.llm_timeout_seconds = max(0.01, resolved_timeout)
         env_min_turns = os.environ.get("CLEA_CONSOLIDATION_MIN_TURNS")
         if min_user_turns is not None:
             self.min_user_turns = min_user_turns
@@ -380,11 +391,10 @@ class ConsolidationManager:
         if not force and self.is_consolidated(session_id):
             return True
 
-        if effective_status_cb is not None:
-            await effective_status_cb("running", None)
-
         terminal_emitted = False
         try:
+            if effective_status_cb is not None:
+                await effective_status_cb("running", None)
             # Record in-flight running state on disk so unexpected crashes/restarts can recover.
             running_state = self.load_state()
             prev_sess_info = running_state.get("sessions", {}).get(session_id, {})

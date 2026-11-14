@@ -644,6 +644,8 @@ async def test_daemon_startup_reconciles_orphaned_running_background_tasks(tmp_p
         port=0,
         provider=FakeConsolidationProvider(),
         memory=mem,
+        token_file=auth.token_path(tmp_path),
+        lock_file=auth.lock_path(tmp_path),
     )
     await daemon.start()
     try:
@@ -766,3 +768,315 @@ async def test_consolidation_empty_transcript_and_unexpected_error_never_stay_ru
     assert err_statuses[0] == ("running", None)
     assert err_statuses[1][0] == "failed"
     assert "disk I/O failure" in (err_statuses[1][1] or "")
+
+
+async def test_voice_transcript_sync_succeeds_during_subsequent_call_and_rejects_bad_id(
+    tmp_path: Path,
+) -> None:
+    from clea.core.protocol import VoiceStartCallParams, VoiceStartCallRequest
+
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeConsolidationProvider(),
+        memory=mem,
+        token_file=auth.token_path(tmp_path),
+        lock_file=auth.lock_path(tmp_path),
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+            # Start a brand-new active call ("call-2")
+            await ws.send(
+                VoiceStartCallRequest(
+                    params=VoiceStartCallParams(trigger="wake_word")
+                ).model_dump_json()
+            )
+            start_frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            while not isinstance(start_frame, ResponseFrame):
+                start_frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            assert start_frame.ok and start_frame.result is not None
+            active_call_id = start_frame.result["call_id"]
+
+            # Late transcript_sync + consolidate for an earlier call ("voice-prev-call")
+            # that daemon never saw start_call for must still persist and consolidate!
+            sync_req = VoiceEndCallRequest(
+                params=VoiceEndCallParams(
+                    call_id="voice-prev-call",
+                    reason="transcript_sync",
+                    transcript=[
+                        {
+                            "role": "user",
+                            "text": "User only voice question",
+                            "timestamp": "2026-11-14T10:00:00+00:00",
+                        }
+                    ],
+                )
+            )
+            await ws.send(sync_req.model_dump_json())
+            sync_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            while not isinstance(sync_resp, ResponseFrame) or sync_resp.id != sync_req.id:
+                sync_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            assert sync_resp.ok is True
+
+            # Normal mismatched voice.end_call (not transcript_sync/consolidate) must still fail
+            bad_hangup = VoiceEndCallRequest(
+                params=VoiceEndCallParams(call_id="wrong-call-id", reason="user_hangup")
+            )
+            await ws.send(bad_hangup.model_dump_json())
+            bad_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            while not isinstance(bad_resp, ResponseFrame) or bad_resp.id != bad_hangup.id:
+                bad_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            assert bad_resp.ok is False
+            assert daemon._voice_call_id == active_call_id
+
+            # Path-traversal call_id in transcript_sync must be rejected
+            traversal_req = VoiceEndCallRequest(
+                params=VoiceEndCallParams(
+                    call_id="../evil",
+                    reason="transcript_sync",
+                    transcript=[
+                        {
+                            "role": "user",
+                            "text": "hello",
+                            "timestamp": "2026-11-14T10:00:00+00:00",
+                        }
+                    ],
+                )
+            )
+            await ws.send(traversal_req.model_dump_json())
+            trav_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            while not isinstance(trav_resp, ResponseFrame) or trav_resp.id != traversal_req.id:
+                trav_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            assert trav_resp.ok is False
+
+            # Consolidate for the earlier call succeeds
+            cons_req = VoiceEndCallRequest(
+                params=VoiceEndCallParams(call_id="voice-prev-call", reason="consolidate")
+            )
+            await ws.send(cons_req.model_dump_json())
+            cons_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            while not isinstance(cons_resp, ResponseFrame) or cons_resp.id != cons_req.id:
+                cons_resp = parse_frame(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            assert cons_resp.ok is True
+
+            # Wait for consolidation to finish
+            await _wait_until(lambda: daemon.consolidation.is_consolidated("voice-prev-call"))
+    finally:
+        await daemon.stop()
+
+
+def test_get_conversation_preserves_consecutive_and_trailing_user_turns(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    mem.append_transcript_message(
+        session_id="voice-user-turns",
+        role="user",
+        text="First question",
+        title="First question",
+        timestamp=datetime.fromisoformat("2026-11-14T10:00:00+00:00"),
+    )
+    mem.append_transcript_message(
+        session_id="voice-user-turns",
+        role="user",
+        text="Second follow-up",
+        timestamp=datetime.fromisoformat("2026-11-14T10:00:05+00:00"),
+    )
+    mem.append_transcript_message(
+        session_id="voice-user-turns",
+        role="assistant",
+        text="Reply to second",
+        timestamp=datetime.fromisoformat("2026-11-14T10:00:10+00:00"),
+    )
+    mem.append_transcript_message(
+        session_id="voice-user-turns",
+        role="user",
+        text="Trailing interrupted query",
+        timestamp=datetime.fromisoformat("2026-11-14T10:00:15+00:00"),
+    )
+
+    turns = mem.get_conversation("2026-11-14", "voice-user-turns")
+    assert len(turns) == 3
+    assert turns[0]["user"] == "First question"
+    assert turns[0]["assistant"] == ""
+    assert turns[1]["user"] == "Second follow-up"
+    assert turns[1]["assistant"] == "Reply to second"
+    assert turns[2]["user"] == "Trailing interrupted query"
+    assert turns[2]["assistant"] == ""
+
+
+async def test_voice_runner_transitions_idle_before_slow_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import clea.surfaces.voice.runner as runner_mod
+
+    backend = FakeLiveBackend()
+    events: list[Any] = []
+    hook_entered = asyncio.Event()
+    release_hook = asyncio.Event()
+    idle_before_hook = False
+
+    async def _slow_store(**kwargs: Any) -> bool:
+        nonlocal idle_before_hook
+        idle_before_hook = (
+            runner.call_state == "idle"
+            and runner.voice_state == "idle"
+            and len(runner._transcript_history) == 0
+            and any(getattr(ev, "event", None) == "call_ended" for ev in events)
+        )
+        hook_entered.set()
+        await release_hook.wait()
+        return True
+
+    async def _noop_consolidate(**kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(runner_mod, "safe_store_voice_transcript", _slow_store)
+    monkeypatch.setattr(runner_mod, "safe_consolidate_voice_call", _noop_consolidate)
+
+    runner = VoiceRunner(
+        config=VoiceConfig(silence_timeout_seconds=60.0),
+        data_dir=tmp_path,
+        daemon_url="ws://127.0.0.1:1",
+        token="offline-token",
+        backend_factory=lambda: backend,
+        audio_manager=_make_fake_audio(),
+        wake_word_detector=_make_fake_wake_word(),
+        enable_hotkey=False,
+        on_event=events.append,
+    )
+    await runner.start()
+    try:
+        await runner.start_call(trigger="hotkey")
+        await backend.event_queue.put(
+            TranscriptOutputEvent(role="user", text="Hi Clea", final=True)
+        )
+        await backend.event_queue.put(TurnCompleteEvent())
+        await _wait_until(lambda: len(runner._transcript_history) >= 1)
+
+        end_task = asyncio.create_task(runner.end_call(reason="user_hangup"))
+        await asyncio.wait_for(hook_entered.wait(), timeout=2.0)
+        assert idle_before_hook is True
+        release_hook.set()
+        await asyncio.wait_for(end_task, timeout=2.0)
+    finally:
+        await runner.stop()
+
+
+async def test_daemon_stop_reconciles_running_tasks_and_env_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLEA_CONSOLIDATION_TIMEOUT_SECONDS", "invalid-float")
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    manager = ConsolidationManager(memory=mem, provider=FakeConsolidationProvider())
+    assert manager.llm_timeout_seconds == 60.0
+
+    monkeypatch.setenv("CLEA_CONSOLIDATION_TIMEOUT_SECONDS", "12.5")
+    manager2 = ConsolidationManager(memory=mem, provider=FakeConsolidationProvider())
+    assert manager2.llm_timeout_seconds == 12.5
+
+    daemon_mem = MemoryStore(base_dir=tmp_path / "daemon")
+    daemon_mem.ensure_initialized()
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeConsolidationProvider(),
+        memory=daemon_mem,
+    )
+    await daemon.start()
+    daemon.agent.memory.record_background_task(
+        task_id="cons-mid-shutdown",
+        title="Summarising session 14:30",
+        status="running",
+        started_at="2026-11-14T14:30:00+00:00",
+        session_id="mid-shutdown",
+    )
+    await daemon.stop()
+    tasks = daemon.agent.memory.load_background_tasks()
+    assert tasks["cons-mid-shutdown"]["status"] == "failed"
+    assert "shutdown" in (tasks["cons-mid-shutdown"].get("detail") or "").lower()
+
+
+async def test_standalone_memory_hook_rpcs_work_without_request_fn(tmp_path: Path) -> None:
+    from clea.surfaces.voice.memory_hooks import (
+        consolidate_voice_call,
+        load_voice_memory_context,
+        store_voice_transcript,
+    )
+
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    mem.add_or_update_entry(
+        text="User works on Clea voice hooks.",
+        section="Projects",
+        source="stated",
+    )
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeConsolidationProvider(),
+        memory=mem,
+        token_file=auth.token_path(tmp_path),
+        lock_file=auth.lock_path(tmp_path),
+    )
+    daemon.consolidation.min_user_turns = 2
+    await daemon.start()
+    try:
+        # 1. Explicit daemon_url + token without request_fn
+        ctx = await load_voice_memory_context(
+            daemon_url=f"ws://127.0.0.1:{daemon.bound_port}",
+            token=daemon.token,
+        )
+        assert "User works on Clea voice hooks." in ctx
+
+        # 2. Discovery purely from data_dir lock/token files (no daemon_url or token passed)
+        entries = [
+            {
+                "role": "user",
+                "text": "First standalone voice turn",
+                "timestamp": "2026-11-14T11:00:00+00:00",
+                "final": True,
+            },
+            {
+                "role": "assistant",
+                "text": "First standalone reply",
+                "timestamp": "2026-11-14T11:00:02+00:00",
+                "final": True,
+            },
+            {
+                "role": "user",
+                "text": "Second standalone voice turn",
+                "timestamp": "2026-11-14T11:00:04+00:00",
+                "final": True,
+            },
+            {
+                "role": "assistant",
+                "text": "Second standalone reply",
+                "timestamp": "2026-11-14T11:00:06+00:00",
+                "final": True,
+            },
+        ]
+        stored = await store_voice_transcript(
+            call_id="standalone-voice-1",
+            entries=entries,
+            data_dir=tmp_path,
+        )
+        assert stored is True
+        tr = mem.get_transcript("standalone-voice-1")
+        assert tr is not None
+        assert len(tr["messages"]) == 4
+
+        triggered = await consolidate_voice_call(
+            call_id="standalone-voice-1",
+            entries=entries,
+            data_dir=tmp_path,
+        )
+        assert triggered is True
+        await _wait_until(lambda: daemon.consolidation.is_consolidated("standalone-voice-1"))
+    finally:
+        await daemon.stop()

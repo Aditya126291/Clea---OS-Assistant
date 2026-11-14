@@ -1154,6 +1154,14 @@ class MemoryStore:
                     time_fmt = ts_str
 
                 if role == "user":
+                    if user_msg:
+                        turns.append(
+                            {
+                                "time": user_time or time_fmt,
+                                "user": user_msg,
+                                "assistant": "",
+                            }
+                        )
                     user_msg = text
                     user_time = time_fmt
                 elif role == "assistant":
@@ -1165,6 +1173,15 @@ class MemoryStore:
                         }
                     )
                     user_msg = ""
+                    user_time = ""
+            if user_msg:
+                turns.append(
+                    {
+                        "time": user_time,
+                        "user": user_msg,
+                        "assistant": "",
+                    }
+                )
             return turns
 
         return [

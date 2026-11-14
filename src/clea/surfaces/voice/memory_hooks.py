@@ -12,6 +12,7 @@ never delayed or crashed.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Sequence
@@ -26,6 +27,7 @@ from clea.core.protocol import (
     BaseRequest,
     MemoryEpisodesRequest,
     MemoryGetRequest,
+    ResponseFrame,
     VoiceEndCallParams,
     VoiceEndCallRequest,
     parse_frame,
@@ -178,33 +180,36 @@ async def _daemon_rpc(
     timeout: float = 5.0,
 ) -> dict[str, Any]:
     """Execute a single typed RPC call against the local Clea daemon."""
-    resolved_token = token or auth.load_token(auth.token_path(data_dir))
+    resolved_token = token or auth.read_token(auth.token_path(data_dir))
     if not resolved_token:
         raise RuntimeError("No daemon auth token available.")
 
     resolved_url = daemon_url
     if not resolved_url:
         try:
-            resolved_url = auth.daemon_ws_url(data_dir)
+            lock_info = auth._read_lock_metadata(auth.lock_path(data_dir))
+            host = lock_info.get("host")
+            port = lock_info.get("port")
+            if host and port:
+                resolved_url = f"ws://{host}:{port}"
         except Exception:
             resolved_url = None
     if not resolved_url:
         raise RuntimeError("No active daemon lock file / URL available.")
 
-    subprotocol = f"{auth.AUTH_SUBPROTOCOL_PREFIX}{resolved_token}"
     async with websockets.connect(
         resolved_url,
-        subprotocols=[subprotocol],
+        subprotocols=auth.client_subprotocols(resolved_token),
         open_timeout=timeout,
         close_timeout=2.0,
     ) as ws:
         await ws.send(req.model_dump_json())
         while True:
-            raw = await ws.recv()
+            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             frame = parse_frame(raw)
-            if frame.type == "response" and frame.id == req.id:
+            if isinstance(frame, ResponseFrame) and frame.id == req.id:
                 if not frame.ok:
                     raise RuntimeError(frame.error or f"Daemon request {req.method} failed.")
                 return dict(frame.result or {})

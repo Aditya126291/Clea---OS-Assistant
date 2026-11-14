@@ -177,11 +177,21 @@ class CleaDaemon:
         self._voice_state: VoiceState = "idle"
         self._screen_capture_active: bool = False
         self._screen_capture_target: ScreenCaptureTarget | None = None
+        try:
+            min_turns = int(os.environ.get("CLEA_CONSOLIDATION_MIN_TURNS", "2"))
+        except ValueError:
+            min_turns = 2
+        try:
+            consolidation_timeout = float(
+                os.environ.get("CLEA_CONSOLIDATION_TIMEOUT_SECONDS", "60.0")
+            )
+        except ValueError:
+            consolidation_timeout = 60.0
         self.consolidation = ConsolidationManager(
             memory=agent.memory,
             provider=agent.provider,
-            min_user_turns=int(os.environ.get("CLEA_CONSOLIDATION_MIN_TURNS", "2")),
-            llm_timeout_seconds=float(os.environ.get("CLEA_CONSOLIDATION_TIMEOUT_SECONDS", "60.0")),
+            min_user_turns=min_turns,
+            llm_timeout_seconds=consolidation_timeout,
         )
         self.consolidation_idle_seconds = 900.0
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
@@ -284,6 +294,10 @@ class CleaDaemon:
                 t.cancel()
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
         self._idle_tasks.clear()
         self._consolidation_tasks.clear()
         self._background_tasks.clear()
@@ -291,11 +305,10 @@ class CleaDaemon:
             self.agent.memory.reconcile_orphaned_background_tasks(
                 reason="Interrupted by daemon shutdown"
             )
-
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        with contextlib.suppress(Exception):
+            self.consolidation.reconcile_orphaned_running(
+                reason="Interrupted by daemon shutdown"
+            )
         auth.remove_token(self.token_file, self.token)
         self._instance_lock.release()
 
@@ -1262,6 +1275,44 @@ class CleaDaemon:
                 ),
             )
         elif method == "voice.end_call":
+            if req.params.reason in ("transcript_sync", "consolidate"):
+                req_call_id = (req.params.call_id or "").strip()
+                if not req_call_id:
+                    await self._respond(ws, req, error="Unknown call_id.")
+                    return
+                try:
+                    self.agent.memory.validate_session_id(req_call_id)
+                except ValueError as exc:
+                    await self._respond(ws, req, error=str(exc))
+                    return
+                if req.params.reason == "transcript_sync":
+                    persisted = self._persist_voice_transcript(req_call_id, req.params.transcript)
+                    await self._respond(
+                        ws,
+                        req,
+                        METHOD_RESULTS[method](
+                            call_id=req_call_id,
+                            call_state=self._call_state,
+                            voice_state=self._voice_state,
+                        ),
+                    )
+                    if persisted:
+                        await self._broadcast_conversation_updated(req_call_id)
+                    return
+                tr = self.agent.memory.get_transcript(req_call_id)
+                if tr and tr.get("messages"):
+                    self._schedule_consolidation_now(req_call_id)
+                self._ended_voice_call_ids.discard(req_call_id)
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS[method](
+                        call_id=req_call_id,
+                        call_state=self._call_state,
+                        voice_state=self._voice_state,
+                    ),
+                )
+                return
             if (
                 req.params.call_id is not None
                 and self._voice_call_id is not None
@@ -1271,40 +1322,6 @@ class CleaDaemon:
                 return
             if self._voice_call_id is None or self._call_state == "idle":
                 if req.params.call_id is not None:
-                    req_call_id = req.params.call_id
-                    if (
-                        req.params.reason == "transcript_sync"
-                        and req_call_id in self._ended_voice_call_ids
-                    ):
-                        persisted = self._persist_voice_transcript(
-                            req_call_id, req.params.transcript
-                        )
-                        await self._respond(
-                            ws,
-                            req,
-                            METHOD_RESULTS[method](
-                                call_id=req_call_id, call_state="idle", voice_state="idle"
-                            ),
-                        )
-                        if persisted:
-                            await self._broadcast_conversation_updated(req_call_id)
-                        return
-                    if req.params.reason == "consolidate" and (
-                        req_call_id in self._ended_voice_call_ids
-                        or self.agent.memory.get_transcript(req_call_id) is not None
-                    ):
-                        tr = self.agent.memory.get_transcript(req_call_id)
-                        if tr and tr.get("messages"):
-                            self._schedule_consolidation_now(req_call_id)
-                        self._ended_voice_call_ids.discard(req_call_id)
-                        await self._respond(
-                            ws,
-                            req,
-                            METHOD_RESULTS[method](
-                                call_id=req_call_id, call_state="idle", voice_state="idle"
-                            ),
-                        )
-                        return
                     await self._respond(ws, req, error="Unknown call_id.")
                     return
                 await self._respond(
