@@ -20,10 +20,15 @@ from clea.core.protocol import (
     TranscriptEvent,
     UsageEvent,
     VoiceDelegateTaskRequest,
+    VoiceStateData,
     VoiceStateEvent,
     parse_frame,
 )
-from clea.surfaces.voice.audio import AudioManager
+from clea.surfaces.voice.audio import (
+    AmbiguousAudioDeviceError,
+    AudioDeviceNotFoundError,
+    AudioManager,
+)
 from clea.surfaces.voice.backends.base import (
     AudioOutputEvent,
     BackendErrorEvent,
@@ -751,3 +756,140 @@ async def test_voice_runner_wake_word_resets_immediately_on_detection(tmp_path: 
     # Verify reset was called immediately
     assert wake_detector.reset.called
     await runner.stop()
+
+
+async def test_voice_runner_retries_audio_init_on_wasapi_wakeup(tmp_path: Path) -> None:
+    """VoiceRunner.start retries audio initialization if WASAPI endpoints wake up slowly."""
+    import sounddevice as sd
+
+    cfg = VoiceConfig()
+    audio = create_fake_audio_manager()
+    attempts = 0
+
+    def flaky_audio_start() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise AudioDeviceNotFoundError("No audio input devices found")
+        if attempts == 2:
+            raise sd.PortAudioError("WASAPI not ready")
+
+    audio.start = MagicMock(side_effect=flaky_audio_start)  # type: ignore[method-assign]
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: FakeLiveBackend(),
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        audio_init_retries=4,
+        audio_init_retry_delay=0.01,
+    )
+    with patch("clea.surfaces.voice.runner.refresh_audio_devices") as mock_refresh:
+        await runner.start()
+
+    assert attempts == 3
+    assert mock_refresh.call_count == 2
+    await runner.stop()
+
+
+async def test_voice_runner_releases_lock_when_audio_init_exhausts_retries(tmp_path: Path) -> None:
+    """VoiceRunner releases voice.lock if audio init fails after retries or ambiguous config."""
+    cfg = VoiceConfig()
+    audio = create_fake_audio_manager()
+    audio.start = MagicMock(side_effect=AmbiguousAudioDeviceError("Multiple devices"))  # type: ignore[method-assign]
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: FakeLiveBackend(),
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        audio_init_retries=3,
+        audio_init_retry_delay=0.01,
+    )
+    with pytest.raises(AmbiguousAudioDeviceError):
+        await runner.start()
+
+    assert audio.start.call_count == 1
+    assert not (tmp_path / "voice.lock").exists()
+
+
+async def test_voice_runner_retries_daemon_startup_including_missing_token_and_stale_401(
+    tmp_path: Path,
+) -> None:
+    """VoiceRunner retries cleanly when daemon is booting (no token / refused / 401)."""
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response
+
+    from clea.core import auth
+
+    cfg = VoiceConfig()
+    audio = create_fake_audio_manager()
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        daemon_url="ws://127.0.0.1:8765",
+        token=None,
+        backend_factory=lambda: FakeLiveBackend(),
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        daemon_retry_delay=0.02,
+    )
+
+    connect_calls: list[list[str]] = []
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def __aenter__(self) -> FakeWS:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def send(self, data: str) -> None:
+            self.sent.append(data)
+
+        async def recv(self) -> str:
+            runner._stop_event.set()
+            await asyncio.sleep(0.01)
+            return VoiceStateEvent(data=VoiceStateData(state="idle")).model_dump_json()
+
+        async def close(self) -> None:
+            return None
+
+    fake_ws = FakeWS()
+
+    def fake_connect(_url: str, *, subprotocols: list[str]) -> Any:
+        connect_calls.append(subprotocols)
+        if len(connect_calls) == 1:
+            raise ConnectionRefusedError("daemon still booting")
+        if len(connect_calls) == 2:
+            # Simulate stale session_token rejected with HTTP 401 before daemon writes fresh token
+            auth.write_token("fresh-token-123", auth.token_path(tmp_path))
+            resp = Response(401, "Unauthorized", [])  # type: ignore[arg-type]
+            raise InvalidStatus(resp)
+        return fake_ws
+
+    # Initially write a stale token after one missing-token poll
+    async def seed_stale_token_soon() -> None:
+        await asyncio.sleep(0.03)
+        auth.write_token("stale-token", auth.token_path(tmp_path))
+
+    seeder = asyncio.create_task(seed_stale_token_soon())
+    with patch("clea.surfaces.voice.runner.connect", side_effect=fake_connect):
+        await asyncio.wait_for(runner.run_forever(), timeout=3.0)
+    await seeder
+
+    assert len(connect_calls) == 3
+    assert "clea.token.stale-token" in connect_calls[0]
+    assert "clea.token.stale-token" in connect_calls[1]
+    assert "clea.token.fresh-token-123" in connect_calls[2]
+    assert len(fake_ws.sent) >= 1
+    assert runner._daemon_ws is None
+    assert not (tmp_path / "voice.lock").exists()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import sys
 import time
@@ -14,6 +15,8 @@ import numpy as np
 from clea.core import auth
 from clea.paths import default_data_dir
 from clea.surfaces.voice.audio import (
+    AmbiguousAudioDeviceError,
+    AudioDeviceNotFoundError,
     AudioManager,
     compute_audio_rms,
     list_audio_devices,
@@ -30,7 +33,7 @@ from clea.surfaces.voice.backends.base import (
 )
 from clea.surfaces.voice.config import load_voice_config, voice_config_path
 from clea.surfaces.voice.lock import VoiceAlreadyRunningError
-from clea.surfaces.voice.runner import VoiceRunner
+from clea.surfaces.voice.runner import VoiceRunner, voice_log_path
 from clea.surfaces.voice.wake_word import (
     WakeWordDetector,
     WakeWordModelNotFoundError,
@@ -167,21 +170,41 @@ async def _run_live_voice_test_prompt(
         await backend.close()
 
 
+logger = logging.getLogger(__name__)
+
+
+def _configure_voice_service_logging() -> None:
+    """Configure console logging in foreground or rotating file logging under pythonw."""
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    if sys.stderr is None:
+        log_file = voice_log_path()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(fmt))
+        logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S",
+        )
+
+
 def run_voice_service(
     *, host: str = "127.0.0.1", port: int = 8765, debug_audio: bool = False
 ) -> None:
     """Run the main Clea voice background surface."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    _configure_voice_service_logging()
     enable_per_monitor_dpi_awareness()
     config = load_voice_config()
     daemon_url = f"ws://{host}:{port}"
-    token = auth.read_token()
 
-    if not token:
+    if not auth.read_token():
         print(
             "Note: Clea daemon is not running yet. Starting voice surface;\n"
             f"it will automatically connect when the daemon starts at {daemon_url}.",
@@ -192,7 +215,7 @@ def run_voice_service(
         runner = VoiceRunner(
             config=config,
             daemon_url=daemon_url,
-            token=token,
+            token=None,
             debug_audio=debug_audio,
         )
         print("Starting Clea voice service (press Ctrl+C to quit)...")
@@ -201,9 +224,15 @@ def run_voice_service(
         print(f"Listening on mic for '{config.wake_word_model}' or press {config.hotkey}...")
         asyncio.run(runner.run_forever())
     except VoiceAlreadyRunningError as exc:
+        logger.error("%s", exc)
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except WakeWordModelNotFoundError as exc:
+        logger.error("%s", exc)
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except (AudioDeviceNotFoundError, AmbiguousAudioDeviceError, OSError) as exc:
+        logger.error("Voice service startup failed: %s", exc)
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except KeyboardInterrupt:

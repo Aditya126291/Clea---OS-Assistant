@@ -6,6 +6,7 @@ import logging
 import math
 import queue
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -28,6 +29,17 @@ class AudioDeviceNotFoundError(ValueError):
 
 class AmbiguousAudioDeviceError(ValueError):
     """Raised when an audio device name substring matches multiple candidate devices."""
+
+
+def refresh_audio_devices() -> None:
+    """Re-initialize PortAudio so newly woken OS audio endpoints are discovered."""
+    try:
+        if getattr(sd, "_initialized", 0) > 0 and hasattr(sd, "_terminate"):
+            sd._terminate()
+        if getattr(sd, "_initialized", 0) == 0 and hasattr(sd, "_initialize"):
+            sd._initialize()
+    except Exception as exc:
+        logger.debug("Could not refresh PortAudio device list: %s", exc)
 
 
 def list_audio_devices() -> list[dict[str, Any]]:
@@ -330,8 +342,31 @@ class AudioManager:
         with self._lock:
             self._on_audio_input = callback
 
-    def start(self) -> None:
-        """Start microphone input and audio output streams."""
+    def start(self, *, max_attempts: int = 1, retry_delay: float = 1.0) -> None:
+        """Start microphone input and audio output streams, retrying transient endpoint failures."""
+        attempts = max(1, max_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                self._start_once()
+                return
+            except AmbiguousAudioDeviceError:
+                raise
+            except (AudioDeviceNotFoundError, sd.PortAudioError, OSError) as exc:
+                if attempt >= attempts:
+                    raise
+                logger.warning(
+                    "Audio initialization failed (attempt %d/%d: %s); retrying in %.1fs...",
+                    attempt,
+                    attempts,
+                    exc,
+                    retry_delay,
+                )
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+                refresh_audio_devices()
+
+    def _start_once(self) -> None:
+        """Start microphone input and audio output streams once."""
         with self._lock:
             if self._running:
                 return

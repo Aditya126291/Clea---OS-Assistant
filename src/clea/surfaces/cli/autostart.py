@@ -12,6 +12,12 @@ from xml.sax.saxutils import escape
 
 TASK_NAME = "CleaDaemon"
 DAEMON_BG_ARGS = "-m clea daemon --background"
+DAEMON_DESCRIPTION = "Clea personal AI assistant localhost daemon"
+
+VOICE_TASK_NAME = "CleaVoice"
+VOICE_BG_ARGS = "-m clea.surfaces.cli.main voice"
+VOICE_DESCRIPTION = "Clea personal AI assistant voice surface"
+VOICE_LOGON_DELAY = "PT5S"
 
 
 @dataclass(slots=True)
@@ -55,22 +61,33 @@ def current_windows_user(env: dict[str, str] | os._Environ[str] | None = None) -
     return username
 
 
-def build_task_xml(*, pythonw_path: Path, working_dir: Path, user_id: str) -> str:
+def build_task_xml(
+    *,
+    pythonw_path: Path,
+    working_dir: Path,
+    user_id: str,
+    arguments: str = DAEMON_BG_ARGS,
+    description: str = DAEMON_DESCRIPTION,
+    delay: str | None = None,
+) -> str:
     """Render Task Scheduler 1.2 XML for an interactive, hidden, current-user logon task."""
     esc_user = escape(user_id)
     esc_cmd = escape(str(pythonw_path))
-    esc_args = escape(DAEMON_BG_ARGS)
+    esc_args = escape(arguments)
     esc_dir = escape(str(working_dir))
+    esc_desc = escape(description)
+    delay_xml = f"      <Delay>{escape(delay)}</Delay>\n" if delay else ""
     return (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
         '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
         "  <RegistrationInfo>\n"
-        "    <Description>Clea personal AI assistant localhost daemon</Description>\n"
+        f"    <Description>{esc_desc}</Description>\n"
         "  </RegistrationInfo>\n"
         "  <Triggers>\n"
         "    <LogonTrigger>\n"
         "      <Enabled>true</Enabled>\n"
         f"      <UserId>{esc_user}</UserId>\n"
+        f"{delay_xml}"
         "    </LogonTrigger>\n"
         "  </Triggers>\n"
         "  <Principals>\n"
@@ -115,6 +132,9 @@ def _require_windows() -> None:
 def install_autostart(
     *,
     task_name: str = TASK_NAME,
+    arguments: str = DAEMON_BG_ARGS,
+    description: str = DAEMON_DESCRIPTION,
+    delay: str | None = None,
     python_exe: Path | None = None,
     working_dir: Path | None = None,
     user_id: str | None = None,
@@ -132,6 +152,9 @@ def install_autostart(
         pythonw_path=resolved_py,
         working_dir=resolved_dir,
         user_id=resolved_user,
+        arguments=arguments,
+        description=description,
+        delay=delay,
     )
 
     tmp_file = tempfile.NamedTemporaryFile(
@@ -160,7 +183,7 @@ def install_autostart(
     return AutostartStatus(
         installed=True,
         task_name=task_name,
-        command=f'"{resolved_py}" {DAEMON_BG_ARGS}',
+        command=f'"{resolved_py}" {arguments}',
         working_dir=str(resolved_dir),
         state="Ready",
         raw_output=(proc.stdout or "").strip(),
@@ -219,3 +242,43 @@ def status_autostart(
         state=fields.get("status"),
         raw_output=raw,
     )
+
+
+def install_voice_autostart(
+    *,
+    task_name: str = VOICE_TASK_NAME,
+    delay: str | None = VOICE_LOGON_DELAY,
+    python_exe: Path | None = None,
+    working_dir: Path | None = None,
+    user_id: str | None = None,
+    runner: object = subprocess.run,
+) -> AutostartStatus:
+    """Register the current-user Windows Task Scheduler logon task for ``clea voice``."""
+    return install_autostart(
+        task_name=task_name,
+        arguments=VOICE_BG_ARGS,
+        description=VOICE_DESCRIPTION,
+        delay=delay,
+        python_exe=python_exe,
+        working_dir=working_dir,
+        user_id=user_id,
+        runner=runner,
+    )
+
+
+def uninstall_voice_autostart(
+    *,
+    task_name: str = VOICE_TASK_NAME,
+    runner: object = subprocess.run,
+) -> bool:
+    """Remove the ``CleaVoice`` Windows Task Scheduler logon task."""
+    return uninstall_autostart(task_name=task_name, runner=runner)
+
+
+def status_voice_autostart(
+    *,
+    task_name: str = VOICE_TASK_NAME,
+    runner: object = subprocess.run,
+) -> AutostartStatus:
+    """Query Windows Task Scheduler for the current status of ``CleaVoice``."""
+    return status_autostart(task_name=task_name, runner=runner)

@@ -9,6 +9,7 @@ import pytest
 
 from clea.surfaces.cli.main import build_parser, main
 from clea.surfaces.cli.voice import run_voice_doctor, run_voice_service, run_voice_test
+from clea.surfaces.voice.audio import AudioDeviceNotFoundError
 from clea.surfaces.voice.lock import VoiceAlreadyRunningError
 from clea.surfaces.voice.wake_word import WakeWordModelNotFoundError
 
@@ -165,3 +166,57 @@ def test_voice_doctor_diagnostics_output(
     assert "3-second mic check: RMS = 150.0, Peak = 500.0" in out
     assert "Daemon answered health.ping" in out
     assert "Connected successfully to Gemini Live API" in out
+
+
+def test_voice_service_does_not_pin_stale_token_and_handles_audio_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+    token_file = tmp_path / "session_token"
+    token_file.write_text("stale-token", encoding="utf-8")
+
+    with patch("clea.surfaces.cli.voice.VoiceRunner") as mock_runner_cls:
+        mock_runner = MagicMock()
+        mock_runner.run_forever.side_effect = AudioDeviceNotFoundError("No mic found")
+        mock_runner_cls.return_value = mock_runner
+
+        with pytest.raises(SystemExit) as exc:
+            run_voice_service()
+        assert exc.value.code == 1
+
+    assert mock_runner_cls.call_args.kwargs["token"] is None
+    err = capsys.readouterr().err
+    assert "No mic found" in err
+
+
+def test_voice_service_headless_pythonw_logging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import logging
+    import sys
+
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+    root = logging.getLogger()
+    old_handlers = list(root.handlers)
+    try:
+        monkeypatch.setattr(sys, "stdout", None)
+        monkeypatch.setattr(sys, "stderr", None)
+        with patch("clea.surfaces.cli.voice.VoiceRunner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_forever.side_effect = VoiceAlreadyRunningError("already running")
+            mock_runner_cls.return_value = mock_runner
+
+            with pytest.raises(SystemExit) as exc:
+                run_voice_service()
+            assert exc.value.code == 1
+
+        log_file = tmp_path / "logs" / "voice.log"
+        assert log_file.is_file()
+        assert "already running" in log_file.read_text(encoding="utf-8")
+    finally:
+        for h in root.handlers:
+            h.close()
+        root.handlers = old_handlers

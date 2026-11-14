@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import logging.handlers
 import sys
 import time
 from collections.abc import AsyncIterator, Callable
@@ -14,8 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import sounddevice as sd
 from websockets.asyncio.client import ClientConnection, connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import InvalidURI, WebSocketException
 
 from clea.core import auth
 from clea.core.protocol import (
@@ -42,7 +44,12 @@ from clea.core.protocol import (
     parse_frame,
 )
 from clea.paths import default_data_dir
-from clea.surfaces.voice.audio import AudioManager
+from clea.surfaces.voice.audio import (
+    AmbiguousAudioDeviceError,
+    AudioDeviceNotFoundError,
+    AudioManager,
+    refresh_audio_devices,
+)
 from clea.surfaces.voice.backends.base import (
     AudioOutputEvent,
     BackendErrorEvent,
@@ -114,12 +121,19 @@ class VoiceRunner:
         on_event: Callable[[BaseEvent], None] | None = None,
         screen_service: ScreenCaptureService | None = None,
         debug_audio: bool = False,
+        audio_init_retries: int = 8,
+        audio_init_retry_delay: float = 1.5,
+        daemon_retry_delay: float = 2.0,
     ) -> None:
         self.config = config or load_voice_config(create_if_missing=False)
         self.data_dir = data_dir
         self.daemon_url = daemon_url
         self.token = token
         self.debug_audio = debug_audio
+        self._audio_init_retries = max(1, audio_init_retries)
+        self._audio_init_retry_delay = max(0.0, audio_init_retry_delay)
+        self._daemon_retry_delay = max(0.05, daemon_retry_delay)
+        self._daemon_ever_connected = False
         self._setup_voice_file_logging()
         self._backend_factory = backend_factory or (lambda: GeminiLiveBackend())
         self._audio_manager = audio_manager
@@ -171,13 +185,19 @@ class VoiceRunner:
             log_file = voice_log_path(self.data_dir)
             log_file.parent.mkdir(parents=True, exist_ok=True)
             voice_logger = logging.getLogger("clea.surfaces.voice")
+            root_logger = logging.getLogger()
             has_file = any(
                 isinstance(h, logging.FileHandler)
                 and getattr(h, "baseFilename", None) == str(log_file)
-                for h in voice_logger.handlers
+                for h in (*voice_logger.handlers, *root_logger.handlers)
             )
             if not has_file:
-                fh = logging.FileHandler(log_file, encoding="utf-8")
+                fh = logging.handlers.RotatingFileHandler(
+                    log_file,
+                    maxBytes=5 * 1024 * 1024,
+                    backupCount=3,
+                    encoding="utf-8",
+                )
                 fh.setLevel(logging.INFO)
                 fh.setFormatter(
                     logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -259,7 +279,36 @@ class VoiceRunner:
             else:
                 self._audio_manager.set_input_callback(self._on_audio_chunk)
 
-            self._audio_manager.start()
+            for attempt in range(1, self._audio_init_retries + 1):
+                try:
+                    self._audio_manager.start()
+                    break
+                except AmbiguousAudioDeviceError:
+                    raise
+                except (AudioDeviceNotFoundError, sd.PortAudioError, OSError) as exc:
+                    if attempt >= self._audio_init_retries or self._stop_event.is_set():
+                        logger.error(
+                            "Audio initialization failed after %d attempt(s): %s",
+                            attempt,
+                            exc,
+                        )
+                        raise
+                    logger.warning(
+                        "Audio devices not ready (attempt %d/%d: %s); retrying in %.1fs...",
+                        attempt,
+                        self._audio_init_retries,
+                        exc,
+                        self._audio_init_retry_delay,
+                    )
+                    if self._audio_init_retry_delay > 0:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                self._stop_event.wait(),
+                                timeout=self._audio_init_retry_delay,
+                            )
+                    if self._stop_event.is_set():
+                        raise
+                    refresh_audio_devices()
 
             if self._audio_manager.resolved_input_device:
                 inp = self._audio_manager.resolved_input_device
@@ -306,6 +355,9 @@ class VoiceRunner:
 
             logger.info("VoiceRunner started in state: IDLE (hotkey=%s).", self.config.hotkey)
         except Exception:
+            if self._audio_manager is not None:
+                with contextlib.suppress(Exception):
+                    self._audio_manager.stop()
             self._lock.release()
             raise
 
@@ -316,11 +368,29 @@ class VoiceRunner:
             while not self._stop_event.is_set():
                 try:
                     await self._connect_daemon_and_listen()
-                except (OSError, ConnectionClosed) as exc:
+                except InvalidURI:
+                    raise
+                except (OSError, WebSocketException) as exc:
                     if self._stop_event.is_set():
                         break
-                    logger.info("Daemon connection lost (%s); retrying in 2s...", exc)
-                    await asyncio.sleep(2.0)
+                    if self._daemon_ever_connected:
+                        logger.info(
+                            "Daemon connection lost (%s); retrying in %.1fs...",
+                            exc,
+                            self._daemon_retry_delay,
+                        )
+                    else:
+                        logger.info(
+                            "Daemon at %s not ready yet (%s); retrying in %.1fs...",
+                            self.daemon_url,
+                            exc,
+                            self._daemon_retry_delay,
+                        )
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            self._stop_event.wait(),
+                            timeout=self._daemon_retry_delay,
+                        )
         finally:
             await self.stop()
 
@@ -432,7 +502,10 @@ class VoiceRunner:
                 start_req = VoiceStartCallRequest(
                     params=VoiceStartCallParams(trigger=trigger)  # type: ignore[arg-type]
                 )
-                await self._daemon_ws.send(start_req.model_dump_json())
+                try:
+                    await self._daemon_ws.send(start_req.model_dump_json())
+                except (OSError, WebSocketException) as exc:
+                    logger.warning("Could not notify daemon of call start: %s", exc)
 
             # 2. Resolve system instruction safely
             system_instruction = await resolve_voice_system_instruction()
@@ -1016,35 +1089,42 @@ class VoiceRunner:
         token = self.token or auth.read_token(auth.token_path(self.data_dir))
         if not token:
             logger.debug("No daemon token found; running offline until daemon starts.")
-            await asyncio.sleep(2.0)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._daemon_retry_delay)
             return
 
-        async with connect(
-            self.daemon_url,
-            subprotocols=auth.client_subprotocols(token),  # type: ignore[arg-type]
-        ) as ws:
-            self._daemon_ws = ws
-            logger.info("Connected to daemon at %s.", self.daemon_url)
-            # Notify daemon that voice process is connected and register state
-            await ws.send(VoiceStateEvent(data=VoiceStateData(state=self._state)).model_dump_json())
+        try:
+            async with connect(
+                self.daemon_url,
+                subprotocols=auth.client_subprotocols(token),  # type: ignore[arg-type]
+            ) as ws:
+                self._daemon_ws = ws
+                self._daemon_ever_connected = True
+                logger.info("Connected to daemon at %s.", self.daemon_url)
+                # Notify daemon that voice process is connected and register state
+                await ws.send(
+                    VoiceStateEvent(data=VoiceStateData(state=self._state)).model_dump_json()
+                )
 
-            while not self._stop_event.is_set():
-                raw = await ws.recv()
-                frame = parse_frame(raw)
+                while not self._stop_event.is_set():
+                    raw = await ws.recv()
+                    frame = parse_frame(raw)
 
-                if isinstance(frame, CallStartedEvent):
-                    self._call_id = frame.data.call_id
-                    if self._call_state == "idle":
-                        # Daemon started call (e.g. from UI)
-                        await self.start_call(trigger="daemon_event")
-                elif isinstance(frame, CallEndedEvent):
-                    if self._call_state in ("connecting", "active"):
-                        await self.end_call(reason=frame.data.reason or "daemon_event")
-                elif isinstance(frame, ResponseFrame):
-                    # Check if this resolves a delegated task
-                    fut = self._pending_tasks.get(frame.id)
-                    if fut and not fut.done():
-                        if frame.ok:
-                            fut.set_result(frame.result)
-                        else:
-                            fut.set_exception(RuntimeError(frame.error or "Task failed"))
+                    if isinstance(frame, CallStartedEvent):
+                        self._call_id = frame.data.call_id
+                        if self._call_state == "idle":
+                            # Daemon started call (e.g. from UI)
+                            await self.start_call(trigger="daemon_event")
+                    elif isinstance(frame, CallEndedEvent):
+                        if self._call_state in ("connecting", "active"):
+                            await self.end_call(reason=frame.data.reason or "daemon_event")
+                    elif isinstance(frame, ResponseFrame):
+                        # Check if this resolves a delegated task
+                        fut = self._pending_tasks.get(frame.id)
+                        if fut and not fut.done():
+                            if frame.ok:
+                                fut.set_result(frame.result)
+                            else:
+                                fut.set_exception(RuntimeError(frame.error or "Task failed"))
+        finally:
+            self._daemon_ws = None

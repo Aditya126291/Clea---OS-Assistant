@@ -324,38 +324,71 @@ def _run_daemon_cmd(host: str, port: int, *, background: bool = False) -> None:
         raise SystemExit(1) from exc
 
 
-def _run_autostart_cmd(action: str) -> None:
+def _run_autostart_cmd(action: str, target: str = "daemon") -> None:
     from clea.core.daemon import daemon_log_path
     from clea.surfaces.cli.autostart import (
+        TASK_NAME,
+        VOICE_TASK_NAME,
         install_autostart,
+        install_voice_autostart,
         status_autostart,
+        status_voice_autostart,
         uninstall_autostart,
+        uninstall_voice_autostart,
     )
+    from clea.surfaces.voice.runner import voice_log_path
 
+    targets = ["daemon", "voice"] if target == "all" else [target]
     try:
-        if action == "install":
-            status = install_autostart()
-            print(f"Installed Windows logon task '{status.task_name}'.")
-            print(f"Command: {status.command}")
-            print(f"Working directory: {status.working_dir}")
-            print(f"Daemon log: {daemon_log_path()}")
-        elif action == "uninstall":
-            removed = uninstall_autostart()
-            if removed:
-                print("Removed Windows logon task 'CleaDaemon'.")
-            else:
-                print("Windows logon task 'CleaDaemon' is not installed.")
-        elif action == "status":
-            status = status_autostart()
-            if not status.installed:
-                print(f"Task '{status.task_name}': not installed")
-            else:
-                print(f"Task '{status.task_name}': installed ({status.state or 'Ready'})")
-                if status.command:
+        for item in targets:
+            if item == "daemon":
+                if action == "install":
+                    status = install_autostart()
+                    print(f"Installed Windows logon task '{status.task_name}'.")
                     print(f"Command: {status.command}")
-                if status.working_dir:
                     print(f"Working directory: {status.working_dir}")
-                print(f"Daemon log: {daemon_log_path()}")
+                    print(f"Daemon log: {daemon_log_path()}")
+                elif action == "uninstall":
+                    removed = uninstall_autostart()
+                    if removed:
+                        print(f"Removed Windows logon task '{TASK_NAME}'.")
+                    else:
+                        print(f"Windows logon task '{TASK_NAME}' is not installed.")
+                elif action == "status":
+                    status = status_autostart()
+                    if not status.installed:
+                        print(f"Task '{status.task_name}': not installed")
+                    else:
+                        print(f"Task '{status.task_name}': installed ({status.state or 'Ready'})")
+                        if status.command:
+                            print(f"Command: {status.command}")
+                        if status.working_dir:
+                            print(f"Working directory: {status.working_dir}")
+                        print(f"Daemon log: {daemon_log_path()}")
+            elif item == "voice":
+                if action == "install":
+                    status = install_voice_autostart()
+                    print(f"Installed Windows logon task '{status.task_name}'.")
+                    print(f"Command: {status.command}")
+                    print(f"Working directory: {status.working_dir}")
+                    print(f"Voice log: {voice_log_path()}")
+                elif action == "uninstall":
+                    removed = uninstall_voice_autostart()
+                    if removed:
+                        print(f"Removed Windows logon task '{VOICE_TASK_NAME}'.")
+                    else:
+                        print(f"Windows logon task '{VOICE_TASK_NAME}' is not installed.")
+                elif action == "status":
+                    status = status_voice_autostart()
+                    if not status.installed:
+                        print(f"Task '{status.task_name}': not installed")
+                    else:
+                        print(f"Task '{status.task_name}': installed ({status.state or 'Ready'})")
+                        if status.command:
+                            print(f"Command: {status.command}")
+                        if status.working_dir:
+                            print(f"Working directory: {status.working_dir}")
+                        print(f"Voice log: {voice_log_path()}")
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
@@ -393,12 +426,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     autostart_parser = subparsers.add_parser(
         "autostart",
-        help="Manage Windows logon auto-start for the Clea daemon",
+        help="Manage Windows logon auto-start for Clea daemon and voice",
     )
     autostart_parser.add_argument(
         "action",
         choices=["install", "uninstall", "status"],
-        help="Install, uninstall, or inspect the Task Scheduler logon task",
+        help="Install, uninstall, or inspect the Task Scheduler logon task(s)",
+    )
+    autostart_parser.add_argument(
+        "--target",
+        choices=["daemon", "voice", "all"],
+        default="daemon",
+        help="Which service to manage: daemon, voice, or all (default: daemon)",
     )
 
     voice_parser = subparsers.add_parser("voice", help="Run or inspect the Clea live voice surface")
@@ -457,7 +496,7 @@ def main(argv: list[str] | None = None) -> None:
         ws_url = args.url or f"ws://{host}:{port}"
         asyncio.run(_send_and_stream(ws_url))
     elif args.command == "autostart":
-        _run_autostart_cmd(args.action)
+        _run_autostart_cmd(args.action, target=args.target)
     elif args.command == "memory":
         if args.memory_subcommand == "status":
             asyncio.run(_run_memory_status_cmd(args.url))

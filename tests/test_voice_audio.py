@@ -17,6 +17,7 @@ from clea.surfaces.voice.audio import (
     compute_audio_rms,
     list_audio_devices,
     negotiate_input_sample_rate,
+    refresh_audio_devices,
     resample_to_16k_mono,
     resolve_audio_device,
 )
@@ -563,3 +564,65 @@ def test_resample_to_16k_mono_sanitizes_nan_and_inf() -> None:
         assert resampled[3] == 32767
         assert resampled[4] == -32768
         assert not any("invalid value encountered" in str(w.message) for w in recorded)
+
+
+def test_audio_manager_start_retries_on_transient_endpoint_wakeup() -> None:
+    """AudioManager.start retries transient AudioDeviceNotFoundError / PortAudioError."""
+    manager = AudioManager()
+    attempts = 0
+
+    def flaky_start_once() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise AudioDeviceNotFoundError("No audio input devices found on the system.")
+        if attempts == 2:
+            raise sd.PortAudioError("WASAPI endpoint not ready")
+        manager._running = True
+
+    with (
+        patch.object(manager, "_start_once", side_effect=flaky_start_once),
+        patch("clea.surfaces.voice.audio.refresh_audio_devices") as mock_refresh,
+    ):
+        manager.start(max_attempts=3, retry_delay=0.0)
+
+    assert attempts == 3
+    assert manager._running is True
+    assert mock_refresh.call_count == 2
+
+
+def test_audio_manager_start_does_not_retry_ambiguous_device() -> None:
+    """AmbiguousAudioDeviceError is a config error and fails immediately without retry."""
+    manager = AudioManager()
+    attempts = 0
+
+    def fail_ambiguous() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise AmbiguousAudioDeviceError("Multiple devices match")
+
+    with (
+        patch.object(manager, "_start_once", side_effect=fail_ambiguous),
+        patch("clea.surfaces.voice.audio.refresh_audio_devices") as mock_refresh,
+        pytest.raises(AmbiguousAudioDeviceError),
+    ):
+        manager.start(max_attempts=4, retry_delay=0.0)
+
+    assert attempts == 1
+    assert mock_refresh.call_count == 0
+
+
+def test_refresh_audio_devices_reinitializes_portaudio() -> None:
+    with (
+        patch.object(sd, "_initialized", 1),
+        patch.object(sd, "_terminate") as mock_term,
+        patch.object(sd, "_initialize") as mock_init,
+    ):
+        # Simulate _terminate dropping _initialized to 0
+        def drop_init() -> None:
+            sd._initialized = 0
+
+        mock_term.side_effect = drop_init
+        refresh_audio_devices()
+        assert mock_term.called
+        assert mock_init.called
