@@ -64,9 +64,11 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="look_at_screen",
             description=(
                 "Capture a fresh live screenshot RIGHT NOW along with ground-truth active "
-                "application name, process executable, and window title metadata. Always call "
-                "this again on every user question about the screen, active app, code, errors, "
-                "or UI rather than relying on earlier screenshots in the conversation. Use "
+                "application name, process executable, and window title metadata. Only use when "
+                "the user asks about what is currently visible on their screen. Do NOT call when "
+                "the user asks about past conversations, memory, stored facts, or Clea app "
+                "actions. Always call this again on every visual question about the screen, "
+                "active app, code, errors, or UI rather than relying on earlier screenshots. Use "
                 "target='active_window' (1:1 native resolution) whenever reading code, tabs, "
                 "menus, or small UI text, and target='full_screen' when whole-monitor context "
                 "is needed."
@@ -100,7 +102,9 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="watch_screen",
             description=(
                 "Stream fresh periodic screen frames for a bounded duration while guiding the "
-                "user live through an on-screen workflow."
+                "user live through an on-screen workflow. Only use when the user asks about what "
+                "is currently visible on their screen. Do NOT call when the user asks about past "
+                "conversations, memory, stored facts, or Clea app actions."
             ),
             parameters_schema={
                 "type": "object",
@@ -130,9 +134,11 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="search_conversations",
             description=(
-                "Search raw message content and titles across all saved text conversations and the "
-                "continuous Voice Companion history. Use this to recall exact code snippets, "
-                "commands, links, or earlier decisions when the user asks about past threads."
+                "Search raw message content and titles across ALL saved text conversations and "
+                "the continuous Voice Companion history. Call this immediately whenever the user "
+                "asks about past discussions, earlier decisions, previous chats, stored facts, "
+                "or project history—even without exact keywords. Never call `look_at_screen` or "
+                "ask the user to focus a chat first to read history."
             ),
             parameters_schema={
                 "type": "object",
@@ -156,9 +162,10 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="post_to_active_chat",
             description=(
                 "Write a clean assistant message (such as code, shell commands, or a structured "
-                "summary) directly into the user's currently focused text chat in the UI. Call "
-                "this ONLY when the user explicitly asks to send, drop, paste, write, or save "
-                "something into their chat."
+                "summary) directly into the user's currently focused text chat in the UI. Check "
+                "`focused_chat_available` in startup state first; call directly without calling "
+                "`look_at_screen` when the user asks to send, drop, paste, write, or save "
+                "something into the focused chat."
             ),
             parameters_schema={
                 "type": "object",

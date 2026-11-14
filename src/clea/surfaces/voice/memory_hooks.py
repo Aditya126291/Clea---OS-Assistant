@@ -25,11 +25,11 @@ import websockets
 from clea.core import auth
 from clea.core.protocol import (
     BaseRequest,
-    ConversationResumeParams,
-    ConversationResumeRequest,
     MemoryEpisodesRequest,
     MemoryGetRequest,
     ResponseFrame,
+    TranscriptsGetParams,
+    TranscriptsGetRequest,
     VoiceEndCallParams,
     VoiceEndCallRequest,
     VoiceHistoryParams,
@@ -40,6 +40,7 @@ from clea.core.protocol import (
 logger = logging.getLogger(__name__)
 
 _VOICE_COMPANION_SESSION_ID = "voice_companion"
+_ACTIVE_CHAT_HEADER = "## Active Focused Text Chat (Read-Only Context)"
 
 BASE_VOICE_SYSTEM_INSTRUCTION = (
     "You are Clea, a helpful, concise, natural-sounding personal desktop AI assistant "
@@ -49,28 +50,45 @@ BASE_VOICE_SYSTEM_INSTRUCTION = (
     "code-switching) when they mix both. Avoid overly formal or textbook Hindi unless requested.\n"
     "- Keep spoken replies crisp, conversational, and easy to follow out loud (no markdown lists "
     "or code blocks unless asked).\n"
-    "- Use `delegate_task` for desktop, file, system, or multi-step work; and use "
-    "`end_call` when the user asks to end the call.\n"
-    "- Cross-Chat Context & Tools:\n"
-    "  * If an Active Focused Text Chat section is provided in your context, treat it as "
-    "read-only awareness of what thread the user currently has open in the UI.\n"
-    "  * Use `search_conversations` whenever the user asks about exact commands, code, "
-    "decisions, or discussions from other chats or earlier in the Voice Companion log.\n"
-    "  * Use `post_to_active_chat` ONLY when the user explicitly asks to send, drop, paste, "
-    "write, or save something (such as code, commands, or a summary) into their open chat. "
-    "Never call `post_to_active_chat` unprompted; if no text chat is focused, let the user "
-    "know clearly so they can open a chat tab first.\n"
-    "- Screen Vision & Freshness Rules (CRITICAL):\n"
-    "  * NEVER answer questions about what is currently on the screen, which app is open, or "
+    "- Intent-to-Tool Routing Rules (CRITICAL — route by user intent, NEVER default to "
+    "screen capture):\n"
+    "  1. Visual / Active Screen Intent (`look_at_screen`, `watch_screen`):\n"
+    "     * Trigger ONLY when the user explicitly asks about what is currently visible on their "
+    "monitor, active window, open editor/browser tab, on-screen UI, or a visual error.\n"
+    "     * NEVER answer questions about what is currently on the screen, which app is open, or "
     "what code/UI text says from memory of screenshots earlier in the call. ALWAYS call "
     "`look_at_screen` again on EVERY turn that asks about the current screen or app state.\n"
-    "  * Prefer `look_at_screen(target='active_window', ...)` when reading code, editor tabs, "
+    "     * Prefer `look_at_screen(target='active_window', ...)` when reading code, editor tabs, "
     "terminal logs, or fine UI details so you receive a 1:1 native-resolution capture; use "
     "`target='full_screen'` only when the user asks about the whole desktop or multiple windows.\n"
-    "  * Trust the structured ground-truth window metadata returned with every screenshot "
+    "     * Trust the structured ground-truth window metadata returned with every screenshot "
     "(`active_app_name`, `active_process_name`, `active_window_title`, `captured_at`) instead "
     "of guessing the application name visually from dark-mode pixels. Only state visual details "
-    "you can actually read in the latest screenshot."
+    "you can actually read in the latest screenshot.\n"
+    "  2. Memory / Past Conversation Recall Intent (`search_conversations` & Memory Context):\n"
+    "     * Trigger whenever the user asks about past conversations, earlier decisions, "
+    "previous chats, stored facts, or project history—even if they describe the topic vaguely "
+    "without exact keywords. Check your injected Memory Context (long-term memory, Recent "
+    "Episodes, Recent Voice Companion History) and call `search_conversations` immediately with "
+    "concise topic keywords (retrying with broader/alternate keywords if needed).\n"
+    "     * HARD NEGATIVE RULE: NEVER call `look_at_screen` or `watch_screen` for memory or "
+    "past-chat questions, and NEVER tell the user to open or focus a chat on screen in order "
+    "to read its history.\n"
+    "  3. Clea App, Chat Output & Task Action Intent (`post_to_active_chat`, `delegate_task`, "
+    "`end_call`):\n"
+    "     * When the user explicitly asks to send, drop, paste, write, save, or summarize "
+    "output into their open Clea chat, route directly to `post_to_active_chat` rather than "
+    "checking the screen first. Never call `post_to_active_chat` unprompted.\n"
+    "     * Check `focused_chat_available` in Call Startup Runtime State (and treat any Active "
+    "Focused Text Chat section as read-only awareness of the currently open thread). If "
+    "`focused_chat_available` is `false`, NEVER claim a chat is focused and NEVER ask the user "
+    "to open or focus one on screen—use `search_conversations` for recall, or state clearly "
+    "that no text chat is currently focused if they ask to post into the active chat.\n"
+    "     * Use `delegate_task` for desktop, file, system, or multi-step background work, and "
+    "use `end_call` when the user asks to end the call.\n"
+    "  4. General Spoken Q&A:\n"
+    "     * Answer directly without calling any tool when neither screen vision, stored "
+    "history, nor app/system actions are needed."
 )
 
 
@@ -266,11 +284,118 @@ def _filter_supported_kwargs(
     return {k: v for k, v in kwargs.items() if v is not None and _accepts_kwarg(fn, k)}
 
 
-def build_voice_system_instruction(*, memory_context: str | None = None) -> str:
-    """Build the live voice system instruction with optional memory context."""
+def extract_focused_chat_from_context(
+    memory_context: str | None,
+) -> tuple[str | None, str | None]:
+    """Extract focused chat ID and title from rendered voice memory context."""
+    if not memory_context:
+        return None, None
+
+    lines = memory_context.splitlines()
+    start_idx: int | None = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].strip() == _ACTIVE_CHAT_HEADER:
+            start_idx = idx
+            break
+    if start_idx is None:
+        return None, None
+
+    chat_id: str | None = None
+    chat_title: str | None = None
+    for line in lines[start_idx + 1 :]:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            break
+        if stripped.startswith("Active Conversation ID:"):
+            raw_id = stripped.removeprefix("Active Conversation ID:").strip().strip("`").strip()
+            if raw_id and raw_id != _VOICE_COMPANION_SESSION_ID:
+                chat_id = " ".join(raw_id.split())
+        elif stripped.startswith("Title:"):
+            raw_title = stripped.removeprefix("Title:").strip()
+            if raw_title:
+                chat_title = " ".join(raw_title.split())
+
+    if not chat_id:
+        return None, None
+    return chat_id, chat_title
+
+
+def format_focus_state_context(
+    *,
+    focused_chat_available: bool,
+    focused_chat_id: str | None = None,
+    focused_chat_title: str | None = None,
+) -> str:
+    """Format deterministic runtime UI focus metadata for the voice startup prompt."""
+    clean_id = " ".join(focused_chat_id.split()) if focused_chat_id else ""
+    clean_title = " ".join(focused_chat_title.split()) if focused_chat_title else ""
+
+    if focused_chat_available and clean_id and clean_id != _VOICE_COMPANION_SESSION_ID:
+        lines = [
+            "## Call Startup Runtime State",
+            "focused_chat_available: true",
+            f"focused_chat_id: {clean_id}",
+            f"focused_chat_title: {clean_title or '(untitled)'}",
+        ]
+        return "\n".join(lines)
+
+    return "\n".join(
+        [
+            "## Call Startup Runtime State",
+            "focused_chat_available: false",
+            (
+                "Rule: No text chat is currently focused. NEVER claim a chat is focused, "
+                "NEVER ask the user to open or focus a chat, and NEVER call "
+                "`post_to_active_chat` or `look_at_screen` to find a conversation. "
+                "Use `search_conversations` for past chats or `delegate_task` for new tasks."
+            ),
+        ]
+    )
+
+
+def build_voice_system_instruction(
+    *,
+    memory_context: str | None = None,
+    focused_chat_available: bool | None = None,
+    focused_chat_id: str | None = None,
+    focused_chat_title: str | None = None,
+) -> str:
+    """Build the live voice system instruction with optional focus state and memory context."""
+    parts = [BASE_VOICE_SYSTEM_INSTRUCTION]
+
+    parsed_id, parsed_title = extract_focused_chat_from_context(memory_context)
+    clean_explicit_id = " ".join(focused_chat_id.split()) if focused_chat_id else None
+    effective_id = clean_explicit_id or parsed_id
+    if focused_chat_title is not None and focused_chat_title.strip():
+        effective_title: str | None = focused_chat_title
+    elif effective_id and parsed_id == effective_id:
+        effective_title = parsed_title
+    else:
+        effective_title = None
+
+    if focused_chat_available is not None:
+        parts.append(
+            format_focus_state_context(
+                focused_chat_available=focused_chat_available,
+                focused_chat_id=effective_id,
+                focused_chat_title=effective_title,
+            )
+        )
+    elif parsed_id:
+        parts.append(
+            format_focus_state_context(
+                focused_chat_available=True,
+                focused_chat_id=parsed_id,
+                focused_chat_title=parsed_title,
+            )
+        )
+    elif memory_context and memory_context.strip():
+        parts.append(format_focus_state_context(focused_chat_available=False))
+
     if memory_context and memory_context.strip():
-        return f"{BASE_VOICE_SYSTEM_INSTRUCTION}\n\n## Memory Context\n{memory_context.strip()}"
-    return BASE_VOICE_SYSTEM_INSTRUCTION
+        parts.append(f"## Memory Context\n{memory_context.strip()}")
+
+    return "\n\n".join(parts)
 
 
 async def load_voice_memory_context(
@@ -352,18 +477,16 @@ async def load_voice_memory_context(
     target_chat_id = active_conversation_id
     if target_chat_id and target_chat_id != _VOICE_COMPANION_SESSION_ID:
         try:
-            resume_res = await _run_request(
-                ConversationResumeRequest(
-                    params=ConversationResumeParams(session_id=target_chat_id)
-                ),
+            tr_res = await _run_request(
+                TranscriptsGetRequest(params=TranscriptsGetParams(session_id=target_chat_id)),
                 request_fn=request_fn,
                 daemon_url=daemon_url,
                 token=token,
                 data_dir=data_dir,
             )
-            chat_msgs = resume_res.get("messages") or []
+            chat_msgs = tr_res.get("messages") or []
             if isinstance(chat_msgs, list) and chat_msgs:
-                chat_title = str(resume_res.get("title") or "Conversation").strip()
+                chat_title = str(tr_res.get("title") or "Conversation").strip()
                 chat_lines = [
                     "## Active Focused Text Chat (Read-Only Context)",
                     f"Active Conversation ID: `{target_chat_id}`",
@@ -502,6 +625,9 @@ async def resolve_voice_system_instruction(
     memory_context: str | None = None,
     memory_loader: Callable[..., Awaitable[str]] | None = load_voice_memory_context,
     active_conversation_id: str | None = None,
+    focused_chat_available: bool | None = None,
+    focused_chat_id: str | None = None,
+    focused_chat_title: str | None = None,
     daemon_url: str | None = None,
     token: str | None = None,
     data_dir: Path | None = None,
@@ -509,20 +635,37 @@ async def resolve_voice_system_instruction(
 ) -> str:
     """Resolve the voice system instruction, safely falling back if memory is unready."""
     if memory_context is not None:
-        return build_voice_system_instruction(memory_context=memory_context)
+        return build_voice_system_instruction(
+            memory_context=memory_context,
+            focused_chat_available=focused_chat_available,
+            focused_chat_id=focused_chat_id,
+            focused_chat_title=focused_chat_title,
+        )
 
     if memory_loader is None:
-        return BASE_VOICE_SYSTEM_INSTRUCTION
+        return build_voice_system_instruction(
+            focused_chat_available=focused_chat_available,
+            focused_chat_id=focused_chat_id,
+            focused_chat_title=focused_chat_title,
+        )
 
+    target_chat_id = (
+        None if focused_chat_available is False else (active_conversation_id or focused_chat_id)
+    )
     context = await safe_load_voice_memory_context(
         loader=memory_loader,
-        active_conversation_id=active_conversation_id,
+        active_conversation_id=target_chat_id,
         daemon_url=daemon_url,
         token=token,
         data_dir=data_dir,
         request_fn=request_fn,
     )
-    return build_voice_system_instruction(memory_context=context)
+    return build_voice_system_instruction(
+        memory_context=context,
+        focused_chat_available=focused_chat_available,
+        focused_chat_id=focused_chat_id,
+        focused_chat_title=focused_chat_title,
+    )
 
 
 async def safe_store_voice_transcript(

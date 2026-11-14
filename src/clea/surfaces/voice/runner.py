@@ -27,9 +27,13 @@ from clea.core.protocol import (
     CallEndedEvent,
     CallStartedData,
     CallStartedEvent,
+    ChatFocusParams,
+    ChatFocusRequest,
     ResponseFrame,
     TranscriptData,
     TranscriptEvent,
+    TranscriptsGetParams,
+    TranscriptsGetRequest,
     UsageData,
     UsageEvent,
     VoiceDelegateTaskParams,
@@ -74,7 +78,9 @@ from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
 from clea.surfaces.voice.config import VoiceConfig, load_voice_config
 from clea.surfaces.voice.lock import VoiceInstanceLock
 from clea.surfaces.voice.memory_hooks import (
+    _VOICE_COMPANION_SESSION_ID,
     _daemon_rpc,
+    extract_focused_chat_from_context,
     normalize_voice_transcript,
     resolve_voice_system_instruction,
     safe_consolidate_voice_call,
@@ -628,10 +634,57 @@ class VoiceRunner:
                 except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
                     logger.warning("Could not notify daemon of call start: %s", exc)
 
-            # 2. Resolve system instruction safely
+            # 2. Resolve deterministic UI focus state for call startup context
+            parsed_id, parsed_title = extract_focused_chat_from_context(memory_context)
+            focused_chat_id = parsed_id
+            focused_chat_title = parsed_title
+            focused_chat_available = bool(parsed_id)
+            if self._daemon_ws is not None and self._daemon_listener_active:
+                try:
+                    focus_res = await self._request_daemon(
+                        ChatFocusRequest(params=ChatFocusParams())
+                    )
+                    raw_focus_id = focus_res.get("active_conversation_id")
+                    if (
+                        isinstance(raw_focus_id, str)
+                        and raw_focus_id.strip()
+                        and raw_focus_id.strip() != _VOICE_COMPANION_SESSION_ID
+                    ):
+                        focused_chat_id = " ".join(raw_focus_id.split())
+                        focused_chat_available = True
+                        focused_chat_title = parsed_title if parsed_id == focused_chat_id else None
+                    else:
+                        focused_chat_id = None
+                        focused_chat_title = None
+                        focused_chat_available = False
+                except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
+                    logger.warning("Could not query focused chat state: %s", exc)
+
+                if focused_chat_available and focused_chat_id and not focused_chat_title:
+                    try:
+                        tr_res = await self._request_daemon(
+                            TranscriptsGetRequest(
+                                params=TranscriptsGetParams(session_id=focused_chat_id)
+                            )
+                        )
+                        raw_title = tr_res.get("title")
+                        if isinstance(raw_title, str) and raw_title.strip():
+                            focused_chat_title = " ".join(raw_title.split())
+                    except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
+                        logger.debug(
+                            "Could not fetch focused chat title for %s: %s",
+                            focused_chat_id,
+                            exc,
+                        )
+
+            # 3. Resolve system instruction safely
             request_fn = self._request_daemon if self._daemon_listener_active else None
             system_instruction = await resolve_voice_system_instruction(
                 memory_context=memory_context,
+                active_conversation_id=focused_chat_id,
+                focused_chat_available=focused_chat_available,
+                focused_chat_id=focused_chat_id,
+                focused_chat_title=focused_chat_title,
                 daemon_url=self.daemon_url,
                 token=self.token,
                 data_dir=self.data_dir,
