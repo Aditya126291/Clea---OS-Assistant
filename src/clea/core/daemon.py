@@ -8,7 +8,7 @@ import logging
 import logging.handlers
 import os
 import time
-from collections.abc import Awaitable, Iterable
+from collections.abc import Awaitable, Coroutine, Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -181,10 +181,58 @@ class CleaDaemon:
             memory=agent.memory,
             provider=agent.provider,
             min_user_turns=int(os.environ.get("CLEA_CONSOLIDATION_MIN_TURNS", "2")),
+            llm_timeout_seconds=float(os.environ.get("CLEA_CONSOLIDATION_TIMEOUT_SECONDS", "60.0")),
         )
         self.consolidation_idle_seconds = 900.0
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
+        self._consolidation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._task_started_at: dict[str, str] = {}
+        self._consolidation_task_terminal: dict[str, bool] = {}
+        self._ended_voice_call_ids: set[str] = set()
         self._startup_task: asyncio.Task[None] | None = None
+
+    def _spawn_background_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Spawn a background asyncio.Task while retaining a strong reference until done."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error(
+                    "Unhandled exception in background task %s",
+                    done_task.get_name(),
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_on_done)
+        return task
+
+    def _reconcile_orphaned_tasks(self) -> list[dict[str, Any]]:
+        """Reconcile orphaned 'running' Activity/consolidation tasks from prior runs."""
+        reconciled_tasks = self.agent.memory.reconcile_orphaned_background_tasks(
+            reason="Interrupted by daemon restart"
+        )
+        reconciled_cons = self.consolidation.reconcile_orphaned_running(
+            reason="Interrupted by daemon restart"
+        )
+        if reconciled_tasks or reconciled_cons:
+            logger.warning(
+                "Reconciled %d orphaned background task(s) and %d consolidation session(s) "
+                "on startup",
+                len(reconciled_tasks),
+                len(reconciled_cons),
+            )
+        return reconciled_tasks
 
     @property
     def bound_port(self) -> int:
@@ -198,6 +246,7 @@ class CleaDaemon:
         self.agent.memory.ensure_initialized()
         self.agent.memory.migrate_legacy_daily_logs()
         self.agent.memory.purge_trash()
+        self._reconcile_orphaned_tasks()
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
             self._server = await serve(
@@ -209,7 +258,10 @@ class CleaDaemon:
             )
             self._instance_lock.update_port(host=self.host, port=self.bound_port)
             auth.write_token(self.token, self.token_file)
-            self._startup_task = asyncio.create_task(self._run_startup_consolidation())
+            self._startup_task = self._spawn_background_task(
+                self._run_startup_consolidation(),
+                name="startup-consolidation",
+            )
         except Exception:
             if self._server is not None:
                 self._server.close()
@@ -221,14 +273,24 @@ class CleaDaemon:
 
     async def stop(self) -> None:
         """Gracefully close the WebSocket server and remove the token and lock files."""
-        if self._startup_task is not None and not self._startup_task.done():
-            self._startup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._startup_task
+        pending_tasks = list(self._background_tasks)
         for t in list(self._idle_tasks.values()):
+            if t not in pending_tasks:
+                pending_tasks.append(t)
+        if self._startup_task is not None and self._startup_task not in pending_tasks:
+            pending_tasks.append(self._startup_task)
+        for t in pending_tasks:
             if not t.done():
                 t.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         self._idle_tasks.clear()
+        self._consolidation_tasks.clear()
+        self._background_tasks.clear()
+        with contextlib.suppress(Exception):
+            self.agent.memory.reconcile_orphaned_background_tasks(
+                reason="Interrupted by daemon shutdown"
+            )
 
         if self._server is not None:
             self._server.close()
@@ -308,16 +370,35 @@ class CleaDaemon:
         status: str,
         detail: str | None = None,
     ) -> None:
+        task_id = f"cons-{session_id}"
         title = self._format_session_consolidation_title(session_id)
         now_iso = _now_iso()
-        finished_at = now_iso if status in ("succeeded", "failed") else None
+        if status == "running":
+            self._task_started_at[task_id] = now_iso
+            self._consolidation_task_terminal[task_id] = False
+            started_at = now_iso
+        else:
+            started_at = self._task_started_at.pop(task_id, now_iso)
+            self._consolidation_task_terminal[task_id] = True
+        finished_at = now_iso if status in ("succeeded", "failed", "cancelled") else None
+        with contextlib.suppress(Exception):
+            self.agent.memory.record_background_task(
+                task_id=task_id,
+                title=title,
+                status=status,
+                started_at=started_at,
+                finished_at=finished_at,
+                kind="background_task",
+                detail=detail,
+                session_id=session_id,
+            )
         await self._broadcast(
             TaskStatusEvent(
                 data=TaskStatusData(
-                    task_id=f"cons-{session_id}",
+                    task_id=task_id,
                     title=title,
                     status=status,  # type: ignore[arg-type]
-                    started_at=now_iso,
+                    started_at=started_at,
                     finished_at=finished_at,
                     kind="background_task",
                     detail=detail,
@@ -332,6 +413,8 @@ class CleaDaemon:
                     sid, st, det
                 )
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Error during startup memory consolidation crash recovery")
 
@@ -341,6 +424,7 @@ class CleaDaemon:
             old_task.cancel()
 
         async def _timer() -> None:
+            task_id = f"cons-{session_id}"
             try:
                 await asyncio.sleep(self.consolidation_idle_seconds)
                 await self.consolidation.consolidate_session(
@@ -351,20 +435,39 @@ class CleaDaemon:
                     ),
                 )
             except asyncio.CancelledError:
-                pass
-            except Exception:
+                if self._consolidation_task_terminal.get(task_id) is False:
+                    with contextlib.suppress(Exception):
+                        await self._emit_consolidation_task_status(
+                            session_id, "failed", "Cancelled"
+                        )
+            except Exception as exc:
                 logger.exception("Error consolidating session %s after idle timeout", session_id)
+                if self._consolidation_task_terminal.get(task_id) is False:
+                    with contextlib.suppress(Exception):
+                        await self._emit_consolidation_task_status(session_id, "failed", str(exc))
             finally:
+                if self._consolidation_task_terminal.get(task_id) is False:
+                    with contextlib.suppress(Exception):
+                        await self._emit_consolidation_task_status(
+                            session_id, "failed", "Consolidation did not complete cleanly"
+                        )
                 self._idle_tasks.pop(session_id, None)
 
-        self._idle_tasks[session_id] = asyncio.create_task(_timer())
+        self._idle_tasks[session_id] = self._spawn_background_task(
+            _timer(),
+            name=f"cons-idle-{session_id}",
+        )
 
-    def _schedule_consolidation_now(self, session_id: str) -> None:
+    def _schedule_consolidation_now(self, session_id: str) -> asyncio.Task[None]:
         old_task = self._idle_tasks.pop(session_id, None)
         if old_task is not None and not old_task.done():
             old_task.cancel()
+        existing_now = self._consolidation_tasks.get(session_id)
+        if existing_now is not None and not existing_now.done():
+            return existing_now
 
         async def _run() -> None:
+            task_id = f"cons-{session_id}"
             try:
                 await self.consolidation.consolidate_session(
                     session_id,
@@ -373,10 +476,29 @@ class CleaDaemon:
                         session_id, st, det
                     ),
                 )
-            except Exception:
+            except asyncio.CancelledError:
+                if self._consolidation_task_terminal.get(task_id) is False:
+                    with contextlib.suppress(Exception):
+                        await self._emit_consolidation_task_status(
+                            session_id, "failed", "Cancelled"
+                        )
+            except Exception as exc:
                 logger.exception("Error consolidating session %s on end/switch", session_id)
+                if self._consolidation_task_terminal.get(task_id) is False:
+                    with contextlib.suppress(Exception):
+                        await self._emit_consolidation_task_status(session_id, "failed", str(exc))
+            finally:
+                if self._consolidation_task_terminal.get(task_id) is False:
+                    with contextlib.suppress(Exception):
+                        await self._emit_consolidation_task_status(
+                            session_id, "failed", "Consolidation did not complete cleanly"
+                        )
+                if self._consolidation_tasks.get(session_id) is asyncio.current_task():
+                    self._consolidation_tasks.pop(session_id, None)
 
-        asyncio.create_task(_run())
+        task = self._spawn_background_task(_run(), name=f"cons-now-{session_id}")
+        self._consolidation_tasks[session_id] = task
+        return task
 
     async def _handle_connection(self, ws: ServerConnection) -> None:
         conn = _Connection(ws)
@@ -453,7 +575,93 @@ class CleaDaemon:
             if purged > 0:
                 logger.info("Purged %d transcripts from trash", purged)
 
-        asyncio.create_task(_purge_after_delay())
+        self._spawn_background_task(_purge_after_delay(), name="trash-purge")
+
+    async def _broadcast_conversation_updated(self, session_id: str) -> None:
+        tr = self.agent.memory.get_transcript(session_id)
+        if not tr:
+            return
+        msgs = tr.get("messages", [])
+        await self._broadcast(
+            ConversationUpdatedEvent(
+                data=ConversationUpdatedData(
+                    session_id=session_id,
+                    title=tr.get("title"),
+                    updated_at=tr.get("updated_at") or tr.get("started_at"),
+                    turns=(len(msgs) + 1) // 2,
+                )
+            )
+        )
+
+    def _persist_voice_transcript(
+        self,
+        call_id: str,
+        transcript: list[dict[str, Any]] | None,
+    ) -> bool:
+        """Persist a non-empty voice call transcript chronologically into History.
+
+        Returns True if one or more messages were newly persisted.
+        """
+        if not transcript:
+            return False
+
+        cleaned: list[tuple[str, str, datetime]] = []
+        first_user_text: str | None = None
+        fallback_dt: datetime | None = None
+
+        for entry in transcript:
+            if not isinstance(entry, dict):
+                continue
+            raw_role = str(entry.get("role", "assistant")).strip().lower()
+            role = raw_role if raw_role in ("user", "assistant") else "assistant"
+            text = str(entry.get("text", "")).strip()
+            if not text:
+                continue
+            dt: datetime | None = None
+            raw_ts = entry.get("timestamp")
+            if isinstance(raw_ts, str) and raw_ts.strip():
+                with contextlib.suppress(ValueError):
+                    parsed = datetime.fromisoformat(raw_ts.strip())
+                    dt = parsed if parsed.tzinfo is not None else parsed.astimezone()
+            if dt is None:
+                dt = datetime.now().astimezone()
+            if fallback_dt is None:
+                fallback_dt = dt
+            if role == "user" and first_user_text is None:
+                first_user_text = text
+            cleaned.append((role, text, dt))
+
+        if not cleaned:
+            return False
+
+        # Ensure monotonic chronological order
+        for i in range(1, len(cleaned)):
+            prev_dt = cleaned[i - 1][2]
+            curr_role, curr_text, curr_dt = cleaned[i]
+            if curr_dt < prev_dt:
+                cleaned[i] = (curr_role, curr_text, prev_dt)
+
+        existing = self.agent.memory.get_transcript(call_id)
+        existing_count = len(existing.get("messages", [])) if existing else 0
+        new_entries = cleaned[existing_count:]
+        if not new_entries:
+            return False
+
+        if first_user_text:
+            title = " ".join(first_user_text.split())
+        else:
+            ref_dt = fallback_dt or datetime.now().astimezone()
+            title = f"Voice call ({ref_dt.astimezone().strftime('%H:%M')})"
+
+        for role, text, dt in new_entries:
+            self.agent.memory.append_transcript_message(
+                session_id=call_id,
+                role=role,
+                text=text,
+                title=title,
+                timestamp=dt,
+            )
+        return True
 
     def _audit_log(self, action: str, **details: Any) -> None:
         try:
@@ -1063,6 +1271,40 @@ class CleaDaemon:
                 return
             if self._voice_call_id is None or self._call_state == "idle":
                 if req.params.call_id is not None:
+                    req_call_id = req.params.call_id
+                    if (
+                        req.params.reason == "transcript_sync"
+                        and req_call_id in self._ended_voice_call_ids
+                    ):
+                        persisted = self._persist_voice_transcript(
+                            req_call_id, req.params.transcript
+                        )
+                        await self._respond(
+                            ws,
+                            req,
+                            METHOD_RESULTS[method](
+                                call_id=req_call_id, call_state="idle", voice_state="idle"
+                            ),
+                        )
+                        if persisted:
+                            await self._broadcast_conversation_updated(req_call_id)
+                        return
+                    if req.params.reason == "consolidate" and (
+                        req_call_id in self._ended_voice_call_ids
+                        or self.agent.memory.get_transcript(req_call_id) is not None
+                    ):
+                        tr = self.agent.memory.get_transcript(req_call_id)
+                        if tr and tr.get("messages"):
+                            self._schedule_consolidation_now(req_call_id)
+                        self._ended_voice_call_ids.discard(req_call_id)
+                        await self._respond(
+                            ws,
+                            req,
+                            METHOD_RESULTS[method](
+                                call_id=req_call_id, call_state="idle", voice_state="idle"
+                            ),
+                        )
+                        return
                     await self._respond(ws, req, error="Unknown call_id.")
                     return
                 await self._respond(
@@ -1072,6 +1314,9 @@ class CleaDaemon:
                 )
                 return
             ended_id = self._voice_call_id
+            if len(self._ended_voice_call_ids) >= 64:
+                self._ended_voice_call_ids.clear()
+            self._ended_voice_call_ids.add(ended_id)
             duration_seconds = (
                 round(max(0.0, time.monotonic() - self._call_started_monotonic), 3)
                 if self._call_started_monotonic is not None
@@ -1084,17 +1329,12 @@ class CleaDaemon:
             self._screen_capture_active = False
             self._screen_capture_target = None
 
-            # Persist transcript to logs/transcripts/ and schedule consolidation if provided
-            if getattr(req.params, "transcript", None):
-                for entry in req.params.transcript:
-                    role = entry.get("role", "assistant")
-                    text = str(entry.get("text", "")).strip()
-                    if text:
-                        self.agent.memory.append_transcript_message(
-                            session_id=ended_id,
-                            role=role,
-                            text=text,
-                        )
+            # Persist transcript to logs/transcripts/ and schedule consolidation if non-empty
+            persisted = self._persist_voice_transcript(
+                ended_id,
+                getattr(req.params, "transcript", None),
+            )
+            if persisted and req.params.reason != "transcript_sync":
                 self._schedule_consolidation_now(ended_id)
 
             await self._broadcast(
@@ -1114,6 +1354,8 @@ class CleaDaemon:
                 req,
                 METHOD_RESULTS[method](call_id=ended_id, call_state="idle", voice_state="idle"),
             )
+            if persisted:
+                await self._broadcast_conversation_updated(ended_id)
         elif method == "voice.delegate_task":
             description = req.params.description.strip()
             if not description:
@@ -1390,6 +1632,18 @@ class CleaDaemon:
         pending_approval_id: str | None = None
 
         async def task_status(status: str, detail: str | None = None) -> None:
+            finished_at = None if status == "running" else _now_iso()
+            with contextlib.suppress(Exception):
+                self.agent.memory.record_background_task(
+                    task_id=req.id,
+                    title=title,
+                    status=status,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    kind="agent_run",
+                    detail=detail,
+                    session_id=session.id,
+                )
             await self._broadcast(
                 TaskStatusEvent(
                     request_id=req.id,
@@ -1399,7 +1653,7 @@ class CleaDaemon:
                         title=title,
                         status=status,  # type: ignore[arg-type]
                         started_at=started_at,
-                        finished_at=None if status == "running" else _now_iso(),
+                        finished_at=finished_at,
                         kind="agent_run",
                         detail=detail,
                     ),
