@@ -338,7 +338,7 @@ async def test_focused_chat_context_injection_at_call_start(tmp_path: Path) -> N
         assert len(chat_tr["messages"]) == 2
 
         # User navigates away to blank/activity/settings
-        clear_focus = await _send_rpc(ws, ChatFocusRequest(params=ChatFocusParams(session_id=None)))
+        clear_focus = await _send_rpc(ws, ChatFocusRequest(params=ChatFocusParams(clear=True)))
         assert clear_focus.ok
         assert clear_focus.result["active_conversation_id"] is None
 
@@ -524,3 +524,206 @@ def test_voice_companion_rolling_context_tail_sizing(tmp_path: Path) -> None:
     assert "Voice turn #30" in ctx
     assert "Voice turn #10" not in ctx  # older turns rolling-trimmed
     assert "Voice turn #5" not in ctx
+
+
+# --- 6. Robustness & Edge Cases: Chat Focus Safety, Deletion, Tool Search & Multi-KB Code ---
+
+
+async def test_chat_focus_query_safety_and_voice_companion_rejection(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    provider = FakeConsolidationProvider()
+    daemon: CleaDaemon = build_daemon(host="127.0.0.1", port=0, provider=provider, memory=mem)
+    await daemon.start()
+
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+    async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+        # 6.1 Set active chat
+        set_res = await _send_rpc(ws, ChatFocusRequest(params=ChatFocusParams(session_id="chat-1")))
+        assert set_res.ok
+        assert set_res.result["active_conversation_id"] == "chat-1"
+
+        # 6.2 Query active chat without params (should NOT clear active chat)
+        query_res = await _send_rpc(ws, ChatFocusRequest(params=ChatFocusParams()))
+        assert query_res.ok
+        assert query_res.result["active_conversation_id"] == "chat-1"
+
+        # 6.3 Attempt to set voice_companion as focused chat (should be rejected/cleared)
+        vc_focus_res = await _send_rpc(
+            ws, ChatFocusRequest(params=ChatFocusParams(session_id=VOICE_COMPANION_SESSION_ID))
+        )
+        assert vc_focus_res.ok
+        assert vc_focus_res.result["active_conversation_id"] is None
+
+    await daemon.stop()
+
+
+async def test_conversation_deletion_clears_active_focused_chat(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    mem.append_transcript_message(
+        session_id="chat-to-delete",
+        role="user",
+        text="Temporary conversation to delete.",
+    )
+    provider = FakeConsolidationProvider()
+    daemon: CleaDaemon = build_daemon(host="127.0.0.1", port=0, provider=provider, memory=mem)
+    await daemon.start()
+
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+    async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+        from clea.core.protocol import ConversationDeleteParams, ConversationDeleteRequest
+
+        # Focus the chat
+        await _send_rpc(ws, ChatFocusRequest(params=ChatFocusParams(session_id="chat-to-delete")))
+        assert daemon._active_conversation_id == "chat-to-delete"
+
+        # Delete it via daemon RPC
+        del_res = await _send_rpc(
+            ws,
+            ConversationDeleteRequest(
+                params=ConversationDeleteParams(session_id="chat-to-delete", delete_episodes=False)
+            ),
+        )
+        assert del_res.ok
+
+        # Active conversation id must be reset to None (no zombie focused chat)
+        assert daemon._active_conversation_id is None
+
+    await daemon.stop()
+
+
+async def test_post_to_active_chat_synchronizes_in_memory_session(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    chat_sid = "chat-sync-test"
+    mem.append_transcript_message(
+        session_id=chat_sid,
+        role="user",
+        text="What is the plan?",
+    )
+    provider = FakeConsolidationProvider()
+    daemon: CleaDaemon = build_daemon(host="127.0.0.1", port=0, provider=provider, memory=mem)
+    await daemon.start()
+
+    # Pre-load session into memory
+    active_sess = daemon.sessions.get_or_create(chat_sid)
+    assert len(active_sess.messages) == 0
+
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+    async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+        await _send_rpc(ws, ChatFocusRequest(params=ChatFocusParams(session_id=chat_sid)))
+
+        # Post multi-kilobyte code block with markdown table
+        multi_kb_code = "```python\n" + "# Large generated script\n" + ("x = 1\n" * 500) + "```"
+        post_res = await _send_rpc(
+            ws,
+            VoicePostToActiveChatRequest(
+                params=VoicePostToActiveChatParams(content=multi_kb_code, label="Generated Script")
+            ),
+        )
+        assert post_res.ok
+        assert post_res.result["ok"] is True
+
+        # In-memory session messages list must be updated
+        assert len(active_sess.messages) == 1
+        assert active_sess.messages[0].role == "assistant"
+        assert "Generated Script" in active_sess.messages[0].content
+        assert "x = 1" in active_sess.messages[0].content
+
+        # On-disk transcript must have the turn
+        disk_tr = mem.get_transcript(chat_sid)
+        assert disk_tr is not None
+        assert len(disk_tr["messages"]) == 2
+
+    await daemon.stop()
+
+
+def test_search_conversations_tool_calls_and_title_dedup(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    # Chat 1: Tool execution with curl command and output
+    mem.append_transcript_message(
+        session_id="chat-curl",
+        role="assistant",
+        text="I queried the status endpoint for you.",
+        tool_calls=[
+            {
+                "name": "run_command",
+                "arguments": {"command": "curl -s http://localhost:8080/v1/health"},
+                "output": '{"status": "UP", "database": "connected"}',
+            }
+        ],
+        title="API Health Check",
+    )
+
+    # Chat 2: Long conversation matching title "API Health Check" but no message matching curl
+    for i in range(10):
+        mem.append_transcript_message(
+            session_id="chat-long-title",
+            role="user" if i % 2 == 0 else "assistant",
+            text=f"General discussion message {i}",
+            title="API Health Check",
+        )
+
+    # 1. Search for command inside tool call arguments
+    hits = mem.search_conversations(query="curl -s http://localhost:8080/v1/health", limit=5)
+    assert len(hits) >= 1
+    assert hits[0]["session_id"] == "chat-curl"
+    assert "curl -s http://localhost:8080/v1/health" in hits[0]["snippet"]
+
+    # 2. Search for output inside tool call
+    hits_out = mem.search_conversations(query="database connected", limit=5)
+    assert len(hits_out) >= 1
+    assert hits_out[0]["session_id"] == "chat-curl"
+
+    # 3. Title match does not flood 10 messages from chat-long-title
+    hits_title = mem.search_conversations(query="API Health Check", limit=5)
+    long_title_hits = [h for h in hits_title if h["session_id"] == "chat-long-title"]
+    assert len(long_title_hits) == 1  # exactly 1 representative hit, not 10!
+
+
+async def test_safe_load_voice_memory_context_injects_focused_chat(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    chat_sid = "chat-safe-loader"
+    mem.append_transcript_message(
+        session_id=chat_sid,
+        role="user",
+        text="Let's build a Redis cache wrapper.",
+        title="Redis Cache Wrapper",
+    )
+    mem.append_transcript_message(
+        session_id=chat_sid,
+        role="assistant",
+        text="Created cache/redis.py with TTL support.",
+        title="Redis Cache Wrapper",
+    )
+
+    provider = FakeConsolidationProvider()
+    daemon: CleaDaemon = build_daemon(host="127.0.0.1", port=0, provider=provider, memory=mem)
+    await daemon.start()
+
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+    async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+        from clea.surfaces.voice.memory_hooks import safe_load_voice_memory_context
+
+        # Set focus
+        await _send_rpc(ws, ChatFocusRequest(params=ChatFocusParams(session_id=chat_sid)))
+
+        # Call safe_load_voice_memory_context with daemon connection and active conversation
+        context = await safe_load_voice_memory_context(
+            active_conversation_id=chat_sid,
+            daemon_url=url,
+            token=daemon.token,
+            data_dir=tmp_path,
+        )
+        assert context is not None
+        assert "## Active Focused Text Chat (Read-Only Context)" in context
+        assert chat_sid in context
+        assert "Redis Cache Wrapper" in context
+        assert "Let's build a Redis cache wrapper." in context
+
+    await daemon.stop()

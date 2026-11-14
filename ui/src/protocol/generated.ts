@@ -59,6 +59,7 @@ export type Id3 = string;
 export type SessionId3 = string | null;
 export type Method3 = "chat.focus";
 export type SessionId4 = string | null;
+export type Clear = boolean;
 export type FrameType4 = "request";
 export type Id4 = string;
 export type SessionId5 = string | null;
@@ -648,6 +649,7 @@ export interface ChatFocusRequest {
 }
 export interface ChatFocusParams {
   session_id?: SessionId4;
+  clear?: Clear;
 }
 export interface ApprovalRespondRequest {
   frame_type?: FrameType4;

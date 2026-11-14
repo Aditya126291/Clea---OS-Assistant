@@ -50,6 +50,7 @@ class ChatSendParams(_Model):
 
 class ChatFocusParams(_Model):
     session_id: str | None = None
+    clear: bool = False
 
 
 class ApprovalRespondParams(_Model):

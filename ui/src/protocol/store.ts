@@ -177,7 +177,9 @@ let undoToastTimer: ReturnType<typeof setTimeout> | null = null;
 
 function notifyChatFocus(sessionId: string | null): void {
   if (activeClient?.isConnected) {
-    void activeClient.request("chat.focus", { session_id: sessionId }).catch(() => {});
+    void activeClient
+      .request("chat.focus", sessionId ? { session_id: sessionId, clear: false } : { clear: true })
+      .catch(() => {});
   }
 }
 
@@ -263,6 +265,11 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         }));
         const currentSid = get().sessionId;
         if (currentSid) {
+          if (get().activeView === "chat") {
+            notifyChatFocus(currentSid);
+          } else {
+            notifyChatFocus(null);
+          }
           void activeClient
             ?.request("conversation.resume", { session_id: currentSid })
             .then((res) => {

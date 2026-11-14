@@ -737,17 +737,21 @@ class CleaDaemon:
                 return
             conn.spawn(self._run_chat(conn, req, text))
         elif method == "chat.focus":
-            target_id = req.params.session_id
-            if isinstance(target_id, str):
-                target_id = target_id.strip() or None
-            if target_id is not None:
-                try:
-                    self.agent.memory.validate_session_id(target_id)
-                    self._active_conversation_id = target_id
-                except ValueError:
-                    self._active_conversation_id = None
-            else:
+            if req.params.clear:
                 self._active_conversation_id = None
+            elif req.params.session_id is not None:
+                target_id = req.params.session_id.strip() or None
+                if target_id is not None:
+                    try:
+                        self.agent.memory.validate_session_id(target_id)
+                        if target_id == VOICE_COMPANION_SESSION_ID:
+                            self._active_conversation_id = None
+                        else:
+                            self._active_conversation_id = target_id
+                    except ValueError:
+                        self._active_conversation_id = None
+                else:
+                    self._active_conversation_id = None
             await self._respond(
                 ws,
                 req,
@@ -1149,6 +1153,8 @@ class CleaDaemon:
                 delete_episodes=delete_episodes,
             )
             self.sessions._sessions.pop(session_id, None)
+            if self._active_conversation_id == session_id:
+                self._active_conversation_id = None
             for c in list(self._connections):
                 if c.current_session_id == session_id:
                     c.current_session_id = None
@@ -1180,6 +1186,7 @@ class CleaDaemon:
             count = self.agent.memory.delete_all_transcripts()
             self._audit_log("conversation_delete_all", deleted_count=count)
             self.sessions._sessions.clear()
+            self._active_conversation_id = None
             for c in list(self._connections):
                 c.current_session_id = None
 
@@ -1448,15 +1455,19 @@ class CleaDaemon:
                     content=content,
                     label=label,
                 )
+                active_sess = self.sessions.get(self._active_conversation_id)
+                if active_sess is not None:
+                    active_sess.messages.append(Message(role="assistant", content=res["message"]))
                 await self._broadcast(
                     ConversationUpdatedEvent(
+                        session_id=self._active_conversation_id,
                         data=ConversationUpdatedData(
                             session_id=self._active_conversation_id,
                             title=res["title"],
                             updated_at=res["updated_at"],
                             turns=res["turns"],
                             assistant_message=res["message"],
-                        )
+                        ),
                     )
                 )
                 await self._respond(

@@ -678,6 +678,15 @@ class MemoryStore:
                 for msg in recent_chat_msgs:
                     speaker = "User" if msg.get("role") == "user" else "Clea"
                     text = str(msg.get("text", "")).strip()
+                    if not text:
+                        tool_calls = msg.get("tool_calls") or []
+                        if tool_calls:
+                            names = [
+                                str(tc.get("name", "tool"))
+                                for tc in tool_calls
+                                if isinstance(tc, dict)
+                            ]
+                            text = f"[Executed {', '.join(names)}]"
                     if text:
                         chat_lines.append(f"- **{speaker}:** {text}")
                 extra_sections.append("\n".join(chat_lines))
@@ -1347,11 +1356,25 @@ class MemoryStore:
             title_lower = title.lower()
             title_exact = q_lower in title_lower
             title_token_hits = sum(1 for tok in q_tokens if tok in title_lower)
+            file_had_text_match = False
 
             for msg in tr.get("messages", []):
                 text = str(msg.get("text") or "").strip()
-                if not text:
+                tool_calls = msg.get("tool_calls") or []
+                tool_parts: list[str] = []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    tname = str(tc.get("name") or "")
+                    targs = tc.get("arguments")
+                    targs_str = json.dumps(targs, ensure_ascii=False) if targs else ""
+                    tout = str(tc.get("output") or "")
+                    tool_parts.append(f"{tname} {targs_str} {tout[:400]}")
+                tool_text = " ".join(tool_parts).strip()
+                searchable_text = f"{text} {tool_text}".strip() if tool_text else text
+                if not searchable_text:
                     continue
+
                 role = str(msg.get("role") or "assistant")
                 ts = str(
                     msg.get("timestamp")
@@ -1359,44 +1382,69 @@ class MemoryStore:
                     or tr.get("started_at")
                     or ""
                 )
-                text_lower = text.lower()
+                text_lower = searchable_text.lower()
                 text_exact = q_lower in text_lower
                 text_token_hits = sum(1 for tok in q_tokens if tok in text_lower)
-                combined_token_hits = sum(
-                    1 for tok in q_tokens if (tok in text_lower or tok in title_lower)
-                )
 
                 matched = False
                 score = 0
                 if text_exact:
                     matched = True
                     score += 100
-                if title_exact:
+                elif q_tokens and text_token_hits == len(q_tokens):
                     matched = True
                     score += 50
-                if q_tokens and combined_token_hits == len(q_tokens):
+                elif len(q_tokens) >= 2 and text_token_hits >= max(1, (len(q_tokens) + 1) // 2):
                     matched = True
-                    score += 30
-                elif len(q_tokens) >= 2 and combined_token_hits >= max(2, (len(q_tokens) + 1) // 2):
-                    matched = True
-                    score += 15
+                    score += 25
 
-                if not matched:
-                    continue
+                if matched:
+                    file_had_text_match = True
+                    score += text_token_hits * 10 + (30 if title_exact else title_token_hits * 10)
+                    snippet = _build_search_snippet(searchable_text, q_lower, q_tokens)
+                    hit: dict[str, Any] = {
+                        "session_id": sid,
+                        "title": title,
+                        "role": role,
+                        "timestamp": ts,
+                        "snippet": snippet,
+                        "source": source,
+                    }
+                    if msg.get("call_id"):
+                        hit["call_id"] = str(msg["call_id"])
+                    scored_hits.append((score, ts, hit))
 
-                score += text_token_hits * 10 + title_token_hits * 5
-                snippet = _build_search_snippet(text, q_lower, q_tokens)
-                hit: dict[str, Any] = {
-                    "session_id": sid,
-                    "title": title,
-                    "role": role,
-                    "timestamp": ts,
-                    "snippet": snippet,
-                    "source": source,
-                }
-                if msg.get("call_id"):
-                    hit["call_id"] = str(msg["call_id"])
-                scored_hits.append((score, ts, hit))
+            if not file_had_text_match and (
+                title_exact or (q_tokens and title_token_hits == len(q_tokens))
+            ):
+                msgs = tr.get("messages", [])
+                rep_msg = next(
+                    (
+                        m
+                        for m in msgs
+                        if m.get("role") == "user" and str(m.get("text", "")).strip()
+                    ),
+                    None,
+                )
+                if rep_msg is None and msgs:
+                    rep_msg = msgs[0]
+                if rep_msg:
+                    rep_text = str(rep_msg.get("text") or rep_msg.get("role") or "").strip()
+                    rep_role = str(rep_msg.get("role") or "user")
+                    rep_ts = str(rep_msg.get("timestamp") or tr.get("started_at") or "")
+                    score = 60 + title_token_hits * 10
+                    snippet = _build_search_snippet(rep_text or title, q_lower, q_tokens)
+                    rep_hit = {
+                        "session_id": sid,
+                        "title": title,
+                        "role": rep_role,
+                        "timestamp": rep_ts,
+                        "snippet": snippet,
+                        "source": source,
+                    }
+                    if rep_msg.get("call_id"):
+                        rep_hit["call_id"] = str(rep_msg["call_id"])
+                    scored_hits.append((score, rep_ts, rep_hit))
 
         scored_hits.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [item[2] for item in scored_hits[:cap]]

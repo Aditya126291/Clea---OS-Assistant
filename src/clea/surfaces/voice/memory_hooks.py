@@ -25,6 +25,8 @@ import websockets
 from clea.core import auth
 from clea.core.protocol import (
     BaseRequest,
+    ConversationResumeParams,
+    ConversationResumeRequest,
     MemoryEpisodesRequest,
     MemoryGetRequest,
     ResponseFrame,
@@ -36,6 +38,8 @@ from clea.core.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+_VOICE_COMPANION_SESSION_ID = "voice_companion"
 
 BASE_VOICE_SYSTEM_INSTRUCTION = (
     "You are Clea, a helpful, concise, natural-sounding personal desktop AI assistant "
@@ -271,12 +275,13 @@ def build_voice_system_instruction(*, memory_context: str | None = None) -> str:
 
 async def load_voice_memory_context(
     *,
+    active_conversation_id: str | None = None,
     daemon_url: str | None = None,
     token: str | None = None,
     data_dir: Path | None = None,
     request_fn: Callable[[BaseRequest], Awaitable[dict[str, Any]]] | None = None,
 ) -> str:
-    """Load long-term memory and recent episode summaries from the Clea daemon."""
+    """Load long-term memory, episode summaries, voice tail, and active text chat context."""
     mem_result = await _run_request(
         MemoryGetRequest(),
         request_fn=request_fn,
@@ -343,6 +348,48 @@ async def load_voice_memory_context(
                 parts.append("\n".join(vc_lines))
     except Exception as exc:  # noqa: BLE001
         logger.debug("Skipping optional Voice Companion tail for voice context: %s", exc)
+
+    target_chat_id = active_conversation_id
+    if target_chat_id and target_chat_id != _VOICE_COMPANION_SESSION_ID:
+        try:
+            resume_res = await _run_request(
+                ConversationResumeRequest(
+                    params=ConversationResumeParams(session_id=target_chat_id)
+                ),
+                request_fn=request_fn,
+                daemon_url=daemon_url,
+                token=token,
+                data_dir=data_dir,
+            )
+            chat_msgs = resume_res.get("messages") or []
+            if isinstance(chat_msgs, list) and chat_msgs:
+                chat_title = str(resume_res.get("title") or "Conversation").strip()
+                chat_lines = [
+                    "## Active Focused Text Chat (Read-Only Context)",
+                    f"Active Conversation ID: `{target_chat_id}`",
+                    f"Title: {chat_title}",
+                    "Recent turns in this open text chat:",
+                ]
+                for msg in chat_msgs[-10:]:
+                    if not isinstance(msg, dict):
+                        continue
+                    speaker = "User" if msg.get("role") == "user" else "Clea"
+                    text = str(msg.get("text") or "").strip()
+                    if not text:
+                        tool_calls = msg.get("tool_calls") or []
+                        if tool_calls:
+                            names = [
+                                str(tc.get("name", "tool"))
+                                for tc in tool_calls
+                                if isinstance(tc, dict)
+                            ]
+                            text = f"[Executed {', '.join(names)}]"
+                    if text:
+                        chat_lines.append(f"- **{speaker}:** {text}")
+                if len(chat_lines) > 4:
+                    parts.append("\n".join(chat_lines))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skipping active text chat context for voice: %s", exc)
 
     return "\n\n".join(parts)
 
@@ -417,6 +464,7 @@ async def consolidate_voice_call(
 async def safe_load_voice_memory_context(
     *,
     loader: Callable[..., Awaitable[str]] = load_voice_memory_context,
+    active_conversation_id: str | None = None,
     daemon_url: str | None = None,
     token: str | None = None,
     data_dir: Path | None = None,
@@ -426,6 +474,7 @@ async def safe_load_voice_memory_context(
     extra = _filter_supported_kwargs(
         loader,
         {
+            "active_conversation_id": active_conversation_id,
             "daemon_url": daemon_url,
             "token": token,
             "data_dir": data_dir,
@@ -452,6 +501,7 @@ async def resolve_voice_system_instruction(
     *,
     memory_context: str | None = None,
     memory_loader: Callable[..., Awaitable[str]] | None = load_voice_memory_context,
+    active_conversation_id: str | None = None,
     daemon_url: str | None = None,
     token: str | None = None,
     data_dir: Path | None = None,
@@ -466,6 +516,7 @@ async def resolve_voice_system_instruction(
 
     context = await safe_load_voice_memory_context(
         loader=memory_loader,
+        active_conversation_id=active_conversation_id,
         daemon_url=daemon_url,
         token=token,
         data_dir=data_dir,
