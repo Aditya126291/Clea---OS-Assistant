@@ -23,6 +23,7 @@ from clea.surfaces.voice.backends.base import (
     UsageUpdateEvent,
     VoiceSessionConfig,
     VoiceToolDeclaration,
+    VoiceToolMediaPart,
     VoiceToolResponse,
 )
 from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
@@ -287,11 +288,82 @@ async def test_gemini_backend_send_tool_responses_maps_scheduling() -> None:
     assert len(sent_list) == 3
     assert sent_list[0].id == "call-1"
     assert sent_list[0].scheduling == types.FunctionResponseScheduling.WHEN_IDLE
+    assert sent_list[0].parts is None
     assert sent_list[1].id == "call-2"
     assert sent_list[1].scheduling == types.FunctionResponseScheduling.INTERRUPT
     assert sent_list[2].id == "call-3"
     assert sent_list[2].scheduling == types.FunctionResponseScheduling.SILENT
     assert sent_list[2].response == {"error": "denied"}
+
+    await backend.close()
+
+
+async def test_gemini_backend_send_tool_responses_attaches_media_parts() -> None:
+    mock_session = MagicMock()
+    mock_session.send_tool_response = AsyncMock()
+    mock_session.send_realtime_input = AsyncMock()
+
+    async def empty_recv() -> Any:
+        if False:
+            yield None
+
+    mock_session.receive.side_effect = empty_recv
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    backend = GeminiLiveBackend(api_key="k", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="s"))
+
+    responses = [
+        VoiceToolResponse(
+            call_id="call-img-1",
+            name="look_at_screen",
+            response={"status": "success", "active_app_name": "Google Antigravity"},
+            media_parts=[
+                VoiceToolMediaPart(data=b"jpeg-desktop", mime_type="image/jpeg"),
+                VoiceToolMediaPart(data=b"png-window", mime_type="image/png"),
+            ],
+            scheduling="when_idle",
+        ),
+        VoiceToolResponse(
+            call_id="call-img-err",
+            name="look_at_screen",
+            response={"error": "blocked"},
+            media_parts=[VoiceToolMediaPart(data=b"should-not-send", mime_type="image/png")],
+            is_error=True,
+            scheduling="when_idle",
+        ),
+    ]
+
+    await backend.send_tool_responses(responses)
+    assert mock_session.send_realtime_input.call_count == 0
+    assert mock_session.send_tool_response.called
+
+    sent_list: list[types.FunctionResponse] = (
+        mock_session.send_tool_response.call_args.kwargs["function_responses"]
+    )
+    assert len(sent_list) == 2
+
+    ok_resp = sent_list[0]
+    assert ok_resp.id == "call-img-1"
+    assert ok_resp.parts is not None
+    assert len(ok_resp.parts) == 2
+    assert ok_resp.parts[0].inline_data == types.FunctionResponseBlob(
+        mime_type="image/jpeg",
+        data=b"jpeg-desktop",
+    )
+    assert ok_resp.parts[1].inline_data == types.FunctionResponseBlob(
+        mime_type="image/png",
+        data=b"png-window",
+    )
+
+    err_resp = sent_list[1]
+    assert err_resp.id == "call-img-err"
+    assert err_resp.response == {"error": "blocked"}
+    assert err_resp.parts is None
 
     await backend.close()
 

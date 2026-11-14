@@ -452,12 +452,24 @@ class GeminiLiveBackend(VoiceBackend):
             resp_payload = (
                 r.response if not r.is_error else {"error": r.response.get("error", "Error")}
             )
+            parts: list[types.FunctionResponsePart] | None = None
+            if r.media_parts and not r.is_error:
+                parts = [
+                    types.FunctionResponsePart(
+                        inline_data=types.FunctionResponseBlob(
+                            mime_type=part.mime_type,
+                            data=part.data,
+                        )
+                    )
+                    for part in r.media_parts
+                ]
             formatted.append(
                 types.FunctionResponse(
                     id=r.call_id,
                     name=r.name,
                     response=resp_payload,
                     scheduling=sched,
+                    parts=parts,
                 )
             )
         try:

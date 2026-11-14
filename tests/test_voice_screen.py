@@ -203,13 +203,19 @@ async def test_voice_runner_look_at_screen_success(tmp_path: Path) -> None:
     )
     await runner._handle_tool_call(call_ev, backend)
 
-    # Frame sent to backend
-    assert len(backend.sent_video_frames) == 1
+    # Frame attached atomically to tool response (not buffered via send_video_frame)
+    assert len(backend.sent_video_frames) == 0
     assert len(backend.sent_tool_responses) == 1
     resp = backend.sent_tool_responses[0]
     assert resp.call_id == "call-look-1"
     assert resp.response["status"] == "success"
     assert resp.response["target"] == "full_screen"
+    assert resp.response["frames_sent"] == 1
+    assert resp.response["image_order"] == ["full_screen"]
+    assert len(resp.media_parts) == 1
+    assert resp.media_parts[0].mime_type == "image/jpeg"
+    decoded = Image.open(io.BytesIO(resp.media_parts[0].data))
+    assert decoded.size == (640, 480)
 
     await runner.stop()
 
@@ -503,11 +509,13 @@ async def test_voice_runner_look_at_screen_sends_ground_truth_and_pulses_indicat
     )
     await runner._handle_tool_call(call_ev, backend)
 
-    assert len(backend.sent_video_frames) == 1
-    assert backend.sent_video_mime_types == ["image/png"]
+    assert len(backend.sent_video_frames) == 0
     resp = backend.sent_tool_responses[0]
+    assert len(resp.media_parts) == 1
+    assert resp.media_parts[0].mime_type == "image/png"
     assert resp.response["status"] == "success"
     assert resp.response["target"] == "active_window"
+    assert resp.response["image_order"] == ["active_window"]
     assert resp.response["mime_type"] == "image/png"
     assert resp.response["active_app_name"] == "Google Antigravity"
     assert resp.response["active_process_name"] == "Antigravity.exe"
@@ -654,16 +662,18 @@ async def test_voice_runner_look_at_screen_full_screen_also_sends_native_active_
     )
     await runner._handle_tool_call(call_ev, backend)
 
-    assert len(backend.sent_video_frames) == 2
-    assert backend.sent_video_mime_types == ["image/jpeg", "image/png"]
-    full_img = Image.open(io.BytesIO(backend.sent_video_frames[0]))
-    native_img = Image.open(io.BytesIO(backend.sent_video_frames[1]))
+    assert len(backend.sent_video_frames) == 0
+    resp = backend.sent_tool_responses[0]
+    assert len(resp.media_parts) == 2
+    assert [p.mime_type for p in resp.media_parts] == ["image/jpeg", "image/png"]
+    full_img = Image.open(io.BytesIO(resp.media_parts[0].data))
+    native_img = Image.open(io.BytesIO(resp.media_parts[1].data))
     assert full_img.size == (1920, 1080)
     assert native_img.size == (1500, 840)
 
-    resp = backend.sent_tool_responses[0]
     assert resp.response["status"] == "success"
     assert resp.response["frames_sent"] == 2
+    assert resp.response["image_order"] == ["full_screen", "active_window"]
     assert resp.response["active_window_mime_type"] == "image/png"
     assert resp.response["active_window_width"] == 1500
     assert resp.response["active_window_height"] == 840
@@ -718,5 +728,239 @@ async def test_voice_runner_watch_screen_respects_blocklist(tmp_path: Path) -> N
     resp = backend.sent_tool_responses[0]
     assert resp.is_error is True
     assert resp.response["status"] == "blocked"
+
+    await runner.stop()
+
+
+async def test_voice_runner_look_at_screen_multi_turn_delivers_fresh_media_per_turn(
+    tmp_path: Path,
+) -> None:
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (10, 10, 10))
+    # Turn 1 active window on Monitor 2: solid red
+    canvas.paste(Image.new("RGB", (1500, 840), (240, 20, 20)), (2100, 120))
+    screen_svc = ScreenCaptureService(api=api, grabber=lambda *a, **k: canvas.copy())
+    backend = FakeLiveBackend()
+    fake_indicator = MagicMock()
+    fake_indicator.enabled = True
+    fake_indicator.is_watching = False
+
+    runner = VoiceRunner(
+        config=VoiceConfig(consent_mode="auto_allow"),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        screen_indicator=fake_indicator,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Turn 1
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="turn-1",
+            name="look_at_screen",
+            arguments={"target": "active_window", "reason": "turn 1"},
+        ),
+        backend,
+    )
+
+    # Turn 2: switch window to PowerShell on Monitor 1 with green pixels
+    api._test_state["title"] = "PowerShell 7"  # type: ignore[attr-defined]
+    api._test_state["exe"] = r"C:\Program Files\PowerShell\7\pwsh.exe"  # type: ignore[attr-defined]
+    api._test_state["bounds"] = (100, 100, 900, 700)  # type: ignore[attr-defined]
+    canvas.paste(Image.new("RGB", (800, 600), (20, 230, 30)), (100, 100))
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="turn-2",
+            name="look_at_screen",
+            arguments={"target": "active_window", "reason": "turn 2"},
+        ),
+        backend,
+    )
+
+    # Turn 3: change active window content to blue
+    api._test_state["title"] = "main.py - Cursor"  # type: ignore[attr-defined]
+    api._test_state["exe"] = r"C:\Users\test\AppData\Local\Programs\Cursor\Cursor.exe"  # type: ignore[attr-defined]
+    canvas.paste(Image.new("RGB", (800, 600), (20, 40, 245)), (100, 100))
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="turn-3",
+            name="look_at_screen",
+            arguments={"target": "active_window", "reason": "turn 3"},
+        ),
+        backend,
+    )
+
+    assert len(backend.sent_video_frames) == 0
+    assert len(backend.sent_tool_responses) == 3
+
+    r1, r2, r3 = backend.sent_tool_responses
+    assert r1.response["active_app_name"] == "Google Antigravity"
+    assert r2.response["active_app_name"] == "PowerShell"
+    assert r3.response["active_app_name"] == "Cursor"
+    assert [r1.response["capture_seq"], r2.response["capture_seq"], r3.response["capture_seq"]] == [
+        1,
+        2,
+        3,
+    ]
+
+    p1 = Image.open(io.BytesIO(r1.media_parts[0].data)).getpixel((50, 50))
+    p2 = Image.open(io.BytesIO(r2.media_parts[0].data)).getpixel((50, 50))
+    p3 = Image.open(io.BytesIO(r3.media_parts[0].data)).getpixel((50, 50))
+    assert p1[0] > 200 and p1[1] < 50
+    assert p2[1] > 200 and p2[0] < 50
+    assert p3[2] > 200 and p3[0] < 50
+
+    await runner.stop()
+
+
+async def test_voice_runner_look_at_screen_explicit_other_monitor_skips_cross_monitor_crop(
+    tmp_path: Path,
+) -> None:
+    # Foreground window is on Monitor 2 (2100..3600), while look_at_screen requests monitor=1.
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(api=api, grabber=lambda *a, **k: canvas.copy())
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=VoiceConfig(consent_mode="auto_allow"),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="call-mon-1",
+            name="look_at_screen",
+            arguments={"target": "full_screen", "monitor": 1, "reason": "check monitor 1"},
+        ),
+        backend,
+    )
+
+    assert len(backend.sent_video_frames) == 0
+    resp = backend.sent_tool_responses[0]
+    assert resp.response["monitor_index"] == 1
+    assert resp.response["frames_sent"] == 1
+    assert resp.response["image_order"] == ["full_screen"]
+    assert len(resp.media_parts) == 1
+    assert resp.media_parts[0].mime_type == "image/jpeg"
+
+    await runner.stop()
+
+
+async def test_voice_runner_look_at_screen_capture_error_attaches_no_media_and_hides_indicator(
+    tmp_path: Path,
+) -> None:
+    def _failing_grab(*_args: object, **_kwargs: object) -> Image.Image:
+        raise RuntimeError("GDI grab failed")
+
+    screen_svc = ScreenCaptureService(grabber=_failing_grab)
+    backend = FakeLiveBackend()
+    fake_indicator = MagicMock()
+    fake_indicator.enabled = True
+    fake_indicator.is_watching = False
+
+    runner = VoiceRunner(
+        config=VoiceConfig(consent_mode="auto_allow"),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        screen_indicator=fake_indicator,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="call-fail-1",
+            name="look_at_screen",
+            arguments={"target": "active_window", "reason": "read error"},
+        ),
+        backend,
+    )
+
+    assert len(backend.sent_video_frames) == 0
+    resp = backend.sent_tool_responses[0]
+    assert resp.is_error is True
+    assert resp.response["status"] == "error"
+    assert "GDI grab failed" in resp.response["error"]
+    assert resp.media_parts == []
+    assert fake_indicator.hide.called
+
+    await runner.stop()
+
+
+async def test_voice_runner_look_at_screen_skips_second_crop_if_switched_to_blocked_window(
+    tmp_path: Path,
+) -> None:
+    blocklist = ScreenBlocklistConfig(window_titles=["*1Password*"])
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(
+        api=api,
+        blocklist=blocklist,
+        grabber=lambda *a, **k: canvas.copy(),
+    )
+
+    real_capture = screen_svc.capture
+    call_count = 0
+
+    def flip_to_blocked_on_second_capture(
+        *, target: str = "full_screen", monitor: int | None = None
+    ):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            api._test_state["title"] = "1Password Vault"  # type: ignore[attr-defined]
+            api._test_state["exe"] = r"C:\Program Files\1Password\1Password.exe"  # type: ignore[attr-defined]
+        return real_capture(target=target, monitor=monitor)
+
+    screen_svc.capture = flip_to_blocked_on_second_capture  # type: ignore[method-assign]
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=VoiceConfig(consent_mode="auto_allow", blocklist=blocklist),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="call-race-block",
+            name="look_at_screen",
+            arguments={"target": "full_screen", "reason": "inspect screen"},
+        ),
+        backend,
+    )
+
+    assert len(backend.sent_video_frames) == 0
+    resp = backend.sent_tool_responses[0]
+    assert resp.is_error is False
+    assert resp.response["frames_sent"] == 1
+    assert resp.response["image_order"] == ["full_screen"]
+    assert len(resp.media_parts) == 1
+    assert resp.media_parts[0].mime_type == "image/jpeg"
 
     await runner.stop()

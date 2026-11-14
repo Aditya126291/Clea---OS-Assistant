@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from clea.surfaces.voice.config import MediaResolution
 
@@ -188,12 +188,28 @@ class VoiceSessionConfig(_StrictModel):
     reconnect_limit: int = Field(default=3, ge=0)
 
 
+class VoiceToolMediaPart(_StrictModel):
+    """Inline binary media attachment delivered atomically with a tool response."""
+
+    data: bytes = Field(min_length=1)
+    mime_type: str = Field(default="image/jpeg", min_length=1)
+
+    @field_validator("mime_type", mode="after")
+    @classmethod
+    def _validate_mime_type(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("mime_type must not be empty or whitespace.")
+        return stripped
+
+
 class VoiceToolResponse(_StrictModel):
     """Tool execution output sent back to the live voice session."""
 
     call_id: str
     name: str
     response: dict[str, Any] = Field(default_factory=dict)
+    media_parts: list[VoiceToolMediaPart] = Field(default_factory=list)
     is_error: bool = False
     scheduling: ToolResponseScheduling = "when_idle"
 

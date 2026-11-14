@@ -27,6 +27,7 @@ from clea.surfaces.voice.backends.base import (
     VoiceBackendEvent,
     VoiceSessionConfig,
     VoiceToolDeclaration,
+    VoiceToolMediaPart,
     VoiceToolResponse,
     default_voice_tools,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "VoiceBackendEvent",
     "VoiceSessionConfig",
     "VoiceToolDeclaration",
+    "VoiceToolMediaPart",
     "VoiceToolResponse",
     "default_voice_tools",
 ]

@@ -27,6 +27,7 @@ from clea.surfaces.voice.backends import (
     VoiceBackend,
     VoiceBackendEvent,
     VoiceSessionConfig,
+    VoiceToolMediaPart,
     VoiceToolResponse,
     default_voice_tools,
 )
@@ -201,6 +202,23 @@ def test_voice_backend_model_validation_rejects_invalid_bounds() -> None:
         GoAwayEvent(time_left_seconds=-1.0)
     with pytest.raises(ValidationError):
         UsageUpdateEvent(input_tokens=-1)
+    with pytest.raises(ValidationError):
+        VoiceToolMediaPart(data=b"", mime_type="image/png")
+    with pytest.raises(ValidationError):
+        VoiceToolMediaPart(data=b"\x89PNG", mime_type="   ")
+    with pytest.raises(ValidationError):
+        VoiceToolMediaPart(data=b"\x89PNG", mime_type="image/png", extra_field=True)  # type: ignore[call-arg]
+
+    part = VoiceToolMediaPart(data=b"\x89PNG\r\n", mime_type=" image/png ")
+    assert part.mime_type == "image/png"
+    resp = VoiceToolResponse(
+        call_id="c-media",
+        name="look_at_screen",
+        response={"status": "success"},
+        media_parts=[part],
+    )
+    assert len(resp.media_parts) == 1
+    assert resp.media_parts[0].data == b"\x89PNG\r\n"
 
 
 async def test_deferred_memory_hooks_are_explicitly_stubbed() -> None:

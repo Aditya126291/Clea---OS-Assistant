@@ -62,6 +62,7 @@ from clea.surfaces.voice.backends.base import (
     UsageUpdateEvent,
     VoiceBackend,
     VoiceSessionConfig,
+    VoiceToolMediaPart,
     VoiceToolResponse,
 )
 from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
@@ -1102,7 +1103,7 @@ class VoiceRunner:
                 await backend.send_tool_responses([resp])
                 return
 
-            if res.image_bytes is not None:
+            if res.image_bytes:
                 if (
                     res.monitor_bounds is not None
                     and res.monitor_bounds != initial_bounds
@@ -1110,13 +1111,18 @@ class VoiceRunner:
                 ):
                     self._screen_indicator.pulse(res.monitor_bounds, duration_seconds=1.5)
 
-                await backend.send_video_frame(res.image_bytes, mime_type=res.mime_type)
-                frames_sent = 1
+                media_parts: list[VoiceToolMediaPart] = [
+                    VoiceToolMediaPart(
+                        data=res.image_bytes,
+                        mime_type=res.mime_type,
+                    )
+                ]
+                image_order: list[str] = [target]
                 active_res = None
 
                 # When full-screen context is requested alongside an active window on the same
-                # display, also send a 1:1 native-resolution active-window crop so small text
-                # and UI elements remain sharp.
+                # display, also attach a 1:1 native-resolution active-window crop atomically so
+                # small text and UI elements remain sharp on the exact same turn.
                 if target == "full_screen" and res.window_bounds is not None:
                     wl, wt, wr, wb = res.window_bounds
                     if wr > wl and wb > wt:
@@ -1131,18 +1137,26 @@ class VoiceRunner:
                                 self._screen_service.capture,
                                 target="active_window",
                             )
-                            if not candidate.blocked and candidate.image_bytes is not None:
+                            same_monitor = (
+                                res.monitor_index is None
+                                or candidate.monitor_index is None
+                                or candidate.monitor_index == res.monitor_index
+                            )
+                            if not candidate.blocked and candidate.image_bytes and same_monitor:
                                 active_res = candidate
-                                await backend.send_video_frame(
-                                    active_res.image_bytes,
-                                    mime_type=active_res.mime_type,
+                                media_parts.append(
+                                    VoiceToolMediaPart(
+                                        data=active_res.image_bytes,
+                                        mime_type=active_res.mime_type,
+                                    )
                                 )
-                                frames_sent += 1
+                                image_order.append("active_window")
 
                 payload: dict[str, Any] = {
                     "status": "success",
                     "target": target,
-                    "frames_sent": frames_sent,
+                    "frames_sent": len(media_parts),
+                    "image_order": image_order,
                     "mime_type": res.mime_type,
                     "width": res.width,
                     "height": res.height,
@@ -1165,6 +1179,7 @@ class VoiceRunner:
                     call_id=event.call_id,
                     name=event.name,
                     response=payload,
+                    media_parts=media_parts,
                     scheduling="when_idle",
                 )
             else:
