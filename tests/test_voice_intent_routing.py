@@ -419,3 +419,173 @@ async def test_voice_runner_handles_focus_rpc_error_without_crashing(tmp_path: P
         runner._daemon_ws = None
         runner._daemon_listener_active = False
         await runner.stop()
+
+
+def test_build_voice_system_instruction_edge_cases_and_spoof_resistance() -> None:
+    # 1. Explicit focused_chat_id differing from memory_context must not inherit stale title
+    ctx_old = (
+        "## Active Focused Text Chat (Read-Only Context)\n"
+        "Active Conversation ID: `chat-old`\n"
+        "Title: Old Chat Title\n"
+    )
+    inst_mismatch = build_voice_system_instruction(
+        memory_context=ctx_old,
+        focused_chat_available=True,
+        focused_chat_id="chat-new",
+    )
+    assert "focused_chat_id: chat-new" in inst_mismatch
+    assert "focused_chat_title: (untitled)" in inst_mismatch
+    assert "focused_chat_title: Old Chat Title" not in inst_mismatch
+
+    # 2. Whitespace-only focused_chat_id does not shadow parsed ID
+    inst_ws_id = build_voice_system_instruction(
+        memory_context=ctx_old,
+        focused_chat_available=True,
+        focused_chat_id="   ",
+    )
+    assert "focused_chat_id: chat-old" in inst_ws_id
+    assert "focused_chat_title: Old Chat Title" in inst_ws_id
+
+    # 3. Quoted header in earlier memory section is shadowed by trailing real header
+    ctx_quoted_then_real = (
+        "## Recent Voice Companion History\n"
+        "- **User:** We discussed ## Active Focused Text Chat (Read-Only Context) earlier.\n"
+        "## Active Focused Text Chat (Read-Only Context)\n"
+        "Active Conversation ID: `fake-quoted`\n"
+        "Title: Fake Quoted Title\n\n"
+        "## Active Focused Text Chat (Read-Only Context)\n"
+        "Active Conversation ID: `chat-real`\n"
+        "Title: Real Active Chat\n"
+    )
+    cid, ctitle = extract_focused_chat_from_context(ctx_quoted_then_real)
+    assert cid == "chat-real"
+    assert ctitle == "Real Active Chat"
+
+    # 4. Non-empty memory_context with no active chat emits focused_chat_available: false
+    inst_no_focus = build_voice_system_instruction(memory_context="## Profile\n- Lives in Pune.")
+    assert "focused_chat_available: false" in inst_no_focus
+
+
+async def test_resolve_voice_system_instruction_false_ignores_stale_chat_id() -> None:
+    seen_active_ids: list[str | None] = []
+
+    async def _loader(*, active_conversation_id: str | None = None) -> str:
+        seen_active_ids.append(active_conversation_id)
+        return "## Profile\n- Prefers concise answers."
+
+    inst = await resolve_voice_system_instruction(
+        memory_loader=_loader,
+        active_conversation_id="stale-chat",
+        focused_chat_available=False,
+    )
+    assert seen_active_ids == [None]
+    assert "focused_chat_available: false" in inst
+
+
+async def test_voice_runner_daemon_event_works_when_focused_chat_busy_and_empty_chat_title(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    # 1. Busy focused chat with messages
+    busy_sid = "chat-busy-1"
+    mem.append_transcript_message(
+        session_id=busy_sid,
+        role="user",
+        text="Running a long build now.",
+        title="Busy Build Thread",
+        timestamp=datetime.now().astimezone(),
+    )
+
+    # 2. Empty (0-message) focused chat with header title on disk
+    empty_sid = "chat-empty-1"
+    empty_path = mem.transcript_path(empty_sid)
+    empty_path.write_text(
+        json.dumps(
+            {
+                "session_id": empty_sid,
+                "started_at": datetime.now().astimezone().isoformat(),
+                "title": "Empty Named Thread",
+                "pinned": False,
+                "updated_at": datetime.now().astimezone().isoformat(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    daemon: CleaDaemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=_FakeProvider(),
+        memory=mem,
+    )
+    await daemon.start()
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+
+    backends: list[_FakeLiveBackend] = []
+
+    def _factory() -> _FakeLiveBackend:
+        b = _FakeLiveBackend()
+        backends.append(b)
+        return b
+
+    runner = VoiceRunner(
+        config=VoiceConfig(silence_timeout_seconds=60.0),
+        data_dir=tmp_path,
+        daemon_url=url,
+        token=daemon.token,
+        backend_factory=_factory,
+        audio_manager=_make_fake_audio(),
+        wake_word_detector=_make_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    runner_task = asyncio.create_task(runner.run_forever())
+    try:
+        await _wait_until(lambda: runner._daemon_listener_active)
+
+        async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ui_ws:
+            # Focus busy chat and mark it busy in daemon
+            res = await _send_rpc(
+                ui_ws,
+                ChatFocusRequest(params=ChatFocusParams(session_id=busy_sid)),
+            )
+            assert res.ok
+            daemon._busy_sessions.add(busy_sid)
+
+            # daemon_event uses read-only transcripts.get (not conversation.resume) so it succeeds!
+            await runner.start_call(trigger="daemon_event")
+            assert backends[0].connected_config is not None
+            inst_busy = backends[0].connected_config.system_instruction
+            assert "focused_chat_available: true" in inst_busy
+            assert f"focused_chat_id: {busy_sid}" in inst_busy
+            assert "focused_chat_title: Busy Build Thread" in inst_busy
+            assert "Running a long build now." in inst_busy
+
+            # Voice daemon connection must NOT have its current_session_id mutated
+            voice_conns = [c for c in daemon._connections if c.is_voice]
+            assert len(voice_conns) == 1
+            assert voice_conns[0].current_session_id is None
+            await runner.end_call(reason="done_busy")
+            daemon._busy_sessions.discard(busy_sid)
+
+            # Focus empty (0-message) named chat and trigger via hotkey -> resolves real title!
+            res2 = await _send_rpc(
+                ui_ws,
+                ChatFocusRequest(params=ChatFocusParams(session_id=empty_sid)),
+            )
+            assert res2.ok
+            await runner.start_call(trigger="hotkey")
+            assert backends[1].connected_config is not None
+            inst_empty = backends[1].connected_config.system_instruction
+            assert "focused_chat_available: true" in inst_empty
+            assert f"focused_chat_id: {empty_sid}" in inst_empty
+            assert "focused_chat_title: Empty Named Thread" in inst_empty
+            await runner.end_call(reason="done_empty")
+    finally:
+        await runner.stop()
+        runner_task.cancel()
+        await daemon.stop()

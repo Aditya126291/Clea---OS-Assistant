@@ -25,11 +25,11 @@ import websockets
 from clea.core import auth
 from clea.core.protocol import (
     BaseRequest,
-    ConversationResumeParams,
-    ConversationResumeRequest,
     MemoryEpisodesRequest,
     MemoryGetRequest,
     ResponseFrame,
+    TranscriptsGetParams,
+    TranscriptsGetRequest,
     VoiceEndCallParams,
     VoiceEndCallRequest,
     VoiceHistoryParams,
@@ -292,11 +292,12 @@ def extract_focused_chat_from_context(
         return None, None
 
     lines = memory_context.splitlines()
-    try:
-        start_idx = next(
-            idx for idx, line in enumerate(lines) if line.strip() == _ACTIVE_CHAT_HEADER
-        )
-    except StopIteration:
+    start_idx: int | None = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].strip() == _ACTIVE_CHAT_HEADER:
+            start_idx = idx
+            break
+    if start_idx is None:
         return None, None
 
     chat_id: str | None = None
@@ -363,8 +364,14 @@ def build_voice_system_instruction(
     parts = [BASE_VOICE_SYSTEM_INSTRUCTION]
 
     parsed_id, parsed_title = extract_focused_chat_from_context(memory_context)
-    effective_id = focused_chat_id or parsed_id
-    effective_title = focused_chat_title or parsed_title
+    clean_explicit_id = " ".join(focused_chat_id.split()) if focused_chat_id else None
+    effective_id = clean_explicit_id or parsed_id
+    if focused_chat_title is not None and focused_chat_title.strip():
+        effective_title: str | None = focused_chat_title
+    elif effective_id and parsed_id == effective_id:
+        effective_title = parsed_title
+    else:
+        effective_title = None
 
     if focused_chat_available is not None:
         parts.append(
@@ -382,6 +389,8 @@ def build_voice_system_instruction(
                 focused_chat_title=parsed_title,
             )
         )
+    elif memory_context and memory_context.strip():
+        parts.append(format_focus_state_context(focused_chat_available=False))
 
     if memory_context and memory_context.strip():
         parts.append(f"## Memory Context\n{memory_context.strip()}")
@@ -468,18 +477,16 @@ async def load_voice_memory_context(
     target_chat_id = active_conversation_id
     if target_chat_id and target_chat_id != _VOICE_COMPANION_SESSION_ID:
         try:
-            resume_res = await _run_request(
-                ConversationResumeRequest(
-                    params=ConversationResumeParams(session_id=target_chat_id)
-                ),
+            tr_res = await _run_request(
+                TranscriptsGetRequest(params=TranscriptsGetParams(session_id=target_chat_id)),
                 request_fn=request_fn,
                 daemon_url=daemon_url,
                 token=token,
                 data_dir=data_dir,
             )
-            chat_msgs = resume_res.get("messages") or []
+            chat_msgs = tr_res.get("messages") or []
             if isinstance(chat_msgs, list) and chat_msgs:
-                chat_title = str(resume_res.get("title") or "Conversation").strip()
+                chat_title = str(tr_res.get("title") or "Conversation").strip()
                 chat_lines = [
                     "## Active Focused Text Chat (Read-Only Context)",
                     f"Active Conversation ID: `{target_chat_id}`",
@@ -642,7 +649,9 @@ async def resolve_voice_system_instruction(
             focused_chat_title=focused_chat_title,
         )
 
-    target_chat_id = active_conversation_id or focused_chat_id
+    target_chat_id = (
+        None if focused_chat_available is False else (active_conversation_id or focused_chat_id)
+    )
     context = await safe_load_voice_memory_context(
         loader=memory_loader,
         active_conversation_id=target_chat_id,
