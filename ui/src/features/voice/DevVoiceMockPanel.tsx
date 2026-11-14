@@ -2,7 +2,13 @@ import { Button } from "@/components/ui/button";
 import { useCleaStore } from "@/protocol/store";
 import type { VoiceState } from "@/protocol/types";
 
-const VOICE_STATES: VoiceState[] = ["idle", "listening", "thinking", "speaking"];
+const VOICE_STATES: VoiceState[] = [
+  "idle",
+  "listening",
+  "thinking",
+  "speaking",
+  "reconnecting",
+];
 
 /**
  * Dev-only panel to simulate daemon `voice_state` events.

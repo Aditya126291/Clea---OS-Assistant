@@ -53,12 +53,14 @@ class VoiceConfig(BaseModel):
     reconnect_limit: int = Field(default=3, ge=0)
     enable_web_search: bool = False
     stall_timeout_seconds: float = Field(default=15.0, gt=0.0)
+    stall_speech_rms_threshold: float = Field(default=250.0, ge=0.0)
     preferred_hostapi: str = Field(default="WASAPI")
 
     @field_validator(
         "wake_threshold",
         "silence_timeout_seconds",
         "stall_timeout_seconds",
+        "stall_speech_rms_threshold",
         "max_burst_seconds",
         "image_max_side",
         "reconnect_limit",
@@ -130,6 +132,9 @@ silence_timeout_seconds = 60
 
 # Stall watchdog timeout: reconnect if audio streamed for N seconds with no server response.
 stall_timeout_seconds = 15
+
+# Speech energy threshold (RMS) to arm stall watchdog timer. Below this, audio is silence.
+stall_speech_rms_threshold = 250.0
 
 # Preferred audio host API (e.g. "WASAPI" on Windows) to avoid duplicate device entries.
 preferred_hostapi = "WASAPI"

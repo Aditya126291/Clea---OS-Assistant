@@ -10,10 +10,10 @@ describe("CallOverlay", () => {
     useCleaStore.setState({ callOverlayOpen: true, voiceState: "idle" });
   });
 
-  it("renders all four voice_state events and resets on End Call", () => {
+  it("renders all voice_state events and resets on End Call", () => {
     const { container } = render(<CallOverlay />);
 
-    const states: VoiceState[] = ["idle", "listening", "thinking", "speaking"];
+    const states: VoiceState[] = ["idle", "listening", "thinking", "speaking", "reconnecting"];
     for (const state of states) {
       act(() => {
         useCleaStore.getState().applyEvent({
@@ -32,7 +32,7 @@ describe("CallOverlay", () => {
     expect(useCleaStore.getState().voiceState).toBe("idle");
   });
 
-  it("drives CallOverlay through all four states from DevVoiceMockPanel", () => {
+  it("drives CallOverlay through states from DevVoiceMockPanel", () => {
     const { container } = render(
       <>
         <CallOverlay />
@@ -40,12 +40,31 @@ describe("CallOverlay", () => {
       </>,
     );
 
-    const states: VoiceState[] = ["listening", "thinking", "speaking", "idle"];
+    const states: VoiceState[] = ["listening", "thinking", "speaking", "reconnecting", "idle"];
     for (const state of states) {
       fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${state}$`, "i") }));
       expect(container.querySelector(`[data-voice-state="${state}"]`)).not.toBeNull();
       expect(useCleaStore.getState().voiceState).toBe(state);
     }
+  });
+
+  it("renders non-alarming reconnecting status without flashing error screen", () => {
+    render(<CallOverlay />);
+
+    act(() => {
+      useCleaStore.getState().applyEvent({
+        frame_type: "event",
+        event: "voice_state",
+        data: { state: "reconnecting" },
+      });
+    });
+
+    const store = useCleaStore.getState();
+    expect(store.voiceState).toBe("reconnecting");
+    expect(store.voiceError).toBeNull();
+    expect(screen.getByText("Reconnecting")).toBeInTheDocument();
+    expect(screen.getByText("Reconnecting session...")).toBeInTheDocument();
+    expect(screen.queryByText("Error")).toBeNull();
   });
 
   it("tracks call_started, transcript, screen_capture_state, usage, and call_ended in store", () => {

@@ -35,6 +35,7 @@ from clea.surfaces.voice.backends.base import (
     InterruptedEvent,
     ToolCallEvent,
     TranscriptOutputEvent,
+    TurnCompleteEvent,
     UsageUpdateEvent,
     VoiceBackend,
     VoiceBackendEvent,
@@ -585,7 +586,7 @@ async def test_voice_runner_surfaces_error_on_start_failure(tmp_path: Path) -> N
 async def test_voice_runner_stall_watchdog_triggers_reconnect(tmp_path: Path) -> None:
     """Verify stall watchdog triggers reconnection when audio streams without server responses."""
     # Set short stall timeout of 0.2s for testing
-    cfg = VoiceConfig(stall_timeout_seconds=0.2)
+    cfg = VoiceConfig(stall_timeout_seconds=0.2, stall_speech_rms_threshold=250.0)
     backend = FakeLiveBackend()
 
     runner = VoiceRunner(
@@ -599,12 +600,13 @@ async def test_voice_runner_stall_watchdog_triggers_reconnect(tmp_path: Path) ->
     await runner.start()
     await runner.start_call(trigger="test")
 
-    # Simulate audio chunks sent to active backend
-    pcm_chunk = b"\x00" * 2560
-    runner._on_audio_chunk(pcm_chunk)
+    # Simulate speech audio chunks (> stall_speech_rms_threshold) sent to active backend
+    speech_chunk = np.full(1280, 1000, dtype=np.int16).tobytes()
+    for _ in range(3):  # 3 * 0.08s = 0.24s > 0.2s
+        runner._on_audio_chunk(speech_chunk)
 
-    # Wait for stall watchdog to fire (sleep > 1.2s since watchdog checks every 1.0s)
-    await asyncio.sleep(1.3)
+    # Wait for stall watchdog to fire
+    await asyncio.sleep(0.3)
 
     assert backend.reconnect_count >= 1
     await runner.end_call(reason="test_done")
@@ -613,7 +615,7 @@ async def test_voice_runner_stall_watchdog_triggers_reconnect(tmp_path: Path) ->
 
 async def test_voice_runner_stall_watchdog_ends_call_after_second_stall(tmp_path: Path) -> None:
     """Verify stall watchdog ends call when server fails to respond after reconnect."""
-    cfg = VoiceConfig(stall_timeout_seconds=0.1)
+    cfg = VoiceConfig(stall_timeout_seconds=0.1, stall_speech_rms_threshold=250.0)
     backend = FakeLiveBackend()
 
     runner = VoiceRunner(
@@ -627,20 +629,158 @@ async def test_voice_runner_stall_watchdog_ends_call_after_second_stall(tmp_path
     await runner.start()
     await runner.start_call(trigger="test")
 
-    # Send audio chunk to start stall timer
-    pcm_chunk = b"\x00" * 2560
-    runner._on_audio_chunk(pcm_chunk)
+    # Send speech chunk to start stall timer
+    speech_chunk = np.full(1280, 1000, dtype=np.int16).tobytes()
+    for _ in range(2):  # 0.16s > 0.1s
+        runner._on_audio_chunk(speech_chunk)
 
     # Wait for first stall -> reconnect
     await asyncio.sleep(0.3)
     assert backend.reconnect_count == 1
 
-    # Send audio again without server response -> second stall
-    runner._on_audio_chunk(pcm_chunk)
+    # Send speech audio again without server response -> second stall
+    for _ in range(2):
+        runner._on_audio_chunk(speech_chunk)
     await asyncio.sleep(0.3)
 
     assert runner.call_state == "idle"
     assert runner.voice_state == "error"
+    await runner.stop()
+
+
+async def test_voice_runner_stall_watchdog_does_not_fire_on_post_turn_silence(
+    tmp_path: Path,
+) -> None:
+    """Verify 30+ seconds of low-RMS silence frames after turn_complete does not trigger stall."""
+    # Set short stall timeout of 0.2s so if silence incorrectly advanced timer, it fires fast
+    cfg = VoiceConfig(stall_timeout_seconds=0.2, stall_speech_rms_threshold=250.0)
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "active"
+
+    # Server sends TurnCompleteEvent
+    await backend.event_queue.put(TurnCompleteEvent())
+    await asyncio.sleep(0.05)
+    assert runner.voice_state == "listening"
+
+    # 30+ seconds of low-RMS silence frames: 380 chunks * 0.08s = 30.4s
+    # All frames have amplitude 50 -> RMS = 50.0 << stall_speech_rms_threshold (250.0)
+    silence_chunk = np.full(1280, 50, dtype=np.int16).tobytes()
+    for _ in range(380):
+        runner._on_audio_chunk(silence_chunk)
+
+    # Allow watchdog loop to run
+    await asyncio.sleep(0.3)
+
+    # Watchdog must NOT trigger reconnect or end call
+    assert backend.reconnect_count == 0
+    assert runner.call_state == "active"
+    assert runner.voice_state == "listening"
+
+    await runner.end_call(reason="test_done")
+    await runner.stop()
+
+
+async def test_voice_runner_stall_watchdog_triggers_on_15s_speech(tmp_path: Path) -> None:
+    """Verify 15+ seconds of speech-level RMS frames (> threshold) triggers reconnect."""
+    # Default 15.0s stall timeout
+    cfg = VoiceConfig(stall_timeout_seconds=15.0, stall_speech_rms_threshold=250.0)
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "active"
+
+    # 15+ seconds of speech-level RMS frames: 195 chunks * 0.08s = 15.6s > 15.0s
+    # Speech frames have amplitude 1000 -> RMS = 1000.0 > 250.0
+    speech_chunk = np.full(1280, 1000, dtype=np.int16).tobytes()
+    for _ in range(195):
+        runner._on_audio_chunk(speech_chunk)
+
+    # Allow watchdog loop to run
+    await asyncio.sleep(0.3)
+
+    # Watchdog MUST trigger reconnect
+    assert backend.reconnect_count >= 1
+    assert runner.call_state == "active"
+    assert runner.voice_state == "listening"
+
+    await runner.end_call(reason="test_done")
+    await runner.stop()
+
+
+async def test_voice_runner_stall_watchdog_sets_reconnecting_state(tmp_path: Path) -> None:
+    """Verify stall watchdog enters 'reconnecting' state instead of 'error' during resumption."""
+    cfg = VoiceConfig(stall_timeout_seconds=0.1, stall_speech_rms_threshold=250.0)
+    backend = FakeLiveBackend()
+
+    reconnect_started = asyncio.Event()
+    reconnect_proceed = asyncio.Event()
+
+    async def slow_reconnect() -> None:
+        backend.reconnect_count += 1
+        reconnect_started.set()
+        await reconnect_proceed.wait()
+
+    backend._reconnect = slow_reconnect  # type: ignore[method-assign]
+
+    states_seen: list[str] = []
+
+    def on_event(evt: BaseEvent) -> None:
+        if isinstance(evt, VoiceStateEvent):
+            states_seen.append(evt.data.state)
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        on_event=on_event,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Send speech chunks to trigger stall
+    speech_chunk = np.full(1280, 1000, dtype=np.int16).tobytes()
+    for _ in range(2):
+        runner._on_audio_chunk(speech_chunk)
+
+    # Wait for reconnect to start
+    await asyncio.wait_for(reconnect_started.wait(), timeout=1.0)
+
+    # While reconnecting, state must be 'reconnecting' and NOT 'error'
+    assert runner.voice_state == "reconnecting"
+    assert "reconnecting" in states_seen
+    assert "error" not in states_seen
+
+    # Complete reconnection
+    reconnect_proceed.set()
+    await asyncio.sleep(0.05)
+
+    assert runner.voice_state == "listening"
+    assert backend.reconnect_count == 1
+
+    await runner.end_call(reason="test_done")
     await runner.stop()
 
 
@@ -720,7 +860,9 @@ async def test_voice_runner_stall_watchdog_does_not_fire_while_speaking(tmp_path
 
     # Mark assistant as actively speaking
     audio_mgr._is_speaking.set()
-    runner._on_audio_chunk(b"\x00" * 2560)
+    speech_chunk = np.full(1280, 1000, dtype=np.int16).tobytes()
+    for _ in range(3):
+        runner._on_audio_chunk(speech_chunk)
 
     # Wait > stall_timeout_seconds
     await asyncio.sleep(0.3)

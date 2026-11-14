@@ -119,7 +119,7 @@ def test_all_required_event_types_exist_and_roundtrip() -> None:
     assert set(EVENT_NAMES) == required
 
 
-@pytest.mark.parametrize("state", ["idle", "listening", "thinking", "speaking"])
+@pytest.mark.parametrize("state", ["idle", "listening", "thinking", "speaking", "reconnecting"])
 def test_voice_state_values(state: str) -> None:
     parsed = parse_frame(VoiceStateEvent(data=VoiceStateData(state=state)).model_dump_json())
     assert parsed.data.state == state

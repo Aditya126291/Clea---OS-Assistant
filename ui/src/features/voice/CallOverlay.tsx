@@ -26,6 +26,11 @@ const ORB_STYLE: Record<VoiceState, { ring: string; label: string; anim: string 
     label: "Speaking",
     anim: "clea-orb-speaking",
   },
+  reconnecting: {
+    ring: "from-amber-400 via-yellow-500 to-amber-600",
+    label: "Reconnecting",
+    anim: "clea-orb-thinking",
+  },
   error: {
     ring: "from-rose-500 to-red-700",
     label: "Error",
@@ -86,6 +91,10 @@ export function CallOverlay() {
         {voiceError ? (
           <div className="mt-1 text-[11px] font-medium text-rose-500 text-center px-1">
             {voiceError}
+          </div>
+        ) : voiceState === "reconnecting" ? (
+          <div className="mt-0.5 text-[11px] text-amber-500 dark:text-amber-400">
+            Reconnecting session...
           </div>
         ) : (
           <div className="mt-0.5 text-[11px] text-[var(--text-subtle)]">Voice session</div>
