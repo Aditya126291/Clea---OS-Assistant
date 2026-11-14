@@ -686,6 +686,8 @@ async def test_voice_runner_stall_watchdog_does_not_fire_on_post_turn_silence(
     assert backend.reconnect_count == 0
     assert runner.call_state == "active"
     assert runner.voice_state == "listening"
+    assert runner._stall_timer_armed is False
+    assert runner._stall_accumulated_seconds == 0.0
 
     await runner.end_call(reason="test_done")
     await runner.stop()
@@ -722,6 +724,8 @@ async def test_voice_runner_stall_watchdog_triggers_on_15s_speech(tmp_path: Path
     assert backend.reconnect_count >= 1
     assert runner.call_state == "active"
     assert runner.voice_state == "listening"
+    assert runner._stall_timer_armed is False
+    assert runner._stall_accumulated_seconds == 0.0
 
     await runner.end_call(reason="test_done")
     await runner.stop()
@@ -838,6 +842,48 @@ async def test_voice_runner_fatal_backend_error_transitions_to_error(tmp_path: P
 
     assert runner.call_state == "idle"
     assert runner.voice_state == "error"
+    await runner.stop()
+
+
+async def test_voice_runner_recoverable_backend_error_sets_reconnecting_state(
+    tmp_path: Path,
+) -> None:
+    """Verify recoverable BackendErrorEvent sets state to reconnecting and clears on next event."""
+    cfg = VoiceConfig()
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "active"
+    assert runner.voice_state == "listening"
+
+    # Emit recoverable BackendErrorEvent (e.g. transient disconnect during session resumption)
+    await backend.event_queue.put(
+        BackendErrorEvent(message="Connection dropped; reconnecting...", recoverable=True)
+    )
+    await asyncio.sleep(0.05)
+
+    # Call remains active in non-alarming 'reconnecting' state
+    assert runner.call_state == "active"
+    assert runner.voice_state == "reconnecting"
+
+    # Server recovers and sends TurnCompleteEvent
+    await backend.event_queue.put(TurnCompleteEvent())
+    await asyncio.sleep(0.05)
+
+    # State returns to 'listening'
+    assert runner.call_state == "active"
+    assert runner.voice_state == "listening"
+
+    await runner.end_call(reason="test_done")
     await runner.stop()
 
 

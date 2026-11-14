@@ -775,16 +775,21 @@ class VoiceRunner:
                     reconnected = False
                     if self._active_backend is not None:
                         try:
-                            if hasattr(self._active_backend, "reconnect"):
-                                await self._active_backend.reconnect()
-                                reconnected = True
-                            elif hasattr(self._active_backend, "_reconnect"):
-                                await self._active_backend._reconnect()
+                            rec_fn = getattr(self._active_backend, "reconnect", None) or getattr(
+                                self._active_backend, "_reconnect", None
+                            )
+                            if callable(rec_fn):
+                                res = rec_fn()
+                                if asyncio.iscoroutine(res):
+                                    await res
                                 reconnected = True
                         except Exception as rec_err:
                             logger.error("Stall watchdog reconnection failed: %s", rec_err)
 
                     if reconnected:
+                        self._stall_timer_armed = False
+                        self._stall_accumulated_seconds = 0.0
+                        self._audio_sent_start_time = None
                         self._set_voice_state("listening")
                     else:
                         await self.end_call(
@@ -916,7 +921,7 @@ class VoiceRunner:
                         )
                         break
                     else:
-                        self._set_voice_state("error", error=event.message)
+                        self._set_voice_state("reconnecting")
         except asyncio.CancelledError:
             pass
         except Exception as exc:

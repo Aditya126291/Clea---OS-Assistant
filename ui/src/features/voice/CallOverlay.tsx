@@ -88,13 +88,13 @@ export function CallOverlay() {
         <div className="text-xs font-medium text-[var(--text)]" aria-live="polite">
           {current.label}
         </div>
-        {voiceError ? (
-          <div className="mt-1 text-[11px] font-medium text-rose-500 text-center px-1">
-            {voiceError}
-          </div>
-        ) : voiceState === "reconnecting" ? (
+        {voiceState === "reconnecting" ? (
           <div className="mt-0.5 text-[11px] text-amber-500 dark:text-amber-400">
             Reconnecting session...
+          </div>
+        ) : voiceError ? (
+          <div className="mt-1 text-[11px] font-medium text-rose-500 text-center px-1">
+            {voiceError}
           </div>
         ) : (
           <div className="mt-0.5 text-[11px] text-[var(--text-subtle)]">Voice session</div>

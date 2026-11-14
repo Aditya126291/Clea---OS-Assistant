@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { useCleaStore } from "@/protocol/store";
 import type { VoiceState } from "@/protocol/types";
 import { CallOverlay } from "./CallOverlay";
+import { CallOverlay as ComponentCallOverlay } from "@/components/voice/CallOverlay";
 import { DevVoiceMockPanel } from "./DevVoiceMockPanel";
 
 describe("CallOverlay", () => {
@@ -65,6 +66,22 @@ describe("CallOverlay", () => {
     expect(screen.getByText("Reconnecting")).toBeInTheDocument();
     expect(screen.getByText("Reconnecting session...")).toBeInTheDocument();
     expect(screen.queryByText("Error")).toBeNull();
+  });
+
+  it("suppresses error banner and displays reconnecting status when voiceState is reconnecting", () => {
+    useCleaStore.setState({ voiceState: "reconnecting", voiceError: "Transient network hiccup" });
+    render(<CallOverlay />);
+
+    expect(screen.getByText("Reconnecting")).toBeInTheDocument();
+    expect(screen.getByText("Reconnecting session...")).toBeInTheDocument();
+    expect(screen.queryByText("Transient network hiccup")).toBeNull();
+    expect(screen.queryByText("Error")).toBeNull();
+  });
+
+  it("can be rendered through components/voice/CallOverlay alias path", () => {
+    useCleaStore.setState({ voiceState: "reconnecting" });
+    render(<ComponentCallOverlay />);
+    expect(screen.getByText("Reconnecting")).toBeInTheDocument();
   });
 
   it("tracks call_started, transcript, screen_capture_state, usage, and call_ended in store", () => {
