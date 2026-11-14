@@ -49,6 +49,7 @@ from clea.core.protocol import (
     ErrorEvent,
     MemoryArchiveItem,
     MemoryFactItem,
+    MemorySearchHit,
     MemorySectionItem,
     PermissionTierInfo,
     ResponseFrame,
@@ -63,6 +64,8 @@ from clea.core.protocol import (
     ToolInfo,
     TranscriptMessageItem,
     TranscriptSummaryItem,
+    VoiceConversationListItem,
+    VoiceConversationTurnItem,
     VoiceHistoryMessageItem,
     VoiceState,
     VoiceStateData,
@@ -1440,12 +1443,74 @@ class CleaDaemon:
                     messages=items,
                 ),
             )
+        elif method == "voice.list_conversations":
+            limit = getattr(req.params, "limit", 10) or 10
+            limit = max(1, min(int(limit), 100))
+            convs_raw = self.agent.memory.list_conversations(limit=limit)
+            items = [VoiceConversationListItem(**c) for c in convs_raw]
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](conversations=items),
+            )
         elif method == "voice.search_conversations":
             query = getattr(req.params, "query", "")
-            limit = getattr(req.params, "limit", 5) or 5
+            limit = getattr(req.params, "limit", 8) or 8
             limit = max(1, min(int(limit), 50))
             hits_raw = self.agent.memory.search_conversations(query=query, limit=limit)
             hits = [ConversationSearchHit(**hit) for hit in hits_raw]
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](results=hits),
+            )
+        elif method == "voice.read_conversation":
+            cid = str(getattr(req.params, "conversation_id", "") or "").strip()
+            if not cid:
+                await self._respond(ws, req, error="conversation_id cannot be empty.")
+                return
+            max_turns = getattr(req.params, "max_turns", 40) or 40
+            max_turns = max(1, min(int(max_turns), 500))
+            try:
+                data = self.agent.memory.read_conversation(
+                    conversation_id=cid,
+                    max_turns=max_turns,
+                )
+            except ValueError:
+                data = None
+            if data is None:
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS[method](
+                        found=False,
+                        conversation_id=cid,
+                        session_id=cid,
+                        message=f"Conversation '{cid}' not found.",
+                    ),
+                )
+                return
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    found=True,
+                    conversation_id=data["conversation_id"],
+                    session_id=data["session_id"],
+                    title=data["title"],
+                    updated_at=data["updated_at"],
+                    episode_summary=data["episode_summary"],
+                    total_turns=data["total_turns"],
+                    truncated=data["truncated"],
+                    turns=[VoiceConversationTurnItem(**t) for t in data["turns"]],
+                ),
+            )
+        elif method == "voice.search_memory":
+            query = getattr(req.params, "query", "")
+            limit = getattr(req.params, "limit", 10) or 10
+            limit = max(1, min(int(limit), 50))
+            hits_raw = self.agent.memory.search_memory(query=query, limit=limit)
+            hits = [MemorySearchHit(**hit) for hit in hits_raw]
             await self._respond(
                 ws,
                 req,

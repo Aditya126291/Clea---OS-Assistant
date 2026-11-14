@@ -36,10 +36,16 @@ from clea.core.protocol import (
     VoiceDelegateTaskRequest,
     VoiceEndCallParams,
     VoiceEndCallRequest,
+    VoiceListConversationsParams,
+    VoiceListConversationsRequest,
     VoicePostToActiveChatParams,
     VoicePostToActiveChatRequest,
+    VoiceReadConversationParams,
+    VoiceReadConversationRequest,
     VoiceSearchConversationsParams,
     VoiceSearchConversationsRequest,
+    VoiceSearchMemoryParams,
+    VoiceSearchMemoryRequest,
     VoiceStartCallParams,
     VoiceStartCallRequest,
     VoiceState,
@@ -1433,14 +1439,46 @@ class VoiceRunner:
             await backend.send_tool_responses([resp])
             return
 
-        # 5. search_conversations tool
+        # 5. list_conversations tool
+        if event.name == "list_conversations":
+            raw_limit = event.arguments.get("limit")
+            limit = 10
+            if raw_limit is not None and not isinstance(raw_limit, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    limit = max(1, min(int(raw_limit), 50))
+            try:
+                res = await self._rpc(
+                    VoiceListConversationsRequest(
+                        params=VoiceListConversationsParams(limit=limit)
+                    ),
+                    timeout=10.0,
+                )
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to list conversations: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
+            return
+
+        # 5b. search_conversations tool
         if event.name == "search_conversations":
             query = str(event.arguments.get("query", "")).strip()
             raw_limit = event.arguments.get("limit")
-            limit = 5
+            limit = 8
             if raw_limit is not None and not isinstance(raw_limit, bool):
                 with contextlib.suppress(TypeError, ValueError):
-                    limit = max(1, min(int(raw_limit), 20))
+                    limit = max(1, min(int(raw_limit), 50))
             if not query:
                 await backend.send_tool_responses(
                     [
@@ -1473,6 +1511,101 @@ class VoiceRunner:
                     call_id=event.call_id,
                     name=event.name,
                     response={"error": f"Failed to search conversations: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
+            return
+
+        # 5c. read_conversation tool
+        if event.name == "read_conversation":
+            conversation_id = str(event.arguments.get("conversation_id", "")).strip()
+            raw_max = event.arguments.get("max_turns")
+            max_turns = 40
+            if raw_max is not None and not isinstance(raw_max, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    max_turns = max(1, min(int(raw_max), 200))
+            if not conversation_id:
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={"error": "conversation_id must not be empty."},
+                            is_error=True,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+            try:
+                res = await self._rpc(
+                    VoiceReadConversationRequest(
+                        params=VoiceReadConversationParams(
+                            conversation_id=conversation_id,
+                            max_turns=max_turns,
+                        )
+                    ),
+                    timeout=10.0,
+                )
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to read conversation: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
+            return
+
+        # 5d. search_memory tool
+        if event.name == "search_memory":
+            query = str(event.arguments.get("query", "")).strip()
+            raw_limit = event.arguments.get("limit")
+            limit = 10
+            if raw_limit is not None and not isinstance(raw_limit, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    limit = max(1, min(int(raw_limit), 50))
+            if not query:
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={"error": "Search query must not be empty."},
+                            is_error=True,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+            try:
+                res = await self._rpc(
+                    VoiceSearchMemoryRequest(
+                        params=VoiceSearchMemoryParams(query=query, limit=limit)
+                    ),
+                    timeout=10.0,
+                )
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to search memory: {exc}"},
                     is_error=True,
                     scheduling="when_idle",
                 )

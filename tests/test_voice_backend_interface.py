@@ -60,7 +60,10 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "look_at_screen",
         "watch_screen",
         "end_call",
+        "list_conversations",
         "search_conversations",
+        "read_conversation",
+        "search_memory",
         "post_to_active_chat",
     }
     for tool in tools:
@@ -79,7 +82,10 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert by_name["watch_screen"].parameters_schema["required"] == ["seconds", "reason"]
 
     assert by_name["end_call"].parameters_schema["required"] == ["reason"]
+    assert by_name["list_conversations"].parameters_schema.get("required", []) == []
     assert by_name["search_conversations"].parameters_schema["required"] == ["query"]
+    assert by_name["read_conversation"].parameters_schema["required"] == ["conversation_id"]
+    assert by_name["search_memory"].parameters_schema["required"] == ["query"]
     assert by_name["post_to_active_chat"].parameters_schema["required"] == ["content"]
 
 

@@ -595,6 +595,12 @@ class ConsolidationManager:
                 except Exception as op_err:
                     logger.warning("Could not apply memory operation (%s): %s", op, op_err)
 
+            # 2b. Backfill Layer 3 semantic embeddings for newly consolidated episodes & facts
+            try:
+                await asyncio.to_thread(self.memory.backfill_embeddings)
+            except Exception as emb_err:
+                logger.debug("Embedding backfill skipped after consolidation: %s", emb_err)
+
             # 3. Mark completed
             resolved_sid = self.memory.resolve_session_id(session_id)
             sess_data = {

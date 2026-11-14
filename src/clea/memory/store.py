@@ -22,6 +22,20 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from clea.memory.retrieval import (
+    WEIGHT_EPISODE,
+    WEIGHT_FACT,
+    EmbeddingProvider,
+    EmbeddingStore,
+    EmbedFn,
+    blend_scores,
+    build_search_snippet,
+    cosine_similarity,
+    field_coverage,
+    score_conversation_lexical,
+    score_memory_lexical,
+    tokenize_query,
+)
 from clea.paths import default_data_dir
 
 logger = logging.getLogger(__name__)
@@ -100,7 +114,14 @@ def _format_time_local(dt: datetime) -> str:
 class MemoryStore:
     """Manages MEMORY.md, episode summaries, and structured transcripts."""
 
-    def __init__(self, base_dir: Path | None = None, token_cap: int = 2000) -> None:
+    def __init__(
+        self,
+        base_dir: Path | None = None,
+        token_cap: int = 2000,
+        *,
+        embed_fn: EmbedFn | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> None:
         self.base_dir = (base_dir or default_data_dir()).expanduser().resolve()
         self.memory_dir = self.base_dir / "memory"
         self.episodes_dir = self.memory_dir / "episodes"
@@ -110,7 +131,104 @@ class MemoryStore:
         self.archive_path = self.memory_dir / "MEMORY_ARCHIVE.md"
         self.backup_legacy_dir = self.memory_dir / "backup_legacy_logs"
         self.background_tasks_path = self.memory_dir / "background_tasks.json"
+        self.embeddings_path = self.memory_dir / "embeddings.json"
+        self.embedding_store = EmbeddingStore(self.embeddings_path)
+        self.embedding_provider = embedding_provider or EmbeddingProvider(embed_fn=embed_fn)
         self.token_cap = token_cap
+
+    @property
+    def embed_fn(self) -> EmbedFn | None:
+        """Optional embedding callback for Layer 3 semantic recall."""
+        return self.embedding_provider.embed_fn
+
+    @embed_fn.setter
+    def embed_fn(self, fn: EmbedFn | None) -> None:
+        self.embedding_provider.embed_fn = fn
+
+    def _embed_item_if_needed(self, key: str, text: str, *, save: bool = True) -> bool:
+        """Generate and store an embedding for key when missing or stale; never raises."""
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return False
+        try:
+            if self.embedding_store.get_vector(key, expected_text=cleaned) is not None:
+                return False
+            vec = self.embedding_provider.embed(cleaned)
+            if vec is None:
+                return False
+            changed = self.embedding_store.set_vector(key, cleaned, vec)
+            if save and changed:
+                self.embedding_store.save()
+            return changed
+        except Exception as exc:
+            logger.debug("Skipping embedding for %s: %s", key, exc)
+            return False
+
+    def backfill_embeddings(self) -> int:
+        """Lazily embed any Episode summaries or Durable Facts missing cached vectors.
+
+        Returns the count of newly generated or updated embeddings. Fails gracefully
+        with 0 if no embedding provider is reachable or configured.
+        """
+        episodes = self.get_recent_episodes(limit=0)
+        sections = self.parse_sections()
+        items: list[tuple[str, str]] = []
+        seen_keys: set[str] = set()
+
+        for ep in episodes:
+            sid = str(ep.get("session_id") or "").strip()
+            summary = str(ep.get("summary") or "").strip()
+            if not sid or not summary:
+                continue
+            key = f"episode:{sid}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if self.embedding_store.get_vector(key, expected_text=summary) is None:
+                items.append((key, summary))
+
+        for entries in sections.values():
+            for entry in entries:
+                fact_text = (entry.text or "").strip()
+                if not entry.id or not fact_text:
+                    continue
+                key = f"fact:{entry.id}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if self.embedding_store.get_vector(key, expected_text=fact_text) is None:
+                    items.append((key, fact_text))
+
+        if not items:
+            return 0
+
+        updated = 0
+        for key, text in items:
+            try:
+                vec = self.embedding_provider.embed(text)
+            except Exception as exc:
+                logger.debug("Embedding backfill stopped early at %s: %s", key, exc)
+                break
+            if vec is None:
+                # Stop after the first unreachable/unconfigured failure so offline
+                # searches never repeat network timeouts across all history items.
+                break
+            if self.embedding_store.set_vector(key, text, vec):
+                updated += 1
+
+        if updated > 0:
+            self.embedding_store.save()
+        return updated
+
+    def _get_episode_summary_map(self) -> dict[str, str]:
+        """Return mapping of session_id -> latest episode summary across all days."""
+        summary_map: dict[str, str] = {}
+        for ep in self.get_recent_episodes(limit=0):
+            sid = str(ep.get("session_id") or "").strip()
+            summary = str(ep.get("summary") or "").strip()
+            if sid and summary and sid not in summary_map:
+                summary_map[sid] = summary
+        return summary_map
 
     def ensure_initialized(self) -> None:
         """Create directories and default MEMORY.md if missing."""
@@ -313,6 +431,7 @@ class MemoryStore:
 
         updated_markdown = self.format_sections(sections)
         self.write_long_term(updated_markdown)
+        self._embed_item_if_needed(f"fact:{new_entry.id}", new_entry.text)
         return new_entry
 
     def find_matches(self, query: str) -> list[MemoryEntry]:
@@ -352,6 +471,12 @@ class MemoryStore:
         if removed:
             logger.info("Removed %d memory entries matching '%s'", len(removed), query)
             self.write_long_term(self.format_sections(sections))
+            changed_emb = False
+            for entry in removed:
+                if self.embedding_store.remove_key(f"fact:{entry.id}"):
+                    changed_emb = True
+            if changed_emb:
+                self.embedding_store.save()
         return removed
 
     def _condense_sections(self, sections: dict[str, list[MemoryEntry]]) -> int:
@@ -510,6 +635,7 @@ class MemoryStore:
                         )
                         updated_content = pattern.sub(lambda _, b=new_block: b, content, count=1)
                         ep_file.write_text(updated_content, encoding="utf-8")
+                        self._embed_item_if_needed(f"episode:{s}", summary.strip())
                         return ep_file
 
         path = self.episodes_dir / f"{date_str}.md"
@@ -524,6 +650,7 @@ class MemoryStore:
         with path.open("a", encoding="utf-8") as handle:
             handle.write("".join(chunks))
 
+        self._embed_item_if_needed(f"episode:{session_id}", summary.strip())
         return path
 
     def get_recent_episodes(self, limit: int = 5) -> list[dict[str, Any]]:
@@ -771,7 +898,8 @@ class MemoryStore:
         )
 
         results: list[dict[str, Any]] = []
-        for f in files[:limit]:
+        target_files = files if limit <= 0 else files[:limit]
+        for f in target_files:
             try:
                 with f.open("r", encoding="utf-8") as handle:
                     first_line = handle.readline()
@@ -1121,6 +1249,9 @@ class MemoryStore:
                     modified = True
             except Exception as exc:
                 logger.warning("Error deleting episode for session %s: %s", session_id, exc)
+        if modified:
+            if self.embedding_store.remove_key(f"episode:{session_id}"):
+                self.embedding_store.save()
         return modified
 
     def _restore_episode_from_trash(self, session_id: str) -> bool:
@@ -1253,20 +1384,31 @@ class MemoryStore:
 
         return path
 
-    def list_conversations(self) -> list[dict[str, str | int]]:
-        """List conversations for the sidebar, excluding the Voice Companion stream."""
-        conversations: list[dict[str, str | int]] = []
+    def list_conversations(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """List conversations newest-first across 100% of stored transcripts.
+
+        When ``limit`` is None (sidebar UI default), pinned conversations stay grouped
+        first and all conversations are returned. When ``limit`` is provided (e.g.
+        ``limit=10`` from voice recall), returns the ``limit`` most recent
+        conversations ordered strictly newest-first regardless of pin status,
+        including associated Episode summaries.
+        """
+        conversations: list[dict[str, Any]] = []
         transcripts = [
-            t for t in self.list_transcripts() if t.get("session_id") != VOICE_COMPANION_SESSION_ID
+            t
+            for t in self.list_transcripts(limit=0)
+            if t.get("session_id") != VOICE_COMPANION_SESSION_ID
         ]
+        episode_map = self._get_episode_summary_map()
+        cap = max(1, min(int(limit), 100)) if limit is not None else None
 
         if transcripts:
             for item in transcripts:
-                sid = item["session_id"]
+                sid = str(item["session_id"])
                 full = self.get_transcript(sid)
                 if not full:
                     continue
-                started = item.get("started_at", "")
+                started = str(item.get("started_at", ""))
                 dt_obj: datetime | None = None
                 try:
                     dt_obj = datetime.fromisoformat(started)
@@ -1276,36 +1418,57 @@ class MemoryStore:
                 date_str = dt_obj.date().isoformat() if dt_obj else "unknown"
                 last_time_str = ""
                 messages = full.get("messages", [])
+                last_msg_ts = ""
                 if messages:
-                    last_ts = messages[-1].get("timestamp", "")
+                    last_msg_ts = str(messages[-1].get("timestamp", ""))
                     try:
-                        last_time_str = _format_time_local(datetime.fromisoformat(last_ts))
+                        last_time_str = _format_time_local(datetime.fromisoformat(last_msg_ts))
                     except Exception:
                         pass
                 if not last_time_str:
                     last_time_str = _format_time_local(dt_obj) if dt_obj else ""
 
+                header_updated = str(item.get("updated_at") or started)
+                effective_updated_at = (
+                    _latest_iso_timestamp(header_updated, last_msg_ts)
+                    if last_msg_ts
+                    else header_updated
+                )
+                resolved_sid = self.resolve_session_id(sid)
+                ep_summary = episode_map.get(sid) or episode_map.get(resolved_sid) or ""
+                turn_count = (int(item.get("message_count", 0)) + 1) // 2
+
                 conversations.append(
                     {
                         "date": date_str,
                         "session_id": sid,
+                        "conversation_id": sid,
                         "title": item.get("title", "Conversation"),
-                        "turns": (item.get("message_count", 0) + 1) // 2,
+                        "turns": turn_count,
+                        "turn_count": turn_count,
                         "last_time": last_time_str,
                         "pinned": bool(item.get("pinned", False)),
-                        "updated_at": item.get("updated_at", started),
-                        "_sort_key": f"{date_str} {started}",
+                        "updated_at": effective_updated_at,
+                        "episode_summary": ep_summary,
+                        "_sort_tuple": (
+                            _iso_sort_value(effective_updated_at),
+                            date_str,
+                            started,
+                            sid,
+                        ),
                     }
                 )
-            conversations.sort(key=lambda c: str(c.get("_sort_key", "")), reverse=True)
+            conversations.sort(key=lambda c: c["_sort_tuple"], reverse=True)
             for c in conversations:
-                c.pop("_sort_key", None)
+                c.pop("_sort_tuple", None)
+            if cap is not None:
+                return conversations[:cap]
             pinned_list = [c for c in conversations if c.get("pinned")]
             unpinned_list = [c for c in conversations if not c.get("pinned")]
             return pinned_list + unpinned_list
 
         for day in self.list_days():
-            by_session: dict[str, dict[str, str | int]] = {}
+            by_session: dict[str, dict[str, Any]] = {}
             for sid, time_str, user, _assistant in _parse_turns(self.read_daily_on(day)):
                 if sid == VOICE_COMPANION_SESSION_ID:
                     continue
@@ -1316,29 +1479,113 @@ class MemoryStore:
                     entry = {
                         "date": day,
                         "session_id": sid,
+                        "conversation_id": sid,
                         "title": _truncate(user),
                         "turns": 0,
+                        "turn_count": 0,
                         "last_time": fmt_time,
                         "pinned": False,
                         "updated_at": f"{day}T00:00:00",
+                        "episode_summary": episode_map.get(sid, ""),
                     }
                     by_session[sid] = entry
                 entry["turns"] = int(entry["turns"]) + 1
+                entry["turn_count"] = entry["turns"]
                 entry["last_time"] = fmt_time
             conversations.extend(reversed(by_session.values()))
+        if cap is not None:
+            return conversations[:cap]
         pinned_list = [c for c in conversations if c.get("pinned")]
         unpinned_list = [c for c in conversations if not c.get("pinned")]
         return pinned_list + unpinned_list
 
-    def search_conversations(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Search raw message content and titles across text chats and Voice Companion."""
+    def _collect_conversation_episodes(
+        self,
+        *,
+        session_id: str,
+        resolved_sid: str,
+        messages: list[dict[str, Any]],
+        episode_map: dict[str, str],
+    ) -> tuple[str, list[list[float]]]:
+        """Collect Episode summary text and cached vectors associated with a conversation."""
+        candidate_sids: list[str] = []
+        for s in (session_id, resolved_sid):
+            if s and s not in candidate_sids:
+                candidate_sids.append(s)
+        if session_id == VOICE_COMPANION_SESSION_ID:
+            for m in messages:
+                cid = str(m.get("call_id") or "").strip()
+                if cid and cid not in candidate_sids:
+                    candidate_sids.append(cid)
+
+        summaries: list[str] = []
+        vectors: list[list[float]] = []
+        seen_summaries: set[str] = set()
+        for s in candidate_sids:
+            ep_text = episode_map.get(s, "").strip()
+            if not ep_text:
+                continue
+            if ep_text not in seen_summaries:
+                summaries.append(ep_text)
+                seen_summaries.add(ep_text)
+            vec = self.embedding_store.get_vector(f"episode:{s}", expected_text=ep_text)
+            if vec is not None:
+                vectors.append(vec)
+        return "\n".join(summaries), vectors
+
+    def search_conversations(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """3-layer hybrid search across 100% of transcripts, Episodes, and Durable Facts.
+
+        Layer 1: Searches 100% of stored transcripts, Episodes, and Durable Facts (zero cap).
+        Layer 2: Multi-term token-ranked weighted scoring across Title (+5.0),
+                 Episode summary (+3.5), Durable Facts (+3.0), and raw turns (+1.0).
+        Layer 3: Cosine similarity against Episode & Durable Fact float32 embeddings
+                 blended as 0.6 * semantic + 0.4 * lexical (graceful fallback to 1.0 * lexical).
+        """
         q_raw = (query or "").strip()
-        if not q_raw or not self.transcripts_dir.is_dir():
+        if not q_raw:
             return []
 
-        cap = max(1, min(int(limit or 5), 50))
+        cap = max(1, min(int(limit or 8), 50))
         q_lower = q_raw.lower()
-        q_tokens = [tok for tok in re.findall(r"\w+", q_lower) if len(tok) >= 2]
+        q_tokens = tokenize_query(q_raw)
+
+        # Lazily backfill any un-embedded Episodes or Durable Facts and embed query.
+        try:
+            self.backfill_embeddings()
+        except Exception as exc:
+            logger.debug("Lazy embedding backfill skipped: %s", exc)
+
+        query_vec: list[float] | None = None
+        try:
+            query_vec = self.embedding_provider.embed(q_raw)
+        except Exception as exc:
+            logger.debug("Query embedding skipped: %s", exc)
+
+        if not self.transcripts_dir.is_dir():
+            return []
+
+        episode_map = self._get_episode_summary_map()
+
+        # Precompute Durable Facts (lexical coverage, tokens, and cached vectors) once.
+        fact_records: list[dict[str, Any]] = []
+        for entries in self.parse_sections().values():
+            for entry in entries:
+                f_text = (entry.text or "").strip()
+                if not f_text:
+                    continue
+                f_tokens = set(tokenize_query(f_text))
+                fact_records.append(
+                    {
+                        "date": entry.date,
+                        "text": f_text,
+                        "tokens": f_tokens,
+                        "cov": field_coverage(q_tokens, q_lower, f_text),
+                        "vector": self.embedding_store.get_vector(
+                            f"fact:{entry.id}", expected_text=f_text
+                        ),
+                    }
+                )
 
         files = sorted(
             self.transcripts_dir.glob("*.jsonl"),
@@ -1346,112 +1593,380 @@ class MemoryStore:
             reverse=True,
         )
 
-        scored_hits: list[tuple[int, str, dict[str, Any]]] = []
+        scored_hits: list[tuple[float, float, str, dict[str, Any]]] = []
         for f in files:
             tr = self._read_transcript_file(f, f.stem)
             if not tr:
                 continue
             sid = str(tr.get("session_id") or f.stem)
+            resolved_sid = self.resolve_session_id(sid)
             default_title = (
                 VOICE_COMPANION_TITLE if sid == VOICE_COMPANION_SESSION_ID else "Conversation"
             )
             title = str(tr.get("title") or default_title)
             source = "voice_companion" if sid == VOICE_COMPANION_SESSION_ID else "chat"
-            title_lower = title.lower()
-            title_exact = q_lower in title_lower
-            title_token_hits = sum(1 for tok in q_tokens if tok in title_lower)
-            file_had_text_match = False
+            msgs = list(tr.get("messages", []))
 
-            for msg in tr.get("messages", []):
-                text = str(msg.get("text") or "").strip()
-                tool_calls = msg.get("tool_calls") or []
-                tool_parts: list[str] = []
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    tname = str(tc.get("name") or "")
-                    targs = tc.get("arguments")
-                    targs_str = json.dumps(targs, ensure_ascii=False) if targs else ""
-                    tout = str(tc.get("output") or "")
-                    tool_parts.append(f"{tname} {targs_str} {tout[:400]}")
-                tool_text = " ".join(tool_parts).strip()
-                searchable_text = f"{text} {tool_text}".strip() if tool_text else text
+            header_updated = str(tr.get("updated_at") or tr.get("started_at") or "")
+            last_msg_ts = str(msgs[-1].get("timestamp") or "") if msgs else ""
+            effective_updated_at = (
+                _latest_iso_timestamp(header_updated, last_msg_ts)
+                if last_msg_ts
+                else header_updated
+            )
+            conv_date = effective_updated_at[:10] if len(effective_updated_at) >= 10 else ""
+
+            episode_summary, ep_vecs = self._collect_conversation_episodes(
+                session_id=sid,
+                resolved_sid=resolved_sid,
+                messages=msgs,
+                episode_map=episode_map,
+            )
+
+            turn_texts: list[str] = []
+            turn_candidates: list[tuple[float, float, str, str, str, str | None]] = []
+            for msg in msgs:
+                searchable_text = _format_searchable_message_text(msg)
                 if not searchable_text:
                     continue
-
+                turn_texts.append(searchable_text)
+                turn_cov = field_coverage(q_tokens, q_lower, searchable_text)
+                if turn_cov <= 0.0:
+                    continue
                 role = str(msg.get("role") or "assistant")
-                ts = str(
-                    msg.get("timestamp")
-                    or tr.get("updated_at")
-                    or tr.get("started_at")
-                    or ""
+                ts = str(msg.get("timestamp") or effective_updated_at)
+                snip = build_search_snippet(searchable_text, q_lower, q_tokens)
+                call_id = str(msg["call_id"]) if msg.get("call_id") else None
+                turn_candidates.append(
+                    (turn_cov, _iso_sort_value(ts), ts, role, snip, call_id)
                 )
-                text_lower = searchable_text.lower()
-                text_exact = q_lower in text_lower
-                text_token_hits = sum(1 for tok in q_tokens if tok in text_lower)
 
-                matched = False
-                score = 0
-                if text_exact:
-                    matched = True
-                    score += 100
-                elif q_tokens and text_token_hits == len(q_tokens):
-                    matched = True
-                    score += 50
-                elif len(q_tokens) >= 2 and text_token_hits >= max(1, (len(q_tokens) + 1) // 2):
-                    matched = True
-                    score += 25
+            q_set = set(q_tokens)
+            conv_tokens = set(tokenize_query("\n".join([title, episode_summary, *turn_texts])))
+            linked_fact_covs: list[float] = []
+            linked_fact_texts: list[str] = []
+            linked_fact_vecs: list[list[float]] = []
+            for rec in fact_records:
+                shared = rec["tokens"] & conv_tokens
+                if not shared:
+                    continue
+                non_query_fact = rec["tokens"] - q_set
+                has_topic_overlap = (
+                    len(shared) >= 2
+                    or rec["date"] == conv_date
+                    or any(len(tok) >= 5 for tok in shared)
+                )
+                is_linked = (
+                    bool(non_query_fact & conv_tokens) and has_topic_overlap
+                    if non_query_fact
+                    else has_topic_overlap
+                )
+                if is_linked:
+                    linked_fact_covs.append(float(rec["cov"]))
+                    linked_fact_texts.append(str(rec["text"]))
+                    if rec["vector"] is not None:
+                        linked_fact_vecs.append(rec["vector"])
 
-                if matched:
-                    file_had_text_match = True
-                    score += text_token_hits * 10 + (30 if title_exact else title_token_hits * 10)
-                    snippet = _build_search_snippet(searchable_text, q_lower, q_tokens)
-                    hit: dict[str, Any] = {
-                        "session_id": sid,
-                        "title": title,
+            fact_cov = max(linked_fact_covs, default=0.0)
+            max_turn_cov = max((c[0] for c in turn_candidates), default=0.0)
+            lexical_score, _, _ = score_conversation_lexical(
+                query_tokens=q_tokens,
+                query_lower=q_lower,
+                title=title,
+                episode_summary=episode_summary,
+                fact_cov=fact_cov,
+                max_turn_cov=max_turn_cov,
+                turn_texts_for_cov=turn_texts,
+                fact_texts_for_cov=linked_fact_texts,
+            )
+
+            candidate_vecs = ep_vecs + linked_fact_vecs
+            semantic_score: float | None = None
+            if query_vec is not None and candidate_vecs:
+                semantic_score = max(cosine_similarity(query_vec, vec) for vec in candidate_vecs)
+
+            if lexical_score <= 0.0 and (semantic_score is None or semantic_score < 0.25):
+                continue
+
+            final_score = blend_scores(lexical_score, semantic_score)
+
+            turn_candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+            matching_snippets: list[dict[str, str]] = []
+            seen_snips: set[tuple[str, str, str]] = set()
+            top_role = "user"
+            top_ts = effective_updated_at
+            top_snippet = ""
+            top_call_id: str | None = None
+
+            for _cov, _ts_val, ts, role, snip, call_id in turn_candidates:
+                if not top_snippet:
+                    top_role = role
+                    top_ts = ts
+                    top_snippet = snip
+                    top_call_id = call_id
+                dedup_key = (role, ts, snip)
+                if dedup_key in seen_snips:
+                    continue
+                seen_snips.add(dedup_key)
+                matching_snippets.append(
+                    {
                         "role": role,
                         "timestamp": ts,
-                        "snippet": snippet,
-                        "source": source,
+                        "excerpt": snip,
+                        "snippet": snip,
                     }
-                    if msg.get("call_id"):
-                        hit["call_id"] = str(msg["call_id"])
-                    scored_hits.append((score, ts, hit))
-
-            if not file_had_text_match and (
-                title_exact or (q_tokens and title_token_hits == len(q_tokens))
-            ):
-                msgs = tr.get("messages", [])
-                rep_msg = next(
-                    (
-                        m
-                        for m in msgs
-                        if m.get("role") == "user" and str(m.get("text", "")).strip()
-                    ),
-                    None,
                 )
-                if rep_msg is None and msgs:
-                    rep_msg = msgs[0]
-                if rep_msg:
-                    rep_text = str(rep_msg.get("text") or rep_msg.get("role") or "").strip()
-                    rep_role = str(rep_msg.get("role") or "user")
-                    rep_ts = str(rep_msg.get("timestamp") or tr.get("started_at") or "")
-                    score = 60 + title_token_hits * 10
-                    snippet = _build_search_snippet(rep_text or title, q_lower, q_tokens)
-                    rep_hit = {
-                        "session_id": sid,
-                        "title": title,
-                        "role": rep_role,
-                        "timestamp": rep_ts,
-                        "snippet": snippet,
-                        "source": source,
-                    }
-                    if rep_msg.get("call_id"):
-                        rep_hit["call_id"] = str(rep_msg["call_id"])
-                    scored_hits.append((score, rep_ts, rep_hit))
+                if len(matching_snippets) >= 3:
+                    break
 
-        scored_hits.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [item[2] for item in scored_hits[:cap]]
+            if not matching_snippets:
+                if episode_summary:
+                    ep_snip = build_search_snippet(episode_summary, q_lower, q_tokens)
+                    top_role = "episode"
+                    top_ts = effective_updated_at
+                    top_snippet = ep_snip
+                    matching_snippets.append(
+                        {
+                            "role": "episode",
+                            "timestamp": effective_updated_at,
+                            "excerpt": ep_snip,
+                            "snippet": ep_snip,
+                        }
+                    )
+                else:
+                    rep_msg = next(
+                        (
+                            m
+                            for m in msgs
+                            if m.get("role") == "user" and str(m.get("text", "")).strip()
+                        ),
+                        msgs[0] if msgs else None,
+                    )
+                    if rep_msg is not None:
+                        rep_text = _format_searchable_message_text(rep_msg) or title
+                        top_role = str(rep_msg.get("role") or "user")
+                        top_ts = str(rep_msg.get("timestamp") or effective_updated_at)
+                        top_snippet = build_search_snippet(rep_text, q_lower, q_tokens)
+                        top_call_id = str(rep_msg["call_id"]) if rep_msg.get("call_id") else None
+                    else:
+                        top_snippet = build_search_snippet(title, q_lower, q_tokens)
+                    matching_snippets.append(
+                        {
+                            "role": top_role,
+                            "timestamp": top_ts,
+                            "excerpt": top_snippet,
+                            "snippet": top_snippet,
+                        }
+                    )
+
+            hit: dict[str, Any] = {
+                "conversation_id": sid,
+                "session_id": sid,
+                "title": title,
+                "updated_at": effective_updated_at,
+                "episode_summary": episode_summary,
+                "matching_snippets": matching_snippets,
+                "score": round(final_score, 4),
+                "semantic_score": round(semantic_score, 4) if semantic_score is not None else None,
+                "lexical_score": round(lexical_score, 4),
+                "role": top_role,
+                "timestamp": top_ts,
+                "snippet": top_snippet,
+                "source": source,
+            }
+            if top_call_id:
+                hit["call_id"] = top_call_id
+
+            scored_hits.append(
+                (
+                    round(final_score, 6),
+                    _iso_sort_value(effective_updated_at),
+                    effective_updated_at,
+                    hit,
+                )
+            )
+
+        scored_hits.sort(
+            key=lambda item: (item[0], item[1], item[2], item[3]["session_id"]),
+            reverse=True,
+        )
+        return [item[3] for item in scored_hits[:cap]]
+
+    def read_conversation(self, conversation_id: str, max_turns: int = 40) -> dict[str, Any] | None:
+        """Read full chronological message turns and Episode summary for a conversation."""
+        cid = (conversation_id or "").strip()
+        if not cid:
+            return None
+
+        tr = self.get_transcript(cid)
+        if tr is None:
+            return None
+
+        sid = str(tr.get("session_id") or cid)
+        resolved_sid = self.resolve_session_id(sid)
+        messages = list(tr.get("messages", []))
+        cap = max(1, min(int(max_turns or 40), 500))
+        truncated = len(messages) > cap
+        selected = messages[-cap:] if truncated else messages
+
+        turns_out: list[dict[str, str]] = []
+        for msg in selected:
+            raw_text = str(msg.get("text") or "").strip()
+            tool_calls = msg.get("tool_calls") or []
+            if raw_text:
+                content = raw_text
+            elif tool_calls:
+                content = _format_searchable_message_text(msg)
+            else:
+                content = ""
+            turns_out.append(
+                {
+                    "role": str(msg.get("role") or "assistant"),
+                    "content": content,
+                    "timestamp": str(
+                        msg.get("timestamp")
+                        or tr.get("updated_at")
+                        or tr.get("started_at")
+                        or ""
+                    ),
+                }
+            )
+
+        episode_map = self._get_episode_summary_map()
+        episode_summary, _ = self._collect_conversation_episodes(
+            session_id=sid,
+            resolved_sid=resolved_sid,
+            messages=messages,
+            episode_map=episode_map,
+        )
+
+        header_updated = str(tr.get("updated_at") or tr.get("started_at") or "")
+        last_msg_ts = str(messages[-1].get("timestamp") or "") if messages else ""
+        effective_updated_at = (
+            _latest_iso_timestamp(header_updated, last_msg_ts)
+            if last_msg_ts
+            else header_updated
+        )
+
+        return {
+            "conversation_id": sid,
+            "session_id": sid,
+            "title": str(tr.get("title") or "Conversation"),
+            "updated_at": effective_updated_at,
+            "episode_summary": episode_summary,
+            "total_turns": len(messages),
+            "truncated": truncated,
+            "turns": turns_out,
+        }
+
+    def search_memory(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Hybrid semantic + token-ranked search directly across Durable Facts and Episodes."""
+        q_raw = (query or "").strip()
+        if not q_raw:
+            return []
+
+        cap = max(1, min(int(limit or 10), 50))
+        q_lower = q_raw.lower()
+        q_tokens = tokenize_query(q_raw)
+
+        try:
+            self.backfill_embeddings()
+        except Exception as exc:
+            logger.debug("Lazy embedding backfill skipped in search_memory: %s", exc)
+
+        query_vec: list[float] | None = None
+        try:
+            query_vec = self.embedding_provider.embed(q_raw)
+        except Exception as exc:
+            logger.debug("Query embedding skipped in search_memory: %s", exc)
+
+        candidates: list[tuple[float, str, str, dict[str, Any]]] = []
+
+        for section_name, entries in self.parse_sections().items():
+            for entry in entries:
+                f_text = (entry.text or "").strip()
+                if not f_text:
+                    continue
+                lex = score_memory_lexical(
+                    query_tokens=q_tokens,
+                    query_lower=q_lower,
+                    text=f_text,
+                    weight=WEIGHT_FACT,
+                )
+                vec = self.embedding_store.get_vector(f"fact:{entry.id}", expected_text=f_text)
+                sem: float | None = None
+                if query_vec is not None and vec is not None:
+                    sem = cosine_similarity(query_vec, vec)
+
+                if lex <= 0.0 and (sem is None or sem < 0.25):
+                    continue
+
+                score = blend_scores(lex, sem)
+                candidates.append(
+                    (
+                        round(score, 6),
+                        str(entry.date or ""),
+                        f"fact:{entry.id}",
+                        {
+                            "kind": "fact",
+                            "item_id": entry.id,
+                            "section": entry.section or section_name,
+                            "date": str(entry.date or ""),
+                            "source": str(entry.source or "stated"),
+                            "session_id": "",
+                            "conversation_id": "",
+                            "text": f_text,
+                            "score": round(score, 4),
+                            "semantic_score": round(sem, 4) if sem is not None else None,
+                            "lexical_score": round(lex, 4),
+                        },
+                    )
+                )
+
+        for ep in self.get_recent_episodes(limit=0):
+            sid = str(ep.get("session_id") or "").strip()
+            summary = str(ep.get("summary") or "").strip()
+            if not sid or not summary:
+                continue
+            lex = score_memory_lexical(
+                query_tokens=q_tokens,
+                query_lower=q_lower,
+                text=summary,
+                weight=WEIGHT_EPISODE,
+            )
+            vec = self.embedding_store.get_vector(f"episode:{sid}", expected_text=summary)
+            sem = None
+            if query_vec is not None and vec is not None:
+                sem = cosine_similarity(query_vec, vec)
+
+            if lex <= 0.0 and (sem is None or sem < 0.25):
+                continue
+
+            score = blend_scores(lex, sem)
+            ep_date = str(ep.get("date") or "")
+            candidates.append(
+                (
+                    round(score, 6),
+                    ep_date,
+                    f"episode:{sid}",
+                    {
+                        "kind": "episode",
+                        "item_id": sid,
+                        "section": "Episodes",
+                        "date": ep_date,
+                        "source": "episode",
+                        "session_id": sid,
+                        "conversation_id": sid,
+                        "text": summary,
+                        "score": round(score, 4),
+                        "semantic_score": round(sem, 4) if sem is not None else None,
+                        "lexical_score": round(lex, 4),
+                    },
+                )
+            )
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return [item[3] for item in candidates[:cap]]
 
     def append_to_active_chat(
         self,
@@ -1791,28 +2306,49 @@ def _truncate(text: str, limit: int = 60) -> str:
 
 def _build_search_snippet(text: str, q_lower: str, q_tokens: list[str], window: int = 240) -> str:
     """Extract a readable snippet centered around the first query match."""
-    clean = text.strip()
-    if len(clean) <= window:
-        return clean
+    return build_search_snippet(text, q_lower, q_tokens, window=window)
 
-    lower = clean.lower()
-    idx = lower.find(q_lower)
-    if idx == -1:
-        for tok in q_tokens:
-            idx = lower.find(tok)
-            if idx != -1:
-                break
-    if idx == -1:
-        return clean[: window - 1] + "…"
 
-    half = window // 2
-    start = max(0, idx - half)
-    end = min(len(clean), start + window)
-    if end - start < window:
-        start = max(0, end - window)
-    prefix = "…" if start > 0 else ""
-    suffix = "…" if end < len(clean) else ""
-    return f"{prefix}{clean[start:end].strip()}{suffix}"
+def _iso_sort_value(ts: str) -> float:
+    """Convert an ISO-8601 timestamp string into a numeric epoch key for sorting."""
+    if not ts:
+        return 0.0
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _latest_iso_timestamp(ts_a: str, ts_b: str) -> str:
+    """Return whichever non-empty ISO-8601 timestamp represents the later instant."""
+    a = (ts_a or "").strip()
+    b = (ts_b or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    val_a = _iso_sort_value(a)
+    val_b = _iso_sort_value(b)
+    if val_a > 0.0 or val_b > 0.0:
+        return b if val_b >= val_a else a
+    return max(a, b)
+
+
+def _format_searchable_message_text(msg: dict[str, Any]) -> str:
+    """Combine message text and any embedded tool call invocations/outputs."""
+    text = str(msg.get("text") or "").strip()
+    tool_calls = msg.get("tool_calls") or []
+    tool_parts: list[str] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        tname = str(tc.get("name") or "")
+        targs = tc.get("arguments")
+        targs_str = json.dumps(targs, ensure_ascii=False) if targs else ""
+        tout = str(tc.get("output") or "")
+        tool_parts.append(f"{tname} {targs_str} {tout[:400]}")
+    tool_text = " ".join(tool_parts).strip()
+    return f"{text} {tool_text}".strip() if tool_text else text
 
 
 def _parse_turns(markdown: str) -> list[tuple[str, str, str, str]]:

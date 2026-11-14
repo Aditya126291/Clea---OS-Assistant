@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 RiskTier = Literal["read_only", "reversible", "destructive"]
 ApprovalDecision = Literal["allow", "deny"]
@@ -118,9 +118,23 @@ class VoiceHistoryParams(_Model):
     limit: int = Field(default=100, ge=1, le=500)
 
 
+class VoiceListConversationsParams(_Model):
+    limit: int = Field(default=10, ge=1, le=100)
+
+
 class VoiceSearchConversationsParams(_Model):
     query: str
-    limit: int = Field(default=5, ge=1, le=50)
+    limit: int = Field(default=8, ge=1, le=50)
+
+
+class VoiceReadConversationParams(_Model):
+    conversation_id: str
+    max_turns: int = Field(default=40, ge=1, le=500)
+
+
+class VoiceSearchMemoryParams(_Model):
+    query: str
+    limit: int = Field(default=10, ge=1, le=50)
 
 
 class VoicePostToActiveChatParams(_Model):
@@ -334,9 +348,24 @@ class VoiceHistoryRequest(_Request):
     params: VoiceHistoryParams = Field(default_factory=VoiceHistoryParams)
 
 
+class VoiceListConversationsRequest(_Request):
+    method: Literal["voice.list_conversations"] = "voice.list_conversations"
+    params: VoiceListConversationsParams = Field(default_factory=VoiceListConversationsParams)
+
+
 class VoiceSearchConversationsRequest(_Request):
     method: Literal["voice.search_conversations"] = "voice.search_conversations"
     params: VoiceSearchConversationsParams
+
+
+class VoiceReadConversationRequest(_Request):
+    method: Literal["voice.read_conversation"] = "voice.read_conversation"
+    params: VoiceReadConversationParams
+
+
+class VoiceSearchMemoryRequest(_Request):
+    method: Literal["voice.search_memory"] = "voice.search_memory"
+    params: VoiceSearchMemoryParams
 
 
 class VoicePostToActiveChatRequest(_Request):
@@ -378,7 +407,10 @@ RequestFrame = Annotated[
     | VoiceStatusRequest
     | VoiceDelegateTaskRequest
     | VoiceHistoryRequest
+    | VoiceListConversationsRequest
     | VoiceSearchConversationsRequest
+    | VoiceReadConversationRequest
+    | VoiceSearchMemoryRequest
     | VoicePostToActiveChatRequest,
     Field(discriminator="method"),
 ]
@@ -542,11 +574,22 @@ class MemoryGetDailyResult(_Model):
 class ConversationSummary(_Model):
     date: str
     session_id: str
+    conversation_id: str = ""
     title: str
     turns: int
+    turn_count: int = 0
     last_time: str
     pinned: bool = False
     updated_at: str = ""
+    episode_summary: str = ""
+
+    @model_validator(mode="after")
+    def _sync_fields(self) -> ConversationSummary:
+        if not self.conversation_id and self.session_id:
+            self.conversation_id = self.session_id
+        if self.turn_count == 0 and self.turns > 0:
+            self.turn_count = self.turns
+        return self
 
 
 class ConversationsListResult(_Model):
@@ -674,18 +717,114 @@ class VoiceHistoryResult(_Model):
     messages: list[VoiceHistoryMessageItem] = Field(default_factory=list)
 
 
-class ConversationSearchHit(_Model):
-    session_id: str
+class VoiceConversationListItem(_Model):
+    conversation_id: str = ""
+    session_id: str = ""
     title: str
+    updated_at: str = ""
+    turn_count: int = 0
+    turns: int = 0
+    episode_summary: str = ""
+    date: str = ""
+    last_time: str = ""
+    pinned: bool = False
+
+    @model_validator(mode="after")
+    def _sync_fields(self) -> VoiceConversationListItem:
+        if not self.conversation_id and self.session_id:
+            self.conversation_id = self.session_id
+        elif not self.session_id and self.conversation_id:
+            self.session_id = self.conversation_id
+        if self.turn_count == 0 and self.turns > 0:
+            self.turn_count = self.turns
+        elif self.turns == 0 and self.turn_count > 0:
+            self.turns = self.turn_count
+        return self
+
+
+class VoiceListConversationsResult(_Model):
+    conversations: list[VoiceConversationListItem] = Field(default_factory=list)
+
+
+class ConversationSearchSnippet(_Model):
     role: str
     timestamp: str
-    snippet: str
+    excerpt: str = ""
+    snippet: str = ""
+
+    @model_validator(mode="after")
+    def _sync_excerpt_and_snippet(self) -> ConversationSearchSnippet:
+        if not self.excerpt and self.snippet:
+            self.excerpt = self.snippet
+        elif not self.snippet and self.excerpt:
+            self.snippet = self.excerpt
+        return self
+
+
+class ConversationSearchHit(_Model):
+    session_id: str = ""
+    conversation_id: str = ""
+    title: str
+    updated_at: str = ""
+    episode_summary: str = ""
+    matching_snippets: list[ConversationSearchSnippet] = Field(default_factory=list)
+    score: float = 0.0
+    semantic_score: float | None = None
+    lexical_score: float = 0.0
+    role: str = "user"
+    timestamp: str = ""
+    snippet: str = ""
     source: str = "chat"
     call_id: str | None = None
+
+    @model_validator(mode="after")
+    def _sync_ids(self) -> ConversationSearchHit:
+        if not self.conversation_id and self.session_id:
+            self.conversation_id = self.session_id
+        elif not self.session_id and self.conversation_id:
+            self.session_id = self.conversation_id
+        return self
 
 
 class VoiceSearchConversationsResult(_Model):
     results: list[ConversationSearchHit] = Field(default_factory=list)
+
+
+class VoiceConversationTurnItem(_Model):
+    role: str
+    content: str
+    timestamp: str = ""
+
+
+class VoiceReadConversationResult(_Model):
+    found: bool = True
+    conversation_id: str = ""
+    session_id: str = ""
+    title: str = ""
+    updated_at: str = ""
+    episode_summary: str = ""
+    total_turns: int = 0
+    truncated: bool = False
+    turns: list[VoiceConversationTurnItem] = Field(default_factory=list)
+    message: str = ""
+
+
+class MemorySearchHit(_Model):
+    kind: Literal["fact", "episode"]
+    item_id: str
+    section: str = ""
+    date: str = ""
+    source: str = ""
+    session_id: str = ""
+    conversation_id: str = ""
+    text: str
+    score: float = 0.0
+    semantic_score: float | None = None
+    lexical_score: float = 0.0
+
+
+class VoiceSearchMemoryResult(_Model):
+    results: list[MemorySearchHit] = Field(default_factory=list)
 
 
 class VoicePostToActiveChatResult(_Model):
@@ -729,7 +868,10 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "voice.status": VoiceStatusResult,
     "voice.delegate_task": VoiceDelegateTaskResult,
     "voice.history": VoiceHistoryResult,
+    "voice.list_conversations": VoiceListConversationsResult,
     "voice.search_conversations": VoiceSearchConversationsResult,
+    "voice.read_conversation": VoiceReadConversationResult,
+    "voice.search_memory": VoiceSearchMemoryResult,
     "voice.post_to_active_chat": VoicePostToActiveChatResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""

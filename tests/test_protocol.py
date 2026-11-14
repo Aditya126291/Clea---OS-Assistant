@@ -191,7 +191,10 @@ def test_every_method_has_a_result_model() -> None:
             ("voice.delegate_task", {"description": "check calendar"}),
             ("chat.focus", {}),
             ("voice.history", {}),
+            ("voice.list_conversations", {}),
             ("voice.search_conversations", {"query": "search query"}),
+            ("voice.read_conversation", {"conversation_id": "s1"}),
+            ("voice.search_memory", {"query": "search query"}),
             ("voice.post_to_active_chat", {"content": "sample content"}),
         ]
     }
