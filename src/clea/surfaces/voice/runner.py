@@ -1081,7 +1081,12 @@ class VoiceRunner:
                 monitor=monitor,
             )
 
-            if res.blocked:
+            res_blocked = res.blocked or is_window_blocked(
+                res.window_title or "",
+                res.process_name or "",
+                self.config.blocklist,
+            )
+            if res_blocked:
                 if not self._screen_indicator.is_watching:
                     self._screen_indicator.hide()
                 resp = VoiceToolResponse(
@@ -1137,12 +1142,26 @@ class VoiceRunner:
                                 self._screen_service.capture,
                                 target="active_window",
                             )
+                            candidate_blocked = candidate.blocked or is_window_blocked(
+                                candidate.window_title or "",
+                                candidate.process_name or "",
+                                self.config.blocklist,
+                            )
                             same_monitor = (
                                 res.monitor_index is None
                                 or candidate.monitor_index is None
                                 or candidate.monitor_index == res.monitor_index
                             )
-                            if not candidate.blocked and candidate.image_bytes and same_monitor:
+                            same_window = (
+                                (candidate.process_name, candidate.window_title)
+                                == (res.process_name, res.window_title)
+                            )
+                            if (
+                                not candidate_blocked
+                                and candidate.image_bytes
+                                and same_monitor
+                                and same_window
+                            ):
                                 active_res = candidate
                                 media_parts.append(
                                     VoiceToolMediaPart(
@@ -1227,23 +1246,29 @@ class VoiceRunner:
 
             if self._watch_screen_task is not None and not self._watch_screen_task.done():
                 prev_task = self._watch_screen_task
-                self._watch_screen_task = None
                 prev_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await prev_task
+                if self._watch_screen_task is prev_task:
+                    self._watch_screen_task = None
+                if self._screen_indicator.is_watching:
+                    self._screen_indicator.stop_watching()
 
             initial_bounds: tuple[int, int, int, int] | None = None
             win_info = self._screen_service.get_active_window_info()
             service_blocklist = getattr(self._screen_service, "blocklist", None)
             if win_info is not None and (
-                is_window_blocked(win_info.title, win_info.process_name, self.config.blocklist)
+                is_window_blocked(
+                    win_info.title or "", win_info.process_name or "", self.config.blocklist
+                )
                 or (
                     service_blocklist is not None
-                    and is_window_blocked(win_info.title, win_info.process_name, service_blocklist)
+                    and is_window_blocked(
+                        win_info.title or "", win_info.process_name or "", service_blocklist
+                    )
                 )
             ):
-                if not self._screen_indicator.is_watching:
-                    self._screen_indicator.hide()
+                self._screen_indicator.stop_watching()
                 resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
@@ -1323,7 +1348,12 @@ class VoiceRunner:
                 )
                 if res.monitor_bounds is not None:
                     self._screen_indicator.update_watch_bounds(res.monitor_bounds)
-                if res.image_bytes is not None and not res.blocked:
+                res_blocked = res.blocked or is_window_blocked(
+                    res.window_title or "",
+                    res.process_name or "",
+                    self.config.blocklist,
+                )
+                if res.image_bytes is not None and not res_blocked:
                     await backend.send_video_frame(res.image_bytes, mime_type=res.mime_type)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import queue
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -27,6 +28,7 @@ from clea.surfaces.voice.screen import (
     encode_native_frame,
     is_window_blocked,
 )
+from clea.surfaces.voice.screen_indicator import ScreenIndicator
 from clea.surfaces.voice.wake_word import WakeWordDetector
 from clea.surfaces.voice.win32 import (
     MONITORINFOF_PRIMARY,
@@ -960,6 +962,260 @@ async def test_voice_runner_look_at_screen_skips_second_crop_if_switched_to_bloc
     assert resp.is_error is False
     assert resp.response["frames_sent"] == 1
     assert resp.response["image_order"] == ["full_screen"]
+    assert len(resp.media_parts) == 1
+    assert resp.media_parts[0].mime_type == "image/jpeg"
+
+    await runner.stop()
+
+
+async def test_voice_runner_watch_screen_superseded_by_blocked_watch_stops_indicator(
+    tmp_path: Path,
+) -> None:
+    class _RecordingOverlayBackend:
+        def __init__(self) -> None:
+            self._q: queue.Queue[str] = queue.Queue()
+            self._sync_cb = None
+            self.events: list[tuple[str, object]] = []
+
+        def set_sync_callback(self, cb) -> None:
+            self._sync_cb = cb
+
+        def create(self, colorref: int, rect: tuple[int, int, int, int]) -> None:
+            self.events.append(("create", rect))
+
+        def show(self, rect: tuple[int, int, int, int]) -> None:
+            self.events.append(("show", rect))
+
+        def hide(self) -> None:
+            self.events.append(("hide", None))
+
+        def start_timer(self, interval_ms: int) -> None:
+            return None
+
+        def stop_timer(self) -> None:
+            return None
+
+        def request_sync(self) -> None:
+            self._q.put("sync")
+
+        def request_quit(self) -> None:
+            self._q.put("quit")
+
+        def pump_once(self) -> bool:
+            msg = self._q.get()
+            if msg == "quit":
+                return False
+            if msg == "sync" and self._sync_cb is not None:
+                self._sync_cb()
+            return True
+
+        def destroy(self) -> None:
+            self.events.append(("destroy", None))
+
+    blocklist = ScreenBlocklistConfig(window_titles=["*1Password*"])
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(
+        api=api,
+        blocklist=blocklist,
+        grabber=lambda *a, **k: canvas.copy(),
+    )
+    overlay_backend = _RecordingOverlayBackend()
+    indicator = ScreenIndicator(
+        enabled=True,
+        api=api,
+        backend_factory=lambda: overlay_backend,
+    )
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=VoiceConfig(consent_mode="auto_allow", blocklist=blocklist, max_burst_seconds=5.0),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        screen_indicator=indicator,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="watch-1",
+            name="watch_screen",
+            arguments={"target": "active_window", "seconds": 5},
+        ),
+        backend,
+    )
+    assert indicator.is_watching is True
+    assert indicator.is_visible is True
+    assert runner._watch_screen_task is not None
+    assert not runner._watch_screen_task.done()
+
+    # Give the indicator backend thread a brief beat to process the show sync.
+    await asyncio.sleep(0.05)
+
+    # Switch to a blocked window and supersede the active watch with a new watch_screen call.
+    api._test_state["title"] = "1Password Vault"  # type: ignore[attr-defined]
+    api._test_state["exe"] = r"C:\Program Files\1Password\1Password.exe"  # type: ignore[attr-defined]
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="watch-2",
+            name="watch_screen",
+            arguments={"target": "active_window", "seconds": 5},
+        ),
+        backend,
+    )
+    await asyncio.sleep(0.05)
+
+    resp2 = backend.sent_tool_responses[1]
+    assert resp2.is_error is True
+    assert resp2.response["status"] == "blocked"
+    assert indicator.is_watching is False
+    assert indicator.is_visible is False
+    assert runner._watch_screen_task is None
+    if indicator.is_supported:
+        show_hide = [ev for ev in overlay_backend.events if ev[0] in ("show", "hide")]
+        assert show_hide and show_hide[-1][0] == "hide"
+
+    await runner.stop()
+
+
+async def test_voice_runner_enforces_config_blocklist_with_empty_service_blocklist(
+    tmp_path: Path,
+) -> None:
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    # Injected ScreenCaptureService intentionally has an empty blocklist;
+    # VoiceRunner must still enforce VoiceConfig.blocklist across all capture paths.
+    screen_svc = ScreenCaptureService(
+        api=api,
+        blocklist=ScreenBlocklistConfig(),
+        grabber=lambda *a, **k: canvas.copy(),
+    )
+    config_blocklist = ScreenBlocklistConfig(processes=["bitwarden.exe"])
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=VoiceConfig(
+            consent_mode="auto_allow",
+            blocklist=config_blocklist,
+            screen_indicator_enabled=False,
+        ),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # 1) look_at_screen must block Bitwarden via VoiceConfig.blocklist
+    api._test_state["title"] = "Private Vault - Bitwarden"  # type: ignore[attr-defined]
+    api._test_state["exe"] = r"C:\Program Files\Bitwarden\Bitwarden.exe"  # type: ignore[attr-defined]
+
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="look-blocked",
+            name="look_at_screen",
+            arguments={"target": "active_window", "reason": "check app"},
+        ),
+        backend,
+    )
+    resp = backend.sent_tool_responses[0]
+    assert resp.is_error is True
+    assert resp.response["status"] == "blocked"
+    assert resp.media_parts == []
+    assert len(backend.sent_video_frames) == 0
+
+    # 2) _stream_screen_burst must also drop frames matching VoiceConfig.blocklist
+    real_capture = screen_svc.capture
+    captures = 0
+
+    def switch_after_first_frame(*, target: str = "full_screen", monitor: int | None = None):
+        nonlocal captures
+        captures += 1
+        if captures == 1:
+            api._test_state["title"] = "notes.txt - Notepad"  # type: ignore[attr-defined]
+            api._test_state["exe"] = r"C:\Windows\System32\notepad.exe"  # type: ignore[attr-defined]
+        else:
+            api._test_state["title"] = "Bitwarden"  # type: ignore[attr-defined]
+            api._test_state["exe"] = r"C:\Program Files\Bitwarden\Bitwarden.exe"  # type: ignore[attr-defined]
+        return real_capture(target=target, monitor=monitor)
+
+    screen_svc.capture = switch_after_first_frame  # type: ignore[method-assign]
+    await runner._stream_screen_burst(
+        burst_seconds=0.12,
+        backend=backend,
+        target="active_window",
+        interval=0.03,
+    )
+    assert captures >= 2
+    assert len(backend.sent_video_frames) == 1
+
+    await runner.stop()
+
+
+async def test_voice_runner_look_at_screen_skips_second_crop_if_foreground_window_changed(
+    tmp_path: Path,
+) -> None:
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(
+        api=api,
+        grabber=lambda *a, **k: canvas.copy(),
+    )
+
+    real_capture = screen_svc.capture
+    call_count = 0
+
+    def switch_unblocked_window_on_second_capture(
+        *, target: str = "full_screen", monitor: int | None = None
+    ):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            api._test_state["title"] = "YouTube - Google Chrome"  # type: ignore[attr-defined]
+            api._test_state["exe"] = (  # type: ignore[attr-defined]
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            )
+        return real_capture(target=target, monitor=monitor)
+
+    screen_svc.capture = switch_unblocked_window_on_second_capture  # type: ignore[method-assign]
+    backend = FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=VoiceConfig(consent_mode="auto_allow", screen_indicator_enabled=False),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    initial_proc = api._test_state["exe"].split("\\")[-1]  # type: ignore[attr-defined]
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="call-race-unblocked",
+            name="look_at_screen",
+            arguments={"target": "full_screen", "reason": "inspect screen"},
+        ),
+        backend,
+    )
+
+    resp = backend.sent_tool_responses[0]
+    assert resp.is_error is False
+    assert resp.response["frames_sent"] == 1
+    assert resp.response["image_order"] == ["full_screen"]
+    assert resp.response["active_process_name"] == initial_proc
     assert len(resp.media_parts) == 1
     assert resp.media_parts[0].mime_type == "image/jpeg"
 
