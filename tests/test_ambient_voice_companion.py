@@ -727,3 +727,181 @@ async def test_safe_load_voice_memory_context_injects_focused_chat(tmp_path: Pat
         assert "Let's build a Redis cache wrapper." in context
 
     await daemon.stop()
+
+
+# --- 7. Voice Companion Stream Protection & Collision Hardening ---
+
+
+async def test_delete_all_transcripts_preserves_voice_companion_stream(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    # 1. Add normal text chat
+    mem.append_transcript_message(
+        session_id="chat-to-delete",
+        role="user",
+        text="Normal chat to be deleted",
+        title="Chat to Delete",
+    )
+    # 2. Add continuous voice companion stream
+    mem.append_voice_companion_call(
+        call_id="call-voice-preserve",
+        entries=[("user", "Preserve this voice turn", datetime.now().astimezone())],
+    )
+
+    assert mem.transcript_path("chat-to-delete").exists()
+    assert mem.transcript_path(VOICE_COMPANION_SESSION_ID).exists()
+
+    # Direct memory store delete_all_transcripts should NOT delete voice_companion.jsonl
+    deleted_count = mem.delete_all_transcripts()
+    assert deleted_count == 1
+    assert not mem.transcript_path("chat-to-delete").exists()
+    assert mem.transcript_path(VOICE_COMPANION_SESSION_ID).exists()
+
+    # Attempting to delete voice companion directly via delete_transcript must raise ValueError
+    import pytest
+
+    with pytest.raises(ValueError, match="Cannot delete the Voice Companion stream"):
+        mem.delete_transcript(VOICE_COMPANION_SESSION_ID)
+
+
+async def test_voice_companion_stream_protected_from_chat_rpcs(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    # Add continuous voice companion stream
+    mem.append_voice_companion_call(
+        call_id="call-protect-test",
+        entries=[("user", "Hello Voice", datetime.now().astimezone())],
+    )
+
+    provider = FakeConsolidationProvider()
+    daemon: CleaDaemon = build_daemon(host="127.0.0.1", port=0, provider=provider, memory=mem)
+    await daemon.start()
+
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+    async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ws:
+        from clea.core.protocol import (
+            ChatSendParams,
+            ChatSendRequest,
+            ConversationDeleteAllParams,
+            ConversationDeleteAllRequest,
+            ConversationDeleteParams,
+            ConversationDeleteRequest,
+            ConversationPinParams,
+            ConversationPinRequest,
+            ConversationRenameParams,
+            ConversationRenameRequest,
+            ConversationResumeParams,
+            ConversationResumeRequest,
+        )
+
+        # 1. conversation.resume should be rejected
+        res_resume = await _send_rpc(
+            ws,
+            ConversationResumeRequest(
+                params=ConversationResumeParams(session_id=VOICE_COMPANION_SESSION_ID)
+            ),
+        )
+        assert not res_resume.ok
+        assert "Voice Companion cannot be resumed" in (res_resume.error or "")
+
+        # 2. conversation.rename should be rejected
+        res_rename = await _send_rpc(
+            ws,
+            ConversationRenameRequest(
+                params=ConversationRenameParams(
+                    session_id=VOICE_COMPANION_SESSION_ID, title="Hacked"
+                )
+            ),
+        )
+        assert not res_rename.ok
+        assert "Cannot rename the Voice Companion stream" in (res_rename.error or "")
+
+        # 3. conversation.pin should be rejected
+        res_pin = await _send_rpc(
+            ws,
+            ConversationPinRequest(
+                params=ConversationPinParams(session_id=VOICE_COMPANION_SESSION_ID, pinned=True)
+            ),
+        )
+        assert not res_pin.ok
+        assert "Cannot pin the Voice Companion stream" in (res_pin.error or "")
+
+        # 4. conversation.delete should be rejected
+        res_del = await _send_rpc(
+            ws,
+            ConversationDeleteRequest(
+                params=ConversationDeleteParams(
+                    session_id=VOICE_COMPANION_SESSION_ID, delete_episodes=False
+                )
+            ),
+        )
+        assert not res_del.ok
+        assert "Cannot delete the Voice Companion stream" in (res_del.error or "")
+
+        # 5. chat.send should be rejected
+        res_chat = await _send_rpc(
+            ws,
+            ChatSendRequest(
+                session_id=VOICE_COMPANION_SESSION_ID,
+                params=ChatSendParams(text="Text into voice stream"),
+            ),
+        )
+        assert not res_chat.ok
+        assert "Cannot send chat messages to the Voice Companion stream" in (res_chat.error or "")
+
+        # 6. conversation.delete_all should preserve voice_companion.jsonl
+        res_del_all = await _send_rpc(
+            ws,
+            ConversationDeleteAllRequest(params=ConversationDeleteAllParams(confirmation="DELETE")),
+        )
+        assert res_del_all.ok
+        assert mem.transcript_path(VOICE_COMPANION_SESSION_ID).exists()
+
+    await daemon.stop()
+
+
+async def test_concurrent_call_start_trigger_collision_safety(tmp_path: Path) -> None:
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    provider = FakeConsolidationProvider()
+    daemon: CleaDaemon = build_daemon(host="127.0.0.1", port=0, provider=provider, memory=mem)
+    await daemon.start()
+
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+    backend_starts = 0
+
+    def _backend_factory() -> FakeLiveBackend:
+        nonlocal backend_starts
+        backend_starts += 1
+        return FakeLiveBackend()
+
+    runner = VoiceRunner(
+        config=VoiceConfig(),
+        data_dir=tmp_path,
+        daemon_url=url,
+        token=daemon.token,
+        backend_factory=_backend_factory,
+        audio_manager=_make_fake_audio(),
+        wake_word_detector=_make_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    runner_task = asyncio.create_task(runner.run_forever())
+    try:
+        await _wait_until(lambda: runner._daemon_listener_active)
+
+        # Fire two concurrent start_call triggers (e.g. hotkey + wake word simultaneously)
+        t1 = asyncio.create_task(runner.start_call(trigger="wake_word"))
+        t2 = asyncio.create_task(runner.start_call(trigger="hotkey"))
+        await asyncio.gather(t1, t2)
+
+        # Only one backend instance must be created and call must be active
+        assert backend_starts == 1
+        assert runner.call_state in ("connecting", "active")
+        await runner.end_call(reason="user_done")
+    finally:
+        await runner.stop()
+        runner_task.cancel()
+        await daemon.stop()
+

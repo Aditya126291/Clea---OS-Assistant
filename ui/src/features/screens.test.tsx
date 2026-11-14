@@ -103,6 +103,9 @@ describe("UI screens & navigation", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Settings/i }));
     expect(useCleaStore.getState().activeView).toBe("settings");
+
+    fireEvent.click(screen.getByRole("button", { name: /Open Voice Companion Transcript/i }));
+    expect(useCleaStore.getState().activeView).toBe("voice");
   });
 
   it("renders running and finished tasks in ActivityView", () => {

@@ -980,6 +980,8 @@ class MemoryStore:
     def delete_transcript(self, session_id: str, *, delete_episodes: bool = False) -> Path:
         """Soft delete a transcript into the trash folder, optionally deleting episode summary."""
         self.validate_session_id(session_id)
+        if session_id == VOICE_COMPANION_SESSION_ID:
+            raise ValueError("Cannot delete the Voice Companion stream.")
         src_path = self.transcript_path(session_id)
         if not src_path.exists():
             raise FileNotFoundError(f"Transcript for session {session_id} not found.")
@@ -1004,12 +1006,14 @@ class MemoryStore:
         return dst_path
 
     def delete_all_transcripts(self) -> int:
-        """Soft delete all transcripts into trash."""
+        """Soft delete all transcripts into trash, excluding Voice Companion."""
         self.trash_dir.mkdir(parents=True, exist_ok=True)
         now_ts = time.time()
         count = 0
         if self.transcripts_dir.is_dir():
             for p in self.transcripts_dir.glob("*.jsonl"):
+                if p.stem == VOICE_COMPANION_SESSION_ID:
+                    continue
                 sid = p.stem
                 dst = self.trash_dir / p.name
                 if dst.exists():

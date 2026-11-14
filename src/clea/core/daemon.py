@@ -1035,6 +1035,11 @@ class CleaDaemon:
             )
         elif method == "conversation.resume":
             session_id = req.params.session_id
+            if session_id == VOICE_COMPANION_SESSION_ID:
+                await self._respond(
+                    ws, req, error="Voice Companion cannot be resumed as a text conversation."
+                )
+                return
             if session_id in self._busy_sessions:
                 await self._respond(ws, req, error="A turn is currently running for this session.")
                 return
@@ -1074,6 +1079,11 @@ class CleaDaemon:
             )
         elif method == "conversation.rename":
             session_id = req.params.session_id
+            if session_id == VOICE_COMPANION_SESSION_ID:
+                await self._respond(
+                    ws, req, error="Cannot rename the Voice Companion stream."
+                )
+                return
             new_title = req.params.title
             try:
                 header = self.agent.memory.update_transcript_header(session_id, title=new_title)
@@ -1095,6 +1105,11 @@ class CleaDaemon:
             )
         elif method == "conversation.pin":
             session_id = req.params.session_id
+            if session_id == VOICE_COMPANION_SESSION_ID:
+                await self._respond(
+                    ws, req, error="Cannot pin the Voice Companion stream."
+                )
+                return
             pinned = req.params.pinned
             try:
                 header = self.agent.memory.update_transcript_header(session_id, pinned=pinned)
@@ -1135,6 +1150,11 @@ class CleaDaemon:
             )
         elif method == "conversation.delete":
             session_id = req.params.session_id
+            if session_id == VOICE_COMPANION_SESSION_ID:
+                await self._respond(
+                    ws, req, error="Cannot delete the Voice Companion stream."
+                )
+                return
             if session_id in self._busy_sessions:
                 await self._respond(
                     ws, req, error="Cannot delete conversation while a turn is running."
@@ -1529,6 +1549,11 @@ class CleaDaemon:
         if session_id:
             try:
                 self.agent.memory.validate_session_id(session_id)
+                if session_id == VOICE_COMPANION_SESSION_ID:
+                    await self._respond(
+                        ws, req, error="Cannot send chat messages to the Voice Companion stream."
+                    )
+                    return
             except ValueError as exc:
                 await self._respond(ws, req, error=str(exc))
                 return
@@ -1741,9 +1766,12 @@ class CleaDaemon:
 
     async def _delegated_task(self, conn: _Connection, req: Any, description: str) -> None:
         ws = conn.ws
+        target_sid = req.session_id
+        if target_sid == VOICE_COMPANION_SESSION_ID:
+            target_sid = None
         session = (
-            self.sessions.get_or_create(req.session_id)
-            if req.session_id is not None
+            self.sessions.get_or_create(target_sid)
+            if target_sid is not None
             else self.sessions.create()
         )
         if session.id in self._busy_sessions:

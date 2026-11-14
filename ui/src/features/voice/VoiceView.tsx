@@ -33,7 +33,9 @@ export function VoiceView() {
   }, [loadVoiceHistory]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (typeof bottomRef.current?.scrollIntoView === "function") {
+      bottomRef.current.scrollIntoView({ behavior: "smooth" });
+    }
   }, [voiceHistoryMessages.length]);
 
   const isCallActive = callState === "active";
@@ -58,8 +60,12 @@ export function VoiceView() {
                       ? "success"
                       : voiceState === "listening"
                         ? "neutral"
-                        : "warning"
-                    : "neutral"
+                        : voiceState === "error"
+                          ? "danger"
+                          : "warning"
+                    : voiceState === "error"
+                      ? "danger"
+                      : "neutral"
                 }
                 className="capitalize text-[11px]"
               >
@@ -68,6 +74,8 @@ export function VoiceView() {
                     <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
                     {voiceState}
                   </span>
+                ) : voiceState === "error" ? (
+                  "Error"
                 ) : (
                   "Idle"
                 )}
@@ -162,7 +170,7 @@ export function VoiceView() {
                   <Card
                     className={`border ${
                       isUser
-                        ? "border-[var(--primary)]/30 bg-[var(--surface)]/80 ml-8"
+                        ? "border-[var(--border-strong)] bg-[var(--bg-subtle)] ml-8"
                         : "border-[var(--border)] bg-[var(--surface)] mr-8"
                     }`}
                   >
@@ -170,7 +178,7 @@ export function VoiceView() {
                       <div className="flex items-center justify-between gap-2 mb-1">
                         <span
                           className={`text-xs font-semibold ${
-                            isUser ? "text-[var(--primary)]" : "text-[var(--text)]"
+                            isUser ? "text-[var(--text)]" : "text-[var(--text-muted)]"
                           }`}
                         >
                           {isUser ? "You" : "Clea"}
