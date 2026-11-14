@@ -41,6 +41,7 @@ from clea.core.protocol import (
     ConversationResumeMessage,
     ConversationResumeRequest,
     ConversationSearchHit,
+    ConversationSearchSnippet,
     ConversationsGetRequest,
     ConversationsListRequest,
     ConversationSummary,
@@ -58,6 +59,7 @@ from clea.core.protocol import (
     MemoryGetDailyRequest,
     MemoryGetRequest,
     MemoryReconsolidateRequest,
+    MemorySearchHit,
     MemoryStatusRequest,
     RequestFrame,
     ResponseFrame,
@@ -76,12 +78,17 @@ from clea.core.protocol import (
     TranscriptsGetRequest,
     TranscriptsListRequest,
     UsageEvent,
+    VoiceConversationListItem,
+    VoiceConversationTurnItem,
     VoiceDelegateTaskRequest,
     VoiceEndCallRequest,
     VoiceHistoryMessageItem,
     VoiceHistoryRequest,
+    VoiceListConversationsRequest,
     VoicePostToActiveChatRequest,
+    VoiceReadConversationRequest,
     VoiceSearchConversationsRequest,
+    VoiceSearchMemoryRequest,
     VoiceStartCallRequest,
     VoiceState,
     VoiceStateEvent,
@@ -158,9 +165,16 @@ def build_json_schema() -> dict[str, Any]:
         voice_status_request: VoiceStatusRequest
         voice_delegate_task_request: VoiceDelegateTaskRequest
         voice_history_request: VoiceHistoryRequest
+        voice_list_conversations_request: VoiceListConversationsRequest
         voice_search_conversations_request: VoiceSearchConversationsRequest
+        voice_read_conversation_request: VoiceReadConversationRequest
+        voice_search_memory_request: VoiceSearchMemoryRequest
         voice_post_to_active_chat_request: VoicePostToActiveChatRequest
+        voice_conversation_list_item: VoiceConversationListItem
+        conversation_search_snippet: ConversationSearchSnippet
         conversation_search_hit: ConversationSearchHit
+        voice_conversation_turn_item: VoiceConversationTurnItem
+        memory_search_hit: MemorySearchHit
         voice_history_message_item: VoiceHistoryMessageItem
         assistant_token_event: AssistantTokenEvent
         tool_call_started_event: ToolCallStartedEvent

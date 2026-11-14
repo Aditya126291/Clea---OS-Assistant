@@ -132,26 +132,99 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="list_conversations",
+            description=(
+                "List the most recent text conversations newest-first with title, updated "
+                "timestamp, turn count, and Episode summary if available. Use this for recency "
+                "questions such as 'what was the chat before this?'."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum number of recent chats to return (default 10).",
+                    },
+                },
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="search_conversations",
             description=(
-                "Search raw message content and titles across ALL saved text conversations and "
-                "the continuous Voice Companion history. Call this immediately whenever the user "
-                "asks about past discussions, earlier decisions, previous chats, stored facts, "
-                "or project history—even without exact keywords. Never call `look_at_screen` or "
-                "ask the user to focus a chat first to read history."
+                "Run 3-layer hybrid (lexical + semantic Episode/Fact) search across 100% of "
+                "saved text conversations and the continuous Voice Companion history. Use this "
+                "to locate past discussions by topic, concept, code snippets, commands, or errors. "
+                "Call this immediately whenever the user asks about past discussions, earlier "
+                "decisions, previous chats, stored facts, or project history—even without exact "
+                "keywords. Never call `look_at_screen` or ask the user to focus a chat first to "
+                "read history."
             ),
             parameters_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search keywords or phrase to match across conversations.",
+                        "description": "Descriptive query, keywords, or concept to search.",
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 20,
-                        "description": "Maximum number of matching snippets to return (default 5).",
+                        "maximum": 50,
+                        "description": "Maximum number of matching conversations (default 8).",
+                    },
+                },
+                "required": ["query"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="read_conversation",
+            description=(
+                "Read full chronological message turns and Episode summary for a specific "
+                "conversation_id returned by list_conversations or search_conversations so you "
+                "can pull exact code, commands, or architectural decisions."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "The conversation_id / session_id to read.",
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": (
+                            "Maximum chronological message turns to return (default 40)."
+                        ),
+                    },
+                },
+                "required": ["conversation_id"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="search_memory",
+            description=(
+                "Run hybrid semantic + token-ranked search directly across all stored Durable "
+                "Facts and Episode summaries on demand during the voice call."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Topic, preference, fact, or concept to search in memory.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum number of memory matches to return (default 10).",
                     },
                 },
                 "required": ["query"],
