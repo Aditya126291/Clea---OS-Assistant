@@ -65,6 +65,16 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "read_conversation",
         "search_memory",
         "post_to_active_chat",
+        "navigate_ui",
+        "create_chat",
+        "send_chat_message",
+        "rename_chat",
+        "delete_chat",
+        "save_memory_fact",
+        "delete_memory_fact",
+        "inspect_activity",
+        "cancel_task",
+        "open_command_palette",
     }
     for tool in tools:
         assert tool.behavior == "non_blocking"
@@ -87,6 +97,23 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert by_name["read_conversation"].parameters_schema["required"] == ["conversation_id"]
     assert by_name["search_memory"].parameters_schema["required"] == ["query"]
     assert by_name["post_to_active_chat"].parameters_schema["required"] == ["content"]
+    assert by_name["navigate_ui"].parameters_schema["properties"]["view"]["enum"] == [
+        "chat",
+        "voice",
+        "activity",
+        "memory",
+        "settings",
+    ]
+    assert by_name["navigate_ui"].parameters_schema["required"] == ["view"]
+    assert by_name["create_chat"].parameters_schema["required"] == ["title"]
+    assert by_name["send_chat_message"].parameters_schema["required"] == ["prompt"]
+    assert by_name["rename_chat"].parameters_schema["required"] == ["conversation_id", "new_title"]
+    assert by_name["delete_chat"].parameters_schema["required"] == ["conversation_id"]
+    assert by_name["save_memory_fact"].parameters_schema["required"] == ["fact"]
+    assert by_name["delete_memory_fact"].parameters_schema["required"] == ["query_or_id"]
+    assert by_name["inspect_activity"].parameters_schema["required"] == []
+    assert by_name["cancel_task"].parameters_schema["required"] == ["task_id"]
+    assert by_name["open_command_palette"].parameters_schema["required"] == []
 
 
 def test_voice_session_config_defaults_and_language_code_omitted() -> None:

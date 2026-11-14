@@ -173,6 +173,31 @@ function updateAssistantByRequest(
   return messages;
 }
 
+function mapTranscriptMessages(
+  sessionId: string,
+  rawMessages: ReadonlyArray<{
+    role: string;
+    text: string;
+    tool_calls?: Array<Record<string, unknown>>;
+  }>,
+): ChatMessage[] {
+  return rawMessages.map((m, idx) => ({
+    id: `resumed-${sessionId}-${idx}`,
+    role: (m.role === "user" ? "user" : "assistant") as "user" | "assistant",
+    content: m.text,
+    streaming: false,
+    toolCalls: (m.tool_calls || []).map((tc, tcIdx) => ({
+      callId: `tc-${idx}-${tcIdx}`,
+      name: (tc.name as string) || "tool",
+      arguments: (tc.arguments as Record<string, unknown>) || {},
+      riskLevel: "read_only" as const,
+      status: "done" as const,
+      output: typeof tc.output === "string" ? tc.output : undefined,
+    })),
+    approvals: [],
+  }));
+}
+
 let undoToastTimer: ReturnType<typeof setTimeout> | null = null;
 
 function notifyChatFocus(sessionId: string | null): void {
@@ -1246,6 +1271,130 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
             void get().newSession();
           }
         }
+        break;
+      }
+      case "ui.navigate": {
+        const d = event.data;
+        if (d.open_command_palette) {
+          set({ commandPaletteOpen: true });
+          break;
+        }
+        if (d.view === "chat" && d.conversation_id) {
+          const cid = d.conversation_id;
+          const switching = get().sessionId !== cid;
+          const needsLoad = switching || get().messages.length === 0;
+          sessionEpoch += 1;
+          set((state) => ({
+            activeView: "chat",
+            sessionId: cid,
+            resumedSessionId: cid,
+            selectedConversation: null,
+            resumeError: null,
+            messages: switching ? [] : state.messages,
+          }));
+          notifyChatFocus(cid);
+          void get().loadConversations();
+          if (needsLoad && activeClient?.isConnected) {
+            const client = activeClient;
+            void client
+              .request("conversation.resume", { session_id: cid })
+              .then((res) => mapTranscriptMessages(res.session_id, res.messages ?? []))
+              .catch(() =>
+                client
+                  .request("transcripts.get", { session_id: cid })
+                  .then((res) => mapTranscriptMessages(res.session_id, res.messages ?? [])),
+              )
+              .then((loaded) => {
+                if (get().sessionId !== cid) return;
+                set((state) => {
+                  const hasStreaming = state.messages.some((m) => m.streaming);
+                  if (hasStreaming) {
+                    let tailStart = -1;
+                    for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+                      if (state.messages[i].id.startsWith("user-voice-chat-")) {
+                        tailStart = i;
+                        break;
+                      }
+                    }
+                    const activeTail =
+                      tailStart >= 0
+                        ? state.messages.slice(tailStart)
+                        : state.messages.filter((m) => m.streaming);
+                    return { messages: [...loaded, ...activeTail] };
+                  }
+                  if (state.messages.length === 0) {
+                    return { messages: loaded };
+                  }
+                  return {};
+                });
+              })
+              .catch(() => {});
+          }
+          break;
+        }
+
+        const targetView = d.view as AppView;
+        set((state) => ({
+          activeView: targetView,
+          selectedConversation: targetView === "chat" ? null : state.selectedConversation,
+        }));
+        if (targetView !== "chat") {
+          notifyChatFocus(null);
+        } else {
+          notifyChatFocus(get().sessionId);
+        }
+        if (targetView === "memory") {
+          void get().loadMemory();
+          void get().loadMemoryFacts();
+          void get().loadEpisodes();
+          void get().loadMemoryStatus();
+        } else if (targetView === "voice") {
+          void get().loadVoiceHistory();
+        } else if (targetView === "chat") {
+          void get().loadConversations();
+        } else if (targetView === "activity" && activeClient?.isConnected) {
+          void activeClient
+            .request("activity.list", { limit: 50 })
+            .then((res) => set({ tasks: res.tasks ?? [] }))
+            .catch(() => {});
+        } else if (targetView === "settings") {
+          void get().loadSettings();
+        }
+        break;
+      }
+      case "conversation_created": {
+        const d = event.data;
+        void get().loadConversations();
+        if (d.open_in_ui) {
+          sessionEpoch += 1;
+          const initialMessages: ChatMessage[] = d.initial_message
+            ? [
+                {
+                  id: `created-${d.session_id}-0`,
+                  role: "assistant",
+                  content: d.initial_message,
+                  streaming: false,
+                  toolCalls: [],
+                  approvals: [],
+                },
+              ]
+            : [];
+          set({
+            activeView: "chat",
+            sessionId: d.session_id,
+            resumedSessionId: d.session_id,
+            selectedConversation: null,
+            resumeError: null,
+            messages: initialMessages,
+          });
+          notifyChatFocus(d.session_id);
+        }
+        break;
+      }
+      case "memory.updated": {
+        void get().loadMemoryFacts();
+        void get().loadMemory();
+        void get().loadMemoryStatus();
         break;
       }
       case "error": {

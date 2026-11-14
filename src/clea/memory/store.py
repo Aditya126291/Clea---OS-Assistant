@@ -2016,6 +2016,65 @@ class MemoryStore:
             "turns": max(1, (len(msgs) + 1) // 2),
         }
 
+    def create_conversation(
+        self,
+        *,
+        session_id: str,
+        title: str,
+        initial_assistant_message: str = "",
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Create a titled transcript file and optionally append an initial assistant message."""
+        self.validate_session_id(session_id)
+        if session_id == VOICE_COMPANION_SESSION_ID:
+            raise ValueError("Cannot create a standard chat conversation for voice_companion.")
+        self.ensure_initialized()
+        dt = timestamp or datetime.now().astimezone()
+        clean_title = re.sub(r"<[^>]*>", "", " ".join((title or "").split())).strip()[:100]
+        if not clean_title:
+            clean_title = "New conversation"
+
+        path = self.transcript_path(session_id)
+        if not path.exists():
+            header = {
+                "session_id": session_id,
+                "started_at": dt.isoformat(),
+                "title": clean_title,
+                "pinned": False,
+                "updated_at": dt.isoformat(),
+            }
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(header, ensure_ascii=False) + "\n")
+        else:
+            self.update_transcript_header(session_id, title=clean_title)
+
+        body = (initial_assistant_message or "").strip()
+        if body:
+            self.append_transcript_message(
+                session_id=session_id,
+                role="assistant",
+                text=body,
+                title=clean_title,
+                timestamp=dt,
+            )
+            try:
+                self.update_transcript_header(session_id, title=clean_title)
+            except Exception:
+                pass
+
+        tr = self.get_transcript(session_id)
+        msgs = tr.get("messages", []) if tr else []
+        started_at = str((tr or {}).get("started_at") or dt.isoformat())
+        updated_at = str((tr or {}).get("updated_at") or dt.isoformat())
+        return {
+            "session_id": session_id,
+            "title": str((tr or {}).get("title") or clean_title),
+            "started_at": started_at,
+            "updated_at": updated_at,
+            "message": body,
+            "turns": (len(msgs) + 1) // 2,
+        }
+
     def get_conversation(self, day: str, session_id: str) -> list[dict[str, str]]:
         """Return conversation turns for a session from transcripts or daily log."""
         full = self.get_transcript(session_id)

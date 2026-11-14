@@ -43,7 +43,16 @@ export type Request =
   | VoiceSearchConversationsRequest
   | VoiceReadConversationRequest
   | VoiceSearchMemoryRequest
-  | VoicePostToActiveChatRequest;
+  | VoicePostToActiveChatRequest
+  | UiNavigateRequest
+  | ChatCreateAndOpenRequest
+  | ChatSendFromVoiceRequest
+  | ChatRenameRequest
+  | ChatDeleteRequest
+  | MemoryAddFactRequest
+  | MemoryDeleteFactRequest
+  | ActivityListRequest
+  | ActivityCancelRequest;
 export type FrameType = "request";
 export type Id = string;
 export type SessionId = string | null;
@@ -253,10 +262,65 @@ export type SessionId47 = string | null;
 export type Method37 = "voice.post_to_active_chat";
 export type Content = string;
 export type Label = string | null;
-export type FrameType38 = "response";
+export type FrameType38 = "request";
 export type Id39 = string;
-export type Ok = boolean;
 export type SessionId48 = string | null;
+export type Method38 = "ui.navigate";
+export type View = "chat" | "voice" | "activity" | "memory" | "settings";
+export type ConversationId1 = string | null;
+export type OpenCommandPalette = boolean;
+export type FrameType39 = "request";
+export type Id40 = string;
+export type SessionId49 = string | null;
+export type Method39 = "chat.create_and_open";
+export type Title1 = string;
+export type Content1 = string;
+export type OpenInUi = boolean;
+export type FrameType40 = "request";
+export type Id41 = string;
+export type SessionId50 = string | null;
+export type Method40 = "chat.send_from_voice";
+export type Prompt = string;
+export type ConversationId2 = string | null;
+export type Title2 = string | null;
+export type FrameType41 = "request";
+export type Id42 = string;
+export type SessionId51 = string | null;
+export type Method41 = "chat.rename";
+export type ConversationId3 = string;
+export type NewTitle = string;
+export type FrameType42 = "request";
+export type Id43 = string;
+export type SessionId52 = string | null;
+export type Method42 = "chat.delete";
+export type ConversationId4 = string;
+export type Confirmed = boolean;
+export type DeleteEpisodes1 = boolean;
+export type FrameType43 = "request";
+export type Id44 = string;
+export type SessionId53 = string | null;
+export type Method43 = "memory.add_fact";
+export type Fact = string;
+export type Category = string | null;
+export type FrameType44 = "request";
+export type Id45 = string;
+export type SessionId54 = string | null;
+export type Method44 = "memory.delete_fact";
+export type QueryOrId = string;
+export type FrameType45 = "request";
+export type Id46 = string;
+export type SessionId55 = string | null;
+export type Method45 = "activity.list";
+export type Limit6 = number;
+export type FrameType46 = "request";
+export type Id47 = string;
+export type SessionId56 = string | null;
+export type Method46 = "activity.cancel";
+export type TaskId = string;
+export type FrameType47 = "response";
+export type Id48 = string;
+export type Ok = boolean;
+export type SessionId57 = string | null;
 export type Error = string | null;
 export type Event =
   | AssistantTokenEvent
@@ -273,22 +337,25 @@ export type Event =
   | UsageEvent
   | ErrorEvent
   | ConversationUpdatedEvent
-  | ConversationDeletedEvent;
-export type FrameType39 = "event";
+  | ConversationDeletedEvent
+  | UiNavigateEvent
+  | ConversationCreatedEvent
+  | MemoryUpdatedEvent;
+export type FrameType48 = "event";
 export type RequestId = string | null;
-export type SessionId49 = string | null;
+export type SessionId58 = string | null;
 export type Event1 = "assistant_token";
 export type Text1 = string;
-export type FrameType40 = "event";
+export type FrameType49 = "event";
 export type RequestId1 = string | null;
-export type SessionId50 = string | null;
+export type SessionId59 = string | null;
 export type Event2 = "tool_call_started";
 export type CallId2 = string;
 export type Name = string;
 export type RiskLevel = "read_only" | "reversible" | "destructive";
-export type FrameType41 = "event";
+export type FrameType50 = "event";
 export type RequestId2 = string | null;
-export type SessionId51 = string | null;
+export type SessionId60 = string | null;
 export type Event3 = "tool_call_finished";
 export type CallId3 = string;
 export type Name1 = string;
@@ -298,74 +365,74 @@ export type Output = string;
  * Execution time, excluding time spent awaiting approval
  */
 export type DurationMs = number;
-export type FrameType42 = "event";
+export type FrameType51 = "event";
 export type RequestId3 = string | null;
-export type SessionId52 = string | null;
+export type SessionId61 = string | null;
 export type Event4 = "approval_requested";
 export type ApprovalId1 = string;
 export type CallId4 = string | null;
 export type Tool = string;
 export type RiskLevel1 = "read_only" | "reversible" | "destructive";
 export type TimeoutSeconds = number;
-export type FrameType43 = "event";
+export type FrameType52 = "event";
 export type RequestId4 = string | null;
-export type SessionId53 = string | null;
+export type SessionId62 = string | null;
 export type Event5 = "approval_resolved";
 export type ApprovalId2 = string;
 export type Decision1 = "allow" | "deny";
 export type Reason1 = "user" | "timeout";
-export type FrameType44 = "event";
+export type FrameType53 = "event";
 export type RequestId5 = string | null;
-export type SessionId54 = string | null;
+export type SessionId63 = string | null;
 export type Event6 = "task_status";
-export type TaskId = string;
-export type Title1 = string;
+export type TaskId1 = string;
+export type Title3 = string;
 export type Status = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type StartedAt = string;
 export type Kind = "chat_turn" | "background_task" | "scheduled" | "agent_run";
 export type FinishedAt = string | null;
 export type NextRunAt = string | null;
 export type Detail = string | null;
-export type FrameType45 = "event";
+export type FrameType54 = "event";
 export type RequestId6 = string | null;
-export type SessionId55 = string | null;
+export type SessionId64 = string | null;
 export type Event7 = "voice_state";
 export type State = "idle" | "listening" | "thinking" | "speaking" | "reconnecting" | "error";
 export type Error1 = string | null;
-export type FrameType46 = "event";
+export type FrameType55 = "event";
 export type RequestId7 = string | null;
-export type SessionId56 = string | null;
+export type SessionId65 = string | null;
 export type Event8 = "call_started";
 export type CallId5 = string;
 export type CallState = "idle" | "connecting" | "active" | "ending";
 export type StartedAt1 = string | null;
-export type FrameType47 = "event";
+export type FrameType56 = "event";
 export type RequestId8 = string | null;
-export type SessionId57 = string | null;
+export type SessionId66 = string | null;
 export type Event9 = "call_ended";
 export type CallId6 = string;
 export type CallState1 = "idle" | "connecting" | "active" | "ending";
 export type Reason2 = string | null;
 export type DurationSeconds = number | null;
-export type FrameType48 = "event";
+export type FrameType57 = "event";
 export type RequestId9 = string | null;
-export type SessionId58 = string | null;
+export type SessionId67 = string | null;
 export type Event10 = "transcript";
 export type Role = "user" | "assistant";
 export type Text2 = string;
 export type Final = boolean;
 export type CallId7 = string | null;
 export type Timestamp = string | null;
-export type FrameType49 = "event";
+export type FrameType58 = "event";
 export type RequestId10 = string | null;
-export type SessionId59 = string | null;
+export type SessionId68 = string | null;
 export type Event11 = "screen_capture_state";
 export type Active = boolean;
 export type Target = ("active_window" | "full_screen") | null;
 export type CallId8 = string | null;
-export type FrameType50 = "event";
+export type FrameType59 = "event";
 export type RequestId11 = string | null;
-export type SessionId60 = string | null;
+export type SessionId69 = string | null;
 export type Event12 = "usage";
 export type CallId9 = string | null;
 export type InputTokens = number;
@@ -373,33 +440,61 @@ export type OutputTokens = number;
 export type TotalTokens = number;
 export type CachedTokens = number | null;
 export type ThoughtTokens = number | null;
-export type FrameType51 = "event";
+export type FrameType60 = "event";
 export type RequestId12 = string | null;
-export type SessionId61 = string | null;
+export type SessionId70 = string | null;
 export type Event13 = "error";
 export type Message = string;
 export type Code = string | null;
-export type FrameType52 = "event";
+export type FrameType61 = "event";
 export type RequestId13 = string | null;
-export type SessionId62 = string | null;
+export type SessionId71 = string | null;
 export type Event14 = "conversation_updated";
-export type SessionId63 = string;
-export type Title2 = string | null;
+export type SessionId72 = string;
+export type Title4 = string | null;
 export type Pinned1 = boolean | null;
 export type UpdatedAt = string | null;
 export type UserMessage = string | null;
 export type AssistantMessage = string | null;
 export type Turns = number | null;
 export type RequestId14 = string | null;
-export type FrameType53 = "event";
+export type FrameType62 = "event";
 export type RequestId15 = string | null;
-export type SessionId64 = string | null;
+export type SessionId73 = string | null;
 export type Event15 = "conversation_deleted";
 export type SessionIds = string[];
 export type All = boolean;
+export type FrameType63 = "event";
+export type RequestId16 = string | null;
+export type SessionId74 = string | null;
+export type Event16 = "ui.navigate";
+export type View1 = "chat" | "voice" | "activity" | "memory" | "settings";
+export type ConversationId5 = string | null;
+export type OpenCommandPalette1 = boolean;
+export type FrameType64 = "event";
+export type RequestId17 = string | null;
+export type SessionId75 = string | null;
+export type Event17 = "conversation_created";
+export type SessionId76 = string;
+export type Title5 = string;
+export type StartedAt2 = string;
+export type UpdatedAt1 = string;
+export type Turns1 = number;
+export type InitialMessage = string | null;
+export type OpenInUi1 = boolean;
+export type FrameType65 = "event";
+export type RequestId18 = string | null;
+export type SessionId77 = string | null;
+export type Event18 = "memory.updated";
+export type Action = "added" | "deleted" | "updated";
+export type FactId = string | null;
+export type Section = string | null;
+export type Text3 = string | null;
+export type RemovedCount = number;
+export type RemovedIds = string[];
 export type Status1 = "ok";
-export type SessionId65 = string;
-export type Text3 = string;
+export type SessionId78 = string;
+export type Text4 = string;
 export type ActiveConversationId = string | null;
 export type ApprovalId3 = string;
 export type Decision2 = "allow" | "deny";
@@ -411,32 +506,32 @@ export type Days = string[];
 export type LastConsolidated = string | null;
 export type FailedConsolidation = string | null;
 export type Date2 = string;
-export type Content1 = string;
+export type Content2 = string;
 export type Date3 = string;
-export type SessionId66 = string;
+export type SessionId79 = string;
 export type Time = string;
 export type Summary = string;
 export type Trivial = boolean;
 export type Episodes = EpisodeItem[];
 export type Name2 = string;
-export type Id40 = string;
+export type Id49 = string;
 export type Date4 = string;
 export type Source = string;
-export type Text4 = string;
+export type Text5 = string;
 export type Entries = MemoryFactItem[];
 export type Sections = MemorySectionItem[];
 export type LastConsolidated1 = string | null;
 export type FailedConsolidation1 = string | null;
-export type Id41 = string;
+export type Id50 = string;
 export type Date5 = string;
 export type Source1 = string;
-export type Text5 = string;
+export type Text6 = string;
 export type ArchivedAt = string | null;
 export type Reason3 = string | null;
 export type Entries1 = MemoryArchiveItem[];
 export type Raw = string;
 export type LastConsolidatedAt = string | null;
-export type SessionId67 = string;
+export type SessionId80 = string;
 export type Status2 = string;
 export type RetryCount = number;
 export type Error2 = string | null;
@@ -445,23 +540,23 @@ export type NextRetryAt = string | null;
 export type Pending = ConsolidationSessionStatus[];
 export type Failed = ConsolidationSessionStatus[];
 export type CompletedCount = number;
-export type SessionId68 = string;
+export type SessionId81 = string;
 export type Ok1 = boolean;
 export type Status3 = string;
 export type Error3 = string | null;
 export type Ok2 = boolean;
-export type RemovedCount = number;
-export type RemovedIds = string[];
-export type SessionId69 = string;
-export type StartedAt2 = string;
-export type Title3 = string;
+export type RemovedCount1 = number;
+export type RemovedIds1 = string[];
+export type SessionId82 = string;
+export type StartedAt3 = string;
+export type Title6 = string;
 export type MessageCount = number;
 export type Transcripts = TranscriptSummaryItem[];
-export type SessionId70 = string;
-export type StartedAt3 = string;
-export type Title4 = string;
+export type SessionId83 = string;
+export type StartedAt4 = string;
+export type Title7 = string;
 export type Role1 = string;
-export type Text6 = string;
+export type Text7 = string;
 export type Timestamp1 = string;
 export type ToolCalls = {
   [k: string]: unknown | undefined;
@@ -469,41 +564,41 @@ export type ToolCalls = {
 export type Messages = TranscriptMessageItem[];
 export type Status4 = "ok";
 export type Date6 = string;
-export type SessionId71 = string;
-export type ConversationId1 = string;
-export type Title5 = string;
-export type Turns1 = number;
+export type SessionId84 = string;
+export type ConversationId6 = string;
+export type Title8 = string;
+export type Turns2 = number;
 export type TurnCount = number;
 export type LastTime = string;
 export type Pinned2 = boolean;
-export type UpdatedAt1 = string;
+export type UpdatedAt2 = string;
 export type EpisodeSummary = string;
 export type Conversations = ConversationSummary[];
 export type Date7 = string;
-export type SessionId72 = string;
+export type SessionId85 = string;
 export type Time1 = string;
 export type User = string;
 export type Assistant = string;
-export type Turns2 = ConversationTurn[];
-export type SessionId73 = string;
-export type Title6 = string;
+export type Turns3 = ConversationTurn[];
+export type SessionId86 = string;
+export type Title9 = string;
 export type Pinned3 = boolean;
 export type Role2 = "user" | "assistant";
-export type Text7 = string;
+export type Text8 = string;
 export type Timestamp2 = string;
 export type ToolCalls1 = {
   [k: string]: unknown | undefined;
 }[];
 export type Messages1 = ConversationResumeMessage[];
-export type SessionId74 = string;
-export type Title7 = string;
-export type SessionId75 = string;
+export type SessionId87 = string;
+export type Title10 = string;
+export type SessionId88 = string;
 export type Pinned4 = boolean;
-export type SessionId76 = string;
-export type Title8 = string;
+export type SessionId89 = string;
+export type Title11 = string;
 export type Filename = string;
-export type Content2 = string;
-export type SessionId77 = string;
+export type Content3 = string;
+export type SessionId90 = string;
 export type Deleted = boolean;
 export type UndoWindowSeconds = number;
 export type DeletedCount = number;
@@ -534,30 +629,30 @@ export type CallState4 = "idle" | "connecting" | "active" | "ending";
 export type VoiceState2 = "idle" | "listening" | "thinking" | "speaking" | "reconnecting" | "error";
 export type ScreenCaptureActive = boolean;
 export type ScreenCaptureTarget = ("active_window" | "full_screen") | null;
-export type TaskId1 = string;
+export type TaskId2 = string;
 export type Status5 = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type Output1 = string;
-export type SessionId78 = string;
+export type SessionId91 = string;
 export type Role3 = "user" | "assistant";
-export type Text8 = string;
+export type Text9 = string;
 export type Timestamp3 = string;
 export type CallId13 = string | null;
 export type Messages2 = VoiceHistoryMessageItem[];
-export type ConversationId2 = string;
-export type SessionId79 = string;
-export type Title9 = string;
-export type UpdatedAt2 = string;
+export type ConversationId7 = string;
+export type SessionId92 = string;
+export type Title12 = string;
+export type UpdatedAt3 = string;
 export type TurnCount1 = number;
-export type Turns3 = number;
+export type Turns4 = number;
 export type EpisodeSummary1 = string;
 export type Date8 = string;
 export type LastTime1 = string;
 export type Pinned5 = boolean;
 export type Conversations1 = VoiceConversationListItem[];
-export type SessionId80 = string;
-export type ConversationId3 = string;
-export type Title10 = string;
-export type UpdatedAt3 = string;
+export type SessionId93 = string;
+export type ConversationId8 = string;
+export type Title13 = string;
+export type UpdatedAt4 = string;
 export type EpisodeSummary2 = string;
 export type Role4 = string;
 export type Timestamp4 = string;
@@ -574,34 +669,67 @@ export type Source2 = string;
 export type CallId14 = string | null;
 export type Results = ConversationSearchHit[];
 export type Found = boolean;
-export type ConversationId4 = string;
-export type SessionId81 = string;
-export type Title11 = string;
-export type UpdatedAt4 = string;
+export type ConversationId9 = string;
+export type SessionId94 = string;
+export type Title14 = string;
+export type UpdatedAt5 = string;
 export type EpisodeSummary3 = string;
 export type TotalTurns = number;
 export type Truncated = boolean;
 export type Role6 = string;
-export type Content3 = string;
+export type Content4 = string;
 export type Timestamp6 = string;
-export type Turns4 = VoiceConversationTurnItem[];
+export type Turns5 = VoiceConversationTurnItem[];
 export type Message1 = string;
 export type Kind1 = "fact" | "episode";
 export type ItemId = string;
-export type Section = string;
+export type Section1 = string;
 export type Date9 = string;
 export type Source3 = string;
-export type SessionId82 = string;
-export type ConversationId5 = string;
-export type Text9 = string;
+export type SessionId95 = string;
+export type ConversationId10 = string;
+export type Text10 = string;
 export type Score1 = number;
 export type SemanticScore1 = number | null;
 export type LexicalScore1 = number;
 export type Results1 = MemorySearchHit[];
 export type Ok3 = boolean;
-export type SessionId83 = string | null;
-export type Title12 = string | null;
+export type SessionId96 = string | null;
+export type Title15 = string | null;
 export type Message2 = string;
+export type Ok4 = boolean;
+export type View2 = "chat" | "voice" | "activity" | "memory" | "settings";
+export type ActiveConversationId1 = string | null;
+export type OpenCommandPalette2 = boolean;
+export type Ok5 = boolean;
+export type SessionId97 = string;
+export type Title16 = string;
+export type Message3 = string;
+export type OpenInUi2 = boolean;
+export type Ok6 = boolean;
+export type SessionId98 = string;
+export type Title17 = string;
+export type RequestId19 = string;
+export type Status6 = string;
+export type Ok7 = boolean;
+export type SessionId99 = string;
+export type Title18 = string;
+export type Ok8 = boolean;
+export type SessionId100 = string;
+export type Deleted1 = boolean;
+export type RequiresConfirmation = boolean;
+export type EpisodesRemoved = number;
+export type Message4 = string;
+export type Ok9 = boolean;
+export type Section2 = string;
+export type Ok10 = boolean;
+export type RemovedCount2 = number;
+export type RemovedIds2 = string[];
+export type Tasks = TaskStatusData[];
+export type Ok11 = boolean;
+export type TaskId3 = string;
+export type Status7 = string;
+export type Message5 = string;
 export type RiskTier = "read_only" | "reversible" | "destructive";
 export type ApprovalDecision = "allow" | "deny";
 export type ApprovalReason = "user" | "timeout";
@@ -612,6 +740,7 @@ export type CallState5 = "idle" | "connecting" | "active" | "ending";
 export type TranscriptRole = "user" | "assistant";
 export type ScreenCaptureTarget1 = "active_window" | "full_screen";
 export type VoiceTrigger = "manual" | "wake_word" | "hotkey" | "ui";
+export type UiView = "chat" | "voice" | "activity" | "memory" | "settings";
 
 export interface CleaProtocolSchema {
   request: Request;
@@ -628,6 +757,7 @@ export interface CleaProtocolSchema {
   transcript_role: TranscriptRole;
   screen_capture_target: ScreenCaptureTarget1;
   voice_trigger: VoiceTrigger;
+  ui_view: UiView;
   health_ping_request: HealthPingRequest;
   session_new_request: SessionNewRequest;
   chat_send_request: ChatSendRequest;
@@ -670,6 +800,15 @@ export interface CleaProtocolSchema {
   voice_post_to_active_chat_request: VoicePostToActiveChatRequest;
   voice_conversation_list_item: VoiceConversationListItem;
   conversation_search_snippet: ConversationSearchSnippet;
+  ui_navigate_request: UiNavigateRequest;
+  chat_create_and_open_request: ChatCreateAndOpenRequest;
+  chat_send_from_voice_request: ChatSendFromVoiceRequest;
+  chat_rename_request: ChatRenameRequest;
+  chat_delete_request: ChatDeleteRequest;
+  memory_add_fact_request: MemoryAddFactRequest;
+  memory_delete_fact_request: MemoryDeleteFactRequest;
+  activity_list_request: ActivityListRequest;
+  activity_cancel_request: ActivityCancelRequest;
   conversation_search_hit: ConversationSearchHit;
   voice_conversation_turn_item: VoiceConversationTurnItem;
   memory_search_hit: MemorySearchHit;
@@ -689,8 +828,14 @@ export interface CleaProtocolSchema {
   error_event: ErrorEvent;
   conversation_updated_event: ConversationUpdatedEvent;
   conversation_deleted_event: ConversationDeletedEvent;
+  ui_navigate_event: UiNavigateEvent;
+  conversation_created_event: ConversationCreatedEvent;
+  memory_updated_event: MemoryUpdatedEvent;
   conversation_updated_data: ConversationUpdatedData;
   conversation_deleted_data: ConversationDeletedData;
+  ui_navigate_data: UiNavigateData;
+  conversation_created_data: ConversationCreatedData;
+  memory_updated_data: MemoryUpdatedData;
 }
 export interface HealthPingRequest {
   frame_type?: FrameType;
@@ -1070,14 +1215,114 @@ export interface VoicePostToActiveChatParams {
   content: Content;
   label?: Label;
 }
+export interface UiNavigateRequest {
+  frame_type?: FrameType38;
+  id?: Id39;
+  session_id?: SessionId48;
+  method?: Method38;
+  params?: UiNavigateParams;
+}
+export interface UiNavigateParams {
+  view?: View;
+  conversation_id?: ConversationId1;
+  open_command_palette?: OpenCommandPalette;
+}
+export interface ChatCreateAndOpenRequest {
+  frame_type?: FrameType39;
+  id?: Id40;
+  session_id?: SessionId49;
+  method?: Method39;
+  params: ChatCreateAndOpenParams;
+}
+export interface ChatCreateAndOpenParams {
+  title: Title1;
+  content?: Content1;
+  open_in_ui?: OpenInUi;
+}
+export interface ChatSendFromVoiceRequest {
+  frame_type?: FrameType40;
+  id?: Id41;
+  session_id?: SessionId50;
+  method?: Method40;
+  params: ChatSendFromVoiceParams;
+}
+export interface ChatSendFromVoiceParams {
+  prompt: Prompt;
+  conversation_id?: ConversationId2;
+  title?: Title2;
+}
+export interface ChatRenameRequest {
+  frame_type?: FrameType41;
+  id?: Id42;
+  session_id?: SessionId51;
+  method?: Method41;
+  params: ChatRenameParams;
+}
+export interface ChatRenameParams {
+  conversation_id: ConversationId3;
+  new_title: NewTitle;
+}
+export interface ChatDeleteRequest {
+  frame_type?: FrameType42;
+  id?: Id43;
+  session_id?: SessionId52;
+  method?: Method42;
+  params: ChatDeleteParams;
+}
+export interface ChatDeleteParams {
+  conversation_id: ConversationId4;
+  confirmed?: Confirmed;
+  delete_episodes?: DeleteEpisodes1;
+}
+export interface MemoryAddFactRequest {
+  frame_type?: FrameType43;
+  id?: Id44;
+  session_id?: SessionId53;
+  method?: Method43;
+  params: MemoryAddFactParams;
+}
+export interface MemoryAddFactParams {
+  fact: Fact;
+  category?: Category;
+}
+export interface MemoryDeleteFactRequest {
+  frame_type?: FrameType44;
+  id?: Id45;
+  session_id?: SessionId54;
+  method?: Method44;
+  params: MemoryDeleteFactParams;
+}
+export interface MemoryDeleteFactParams {
+  query_or_id: QueryOrId;
+}
+export interface ActivityListRequest {
+  frame_type?: FrameType45;
+  id?: Id46;
+  session_id?: SessionId55;
+  method?: Method45;
+  params?: ActivityListParams;
+}
+export interface ActivityListParams {
+  limit?: Limit6;
+}
+export interface ActivityCancelRequest {
+  frame_type?: FrameType46;
+  id?: Id47;
+  session_id?: SessionId56;
+  method?: Method46;
+  params: ActivityCancelParams;
+}
+export interface ActivityCancelParams {
+  task_id: TaskId;
+}
 /**
  * Daemon-to-client response paired with a request ID.
  */
 export interface ResponseFrame {
-  frame_type?: FrameType38;
-  id: Id39;
+  frame_type?: FrameType47;
+  id: Id48;
   ok?: Ok;
-  session_id?: SessionId48;
+  session_id?: SessionId57;
   result?: Result;
   error?: Error;
 }
@@ -1085,9 +1330,9 @@ export interface Result {
   [k: string]: unknown | undefined;
 }
 export interface AssistantTokenEvent {
-  frame_type?: FrameType39;
+  frame_type?: FrameType48;
   request_id?: RequestId;
-  session_id?: SessionId49;
+  session_id?: SessionId58;
   event?: Event1;
   data: AssistantTokenData;
 }
@@ -1095,9 +1340,9 @@ export interface AssistantTokenData {
   text: Text1;
 }
 export interface ToolCallStartedEvent {
-  frame_type?: FrameType40;
+  frame_type?: FrameType49;
   request_id?: RequestId1;
-  session_id?: SessionId50;
+  session_id?: SessionId59;
   event?: Event2;
   data: ToolCallStartedData;
 }
@@ -1111,9 +1356,9 @@ export interface Arguments {
   [k: string]: unknown | undefined;
 }
 export interface ToolCallFinishedEvent {
-  frame_type?: FrameType41;
+  frame_type?: FrameType50;
   request_id?: RequestId2;
-  session_id?: SessionId51;
+  session_id?: SessionId60;
   event?: Event3;
   data: ToolCallFinishedData;
 }
@@ -1125,9 +1370,9 @@ export interface ToolCallFinishedData {
   duration_ms: DurationMs;
 }
 export interface ApprovalRequestedEvent {
-  frame_type?: FrameType42;
+  frame_type?: FrameType51;
   request_id?: RequestId3;
-  session_id?: SessionId52;
+  session_id?: SessionId61;
   event?: Event4;
   data: ApprovalRequestedData;
 }
@@ -1143,9 +1388,9 @@ export interface Arguments1 {
   [k: string]: unknown | undefined;
 }
 export interface ApprovalResolvedEvent {
-  frame_type?: FrameType43;
+  frame_type?: FrameType52;
   request_id?: RequestId4;
-  session_id?: SessionId53;
+  session_id?: SessionId62;
   event?: Event5;
   data: ApprovalResolvedData;
 }
@@ -1155,15 +1400,15 @@ export interface ApprovalResolvedData {
   reason: Reason1;
 }
 export interface TaskStatusEvent {
-  frame_type?: FrameType44;
+  frame_type?: FrameType53;
   request_id?: RequestId5;
-  session_id?: SessionId54;
+  session_id?: SessionId63;
   event?: Event6;
   data: TaskStatusData;
 }
 export interface TaskStatusData {
-  task_id: TaskId;
-  title: Title1;
+  task_id: TaskId1;
+  title: Title3;
   status: Status;
   started_at: StartedAt;
   kind?: Kind;
@@ -1172,9 +1417,9 @@ export interface TaskStatusData {
   detail?: Detail;
 }
 export interface VoiceStateEvent {
-  frame_type?: FrameType45;
+  frame_type?: FrameType54;
   request_id?: RequestId6;
-  session_id?: SessionId55;
+  session_id?: SessionId64;
   event?: Event7;
   data: VoiceStateData;
 }
@@ -1183,9 +1428,9 @@ export interface VoiceStateData {
   error?: Error1;
 }
 export interface CallStartedEvent {
-  frame_type?: FrameType46;
+  frame_type?: FrameType55;
   request_id?: RequestId7;
-  session_id?: SessionId56;
+  session_id?: SessionId65;
   event?: Event8;
   data: CallStartedData;
 }
@@ -1195,9 +1440,9 @@ export interface CallStartedData {
   started_at?: StartedAt1;
 }
 export interface CallEndedEvent {
-  frame_type?: FrameType47;
+  frame_type?: FrameType56;
   request_id?: RequestId8;
-  session_id?: SessionId57;
+  session_id?: SessionId66;
   event?: Event9;
   data: CallEndedData;
 }
@@ -1208,9 +1453,9 @@ export interface CallEndedData {
   duration_seconds?: DurationSeconds;
 }
 export interface TranscriptEvent {
-  frame_type?: FrameType48;
+  frame_type?: FrameType57;
   request_id?: RequestId9;
-  session_id?: SessionId58;
+  session_id?: SessionId67;
   event?: Event10;
   data: TranscriptData;
 }
@@ -1222,9 +1467,9 @@ export interface TranscriptData {
   timestamp?: Timestamp;
 }
 export interface ScreenCaptureStateEvent {
-  frame_type?: FrameType49;
+  frame_type?: FrameType58;
   request_id?: RequestId10;
-  session_id?: SessionId59;
+  session_id?: SessionId68;
   event?: Event11;
   data: ScreenCaptureStateData;
 }
@@ -1234,9 +1479,9 @@ export interface ScreenCaptureStateData {
   call_id?: CallId8;
 }
 export interface UsageEvent {
-  frame_type?: FrameType50;
+  frame_type?: FrameType59;
   request_id?: RequestId11;
-  session_id?: SessionId60;
+  session_id?: SessionId69;
   event?: Event12;
   data: UsageData;
 }
@@ -1249,9 +1494,9 @@ export interface UsageData {
   thought_tokens?: ThoughtTokens;
 }
 export interface ErrorEvent {
-  frame_type?: FrameType51;
+  frame_type?: FrameType60;
   request_id?: RequestId12;
-  session_id?: SessionId61;
+  session_id?: SessionId70;
   event?: Event13;
   data: ErrorData;
 }
@@ -1260,15 +1505,15 @@ export interface ErrorData {
   code?: Code;
 }
 export interface ConversationUpdatedEvent {
-  frame_type?: FrameType52;
+  frame_type?: FrameType61;
   request_id?: RequestId13;
-  session_id?: SessionId62;
+  session_id?: SessionId71;
   event?: Event14;
   data: ConversationUpdatedData;
 }
 export interface ConversationUpdatedData {
-  session_id: SessionId63;
-  title?: Title2;
+  session_id: SessionId72;
+  title?: Title4;
   pinned?: Pinned1;
   updated_at?: UpdatedAt;
   user_message?: UserMessage;
@@ -1277,15 +1522,58 @@ export interface ConversationUpdatedData {
   request_id?: RequestId14;
 }
 export interface ConversationDeletedEvent {
-  frame_type?: FrameType53;
+  frame_type?: FrameType62;
   request_id?: RequestId15;
-  session_id?: SessionId64;
+  session_id?: SessionId73;
   event?: Event15;
   data: ConversationDeletedData;
 }
 export interface ConversationDeletedData {
   session_ids?: SessionIds;
   all?: All;
+}
+export interface UiNavigateEvent {
+  frame_type?: FrameType63;
+  request_id?: RequestId16;
+  session_id?: SessionId74;
+  event?: Event16;
+  data: UiNavigateData;
+}
+export interface UiNavigateData {
+  view?: View1;
+  conversation_id?: ConversationId5;
+  open_command_palette?: OpenCommandPalette1;
+}
+export interface ConversationCreatedEvent {
+  frame_type?: FrameType64;
+  request_id?: RequestId17;
+  session_id?: SessionId75;
+  event?: Event17;
+  data: ConversationCreatedData;
+}
+export interface ConversationCreatedData {
+  session_id: SessionId76;
+  title: Title5;
+  started_at?: StartedAt2;
+  updated_at?: UpdatedAt1;
+  turns?: Turns1;
+  initial_message?: InitialMessage;
+  open_in_ui?: OpenInUi1;
+}
+export interface MemoryUpdatedEvent {
+  frame_type?: FrameType65;
+  request_id?: RequestId18;
+  session_id?: SessionId77;
+  event?: Event18;
+  data: MemoryUpdatedData;
+}
+export interface MemoryUpdatedData {
+  action?: Action;
+  fact_id?: FactId;
+  section?: Section;
+  text?: Text3;
+  removed_count?: RemovedCount;
+  removed_ids?: RemovedIds;
 }
 export interface MethodResults {
   health_ping: HealthPingResult;
@@ -1326,15 +1614,24 @@ export interface MethodResults {
   voice_read_conversation: VoiceReadConversationResult;
   voice_search_memory: VoiceSearchMemoryResult;
   voice_post_to_active_chat: VoicePostToActiveChatResult;
+  ui_navigate: UiNavigateResult;
+  chat_create_and_open: ChatCreateAndOpenResult;
+  chat_send_from_voice: ChatSendFromVoiceResult;
+  chat_rename: ChatRenameResult;
+  chat_delete: ChatDeleteResult;
+  memory_add_fact: MemoryAddFactResult;
+  memory_delete_fact: MemoryDeleteFactResult;
+  activity_list: ActivityListResult;
+  activity_cancel: ActivityCancelResult;
 }
 export interface HealthPingResult {
   status?: Status1;
 }
 export interface SessionNewResult {
-  session_id: SessionId65;
+  session_id: SessionId78;
 }
 export interface ChatSendResult {
-  text: Text3;
+  text: Text4;
 }
 export interface ChatFocusResult {
   active_conversation_id?: ActiveConversationId;
@@ -1351,14 +1648,14 @@ export interface MemoryGetResult {
 }
 export interface MemoryGetDailyResult {
   date: Date2;
-  content: Content1;
+  content: Content2;
 }
 export interface MemoryEpisodesResult {
   episodes: Episodes;
 }
 export interface EpisodeItem {
   date: Date3;
-  session_id: SessionId66;
+  session_id: SessionId79;
   time: Time;
   summary: Summary;
   trivial?: Trivial;
@@ -1373,20 +1670,20 @@ export interface MemorySectionItem {
   entries?: Entries;
 }
 export interface MemoryFactItem {
-  id: Id40;
+  id: Id49;
   date: Date4;
   source: Source;
-  text: Text4;
+  text: Text5;
 }
 export interface MemoryArchiveResult {
   entries?: Entries1;
   raw?: Raw;
 }
 export interface MemoryArchiveItem {
-  id: Id41;
+  id: Id50;
   date: Date5;
   source: Source1;
-  text: Text5;
+  text: Text6;
   archived_at?: ArchivedAt;
   reason?: Reason3;
 }
@@ -1397,7 +1694,7 @@ export interface MemoryStatusResult {
   completed_count?: CompletedCount;
 }
 export interface ConsolidationSessionStatus {
-  session_id: SessionId67;
+  session_id: SessionId80;
   status: Status2;
   retry_count: RetryCount;
   error?: Error2;
@@ -1405,34 +1702,34 @@ export interface ConsolidationSessionStatus {
   next_retry_at?: NextRetryAt;
 }
 export interface MemoryReconsolidateResult {
-  session_id: SessionId68;
+  session_id: SessionId81;
   ok: Ok1;
   status: Status3;
   error?: Error3;
 }
 export interface MemoryForgetResult {
   ok?: Ok2;
-  removed_count?: RemovedCount;
-  removed_ids?: RemovedIds;
+  removed_count?: RemovedCount1;
+  removed_ids?: RemovedIds1;
 }
 export interface TranscriptsListResult {
   transcripts: Transcripts;
 }
 export interface TranscriptSummaryItem {
-  session_id: SessionId69;
-  started_at: StartedAt2;
-  title: Title3;
+  session_id: SessionId82;
+  started_at: StartedAt3;
+  title: Title6;
   message_count: MessageCount;
 }
 export interface TranscriptsGetResult {
-  session_id: SessionId70;
-  started_at: StartedAt3;
-  title: Title4;
+  session_id: SessionId83;
+  started_at: StartedAt4;
+  title: Title7;
   messages: Messages;
 }
 export interface TranscriptMessageItem {
   role: Role1;
-  text: Text6;
+  text: Text7;
   timestamp: Timestamp1;
   tool_calls?: ToolCalls;
 }
@@ -1444,20 +1741,20 @@ export interface ConversationsListResult {
 }
 export interface ConversationSummary {
   date: Date6;
-  session_id: SessionId71;
-  conversation_id?: ConversationId1;
-  title: Title5;
-  turns: Turns1;
+  session_id: SessionId84;
+  conversation_id?: ConversationId6;
+  title: Title8;
+  turns: Turns2;
   turn_count?: TurnCount;
   last_time: LastTime;
   pinned?: Pinned2;
-  updated_at?: UpdatedAt1;
+  updated_at?: UpdatedAt2;
   episode_summary?: EpisodeSummary;
 }
 export interface ConversationsGetResult {
   date: Date7;
-  session_id: SessionId72;
-  turns: Turns2;
+  session_id: SessionId85;
+  turns: Turns3;
 }
 export interface ConversationTurn {
   time: Time1;
@@ -1465,33 +1762,33 @@ export interface ConversationTurn {
   assistant: Assistant;
 }
 export interface ConversationResumeResult {
-  session_id: SessionId73;
-  title: Title6;
+  session_id: SessionId86;
+  title: Title9;
   pinned?: Pinned3;
   messages: Messages1;
 }
 export interface ConversationResumeMessage {
   role: Role2;
-  text: Text7;
+  text: Text8;
   timestamp?: Timestamp2;
   tool_calls?: ToolCalls1;
 }
 export interface ConversationRenameResult {
-  session_id: SessionId74;
-  title: Title7;
+  session_id: SessionId87;
+  title: Title10;
 }
 export interface ConversationPinResult {
-  session_id: SessionId75;
+  session_id: SessionId88;
   pinned: Pinned4;
 }
 export interface ConversationExportResult {
-  session_id: SessionId76;
-  title: Title8;
+  session_id: SessionId89;
+  title: Title11;
   filename: Filename;
-  content: Content2;
+  content: Content3;
 }
 export interface ConversationDeleteResult {
-  session_id: SessionId77;
+  session_id: SessionId90;
   deleted: Deleted;
   undo_window_seconds?: UndoWindowSeconds;
 }
@@ -1543,17 +1840,17 @@ export interface VoiceStatusResult {
   screen_capture_target?: ScreenCaptureTarget;
 }
 export interface VoiceDelegateTaskResult {
-  task_id: TaskId1;
+  task_id: TaskId2;
   status: Status5;
   output?: Output1;
 }
 export interface VoiceHistoryResult {
-  session_id?: SessionId78;
+  session_id?: SessionId91;
   messages?: Messages2;
 }
 export interface VoiceHistoryMessageItem {
   role: Role3;
-  text: Text8;
+  text: Text9;
   timestamp?: Timestamp3;
   call_id?: CallId13;
 }
@@ -1561,12 +1858,12 @@ export interface VoiceListConversationsResult {
   conversations?: Conversations1;
 }
 export interface VoiceConversationListItem {
-  conversation_id?: ConversationId2;
-  session_id?: SessionId79;
-  title: Title9;
-  updated_at?: UpdatedAt2;
+  conversation_id?: ConversationId7;
+  session_id?: SessionId92;
+  title: Title12;
+  updated_at?: UpdatedAt3;
   turn_count?: TurnCount1;
-  turns?: Turns3;
+  turns?: Turns4;
   episode_summary?: EpisodeSummary1;
   date?: Date8;
   last_time?: LastTime1;
@@ -1576,10 +1873,10 @@ export interface VoiceSearchConversationsResult {
   results?: Results;
 }
 export interface ConversationSearchHit {
-  session_id?: SessionId80;
-  conversation_id?: ConversationId3;
-  title: Title10;
-  updated_at?: UpdatedAt3;
+  session_id?: SessionId93;
+  conversation_id?: ConversationId8;
+  title: Title13;
+  updated_at?: UpdatedAt4;
   episode_summary?: EpisodeSummary2;
   matching_snippets?: MatchingSnippets;
   score?: Score;
@@ -1599,19 +1896,19 @@ export interface ConversationSearchSnippet {
 }
 export interface VoiceReadConversationResult {
   found?: Found;
-  conversation_id?: ConversationId4;
-  session_id?: SessionId81;
-  title?: Title11;
-  updated_at?: UpdatedAt4;
+  conversation_id?: ConversationId9;
+  session_id?: SessionId94;
+  title?: Title14;
+  updated_at?: UpdatedAt5;
   episode_summary?: EpisodeSummary3;
   total_turns?: TotalTurns;
   truncated?: Truncated;
-  turns?: Turns4;
+  turns?: Turns5;
   message?: Message1;
 }
 export interface VoiceConversationTurnItem {
   role: Role6;
-  content: Content3;
+  content: Content4;
   timestamp?: Timestamp6;
 }
 export interface VoiceSearchMemoryResult {
@@ -1620,19 +1917,71 @@ export interface VoiceSearchMemoryResult {
 export interface MemorySearchHit {
   kind: Kind1;
   item_id: ItemId;
-  section?: Section;
+  section?: Section1;
   date?: Date9;
   source?: Source3;
-  session_id?: SessionId82;
-  conversation_id?: ConversationId5;
-  text: Text9;
+  session_id?: SessionId95;
+  conversation_id?: ConversationId10;
+  text: Text10;
   score?: Score1;
   semantic_score?: SemanticScore1;
   lexical_score?: LexicalScore1;
 }
 export interface VoicePostToActiveChatResult {
   ok: Ok3;
-  session_id?: SessionId83;
-  title?: Title12;
+  session_id?: SessionId96;
+  title?: Title15;
   message?: Message2;
+}
+export interface UiNavigateResult {
+  ok?: Ok4;
+  view?: View2;
+  active_conversation_id?: ActiveConversationId1;
+  open_command_palette?: OpenCommandPalette2;
+}
+export interface ChatCreateAndOpenResult {
+  ok?: Ok5;
+  session_id: SessionId97;
+  title: Title16;
+  message?: Message3;
+  open_in_ui?: OpenInUi2;
+}
+export interface ChatSendFromVoiceResult {
+  ok?: Ok6;
+  session_id: SessionId98;
+  title?: Title17;
+  request_id?: RequestId19;
+  status?: Status6;
+}
+export interface ChatRenameResult {
+  ok?: Ok7;
+  session_id: SessionId99;
+  title: Title18;
+}
+export interface ChatDeleteResult {
+  ok?: Ok8;
+  session_id: SessionId100;
+  deleted?: Deleted1;
+  requires_confirmation?: RequiresConfirmation;
+  episodes_removed?: EpisodesRemoved;
+  message?: Message4;
+}
+export interface MemoryAddFactResult {
+  ok?: Ok9;
+  fact: MemoryFactItem;
+  section: Section2;
+}
+export interface MemoryDeleteFactResult {
+  ok?: Ok10;
+  removed_count?: RemovedCount2;
+  removed_ids?: RemovedIds2;
+}
+export interface ActivityListResult {
+  tasks?: Tasks;
+}
+export interface ActivityCancelResult {
+  ok?: Ok11;
+  task_id: TaskId3;
+  status: Status7;
+  message?: Message5;
 }

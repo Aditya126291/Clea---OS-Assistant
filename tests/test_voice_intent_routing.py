@@ -140,15 +140,11 @@ def test_base_voice_system_instruction_partitions_intents_and_blocks_screen_bias
     assert "focused_chat_available" in prompt
     assert "Answer directly without calling any tool" in prompt
 
-    # Must not advertise non-existent live voice tools
-    for nonexistent_tool in (
-        "list_conversations",
-        "read_conversation",
-        "search_memory",
-        "create_chat",
-        "navigate_ui",
-    ):
-        assert nonexistent_tool not in prompt
+    # All live voice tools (screen, hybrid recall, UI self-control, task/call) are documented
+    for tool in default_voice_tools():
+        assert tool.name in prompt
+    assert "delete_chat(..., confirmed=True)" in prompt
+    assert "create_chat" in prompt
 
 
 # --- 2. Tool Schema Negative Constraints & Gemini Live Propagation ---
