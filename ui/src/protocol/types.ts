@@ -107,9 +107,19 @@ import type {
   VoiceHistoryParams,
   VoiceHistoryResult,
   VoiceHistoryMessageItem,
+  VoiceListConversationsParams,
+  VoiceListConversationsResult,
+  VoiceConversationListItem,
+  VoiceReadConversationParams,
+  VoiceReadConversationResult,
+  VoiceConversationTurnItem,
   VoiceSearchConversationsParams,
   VoiceSearchConversationsResult,
+  VoiceSearchMemoryParams,
+  VoiceSearchMemoryResult,
+  MemorySearchHit,
   ConversationSearchHit,
+  ConversationSearchSnippet,
   VoicePostToActiveChatParams,
   VoicePostToActiveChatResult,
   VoiceStartCallParams,
@@ -228,9 +238,19 @@ export type {
   VoiceHistoryParams,
   VoiceHistoryResult,
   VoiceHistoryMessageItem,
+  VoiceListConversationsParams,
+  VoiceListConversationsResult,
+  VoiceConversationListItem,
+  VoiceReadConversationParams,
+  VoiceReadConversationResult,
+  VoiceConversationTurnItem,
   VoiceSearchConversationsParams,
   VoiceSearchConversationsResult,
+  VoiceSearchMemoryParams,
+  VoiceSearchMemoryResult,
+  MemorySearchHit,
   ConversationSearchHit,
+  ConversationSearchSnippet,
   VoicePostToActiveChatParams,
   VoicePostToActiveChatResult,
   VoiceStartCallParams,
@@ -276,7 +296,10 @@ export interface MethodParamsMap {
   "voice.delegate_task": VoiceDelegateTaskParams;
   "chat.focus": ChatFocusParams;
   "voice.history": VoiceHistoryParams;
+  "voice.list_conversations": VoiceListConversationsParams;
   "voice.search_conversations": VoiceSearchConversationsParams;
+  "voice.read_conversation": VoiceReadConversationParams;
+  "voice.search_memory": VoiceSearchMemoryParams;
   "voice.post_to_active_chat": VoicePostToActiveChatParams;
   "ui.navigate": UiNavigateParams;
   "chat.create_and_open": ChatCreateAndOpenParams;
@@ -323,7 +346,10 @@ export interface MethodResultMap {
   "voice.delegate_task": VoiceDelegateTaskResult;
   "chat.focus": ChatFocusResult;
   "voice.history": VoiceHistoryResult;
+  "voice.list_conversations": VoiceListConversationsResult;
   "voice.search_conversations": VoiceSearchConversationsResult;
+  "voice.read_conversation": VoiceReadConversationResult;
+  "voice.search_memory": VoiceSearchMemoryResult;
   "voice.post_to_active_chat": VoicePostToActiveChatResult;
   "ui.navigate": UiNavigateResult;
   "chat.create_and_open": ChatCreateAndOpenResult;

@@ -444,7 +444,7 @@ def test_embedding_provider_gemini_and_ollama_fallback(monkeypatch: pytest.Monke
     fake_client.models.embed_content.return_value = fake_resp
     mock_client_cls = MagicMock(return_value=fake_client)
 
-    monkeypatch.setenv("CLEA_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(genai_mod, "Client", mock_client_cls)
 
     provider = EmbeddingProvider()
