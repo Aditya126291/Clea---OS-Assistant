@@ -57,7 +57,7 @@ export function VoiceView() {
                     ? voiceState === "speaking"
                       ? "success"
                       : voiceState === "listening"
-                        ? "default"
+                        ? "neutral"
                         : "warning"
                     : "neutral"
                 }

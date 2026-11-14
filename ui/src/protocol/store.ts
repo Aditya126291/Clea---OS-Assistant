@@ -354,7 +354,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     set({ voiceHistoryLoading: true });
     try {
       const res = await activeClient.request("voice.history", { limit: 200 });
-      set({ voiceHistoryMessages: res.messages, voiceHistoryLoading: false });
+      set({ voiceHistoryMessages: res.messages ?? [], voiceHistoryLoading: false });
     } catch {
       set({ voiceHistoryLoading: false });
     }
@@ -364,7 +364,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     if (!activeClient?.isConnected) return [];
     try {
       const res = await activeClient.request("voice.search_conversations", { query, limit });
-      return res.results;
+      return res.results ?? [];
     } catch {
       return [];
     }

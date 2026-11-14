@@ -230,6 +230,10 @@ export interface MethodParamsMap {
   "voice.end_call": VoiceEndCallParams;
   "voice.status": Record<string, never>;
   "voice.delegate_task": VoiceDelegateTaskParams;
+  "chat.focus": ChatFocusParams;
+  "voice.history": VoiceHistoryParams;
+  "voice.search_conversations": VoiceSearchConversationsParams;
+  "voice.post_to_active_chat": VoicePostToActiveChatParams;
 }
 
 export interface MethodResultMap {
