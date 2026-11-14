@@ -21,6 +21,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from clea.memory.store import (
     FIXED_SECTIONS,
+    VOICE_COMPANION_SESSION_ID,
     MemoryStore,
     SourceTag,
     is_secret_or_sensitive,
@@ -422,6 +423,7 @@ class ConsolidationManager:
                 state.setdefault("sessions", {})[session_id] = sess_data
                 if resolved_sid and resolved_sid != session_id:
                     state["sessions"][resolved_sid] = sess_data
+                self._sync_voice_companion_state(state, transcript, now_iso)
                 state["last_consolidated_at"] = now_iso
                 self.save_state(state)
                 if effective_status_cb is not None:
@@ -459,6 +461,7 @@ class ConsolidationManager:
                 state.setdefault("sessions", {})[session_id] = sess_data
                 if resolved_sid and resolved_sid != session_id:
                     state["sessions"][resolved_sid] = sess_data
+                self._sync_voice_companion_state(state, transcript, now_iso)
                 state["last_consolidated_at"] = now_iso
                 self.save_state(state)
                 if effective_status_cb is not None:
@@ -603,6 +606,7 @@ class ConsolidationManager:
             state.setdefault("sessions", {})[session_id] = sess_data
             if resolved_sid and resolved_sid != session_id:
                 state["sessions"][resolved_sid] = sess_data
+            self._sync_voice_companion_state(state, transcript, now_iso)
             state["last_consolidated_at"] = now_iso
             self.save_state(state)
 
@@ -741,6 +745,32 @@ class ConsolidationManager:
             self.save_pending(pending_state)
         return reconciled_ids
 
+    def _sync_voice_companion_state(
+        self,
+        state: dict[str, Any],
+        transcript: dict[str, Any] | None,
+        now_iso: str,
+    ) -> None:
+        """If a voice call from voice_companion was consolidated, sync voice_companion state."""
+        if not transcript or not transcript.get("is_voice_call"):
+            return
+        vc = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+        if not vc:
+            return
+        vc_msgs = vc.get("messages", [])
+        call_ids = {
+            str(m.get("call_id")) for m in vc_msgs if isinstance(m, dict) and m.get("call_id")
+        }
+        sessions = state.setdefault("sessions", {})
+        if call_ids and all(
+            sessions.get(cid, {}).get("status") == "completed" for cid in call_ids
+        ):
+            sessions[VOICE_COMPANION_SESSION_ID] = {
+                "status": "completed",
+                "consolidated_at": now_iso,
+                "last_consolidated_turn": len(vc_msgs),
+            }
+
     async def run_crash_recovery(
         self,
         *,
@@ -756,8 +786,56 @@ class ConsolidationManager:
         consolidated_count = 0
         now = datetime.now().astimezone()
 
+        def _make_status_cb(session_id: str):
+            async def _status_cb(st: str, detail: str | None = None) -> None:
+                if effective_cb is not None:
+                    try:
+                        await effective_cb(session_id, st, detail)
+                    except TypeError:
+                        await effective_cb(st, detail)
+
+            return _status_cb
+
         for t in transcripts:
             sid = t["session_id"]
+            if sid == VOICE_COMPANION_SESSION_ID:
+                vc = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+                vc_msgs = vc.get("messages", []) if vc else []
+                seen_calls: list[str] = []
+                for m in vc_msgs:
+                    cid = str(m.get("call_id") or "").strip() if isinstance(m, dict) else ""
+                    if cid and cid not in seen_calls:
+                        seen_calls.append(cid)
+                if seen_calls:
+                    for cid in seen_calls:
+                        c_state = state.get("sessions", {}).get(cid)
+                        p_info = pending_data.get(cid)
+                        need_call = False
+                        if not c_state or c_state.get("status") == "running":
+                            need_call = True
+                        elif (
+                            p_info is not None
+                            and int(p_info.get("retry_count", 0)) < MAX_CONSOLIDATION_RETRIES
+                        ):
+                            need_call = True
+                        elif c_state.get("status") == "completed":
+                            last_turn = c_state.get("last_consolidated_turn")
+                            call_msg_count = sum(
+                                1
+                                for m in vc_msgs
+                                if isinstance(m, dict) and str(m.get("call_id") or "") == cid
+                            )
+                            if last_turn is not None and call_msg_count > last_turn:
+                                need_call = True
+                        if need_call:
+                            ok = await self.consolidate_session(
+                                cid, force=True, on_task_status=_make_status_cb(cid)
+                            )
+                            if ok:
+                                consolidated_count += 1
+                            state = self.load_state()
+                    continue
+
             resolved_sid = self.memory.resolve_session_id(sid)
             session_state = state.get("sessions", {}).get(sid) or (
                 state.get("sessions", {}).get(resolved_sid) if resolved_sid else None
@@ -799,16 +877,6 @@ class ConsolidationManager:
                     if is_in_pending
                     else (session_state.get("status") if session_state else "unprocessed"),
                 )
-
-                def _make_status_cb(session_id: str):
-                    async def _status_cb(st: str, detail: str | None = None) -> None:
-                        if effective_cb is not None:
-                            try:
-                                await effective_cb(session_id, st, detail)
-                            except TypeError:
-                                await effective_cb(st, detail)
-
-                    return _status_cb
 
                 ok = await self.consolidate_session(
                     sid, force=True, on_task_status=_make_status_cb(sid)

@@ -52,10 +52,17 @@ def test_voice_backend_is_abstract() -> None:
         VoiceBackend()  # type: ignore[abstract]
 
 
-def test_default_voice_tools_cover_required_four_non_blocking_tools() -> None:
+def test_default_voice_tools_cover_required_tools() -> None:
     tools = default_voice_tools()
     by_name = {tool.name: tool for tool in tools}
-    assert set(by_name) == {"delegate_task", "look_at_screen", "watch_screen", "end_call"}
+    assert set(by_name) == {
+        "delegate_task",
+        "look_at_screen",
+        "watch_screen",
+        "end_call",
+        "search_conversations",
+        "post_to_active_chat",
+    }
     for tool in tools:
         assert tool.behavior == "non_blocking"
 
@@ -72,6 +79,8 @@ def test_default_voice_tools_cover_required_four_non_blocking_tools() -> None:
     assert by_name["watch_screen"].parameters_schema["required"] == ["seconds", "reason"]
 
     assert by_name["end_call"].parameters_schema["required"] == ["reason"]
+    assert by_name["search_conversations"].parameters_schema["required"] == ["query"]
+    assert by_name["post_to_active_chat"].parameters_schema["required"] == ["content"]
 
 
 def test_voice_session_config_defaults_and_language_code_omitted() -> None:
@@ -230,12 +239,25 @@ async def test_memory_hooks_skip_empty_and_use_request_fn() -> None:
             return {"long_term": "User lives in Pune."}
         if req.method == "memory.episodes":
             return {"episodes": [{"date": "2026-11-14", "summary": "Tested voice"}]}
+        if req.method == "voice.history":
+            return {
+                "session_id": "voice_companion",
+                "messages": [
+                    {
+                        "role": "user",
+                        "text": "Recent ambient voice note",
+                        "timestamp": "2026-11-14T10:00:00Z",
+                        "call_id": "call-prev",
+                    }
+                ],
+            }
         return {"ok": True}
 
     ctx = await load_voice_memory_context(request_fn=_fake_request)
     assert "User lives in Pune." in ctx
     assert "Tested voice" in ctx
-    assert calls == ["memory.get", "memory.episodes"]
+    assert "Recent ambient voice note" in ctx
+    assert calls == ["memory.get", "memory.episodes", "voice.history"]
 
     # Empty calls are skipped without making any daemon RPCs
     calls.clear()

@@ -189,6 +189,10 @@ def test_every_method_has_a_result_model() -> None:
             ("voice.end_call", {}),
             ("voice.status", {}),
             ("voice.delegate_task", {"description": "check calendar"}),
+            ("chat.focus", {}),
+            ("voice.history", {}),
+            ("voice.search_conversations", {"query": "search query"}),
+            ("voice.post_to_active_chat", {"content": "sample content"}),
         ]
     }
     assert methods == set(METHOD_RESULTS)

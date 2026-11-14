@@ -27,6 +27,7 @@ from clea.core.protocol import (
     CallEndedEvent,
     CallStartedEvent,
     CallState,
+    ChatFocusRequest,
     ChatSendRequest,
     ConversationDeleteAllRequest,
     ConversationDeletedData,
@@ -39,6 +40,7 @@ from clea.core.protocol import (
     ConversationRenameRequest,
     ConversationResumeMessage,
     ConversationResumeRequest,
+    ConversationSearchHit,
     ConversationsGetRequest,
     ConversationsListRequest,
     ConversationSummary,
@@ -76,6 +78,10 @@ from clea.core.protocol import (
     UsageEvent,
     VoiceDelegateTaskRequest,
     VoiceEndCallRequest,
+    VoiceHistoryMessageItem,
+    VoiceHistoryRequest,
+    VoicePostToActiveChatRequest,
+    VoiceSearchConversationsRequest,
     VoiceStartCallRequest,
     VoiceState,
     VoiceStateEvent,
@@ -146,10 +152,16 @@ def build_json_schema() -> dict[str, Any]:
         conversation_resume_message: ConversationResumeMessage
         settings_get_request: SettingsGetRequest
         dev_emit_sample_task_request: DevEmitSampleTaskRequest
+        chat_focus_request: ChatFocusRequest
         voice_start_call_request: VoiceStartCallRequest
         voice_end_call_request: VoiceEndCallRequest
         voice_status_request: VoiceStatusRequest
         voice_delegate_task_request: VoiceDelegateTaskRequest
+        voice_history_request: VoiceHistoryRequest
+        voice_search_conversations_request: VoiceSearchConversationsRequest
+        voice_post_to_active_chat_request: VoicePostToActiveChatRequest
+        conversation_search_hit: ConversationSearchHit
+        voice_history_message_item: VoiceHistoryMessageItem
         assistant_token_event: AssistantTokenEvent
         tool_call_started_event: ToolCallStartedEvent
         tool_call_finished_event: ToolCallFinishedEvent
@@ -204,12 +216,21 @@ process.stdout.write(ts);
 """
 
 
+def _find_node_cwd() -> Path:
+    if (UI_DIR / "node_modules").is_dir():
+        return UI_DIR
+    sibling_ui = REPO_ROOT.parent / "Clea" / "ui"
+    if (sibling_ui / "node_modules").is_dir():
+        return sibling_ui
+    return UI_DIR
+
+
 def generate_typescript() -> str:
     """Compile the Pydantic JSON Schema into formatted TypeScript via json2ts."""
     schema = build_json_schema()
     proc = subprocess.run(
         ["node", "--input-type=module", "-e", _NODE_SCRIPT],
-        cwd=UI_DIR,
+        cwd=_find_node_cwd(),
         input=json.dumps(schema),
         text=True,
         capture_output=True,

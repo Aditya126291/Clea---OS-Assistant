@@ -412,22 +412,35 @@ export function Sidebar() {
       <Separator />
 
       <div className="flex items-center justify-between gap-1 px-3 py-2.5">
-        <Button
-          size="sm"
-          variant={callOverlayOpen ? "default" : "ghost"}
-          onClick={() => {
-            if (!callOverlayOpen) {
-              void startVoiceCall();
-            } else {
-              void endVoiceCall();
-            }
-          }}
-          aria-pressed={callOverlayOpen}
-          className="text-xs"
-        >
-          <AudioLines className="h-3.5 w-3.5" aria-hidden="true" />
-          Voice
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            size="sm"
+            variant={callOverlayOpen ? "default" : "ghost"}
+            onClick={() => {
+              if (!callOverlayOpen) {
+                void startVoiceCall();
+              } else {
+                void endVoiceCall();
+              }
+            }}
+            aria-pressed={callOverlayOpen}
+            className="text-xs"
+          >
+            <AudioLines className="h-3.5 w-3.5" aria-hidden="true" />
+            Voice
+          </Button>
+
+          <Button
+            size="sm"
+            variant={activeView === "voice" ? "secondary" : "ghost"}
+            onClick={() => setActiveView("voice")}
+            title="Open Voice Companion Transcript"
+            aria-label="Open Voice Companion Transcript"
+            className="text-xs px-2"
+          >
+            Log
+          </Button>
+        </div>
 
         <Button
           size="sm"

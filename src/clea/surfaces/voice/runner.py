@@ -36,6 +36,10 @@ from clea.core.protocol import (
     VoiceDelegateTaskRequest,
     VoiceEndCallParams,
     VoiceEndCallRequest,
+    VoicePostToActiveChatParams,
+    VoicePostToActiveChatRequest,
+    VoiceSearchConversationsParams,
+    VoiceSearchConversationsRequest,
     VoiceStartCallParams,
     VoiceStartCallRequest,
     VoiceState,
@@ -70,6 +74,7 @@ from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
 from clea.surfaces.voice.config import VoiceConfig, load_voice_config
 from clea.surfaces.voice.lock import VoiceInstanceLock
 from clea.surfaces.voice.memory_hooks import (
+    _daemon_rpc,
     normalize_voice_transcript,
     resolve_voice_system_instruction,
     safe_consolidate_voice_call,
@@ -280,6 +285,18 @@ class VoiceRunner:
             return dict(await asyncio.wait_for(fut, timeout=timeout) or {})
         finally:
             self._pending_tasks.pop(req.id, None)
+
+    async def _rpc(self, req: BaseRequest, *, timeout: float = 10.0) -> dict[str, Any]:
+        """Run a typed daemon RPC over the active listener socket or transient fallback."""
+        if self._daemon_ws is not None:
+            return await self._request_daemon(req, timeout=timeout)
+        return await _daemon_rpc(
+            req,
+            daemon_url=self.daemon_url,
+            token=self.token,
+            data_dir=self.data_dir,
+            timeout=timeout,
+        )
 
     def _set_voice_state(self, state: VoiceState, error: str | None = None) -> None:
         """Update voice state and emit a typed VoiceStateEvent."""
@@ -628,6 +645,7 @@ class VoiceRunner:
                 media_resolution=self.config.media_resolution,
                 reconnect_limit=self.config.reconnect_limit,
                 session_resumption=SessionResumptionConfig(enabled=True),
+                transcription_language=self.config.transcription_language,
                 vad_mode=self.config.vad_mode,
             )
             connect_t0 = time.monotonic()
@@ -984,12 +1002,13 @@ class VoiceRunner:
                 elif isinstance(event, TranscriptOutputEvent):
                     if event.role == "user":
                         self._last_user_speech_time = time.monotonic()
+                    ts_iso = datetime.now().astimezone().isoformat()
                     self._transcript_history.append(
                         {
                             "role": event.role,
                             "text": event.text,
                             "final": event.final,
-                            "timestamp": datetime.now().astimezone().isoformat(),
+                            "timestamp": ts_iso,
                         }
                     )
                     self._emit_event(
@@ -999,6 +1018,7 @@ class VoiceRunner:
                                 role=event.role,
                                 text=event.text,
                                 final=event.final,
+                                timestamp=ts_iso,
                             )
                         )
                     )
@@ -1412,6 +1432,109 @@ class VoiceRunner:
             )
             await backend.send_tool_responses([resp])
             return
+
+        # 5. search_conversations tool
+        if event.name == "search_conversations":
+            query = str(event.arguments.get("query", "")).strip()
+            raw_limit = event.arguments.get("limit")
+            limit = 5
+            if raw_limit is not None and not isinstance(raw_limit, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    limit = max(1, min(int(raw_limit), 20))
+            if not query:
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={"error": "Search query must not be empty."},
+                            is_error=True,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+            try:
+                res = await self._rpc(
+                    VoiceSearchConversationsRequest(
+                        params=VoiceSearchConversationsParams(query=query, limit=limit)
+                    ),
+                    timeout=10.0,
+                )
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to search conversations: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
+            return
+
+        # 6. post_to_active_chat tool
+        if event.name == "post_to_active_chat":
+            content = str(event.arguments.get("content", "")).strip()
+            raw_label = event.arguments.get("label")
+            label = (
+                raw_label.strip() if isinstance(raw_label, str) and raw_label.strip() else None
+            )
+            if not content:
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={"error": "Content must not be empty."},
+                            is_error=True,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+            try:
+                res = await self._rpc(
+                    VoicePostToActiveChatRequest(
+                        params=VoicePostToActiveChatParams(content=content, label=label)
+                    ),
+                    timeout=10.0,
+                )
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to post to active chat: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
+            return
+
+        await backend.send_tool_responses(
+            [
+                VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Unsupported voice tool: {event.name}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            ]
+        )
 
     async def _stream_screen_burst(
         self,

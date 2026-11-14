@@ -10,6 +10,7 @@ import { SettingsView } from "@/features/settings/SettingsView";
 import { Sidebar } from "@/features/sidebar/Sidebar";
 import { UndoToast } from "@/features/sidebar/UndoToast";
 import { CallOverlay } from "@/features/voice/CallOverlay";
+import { VoiceView } from "@/features/voice/VoiceView";
 import { ThemeProvider } from "@/lib/theme";
 import { useCleaStore } from "@/protocol/store";
 
@@ -80,6 +81,7 @@ function CleaShell() {
           {activeView === "activity" && <ActivityView />}
           {activeView === "memory" && <MemoryView />}
           {activeView === "settings" && <SettingsView />}
+          {activeView === "voice" && <VoiceView />}
         </div>
       </main>
       <CallOverlay />

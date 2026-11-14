@@ -35,6 +35,9 @@ FIXED_SECTIONS = [
     "Open Threads",
 ]
 
+VOICE_COMPANION_SESSION_ID = "voice_companion"
+VOICE_COMPANION_TITLE = "Voice Companion"
+
 SourceTag = Literal["stated", "confirmed", "inferred-low-confidence"]
 
 
@@ -589,8 +592,17 @@ class MemoryStore:
             )
         return entries, raw_text
 
-    def build_injected_context(self, max_episodes: int = 5, token_cap: int = 2000) -> str:
-        """Combine size-capped MEMORY.md and recent episodes without raw transcripts."""
+    def build_injected_context(
+        self,
+        max_episodes: int = 5,
+        token_cap: int = 2000,
+        *,
+        include_voice_tail: bool = False,
+        voice_tail_turns: int = 15,
+        active_conversation_id: str | None = None,
+        active_chat_turns: int = 10,
+    ) -> str:
+        """Combine size-capped MEMORY.md and recent episodes, plus optional voice/chat context."""
         parts: list[str] = []
         long_term = self.read_long_term().strip()
         if long_term:
@@ -615,6 +627,63 @@ class MemoryStore:
                         f"- **{ep['date']} {ep['time']} ({ep['session_id'][:8]}):** {ep['summary']}"
                     )
                 combined = long_term + ("\n\n" + "\n".join(ep_lines) if episodes else "")
+
+        extra_sections: list[str] = []
+        if include_voice_tail and voice_tail_turns > 0:
+            tail_msgs = self.get_voice_companion_tail(max_turns=voice_tail_turns)
+            if tail_msgs:
+                vc_lines = ["## Recent Voice Companion History"]
+                last_call_id: str | None = None
+                for msg in tail_msgs:
+                    call_id = str(msg.get("call_id") or "").strip() or None
+                    raw_ts = str(msg.get("timestamp") or "").strip()
+                    time_label = ""
+                    if raw_ts:
+                        try:
+                            time_label = _format_time_local(datetime.fromisoformat(raw_ts))
+                        except Exception:
+                            time_label = raw_ts[:16]
+                    if call_id and call_id != last_call_id:
+                        tag = (
+                            f"{time_label} · call {call_id[:8]}"
+                            if time_label
+                            else f"call {call_id[:8]}"
+                        )
+                        vc_lines.append(f"--- [Voice Call {tag}] ---")
+                        last_call_id = call_id
+                    speaker = "User" if msg.get("role") == "user" else "Clea"
+                    prefix = f"[{time_label}] " if time_label else ""
+                    vc_lines.append(f"- {prefix}**{speaker}:** {str(msg.get('text', '')).strip()}")
+                extra_sections.append("\n".join(vc_lines))
+
+        if active_conversation_id and active_conversation_id != VOICE_COMPANION_SESSION_ID:
+            try:
+                active_tr = self.get_transcript(active_conversation_id)
+            except Exception:
+                active_tr = None
+            if (
+                active_tr
+                and not active_tr.get("is_voice_call")
+                and active_tr.get("messages")
+            ):
+                active_title = str(active_tr.get("title") or "Conversation").strip()
+                recent_chat_msgs = list(active_tr.get("messages", []))[-max(1, active_chat_turns) :]
+                active_sid = active_tr.get("session_id", active_conversation_id)
+                chat_lines = [
+                    "## Active Focused Text Chat (Read-Only Context)",
+                    f"Active Conversation ID: `{active_sid}`",
+                    f"Title: {active_title}",
+                    "Recent turns in this open text chat:",
+                ]
+                for msg in recent_chat_msgs:
+                    speaker = "User" if msg.get("role") == "user" else "Clea"
+                    text = str(msg.get("text", "")).strip()
+                    if text:
+                        chat_lines.append(f"- **{speaker}:** {text}")
+                extra_sections.append("\n".join(chat_lines))
+
+        if extra_sections:
+            combined = (combined.strip() + "\n\n" + "\n\n".join(extra_sections)).strip()
 
         return combined.strip()
 
@@ -716,13 +785,81 @@ class MemoryStore:
 
         return results
 
-    def get_transcript(self, session_id: str) -> dict[str, Any] | None:
-        """Read full structured transcript for a session."""
-        resolved_id = self.resolve_session_id(session_id)
-        path = self.transcript_path(resolved_id)
+    def append_voice_companion_call(
+        self,
+        *,
+        call_id: str,
+        entries: list[tuple[str, str, datetime]],
+    ) -> bool:
+        """Append non-empty voice call turns into continuous voice_companion stream."""
+        self.validate_session_id(call_id)
+        if not entries:
+            return False
+
+        self.ensure_initialized()
+        path = self.transcript_path(VOICE_COMPANION_SESSION_ID)
+
+        existing_vc = (
+            self._read_transcript_file(path, VOICE_COMPANION_SESSION_ID)
+            if path.exists()
+            else None
+        )
+        existing_for_call = (
+            [m for m in existing_vc.get("messages", []) if m.get("call_id") == call_id]
+            if existing_vc
+            else []
+        )
+        new_entries = entries[len(existing_for_call) :]
+        if not new_entries:
+            return False
+
+        first_dt = new_entries[0][2]
+        last_dt = new_entries[-1][2]
+
+        if not path.exists():
+            header = {
+                "session_id": VOICE_COMPANION_SESSION_ID,
+                "started_at": first_dt.isoformat(),
+                "title": VOICE_COMPANION_TITLE,
+                "pinned": False,
+                "updated_at": last_dt.isoformat(),
+            }
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(header, ensure_ascii=False) + "\n")
+
+        with path.open("a", encoding="utf-8") as handle:
+            for role, text, dt in new_entries:
+                msg_obj = {
+                    "role": role,
+                    "text": text,
+                    "timestamp": dt.isoformat(),
+                    "call_id": call_id,
+                    "tool_calls": [],
+                }
+                handle.write(json.dumps(msg_obj, ensure_ascii=False) + "\n")
+
+        try:
+            self.update_transcript_header(VOICE_COMPANION_SESSION_ID)
+        except Exception:
+            pass
+        return True
+
+    def get_voice_companion_tail(self, max_turns: int = 15) -> list[dict[str, Any]]:
+        """Return the most recent voice companion turns for rolling startup context."""
+        if max_turns <= 0:
+            return []
+        path = self.transcript_path(VOICE_COMPANION_SESSION_ID)
+        if not path.exists():
+            return []
+        vc = self._read_transcript_file(path, VOICE_COMPANION_SESSION_ID)
+        if not vc:
+            return []
+        messages = list(vc.get("messages", []))
+        return messages[-max_turns:]
+
+    def _read_transcript_file(self, path: Path, fallback_sid: str) -> dict[str, Any] | None:
         if not path.exists():
             return None
-
         messages: list[dict[str, Any]] = []
         header: dict[str, Any] = {}
         try:
@@ -741,17 +878,57 @@ class MemoryStore:
                         except json.JSONDecodeError:
                             logger.warning("Skipping corrupted transcript line in %s", path)
         except Exception as exc:
-            logger.warning("Failed to read transcript for %s: %s", session_id, exc)
+            logger.warning("Failed to read transcript for %s: %s", fallback_sid, exc)
             return None
 
         return {
-            "session_id": header.get("session_id", resolved_id),
+            "session_id": header.get("session_id", fallback_sid),
             "started_at": header.get("started_at", ""),
             "title": header.get("title", "Conversation"),
             "pinned": bool(header.get("pinned", False)),
             "updated_at": header.get("updated_at", header.get("started_at", "")),
             "messages": messages,
         }
+
+    def get_transcript(self, session_id: str) -> dict[str, Any] | None:
+        """Read full structured transcript for a session (or voice call inside voice_companion)."""
+        resolved_id = self.resolve_session_id(session_id)
+        path = self.transcript_path(resolved_id)
+        if path.exists():
+            return self._read_transcript_file(path, resolved_id)
+
+        if resolved_id != VOICE_COMPANION_SESSION_ID:
+            vc_path = self.transcript_path(VOICE_COMPANION_SESSION_ID)
+            if vc_path.exists():
+                vc = self._read_transcript_file(vc_path, VOICE_COMPANION_SESSION_ID)
+                if vc:
+                    call_msgs = [
+                        m
+                        for m in vc.get("messages", [])
+                        if m.get("call_id") in (session_id, resolved_id)
+                    ]
+                    if call_msgs:
+                        first_user = next(
+                            (
+                                str(m.get("text", "")).strip()
+                                for m in call_msgs
+                                if m.get("role") == "user" and str(m.get("text", "")).strip()
+                            ),
+                            "",
+                        )
+                        started_at = str(call_msgs[0].get("timestamp") or vc.get("started_at", ""))
+                        updated_at = str(call_msgs[-1].get("timestamp") or started_at)
+                        title = _truncate(first_user) if first_user else VOICE_COMPANION_TITLE
+                        return {
+                            "session_id": session_id,
+                            "started_at": started_at,
+                            "title": title,
+                            "pinned": False,
+                            "updated_at": updated_at,
+                            "messages": call_msgs,
+                            "is_voice_call": True,
+                        }
+        return None
 
     def update_transcript_header(
         self,
@@ -1064,9 +1241,11 @@ class MemoryStore:
         return path
 
     def list_conversations(self) -> list[dict[str, str | int]]:
-        """List conversations for the sidebar, reading structured transcripts first."""
+        """List conversations for the sidebar, excluding the Voice Companion stream."""
         conversations: list[dict[str, str | int]] = []
-        transcripts = self.list_transcripts()
+        transcripts = [
+            t for t in self.list_transcripts() if t.get("session_id") != VOICE_COMPANION_SESSION_ID
+        ]
 
         if transcripts:
             for item in transcripts:
@@ -1115,6 +1294,8 @@ class MemoryStore:
         for day in self.list_days():
             by_session: dict[str, dict[str, str | int]] = {}
             for sid, time_str, user, _assistant in _parse_turns(self.read_daily_on(day)):
+                if sid == VOICE_COMPANION_SESSION_ID:
+                    continue
                 entry = by_session.get(sid)
                 t_match = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)", time_str)
                 fmt_time = t_match.group(1)[:5] if t_match else time_str
@@ -1135,6 +1316,138 @@ class MemoryStore:
         pinned_list = [c for c in conversations if c.get("pinned")]
         unpinned_list = [c for c in conversations if not c.get("pinned")]
         return pinned_list + unpinned_list
+
+    def search_conversations(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Search raw message content and titles across text chats and Voice Companion."""
+        q_raw = (query or "").strip()
+        if not q_raw or not self.transcripts_dir.is_dir():
+            return []
+
+        cap = max(1, min(int(limit or 5), 50))
+        q_lower = q_raw.lower()
+        q_tokens = [tok for tok in re.findall(r"\w+", q_lower) if len(tok) >= 2]
+
+        files = sorted(
+            self.transcripts_dir.glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        scored_hits: list[tuple[int, str, dict[str, Any]]] = []
+        for f in files:
+            tr = self._read_transcript_file(f, f.stem)
+            if not tr:
+                continue
+            sid = str(tr.get("session_id") or f.stem)
+            default_title = (
+                VOICE_COMPANION_TITLE if sid == VOICE_COMPANION_SESSION_ID else "Conversation"
+            )
+            title = str(tr.get("title") or default_title)
+            source = "voice_companion" if sid == VOICE_COMPANION_SESSION_ID else "chat"
+            title_lower = title.lower()
+            title_exact = q_lower in title_lower
+            title_token_hits = sum(1 for tok in q_tokens if tok in title_lower)
+
+            for msg in tr.get("messages", []):
+                text = str(msg.get("text") or "").strip()
+                if not text:
+                    continue
+                role = str(msg.get("role") or "assistant")
+                ts = str(
+                    msg.get("timestamp")
+                    or tr.get("updated_at")
+                    or tr.get("started_at")
+                    or ""
+                )
+                text_lower = text.lower()
+                text_exact = q_lower in text_lower
+                text_token_hits = sum(1 for tok in q_tokens if tok in text_lower)
+                combined_token_hits = sum(
+                    1 for tok in q_tokens if (tok in text_lower or tok in title_lower)
+                )
+
+                matched = False
+                score = 0
+                if text_exact:
+                    matched = True
+                    score += 100
+                if title_exact:
+                    matched = True
+                    score += 50
+                if q_tokens and combined_token_hits == len(q_tokens):
+                    matched = True
+                    score += 30
+                elif len(q_tokens) >= 2 and combined_token_hits >= max(2, (len(q_tokens) + 1) // 2):
+                    matched = True
+                    score += 15
+
+                if not matched:
+                    continue
+
+                score += text_token_hits * 10 + title_token_hits * 5
+                snippet = _build_search_snippet(text, q_lower, q_tokens)
+                hit: dict[str, Any] = {
+                    "session_id": sid,
+                    "title": title,
+                    "role": role,
+                    "timestamp": ts,
+                    "snippet": snippet,
+                    "source": source,
+                }
+                if msg.get("call_id"):
+                    hit["call_id"] = str(msg["call_id"])
+                scored_hits.append((score, ts, hit))
+
+        scored_hits.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in scored_hits[:cap]]
+
+    def append_to_active_chat(
+        self,
+        session_id: str,
+        *,
+        content: str,
+        label: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Write an assistant message directly into the user's active focused text chat."""
+        self.validate_session_id(session_id)
+        if session_id == VOICE_COMPANION_SESSION_ID:
+            raise ValueError("Cannot post active chat content to voice_companion.")
+        body = (content or "").strip()
+        if not body:
+            raise ValueError("Content cannot be empty.")
+
+        clean_label = label.strip() if isinstance(label, str) and label.strip() else None
+        formatted_text = f"**{clean_label}**\n\n{body}" if clean_label else body
+        dt = timestamp or datetime.now().astimezone()
+
+        self.append_transcript_message(
+            session_id=session_id,
+            role="assistant",
+            text=formatted_text,
+            title=clean_label or body,
+            timestamp=dt,
+        )
+        try:
+            self.update_transcript_header(session_id)
+        except Exception:
+            pass
+
+        tr = self.get_transcript(session_id)
+        msgs = tr.get("messages", []) if tr else []
+        title = (
+            str(tr.get("title") or "Conversation")
+            if tr
+            else _truncate(clean_label or body)
+        )
+        updated_at = str(tr.get("updated_at") or dt.isoformat()) if tr else dt.isoformat()
+        return {
+            "session_id": session_id,
+            "title": title,
+            "updated_at": updated_at,
+            "message": formatted_text,
+            "turns": max(1, (len(msgs) + 1) // 2),
+        }
 
     def get_conversation(self, day: str, session_id: str) -> list[dict[str, str]]:
         """Return conversation turns for a session from transcripts or daily log."""
@@ -1422,6 +1735,32 @@ def parse_day(value: str) -> date:
 def _truncate(text: str, limit: int = 60) -> str:
     flat = " ".join(text.split())
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _build_search_snippet(text: str, q_lower: str, q_tokens: list[str], window: int = 240) -> str:
+    """Extract a readable snippet centered around the first query match."""
+    clean = text.strip()
+    if len(clean) <= window:
+        return clean
+
+    lower = clean.lower()
+    idx = lower.find(q_lower)
+    if idx == -1:
+        for tok in q_tokens:
+            idx = lower.find(tok)
+            if idx != -1:
+                break
+    if idx == -1:
+        return clean[: window - 1] + "…"
+
+    half = window // 2
+    start = max(0, idx - half)
+    end = min(len(clean), start + window)
+    if end - start < window:
+        start = max(0, end - window)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(clean) else ""
+    return f"{prefix}{clean[start:end].strip()}{suffix}"
 
 
 def _parse_turns(markdown: str) -> list[tuple[str, str, str, str]]:

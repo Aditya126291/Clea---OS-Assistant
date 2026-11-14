@@ -54,6 +54,7 @@ class VoiceConfig(BaseModel):
     consent_mode: ConsentMode = "ask"
     reconnect_limit: int = Field(default=3, ge=0)
     enable_web_search: bool = False
+    transcription_language: str | None = Field(default="en-IN")
     stall_timeout_seconds: float = Field(default=15.0, gt=0.0)
     stall_speech_rms_threshold: float = Field(default=250.0, ge=0.0)
     preferred_hostapi: str = Field(default="WASAPI")
@@ -90,6 +91,16 @@ class VoiceConfig(BaseModel):
                 return None
             return stripped
         return value
+
+    @field_validator("transcription_language", mode="before")
+    @classmethod
+    def _validate_transcription_language(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, str):
+            raise ValueError("transcription_language must be a BCP-47 string or null.")
+        stripped = value.strip()
+        return stripped or None
 
     @field_validator("wake_word_model", "hotkey", mode="after")
     @classmethod
@@ -147,6 +158,9 @@ reconnect_limit = 3
 
 # Google Search grounding: set to true to enable Live Google Search grounding tool.
 enable_web_search = false
+
+# Lock input audio transcription language (BCP-47, e.g. "en-IN" or "en-US"; set "" to auto-detect).
+transcription_language = "en-IN"
 
 # Screen capture settings for look_at_screen and watch_screen.
 # Consent mode: "ask" (prompt user), "auto_allow", or "deny".

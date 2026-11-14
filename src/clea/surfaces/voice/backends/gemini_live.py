@@ -169,6 +169,38 @@ class GeminiLiveBackend(VoiceBackend):
                 automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
             )
 
+        # Input audio transcription lock (guarded safely across google-genai versions)
+        input_transcription_cfg = types.AudioTranscriptionConfig()
+        tx_lang = (
+            config.transcription_language.strip()
+            if isinstance(config.transcription_language, str)
+            and config.transcription_language.strip()
+            else None
+        )
+        if tx_lang:
+            tx_fields = getattr(types.AudioTranscriptionConfig, "model_fields", {}) or {}
+            try:
+                if "language_codes" in tx_fields:
+                    input_transcription_cfg = types.AudioTranscriptionConfig(
+                        language_codes=[tx_lang]
+                    )
+                elif "language_code" in tx_fields:
+                    input_transcription_cfg = types.AudioTranscriptionConfig(
+                        language_code=tx_lang  # type: ignore[call-arg]
+                    )
+                elif "language_hints" in tx_fields:
+                    input_transcription_cfg = types.AudioTranscriptionConfig(
+                        language_hints=[tx_lang]
+                    )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "AudioTranscriptionConfig does not support transcription_language=%r (%s); "
+                    "using default AudioTranscriptionConfig().",
+                    tx_lang,
+                    exc,
+                )
+                input_transcription_cfg = types.AudioTranscriptionConfig()
+
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(
@@ -181,7 +213,7 @@ class GeminiLiveBackend(VoiceBackend):
             speech_config=speech_cfg,
             media_resolution=media_res,
             realtime_input_config=realtime_input_cfg,
-            input_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=input_transcription_cfg,
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
 

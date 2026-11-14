@@ -41,6 +41,7 @@ from clea.core.protocol import (
     ConversationDeletedData,
     ConversationDeletedEvent,
     ConversationResumeMessage,
+    ConversationSearchHit,
     ConversationUpdatedData,
     ConversationUpdatedEvent,
     EpisodeItem,
@@ -62,6 +63,7 @@ from clea.core.protocol import (
     ToolInfo,
     TranscriptMessageItem,
     TranscriptSummaryItem,
+    VoiceHistoryMessageItem,
     VoiceState,
     VoiceStateData,
     VoiceStateEvent,
@@ -70,7 +72,7 @@ from clea.core.protocol import (
 )
 from clea.core.sessions import Session, SessionManager
 from clea.memory.consolidation import ConsolidationManager
-from clea.memory.store import MemoryStore
+from clea.memory.store import VOICE_COMPANION_SESSION_ID, MemoryStore
 from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
@@ -171,6 +173,7 @@ class CleaDaemon:
         self._busy_sessions: set[str] = set()
         self._connections: set[_Connection] = set()
         self._shared_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
+        self._active_conversation_id: str | None = None
         self._voice_call_id: str | None = None
         self._call_state: CallState = "idle"
         self._call_started_monotonic: float | None = None
@@ -611,7 +614,7 @@ class CleaDaemon:
         call_id: str,
         transcript: list[dict[str, Any]] | None,
     ) -> bool:
-        """Persist a non-empty voice call transcript chronologically into History.
+        """Persist a non-empty voice call transcript chronologically into Voice Companion stream.
 
         Returns True if one or more messages were newly persisted.
         """
@@ -619,7 +622,6 @@ class CleaDaemon:
             return False
 
         cleaned: list[tuple[str, str, datetime]] = []
-        first_user_text: str | None = None
         fallback_dt: datetime | None = None
 
         for entry in transcript:
@@ -640,8 +642,6 @@ class CleaDaemon:
                 dt = datetime.now().astimezone()
             if fallback_dt is None:
                 fallback_dt = dt
-            if role == "user" and first_user_text is None:
-                first_user_text = text
             cleaned.append((role, text, dt))
 
         if not cleaned:
@@ -654,27 +654,10 @@ class CleaDaemon:
             if curr_dt < prev_dt:
                 cleaned[i] = (curr_role, curr_text, prev_dt)
 
-        existing = self.agent.memory.get_transcript(call_id)
-        existing_count = len(existing.get("messages", [])) if existing else 0
-        new_entries = cleaned[existing_count:]
-        if not new_entries:
-            return False
-
-        if first_user_text:
-            title = " ".join(first_user_text.split())
-        else:
-            ref_dt = fallback_dt or datetime.now().astimezone()
-            title = f"Voice call ({ref_dt.astimezone().strftime('%H:%M')})"
-
-        for role, text, dt in new_entries:
-            self.agent.memory.append_transcript_message(
-                session_id=call_id,
-                role=role,
-                text=text,
-                title=title,
-                timestamp=dt,
-            )
-        return True
+        return self.agent.memory.append_voice_companion_call(
+            call_id=call_id,
+            entries=cleaned,
+        )
 
     def _audit_log(self, action: str, **details: Any) -> None:
         try:
@@ -753,6 +736,23 @@ class CleaDaemon:
                 await self._respond(ws, req, error="Missing non-empty 'text' parameter.")
                 return
             conn.spawn(self._run_chat(conn, req, text))
+        elif method == "chat.focus":
+            target_id = req.params.session_id
+            if isinstance(target_id, str):
+                target_id = target_id.strip() or None
+            if target_id is not None:
+                try:
+                    self.agent.memory.validate_session_id(target_id)
+                    self._active_conversation_id = target_id
+                except ValueError:
+                    self._active_conversation_id = None
+            else:
+                self._active_conversation_id = None
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](active_conversation_id=self._active_conversation_id),
+            )
         elif method == "approval.respond":
             future = conn.approvals.get(req.params.approval_id) or self._shared_approvals.get(
                 req.params.approval_id
@@ -1263,7 +1263,11 @@ class CleaDaemon:
                     ),
                 )
             )
-            memory_ctx = self.agent.memory.build_injected_context()
+            memory_ctx = self.agent.memory.build_injected_context(
+                include_voice_tail=True,
+                voice_tail_turns=15,
+                active_conversation_id=self._active_conversation_id,
+            )
             await self._respond(
                 ws,
                 req,
@@ -1297,6 +1301,7 @@ class CleaDaemon:
                         ),
                     )
                     if persisted:
+                        await self._broadcast_conversation_updated(VOICE_COMPANION_SESSION_ID)
                         await self._broadcast_conversation_updated(req_call_id)
                     return
                 tr = self.agent.memory.get_transcript(req_call_id)
@@ -1372,6 +1377,7 @@ class CleaDaemon:
                 METHOD_RESULTS[method](call_id=ended_id, call_state="idle", voice_state="idle"),
             )
             if persisted:
+                await self._broadcast_conversation_updated(VOICE_COMPANION_SESSION_ID)
                 await self._broadcast_conversation_updated(ended_id)
         elif method == "voice.delegate_task":
             description = req.params.description.strip()
@@ -1379,6 +1385,101 @@ class CleaDaemon:
                 await self._respond(ws, req, error="Missing non-empty 'description' parameter.")
                 return
             conn.spawn(self._run_delegated_task(conn, req, description))
+        elif method == "voice.history":
+            limit = getattr(req.params, "limit", 100) or 100
+            limit = max(1, min(int(limit), 500))
+            tail = self.agent.memory.get_voice_companion_tail(max_turns=limit)
+            items: list[VoiceHistoryMessageItem] = []
+            for m in tail:
+                if not isinstance(m, dict):
+                    continue
+                text = str(m.get("text", "")).strip()
+                if not text:
+                    continue
+                role = "user" if m.get("role") == "user" else "assistant"
+                items.append(
+                    VoiceHistoryMessageItem(
+                        role=role,
+                        text=text,
+                        timestamp=str(m.get("timestamp") or ""),
+                        call_id=str(m.get("call_id") or "") or None,
+                    )
+                )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](
+                    session_id=VOICE_COMPANION_SESSION_ID,
+                    messages=items,
+                ),
+            )
+        elif method == "voice.search_conversations":
+            query = getattr(req.params, "query", "")
+            limit = getattr(req.params, "limit", 5) or 5
+            limit = max(1, min(int(limit), 50))
+            hits_raw = self.agent.memory.search_conversations(query=query, limit=limit)
+            hits = [ConversationSearchHit(**hit) for hit in hits_raw]
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS[method](results=hits),
+            )
+        elif method == "voice.post_to_active_chat":
+            content = getattr(req.params, "content", "").strip()
+            label = getattr(req.params, "label", None)
+            if not content:
+                await self._respond(ws, req, error="Content cannot be empty.")
+                return
+            if not self._active_conversation_id:
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS[method](
+                        ok=False,
+                        session_id=None,
+                        title=None,
+                        message="No active text chat is currently focused in the UI.",
+                    ),
+                )
+                return
+            try:
+                res = self.agent.memory.append_to_active_chat(
+                    self._active_conversation_id,
+                    content=content,
+                    label=label,
+                )
+                await self._broadcast(
+                    ConversationUpdatedEvent(
+                        data=ConversationUpdatedData(
+                            session_id=self._active_conversation_id,
+                            title=res["title"],
+                            updated_at=res["updated_at"],
+                            turns=res["turns"],
+                            assistant_message=res["message"],
+                        )
+                    )
+                )
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS[method](
+                        ok=True,
+                        session_id=self._active_conversation_id,
+                        title=res["title"],
+                        message=res["message"],
+                    ),
+                )
+            except Exception as exc:
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS[method](
+                        ok=False,
+                        session_id=self._active_conversation_id,
+                        title=None,
+                        message=f"Failed to post to active chat: {exc}",
+                    ),
+                )
 
     def _settings(self) -> SettingsGetResult:
         policies = {

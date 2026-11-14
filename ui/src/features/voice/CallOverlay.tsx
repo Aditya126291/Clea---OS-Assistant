@@ -43,6 +43,7 @@ export function CallOverlay() {
   const voiceState = useCleaStore((s) => s.voiceState);
   const voiceError = useCleaStore((s) => s.voiceError);
   const endVoiceCall = useCleaStore((s) => s.endVoiceCall);
+  const setActiveView = useCleaStore((s) => s.setActiveView);
 
   const [MockPanel, setMockPanel] = useState<ComponentType | null>(null);
 
@@ -103,6 +104,15 @@ export function CallOverlay() {
         <Button size="sm" variant="destructive" onClick={handleEndCall} className="mt-3 w-full">
           <PhoneOff className="h-3.5 w-3.5" aria-hidden="true" />
           End Call
+        </Button>
+
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => setActiveView("voice")}
+          className="mt-2 w-full text-xs"
+        >
+          View Companion Log
         </Button>
       </div>
 

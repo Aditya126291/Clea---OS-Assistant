@@ -20,6 +20,8 @@ from clea.core.protocol import (
     TranscriptEvent,
     UsageEvent,
     VoiceDelegateTaskRequest,
+    VoicePostToActiveChatRequest,
+    VoiceSearchConversationsRequest,
     VoiceStateData,
     VoiceStateEvent,
     parse_frame,
@@ -372,6 +374,7 @@ async def test_voice_runner_tool_delegation_to_daemon(tmp_path: Path) -> None:
 
     mock_ws.send = fake_send
     runner._daemon_ws = mock_ws  # type: ignore[assignment]
+    runner._daemon_listener_active = True
 
     # Model triggers delegate_task
     await backend.event_queue.put(
@@ -398,6 +401,113 @@ async def test_voice_runner_tool_delegation_to_daemon(tmp_path: Path) -> None:
     assert tool_resp.name == "delegate_task"
     assert tool_resp.response["status"] == "succeeded"
     assert tool_resp.response["output"] == "Done!"
+
+    await runner.stop()
+
+
+async def test_voice_runner_bridge_tools_to_daemon(tmp_path: Path) -> None:
+    backend = FakeLiveBackend()
+    audio = create_fake_audio_manager()
+    cfg = VoiceConfig(silence_timeout_seconds=60.0)
+
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    sent_to_daemon: list[str] = []
+    mock_ws = MagicMock()
+
+    async def fake_send(text: str) -> None:
+        sent_to_daemon.append(text)
+        frame = parse_frame(text)
+        if isinstance(frame, VoiceSearchConversationsRequest):
+            fut = runner._pending_tasks.get(frame.id)
+            if fut and not fut.done():
+                fut.set_result(
+                    {
+                        "results": [
+                            {
+                                "session_id": "chat-1",
+                                "title": "Config",
+                                "role": "user",
+                                "timestamp": "2026-11-14T10:00:00Z",
+                                "snippet": "database url",
+                                "source": "chat",
+                            }
+                        ]
+                    }
+                )
+        elif isinstance(frame, VoicePostToActiveChatRequest):
+            fut = runner._pending_tasks.get(frame.id)
+            if fut and not fut.done():
+                fut.set_result(
+                    {
+                        "ok": True,
+                        "session_id": "chat-focused",
+                        "title": "Active Thread",
+                        "message": frame.params.content,
+                    }
+                )
+
+    mock_ws.send = fake_send
+    runner._daemon_ws = mock_ws  # type: ignore[assignment]
+    runner._daemon_listener_active = True
+
+    # 1. Model calls search_conversations
+    await backend.event_queue.put(
+        ToolCallEvent(
+            call_id="call-sc-1",
+            name="search_conversations",
+            arguments={"query": "database url", "limit": 3},
+        )
+    )
+    await asyncio.sleep(0.1)
+
+    search_reqs = [
+        f
+        for f in (parse_frame(t) for t in sent_to_daemon)
+        if isinstance(f, VoiceSearchConversationsRequest)
+    ]
+    assert len(search_reqs) == 1
+    assert search_reqs[0].params.query == "database url"
+    assert search_reqs[0].params.limit == 3
+
+    assert len(backend.sent_tool_responses) == 1
+    sc_resp = backend.sent_tool_responses[0]
+    assert sc_resp.name == "search_conversations"
+    assert sc_resp.response["results"][0]["session_id"] == "chat-1"
+
+    # 2. Model calls post_to_active_chat
+    await backend.event_queue.put(
+        ToolCallEvent(
+            call_id="call-pc-1",
+            name="post_to_active_chat",
+            arguments={"content": "const port = 8080;", "label": "Port Config"},
+        )
+    )
+    await asyncio.sleep(0.1)
+
+    post_reqs = [
+        f
+        for f in (parse_frame(t) for t in sent_to_daemon)
+        if isinstance(f, VoicePostToActiveChatRequest)
+    ]
+    assert len(post_reqs) == 1
+    assert post_reqs[0].params.content == "const port = 8080;"
+    assert post_reqs[0].params.label == "Port Config"
+
+    assert len(backend.sent_tool_responses) == 2
+    pc_resp = backend.sent_tool_responses[1]
+    assert pc_resp.name == "post_to_active_chat"
+    assert pc_resp.response["ok"] is True
+    assert pc_resp.response["session_id"] == "chat-focused"
 
     await runner.stop()
 
@@ -1377,9 +1487,7 @@ async def test_voice_runner_full_duplex_multi_turn_speech_rms_and_barge_in(
                     )
                 )
             )
-            yield types.LiveServerMessage(
-                server_content=types.LiveServerContent(interrupted=True)
-            )
+            yield types.LiveServerMessage(server_content=types.LiveServerContent(interrupted=True))
             return
         if current == 3:
             await turn3_seen.wait()

@@ -30,6 +30,8 @@ from clea.core.protocol import (
     ResponseFrame,
     VoiceEndCallParams,
     VoiceEndCallRequest,
+    VoiceHistoryParams,
+    VoiceHistoryRequest,
     parse_frame,
 )
 
@@ -45,6 +47,15 @@ BASE_VOICE_SYSTEM_INSTRUCTION = (
     "or code blocks unless asked).\n"
     "- Use `delegate_task` for desktop, file, system, or multi-step work; and use "
     "`end_call` when the user asks to end the call.\n"
+    "- Cross-Chat Context & Tools:\n"
+    "  * If an Active Focused Text Chat section is provided in your context, treat it as "
+    "read-only awareness of what thread the user currently has open in the UI.\n"
+    "  * Use `search_conversations` whenever the user asks about exact commands, code, "
+    "decisions, or discussions from other chats or earlier in the Voice Companion log.\n"
+    "  * Use `post_to_active_chat` ONLY when the user explicitly asks to send, drop, paste, "
+    "write, or save something (such as code, commands, or a summary) into their open chat. "
+    "Never call `post_to_active_chat` unprompted; if no text chat is focused, let the user "
+    "know clearly so they can open a chat tab first.\n"
     "- Screen Vision & Freshness Rules (CRITICAL):\n"
     "  * NEVER answer questions about what is currently on the screen, which app is open, or "
     "what code/UI text says from memory of screenshots earlier in the call. ALWAYS call "
@@ -299,6 +310,39 @@ async def load_voice_memory_context(
                 parts.append("### Recent Episodes\n" + "\n".join(ep_lines))
     except Exception as exc:  # noqa: BLE001
         logger.debug("Skipping optional episode summaries for voice context: %s", exc)
+
+    try:
+        vh_result = await _run_request(
+            VoiceHistoryRequest(params=VoiceHistoryParams(limit=15)),
+            request_fn=request_fn,
+            daemon_url=daemon_url,
+            token=token,
+            data_dir=data_dir,
+        )
+        messages = vh_result.get("messages") or []
+        if isinstance(messages, list) and messages:
+            vc_lines: list[str] = ["## Recent Voice Companion History"]
+            last_call_id: str | None = None
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                text = str(msg.get("text") or "").strip()
+                if not text:
+                    continue
+                cid = str(msg.get("call_id") or "").strip() or None
+                ts = str(msg.get("timestamp") or "").strip()
+                time_label = ts[:16] if ts else ""
+                if cid and cid != last_call_id:
+                    tag = f"{time_label} · call {cid[:8]}" if time_label else f"call {cid[:8]}"
+                    vc_lines.append(f"--- [Voice Call {tag}] ---")
+                    last_call_id = cid
+                speaker = "User" if msg.get("role") == "user" else "Clea"
+                prefix = f"[{time_label}] " if time_label else ""
+                vc_lines.append(f"- {prefix}**{speaker}:** {text}")
+            if len(vc_lines) > 1:
+                parts.append("\n".join(vc_lines))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skipping optional Voice Companion tail for voice context: %s", exc)
 
     return "\n\n".join(parts)
 

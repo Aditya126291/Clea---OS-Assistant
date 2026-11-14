@@ -358,14 +358,22 @@ async def test_voice_call_persists_to_history_and_can_resume_in_text_chat(tmp_pa
                     break
             assert saw_conv_updated is True
 
-            # Verify History sidebar query lists the voice call with first user turn as title
+            # Verify History sidebar query keeps sidebar clean while voice_companion has it
             list_resp = await _send_rpc(ui_ws, ConversationsListRequest())
             assert list_resp.ok
             convs = list_resp.result["conversations"]
-            assert len(convs) == 1
-            assert convs[0]["session_id"] == call_id
-            assert convs[0]["title"].startswith("Hey Clea, I prefer masala chai")
-            assert convs[0]["turns"] == 2
+            assert len(convs) == 0
+
+            # Verify Voice Companion stream contains the turns
+            from clea.core.protocol import VoiceHistoryParams, VoiceHistoryRequest
+
+            vh_req = VoiceHistoryRequest(params=VoiceHistoryParams(limit=20))
+            vh_resp = await _send_rpc(ui_ws, vh_req)
+            assert vh_resp.ok
+            vh_msgs = vh_resp.result["messages"]
+            assert len(vh_msgs) == 4
+            assert vh_msgs[0]["call_id"] == call_id
+            assert vh_msgs[0]["text"] == "Hey Clea, I prefer masala chai every morning."
 
             # Verify chronological full transcript retrieval (turns + raw transcript timestamps)
             get_resp = await _send_rpc(

@@ -10,6 +10,8 @@ import type {
   CallState,
   ChatSendParams,
   ChatSendResult,
+  ChatFocusParams,
+  ChatFocusResult,
   ConsolidationSessionStatus,
   ConversationGetParams,
   ConversationResumeParams,
@@ -80,6 +82,14 @@ import type {
   VoiceDelegateTaskResult,
   VoiceEndCallParams,
   VoiceEndCallResult,
+  VoiceHistoryParams,
+  VoiceHistoryResult,
+  VoiceHistoryMessageItem,
+  VoiceSearchConversationsParams,
+  VoiceSearchConversationsResult,
+  ConversationSearchHit,
+  VoicePostToActiveChatParams,
+  VoicePostToActiveChatResult,
   VoiceStartCallParams,
   VoiceStartCallResult,
   VoiceState,
@@ -99,6 +109,8 @@ export type {
   CallState,
   ChatSendParams,
   ChatSendResult,
+  ChatFocusParams,
+  ChatFocusResult,
   ConsolidationSessionStatus,
   ConversationGetParams,
   ConversationResumeParams,
@@ -169,6 +181,14 @@ export type {
   VoiceDelegateTaskResult,
   VoiceEndCallParams,
   VoiceEndCallResult,
+  VoiceHistoryParams,
+  VoiceHistoryResult,
+  VoiceHistoryMessageItem,
+  VoiceSearchConversationsParams,
+  VoiceSearchConversationsResult,
+  ConversationSearchHit,
+  VoicePostToActiveChatParams,
+  VoicePostToActiveChatResult,
   VoiceStartCallParams,
   VoiceStartCallResult,
   VoiceState,
@@ -244,12 +264,16 @@ export interface MethodResultMap {
   "voice.end_call": VoiceEndCallResult;
   "voice.status": VoiceStatusResult;
   "voice.delegate_task": VoiceDelegateTaskResult;
+  "chat.focus": ChatFocusResult;
+  "voice.history": VoiceHistoryResult;
+  "voice.search_conversations": VoiceSearchConversationsResult;
+  "voice.post_to_active_chat": VoicePostToActiveChatResult;
 }
 
 export type ConnectionState =
   "idle" | "connecting" | "connected" | "reconnecting" | "daemon_offline" | "auth_error";
 
-export type AppView = "chat" | "activity" | "memory" | "settings";
+export type AppView = "chat" | "activity" | "memory" | "settings" | "voice";
 
 export interface ToolCallItem {
   callId: string;

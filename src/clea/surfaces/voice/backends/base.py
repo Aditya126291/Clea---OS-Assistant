@@ -40,7 +40,7 @@ class VoiceToolDeclaration(_StrictModel):
 
 
 def default_voice_tools() -> list[VoiceToolDeclaration]:
-    """Return the four canonical live voice tool declarations."""
+    """Return the canonical live voice tool declarations."""
     return [
         VoiceToolDeclaration(
             name="delegate_task",
@@ -128,6 +128,55 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="search_conversations",
+            description=(
+                "Search raw message content and titles across all saved text conversations and the "
+                "continuous Voice Companion history. Use this to recall exact code snippets, "
+                "commands, links, or earlier decisions when the user asks about past threads."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search keywords or phrase to match across conversations.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum number of matching snippets to return (default 5).",
+                    },
+                },
+                "required": ["query"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="post_to_active_chat",
+            description=(
+                "Write a clean assistant message (such as code, shell commands, or a structured "
+                "summary) directly into the user's currently focused text chat in the UI. Call "
+                "this ONLY when the user explicitly asks to send, drop, paste, write, or save "
+                "something into their chat."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Clean markdown/text to post into active text chat.",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional short heading prepended to posted message.",
+                    },
+                },
+                "required": ["content"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="end_call",
             description="End the active voice call politely when the user asks to hang up.",
             parameters_schema={
@@ -184,6 +233,7 @@ class VoiceSessionConfig(_StrictModel):
     voice_name: str | None = None
     # Intentionally None by default so the live model can code-switch (e.g. English/Hindi).
     language_code: str | None = None
+    transcription_language: str | None = "en-IN"
     vad_mode: Literal["server", "client"] = "server"
     reconnect_limit: int = Field(default=3, ge=0)
 

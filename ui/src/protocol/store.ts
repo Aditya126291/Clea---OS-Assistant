@@ -9,6 +9,8 @@ import type {
   ConnectionState,
   ConversationSummary,
   ConversationTurn,
+  ConversationSearchHit,
+  VoiceHistoryMessageItem,
   EpisodeItem,
   MemoryArchiveItem,
   MemorySectionItem,
@@ -85,6 +87,8 @@ export interface CleaStoreState {
   screenCaptureActive: boolean;
   screenCaptureTarget: ScreenCaptureTarget | null;
   voiceTranscripts: TranscriptData[];
+  voiceHistoryMessages: VoiceHistoryMessageItem[];
+  voiceHistoryLoading: boolean;
   lastCallUsage: UsageData | null;
 
   connect: (clientOptions?: CleaClientOptions) => void;
@@ -96,6 +100,9 @@ export interface CleaStoreState {
   setCallOverlayOpen: (open: boolean) => void;
   startVoiceCall: () => Promise<void>;
   endVoiceCall: () => Promise<void>;
+  loadVoiceHistory: () => Promise<void>;
+  searchConversations: (query: string, limit?: number) => Promise<ConversationSearchHit[]>;
+  postToActiveChat: (content: string, label?: string) => Promise<boolean>;
   clearError: () => void;
 
   newSession: () => Promise<void>;
@@ -168,6 +175,12 @@ function updateAssistantByRequest(
 
 let undoToastTimer: ReturnType<typeof setTimeout> | null = null;
 
+function notifyChatFocus(sessionId: string | null): void {
+  if (activeClient?.isConnected) {
+    void activeClient.request("chat.focus", { session_id: sessionId }).catch(() => {});
+  }
+}
+
 export const useCleaStore = create<CleaStoreState>((set, get) => ({
   connectionState: "idle",
   reconnectAttempt: 0,
@@ -217,6 +230,8 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   screenCaptureActive: false,
   screenCaptureTarget: null,
   voiceTranscripts: [],
+  voiceHistoryMessages: [],
+  voiceHistoryLoading: false,
   lastCallUsage: null,
 
   connect: (clientOptions = {}) => {
@@ -314,10 +329,49 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     activeClient.retryNow();
   },
 
-  setActiveView: (view) => set({ activeView: view }),
+  setActiveView: (view) => {
+    set({ activeView: view });
+    if (view !== "chat") {
+      notifyChatFocus(null);
+    } else {
+      const sid = get().resumedSessionId || get().sessionId || null;
+      notifyChatFocus(sid);
+    }
+  },
   setMemorySubView: (view) => set({ memorySubView: view }),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
   setCallOverlayOpen: (open) => set({ callOverlayOpen: open }),
+
+  loadVoiceHistory: async () => {
+    if (!activeClient?.isConnected) return;
+    set({ voiceHistoryLoading: true });
+    try {
+      const res = await activeClient.request("voice.history", { limit: 200 });
+      set({ voiceHistoryMessages: res.messages, voiceHistoryLoading: false });
+    } catch {
+      set({ voiceHistoryLoading: false });
+    }
+  },
+
+  searchConversations: async (query: string, limit: number = 5) => {
+    if (!activeClient?.isConnected) return [];
+    try {
+      const res = await activeClient.request("voice.search_conversations", { query, limit });
+      return res.results;
+    } catch {
+      return [];
+    }
+  },
+
+  postToActiveChat: async (content: string, label?: string) => {
+    if (!activeClient?.isConnected) return false;
+    try {
+      const res = await activeClient.request("voice.post_to_active_chat", { content, label });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  },
 
   startVoiceCall: async () => {
     if (!activeClient?.isConnected) {
@@ -363,6 +417,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   clearError: () => set({ lastError: null }),
 
   newSession: async () => {
+    notifyChatFocus(null);
     const epoch = ++sessionEpoch;
     set({
       sessionId: null,
@@ -398,10 +453,13 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         const res = await activeClient.request("session.new", {});
         sessionId = res.session_id;
         set({ sessionId });
+        notifyChatFocus(sessionId);
       } catch (err) {
         set({ lastError: err instanceof Error ? err.message : String(err) });
         return;
       }
+    } else {
+      notifyChatFocus(sessionId);
     }
 
     const requestId = nextRequestId();
@@ -512,6 +570,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
 
   openConversation: async (summary) => {
     if (!activeClient?.isConnected) return;
+    notifyChatFocus(summary.session_id);
     set({
       activeView: "chat",
       sessionId: summary.session_id,
@@ -554,7 +613,10 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     }
   },
 
-  exitReadOnlyConversation: () => set({ selectedConversation: null, activeView: "chat" }),
+  exitReadOnlyConversation: () => {
+    notifyChatFocus(null);
+    set({ selectedConversation: null, activeView: "chat" });
+  },
 
   retryResume: async () => {
     const sid = get().resumedSessionId || get().sessionId;
@@ -1043,13 +1105,30 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
           screenCaptureTarget: null,
           callOverlayOpen: state.voiceState === "error" ? true : false,
         }));
+        void get().loadVoiceHistory();
         break;
       }
       case "transcript": {
         const entry = event.data;
-        set((state) => ({
-          voiceTranscripts: [...state.voiceTranscripts, entry].slice(-200),
-        }));
+        set((state) => {
+          const nextVoiceTranscripts = [...state.voiceTranscripts, entry].slice(-200);
+          let nextHistory = state.voiceHistoryMessages;
+          if (entry.final && entry.text.trim()) {
+            nextHistory = [
+              ...state.voiceHistoryMessages,
+              {
+                role: entry.role,
+                text: entry.text,
+                timestamp: entry.timestamp || new Date().toISOString(),
+                call_id: state.activeCallId || undefined,
+              },
+            ];
+          }
+          return {
+            voiceTranscripts: nextVoiceTranscripts,
+            voiceHistoryMessages: nextHistory,
+          };
+        });
         break;
       }
       case "screen_capture_state": {
@@ -1065,6 +1144,9 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       }
       case "conversation_updated": {
         const d = event.data;
+        if (d.session_id === "voice_companion") {
+          void get().loadVoiceHistory();
+        }
         set((state) => {
           let nextMessages = state.messages;
           if (state.sessionId && state.sessionId === d.session_id) {
@@ -1093,11 +1175,31 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
               }
             }
             if (d.assistant_message) {
-              nextMessages = updateAssistantByRequest(nextMessages, d.request_id, (m) => ({
-                ...m,
-                content: d.assistant_message || m.content,
-                streaming: false,
-              }));
+              const matched = d.request_id
+                ? nextMessages.some((m) => m.id === d.request_id)
+                : false;
+              const hasStreaming = nextMessages.some(
+                (m) => m.role === "assistant" && m.streaming,
+              );
+              if (matched || hasStreaming) {
+                nextMessages = updateAssistantByRequest(nextMessages, d.request_id, (m) => ({
+                  ...m,
+                  content: d.assistant_message || m.content,
+                  streaming: false,
+                }));
+              } else {
+                nextMessages = [
+                  ...nextMessages,
+                  {
+                    id: d.request_id || nextRequestId(),
+                    role: "assistant",
+                    content: d.assistant_message,
+                    streaming: false,
+                    toolCalls: [],
+                    approvals: [],
+                  },
+                ];
+              }
             }
           }
 

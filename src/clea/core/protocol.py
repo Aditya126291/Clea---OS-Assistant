@@ -48,6 +48,10 @@ class ChatSendParams(_Model):
     text: str
 
 
+class ChatFocusParams(_Model):
+    session_id: str | None = None
+
+
 class ApprovalRespondParams(_Model):
     approval_id: str
     decision: ApprovalDecision
@@ -109,6 +113,20 @@ class VoiceDelegateTaskParams(_Model):
     tool_call_id: str | None = None
 
 
+class VoiceHistoryParams(_Model):
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class VoiceSearchConversationsParams(_Model):
+    query: str
+    limit: int = Field(default=5, ge=1, le=50)
+
+
+class VoicePostToActiveChatParams(_Model):
+    content: str
+    label: str | None = None
+
+
 class _Request(_Model):
     frame_type: Literal["request"] = "request"
     id: str = Field(default_factory=new_id)
@@ -128,6 +146,11 @@ class SessionNewRequest(_Request):
 class ChatSendRequest(_Request):
     method: Literal["chat.send"] = "chat.send"
     params: ChatSendParams
+
+
+class ChatFocusRequest(_Request):
+    method: Literal["chat.focus"] = "chat.focus"
+    params: ChatFocusParams = Field(default_factory=ChatFocusParams)
 
 
 class ApprovalRespondRequest(_Request):
@@ -305,10 +328,26 @@ class VoiceDelegateTaskRequest(_Request):
     params: VoiceDelegateTaskParams
 
 
+class VoiceHistoryRequest(_Request):
+    method: Literal["voice.history"] = "voice.history"
+    params: VoiceHistoryParams = Field(default_factory=VoiceHistoryParams)
+
+
+class VoiceSearchConversationsRequest(_Request):
+    method: Literal["voice.search_conversations"] = "voice.search_conversations"
+    params: VoiceSearchConversationsParams
+
+
+class VoicePostToActiveChatRequest(_Request):
+    method: Literal["voice.post_to_active_chat"] = "voice.post_to_active_chat"
+    params: VoicePostToActiveChatParams
+
+
 RequestFrame = Annotated[
     HealthPingRequest
     | SessionNewRequest
     | ChatSendRequest
+    | ChatFocusRequest
     | ApprovalRespondRequest
     | MemoryGetRequest
     | MemoryGetDailyRequest
@@ -336,7 +375,10 @@ RequestFrame = Annotated[
     | VoiceStartCallRequest
     | VoiceEndCallRequest
     | VoiceStatusRequest
-    | VoiceDelegateTaskRequest,
+    | VoiceDelegateTaskRequest
+    | VoiceHistoryRequest
+    | VoiceSearchConversationsRequest
+    | VoicePostToActiveChatRequest,
     Field(discriminator="method"),
 ]
 """Any client-to-daemon request (discriminated by ``method``)."""
@@ -369,6 +411,10 @@ class SessionNewResult(_Model):
 
 class ChatSendResult(_Model):
     text: str
+
+
+class ChatFocusResult(_Model):
+    active_conversation_id: str | None = None
 
 
 class ApprovalRespondResult(_Model):
@@ -615,10 +661,44 @@ class VoiceDelegateTaskResult(_Model):
     output: str = ""
 
 
+class VoiceHistoryMessageItem(_Model):
+    role: TranscriptRole
+    text: str
+    timestamp: str = ""
+    call_id: str | None = None
+
+
+class VoiceHistoryResult(_Model):
+    session_id: str = "voice_companion"
+    messages: list[VoiceHistoryMessageItem] = Field(default_factory=list)
+
+
+class ConversationSearchHit(_Model):
+    session_id: str
+    title: str
+    role: str
+    timestamp: str
+    snippet: str
+    source: str = "chat"
+    call_id: str | None = None
+
+
+class VoiceSearchConversationsResult(_Model):
+    results: list[ConversationSearchHit] = Field(default_factory=list)
+
+
+class VoicePostToActiveChatResult(_Model):
+    ok: bool
+    session_id: str | None = None
+    title: str | None = None
+    message: str = ""
+
+
 METHOD_RESULTS: dict[str, type[_Model]] = {
     "health.ping": HealthPingResult,
     "session.new": SessionNewResult,
     "chat.send": ChatSendResult,
+    "chat.focus": ChatFocusResult,
     "approval.respond": ApprovalRespondResult,
     "memory.get": MemoryGetResult,
     "memory.get_daily": MemoryGetDailyResult,
@@ -647,6 +727,9 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "voice.end_call": VoiceEndCallResult,
     "voice.status": VoiceStatusResult,
     "voice.delegate_task": VoiceDelegateTaskResult,
+    "voice.history": VoiceHistoryResult,
+    "voice.search_conversations": VoiceSearchConversationsResult,
+    "voice.post_to_active_chat": VoicePostToActiveChatResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""
 
@@ -728,6 +811,7 @@ class TranscriptData(_Model):
     text: str
     final: bool = False
     call_id: str | None = None
+    timestamp: str | None = None
 
 
 class ScreenCaptureStateData(_Model):
