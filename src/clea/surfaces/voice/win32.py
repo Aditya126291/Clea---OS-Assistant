@@ -98,6 +98,14 @@ APP_DISPLAY_NAMES: dict[str, str] = {
     "teams.exe": "Microsoft Teams",
     "ms-teams.exe": "Microsoft Teams",
     "zoom.exe": "Zoom",
+    "taskmgr.exe": "Task Manager",
+    "zed.exe": "Zed",
+    "sublime_text.exe": "Sublime Text",
+    "alacritty.exe": "Alacritty",
+    "wezterm-gui.exe": "WezTerm",
+    "postman.exe": "Postman",
+    "docker desktop.exe": "Docker Desktop",
+    "vlc.exe": "VLC media player",
 }
 
 
@@ -105,6 +113,9 @@ def resolve_app_display_name(process_name: str, window_title: str = "") -> str:
     """Resolve a friendly application display name from a process executable name."""
     cleaned = (process_name or "").strip()
     lower = cleaned.lower()
+    if lower == "applicationframehost.exe":
+        title = (window_title or "").strip()
+        return title or "Windows App"
     if lower in APP_DISPLAY_NAMES:
         return APP_DISPLAY_NAMES[lower]
 

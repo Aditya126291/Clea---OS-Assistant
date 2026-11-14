@@ -217,6 +217,10 @@ def test_screen_indicator_real_win32_window_lifecycle() -> None:
         u32 = ctypes.WinDLL("user32", use_last_error=True)
         u32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
         u32.GetWindowLongW.restype = ctypes.c_long
+        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        u32.IsWindowVisible.restype = wintypes.BOOL
+        u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u32.GetWindowRect.restype = wintypes.BOOL
         ex_style = u32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
         assert (ex_style & INDICATOR_EX_STYLE) == INDICATOR_EX_STYLE
 
@@ -227,14 +231,42 @@ def test_screen_indicator_real_win32_window_lifecycle() -> None:
             if u32.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity)):
                 assert affinity.value == WDA_EXCLUDEFROMCAPTURE
 
-        indicator.pulse((0, 0, 800, 600), duration_seconds=0.15)
+        def _wait_visible(expected: bool, timeout: float = 1.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if bool(u32.IsWindowVisible(hwnd)) is expected:
+                    return True
+                time.sleep(0.02)
+            return bool(u32.IsWindowVisible(hwnd)) is expected
+
+        indicator.pulse((0, 0, 800, 600), duration_seconds=0.2)
         assert indicator.is_visible is True
+        assert _wait_visible(True) is True
+
+        rc = wintypes.RECT()
+        assert u32.GetWindowRect(hwnd, ctypes.byref(rc))
+        assert (rc.left, rc.top, rc.right, rc.bottom) == (0, 0, 800, 3)
+
+        # Pulse timer must automatically hide the real HWND when duration elapses.
+        assert _wait_visible(False, timeout=1.0) is True
+        assert indicator.is_visible is False
+
         indicator.start_watching((0, 0, 800, 600))
         assert indicator.is_watching is True
+        assert _wait_visible(True) is True
+
         indicator.stop_watching()
         assert indicator.is_visible is False
+        assert _wait_visible(False) is True
     finally:
         indicator.stop()
+    assert indicator._thread is None
+
+    # Calls after stop() remain strict no-ops.
+    indicator.pulse((0, 0, 800, 600), duration_seconds=0.5)
+    indicator.start_watching((0, 0, 800, 600))
+    assert indicator.is_visible is False
+    assert indicator.is_watching is False
     assert indicator._thread is None
 
 

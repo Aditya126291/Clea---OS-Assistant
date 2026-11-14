@@ -13,7 +13,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from clea.surfaces.voice.win32 import MonitorInfo, Win32API, get_target_monitor
+from clea.surfaces.voice.win32 import (
+    MonitorInfo,
+    Win32API,
+    enable_per_monitor_dpi_awareness,
+    get_target_monitor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +337,7 @@ class _Win32OverlayBackend:
                 self._user32.DestroyWindow(hwnd)
                 return 0
             if msg == WM_DESTROY:
+                self._hwnd = None
                 self._user32.PostQuitMessage(0)
                 return 0
             return int(self._user32.DefWindowProcW(hwnd, msg, wparam, lparam))
@@ -606,6 +612,9 @@ class ScreenIndicator:
     def _run_loop(self) -> None:
         backend: _IndicatorBackend | None = None
         try:
+            if self._backend_factory is None:
+                with contextlib.suppress(Exception):
+                    enable_per_monitor_dpi_awareness(self._api)
             backend = (
                 self._backend_factory()
                 if self._backend_factory is not None
@@ -647,11 +656,16 @@ class ScreenIndicator:
         """Show the red top bar for *duration_seconds* (extending any active pulse)."""
         if not self.enabled:
             return
+        with self._lock:
+            if self._stopped:
+                return
         resolved = self._resolve_monitor_bounds(monitor_bounds)
         rect = compute_bar_rect(resolved, self.height_px)
         dur = self.pulse_seconds if duration_seconds is None else max(0.05, float(duration_seconds))
         deadline = time.monotonic() + dur
         with self._lock:
+            if self._stopped:
+                return
             self._rect = rect
             if deadline > self._pulse_deadline:
                 self._pulse_deadline = deadline
@@ -668,9 +682,14 @@ class ScreenIndicator:
         """Show the red top bar continuously until stop_watching/hide/stop."""
         if not self.enabled:
             return
+        with self._lock:
+            if self._stopped:
+                return
         resolved = self._resolve_monitor_bounds(monitor_bounds)
         rect = compute_bar_rect(resolved, self.height_px)
         with self._lock:
+            if self._stopped:
+                return
             self._watching = True
             self._pulse_deadline = 0.0
             self._rect = rect
@@ -687,11 +706,14 @@ class ScreenIndicator:
         """Reposition the indicator bar during active watching if the target monitor changed."""
         if not self.enabled or monitor_bounds is None:
             return
+        with self._lock:
+            if self._stopped or not self._watching:
+                return
         resolved = self._resolve_monitor_bounds(monitor_bounds)
         new_rect = compute_bar_rect(resolved, self.height_px)
         changed = False
         with self._lock:
-            if self._watching and new_rect != self._rect:
+            if not self._stopped and self._watching and new_rect != self._rect:
                 self._rect = new_rect
                 changed = True
         if changed and self.is_supported:

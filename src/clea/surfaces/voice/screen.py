@@ -14,7 +14,7 @@ import io
 import logging
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -83,6 +83,52 @@ def is_window_blocked(
     return False
 
 
+def _clip_bounds_to_monitors(
+    bounds: tuple[int, int, int, int],
+    monitors: Sequence[MonitorInfo],
+    fallback_bounds: tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int] | None:
+    """Clip window bounds to overlapping monitor(s) so off-screen edges capture no dead void."""
+    left, top, right, bottom = bounds
+    if right <= left or bottom <= top:
+        return fallback_bounds
+
+    if monitors:
+        overlapping = [
+            m
+            for m in monitors
+            if min(right, m.right) > max(left, m.left) and min(bottom, m.bottom) > max(top, m.top)
+        ]
+        if not overlapping:
+            return fallback_bounds
+        area_left = min(m.left for m in overlapping)
+        area_top = min(m.top for m in overlapping)
+        area_right = max(m.right for m in overlapping)
+        area_bottom = max(m.bottom for m in overlapping)
+        clipped = (
+            max(left, area_left),
+            max(top, area_top),
+            min(right, area_right),
+            min(bottom, area_bottom),
+        )
+        return clipped if clipped[2] > clipped[0] and clipped[3] > clipped[1] else fallback_bounds
+
+    if fallback_bounds is not None:
+        fb_left, fb_top, fb_right, fb_bottom = fallback_bounds
+        if min(right, fb_right) > max(left, fb_left) and min(bottom, fb_bottom) > max(top, fb_top):
+            clipped = (
+                max(left, fb_left),
+                max(top, fb_top),
+                min(right, fb_right),
+                min(bottom, fb_bottom),
+            )
+            if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
+                return clipped
+        return fallback_bounds
+
+    return bounds
+
+
 def encode_frame(
     image: Image.Image,
     *,
@@ -104,7 +150,7 @@ def encode_frame(
         img = img.resize((new_w, new_h), resample=resample)
 
     buf = io.BytesIO()
-    save_kwargs: dict[str, object] = {"format": "JPEG", "quality": quality, "optimize": True}
+    save_kwargs: dict[str, object] = {"format": "JPEG", "quality": quality}
     if quality >= 90:
         # Disable chroma subsampling so fine colored IDE text and borders stay crisp.
         save_kwargs["subsampling"] = 0
@@ -135,7 +181,6 @@ def encode_native_frame(
         format="JPEG",
         quality=fallback_jpeg_quality,
         subsampling=0,
-        optimize=True,
     )
     return jpeg_buf.getvalue(), "image/jpeg"
 
@@ -156,6 +201,7 @@ class ScreenCaptureService:
         self.image_max_side = image_max_side
         self.jpeg_quality = jpeg_quality
         self._api = api
+        self._has_injected_api = api is not None
         self._grabber = grabber
         self._capture_seq = 0
         self._seq_lock = threading.Lock()
@@ -167,7 +213,7 @@ class ScreenCaptureService:
 
     def get_active_window_info(self) -> WindowInfo | None:
         """Inspect the current foreground window and its bounds/monitor on Windows."""
-        if sys.platform != "win32" and self._api is None:
+        if not self._has_injected_api and (sys.platform != "win32" or self._grabber is not None):
             return None
 
         try:
@@ -209,7 +255,7 @@ class ScreenCaptureService:
                 target_w = bounds[2] - bounds[0]
                 target_h = bounds[3] - bounds[1]
                 if (
-                    self._api is not None
+                    self._has_injected_api
                     and target_w > 0
                     and target_h > 0
                     and img.size != (target_w, target_h)
@@ -270,8 +316,9 @@ class ScreenCaptureService:
         captured_at = datetime.now(UTC).isoformat()
 
         # Enable Per-Monitor V2 DPI awareness BEFORE querying window/monitor bounds.
-        with contextlib.suppress(Exception):
-            enable_per_monitor_dpi_awareness(self._api)
+        if self._has_injected_api or self._grabber is None:
+            with contextlib.suppress(Exception):
+                enable_per_monitor_dpi_awareness(self._api)
 
         win_info = self.get_active_window_info()
         app_name = (
@@ -305,8 +352,9 @@ class ScreenCaptureService:
             )
 
         target_mon: MonitorInfo | None = None
+        monitors: list[MonitorInfo] = []
         virtual_origin = (0, 0)
-        if sys.platform == "win32" or self._api is not None:
+        if self._has_injected_api or (sys.platform == "win32" and self._grabber is None):
             with contextlib.suppress(Exception):
                 api = self._get_api()
                 monitors = enumerate_monitors(api)
@@ -336,7 +384,7 @@ class ScreenCaptureService:
 
         # Preserve simple test grabbers when no Win32API mock was injected.
         capture_bounds: tuple[int, int, int, int] | None = None
-        if self._grabber is None or self._api is not None:
+        if self._grabber is None or self._has_injected_api:
             if target == "active_window":
                 win_bounds = win_info.bounds if win_info is not None else None
                 if (
@@ -344,7 +392,11 @@ class ScreenCaptureService:
                     and win_bounds[2] > win_bounds[0]
                     and win_bounds[3] > win_bounds[1]
                 ):
-                    capture_bounds = win_bounds
+                    capture_bounds = _clip_bounds_to_monitors(
+                        win_bounds,
+                        monitors,
+                        effective_monitor_bounds,
+                    )
                 elif effective_monitor_bounds is not None:
                     capture_bounds = effective_monitor_bounds
             else:

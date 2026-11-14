@@ -706,3 +706,34 @@ async def test_gemini_backend_defaults_to_high_media_resolution_and_handles_miss
     monkeypatch.delattr(real_types, "MediaResolution")
     built = backend._build_live_config(VoiceSessionConfig(system_instruction="sys"))
     assert built.media_resolution is None
+
+
+async def test_gemini_backend_send_video_and_tool_responses_ignore_close_race() -> None:
+    mock_session = MagicMock()
+
+    async def empty_recv() -> Any:
+        if False:
+            yield None
+
+    mock_session.receive.side_effect = empty_recv
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys"))
+
+    async def fail_during_close(**_kwargs: Any) -> None:
+        backend._closed = True
+        raise RuntimeError("WebSocket closed")
+
+    mock_session.send_realtime_input.side_effect = fail_during_close
+    mock_session.send_tool_response.side_effect = fail_during_close
+
+    await backend.send_video_frame(b"jpeg-bytes", mime_type="image/jpeg")
+    await backend.send_tool_responses(
+        [VoiceToolResponse(call_id="c1", name="look_at_screen", response={"status": "ok"})]
+    )
+    await backend.close()

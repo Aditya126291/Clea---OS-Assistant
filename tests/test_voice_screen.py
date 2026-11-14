@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -559,4 +560,163 @@ async def test_voice_runner_watch_screen_starts_updates_and_stops_indicator(
 
     await runner.end_call(reason="done")
     assert fake_indicator.hide.called
+    await runner.stop()
+
+
+def test_encode_frame_and_native_fallback_high_entropy_jpeg_does_not_crash() -> None:
+    # Deterministic high-entropy 1920x1080 RGB pixels (>2.5 MB PNG so native hits JPEG fallback).
+    chunk = hashlib.sha256(b"clea-high-entropy-seed").digest()
+    row_bytes = (chunk * ((1920 * 3 // len(chunk)) + 1))[: 1920 * 3]
+    buf = bytearray()
+    for y in range(1080):
+        rot = (y * 17) % len(row_bytes)
+        buf.extend(row_bytes[rot:] + row_bytes[:rot])
+    # Add fine per-pixel variation so neither PNG nor JPEG subsampling=0 compresses trivially.
+    for idx in range(0, len(buf), 7):
+        buf[idx] = (buf[idx] + (idx % 251)) & 0xFF
+    img = Image.frombytes("RGB", (1920, 1080), bytes(buf))
+
+    jpeg_bytes = encode_frame(img, max_side=1920, quality=90)
+    assert len(jpeg_bytes) > 0
+    decoded = Image.open(io.BytesIO(jpeg_bytes))
+    assert decoded.format == "JPEG"
+    assert decoded.size == (1920, 1080)
+
+    native_bytes, mime = encode_native_frame(img, fallback_jpeg_quality=94, max_png_bytes=1024)
+    assert mime == "image/jpeg"
+    native_decoded = Image.open(io.BytesIO(native_bytes))
+    assert native_decoded.format == "JPEG"
+    assert native_decoded.size == (1920, 1080)
+
+
+def test_screen_capture_service_grabber_without_api_does_not_crop_to_desktop() -> None:
+    fake_img = Image.new("RGB", (640, 480), color=(20, 40, 60))
+    svc = ScreenCaptureService(grabber=lambda *a, **k: fake_img)
+
+    win_res = svc.capture(target="active_window")
+    full_res = svc.capture(target="full_screen")
+
+    assert svc._api is None
+    assert win_res.width == 640 and win_res.height == 480
+    assert full_res.width == 640 and full_res.height == 480
+    assert win_res.window_bounds is None
+
+
+def test_screen_capture_service_clips_offscreen_window_bounds() -> None:
+    # Window overhangs left edge of monitor 1 (-12 px -> clipped to 0..800 = 800 px wide).
+    api = _make_dual_monitor_mock_api(win_bounds=(-12, 40, 800, 600))
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    svc = ScreenCaptureService(api=api, grabber=lambda *a, **k: canvas.copy())
+
+    res = svc.capture(target="active_window")
+    assert res.image_bytes is not None
+    assert res.width == 800
+    assert res.height == 560
+
+    # Completely off-screen bounds fall back cleanly to target monitor bounds instead of black void.
+    off_api = _make_dual_monitor_mock_api(win_bounds=(5000, 5000, 5800, 5600))
+    off_svc = ScreenCaptureService(api=off_api, grabber=lambda *a, **k: canvas.copy())
+    off_res = off_svc.capture(target="active_window")
+    assert off_res.image_bytes is not None
+    assert off_res.width == 1920
+    assert off_res.height == 1080
+
+
+async def test_voice_runner_look_at_screen_full_screen_also_sends_native_active_window_crop(
+    tmp_path: Path,
+) -> None:
+    api = _make_dual_monitor_mock_api()
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(api=api, grabber=lambda *a, **k: canvas.copy())
+    backend = FakeLiveBackend()
+    fake_indicator = MagicMock()
+    fake_indicator.enabled = True
+    fake_indicator.is_watching = False
+
+    cfg = VoiceConfig(consent_mode="auto_allow")
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        screen_indicator=fake_indicator,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    call_ev = ToolCallEvent(
+        call_id="call-full-dual",
+        name="look_at_screen",
+        arguments={"target": "full_screen", "reason": "inspect desktop and code"},
+    )
+    await runner._handle_tool_call(call_ev, backend)
+
+    assert len(backend.sent_video_frames) == 2
+    assert backend.sent_video_mime_types == ["image/jpeg", "image/png"]
+    full_img = Image.open(io.BytesIO(backend.sent_video_frames[0]))
+    native_img = Image.open(io.BytesIO(backend.sent_video_frames[1]))
+    assert full_img.size == (1920, 1080)
+    assert native_img.size == (1500, 840)
+
+    resp = backend.sent_tool_responses[0]
+    assert resp.response["status"] == "success"
+    assert resp.response["frames_sent"] == 2
+    assert resp.response["active_window_mime_type"] == "image/png"
+    assert resp.response["active_window_width"] == 1500
+    assert resp.response["active_window_height"] == 840
+
+    await runner.end_call(reason="done")
+    await runner.stop()
+
+
+async def test_voice_runner_watch_screen_respects_blocklist(tmp_path: Path) -> None:
+    blocklist = ScreenBlocklistConfig(
+        window_titles=["*1Password*"],
+        processes=["1Password.exe"],
+    )
+    api = _make_dual_monitor_mock_api(
+        title="1Password - Personal Vault",
+        exe_path=r"C:\Program Files\1Password\1Password.exe",
+    )
+    canvas = Image.new("RGB", (3840, 1080), (40, 80, 120))
+    screen_svc = ScreenCaptureService(
+        api=api,
+        blocklist=blocklist,
+        grabber=lambda *a, **k: canvas.copy(),
+    )
+    backend = FakeLiveBackend()
+    fake_indicator = MagicMock()
+    fake_indicator.enabled = True
+    fake_indicator.is_watching = False
+
+    cfg = VoiceConfig(consent_mode="auto_allow", max_burst_seconds=5.0, blocklist=blocklist)
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        screen_service=screen_svc,
+        screen_indicator=fake_indicator,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    call_ev = ToolCallEvent(
+        call_id="call-watch-blocked",
+        name="watch_screen",
+        arguments={"seconds": 2.0, "reason": "assist"},
+    )
+    await runner._handle_tool_call(call_ev, backend)
+
+    assert len(backend.sent_video_frames) == 0
+    fake_indicator.start_watching.assert_not_called()
+    resp = backend.sent_tool_responses[0]
+    assert resp.is_error is True
+    assert resp.response["status"] == "blocked"
+
     await runner.stop()

@@ -479,6 +479,10 @@ def test_resolve_app_display_name() -> None:
     assert resolve_app_display_name("Antigravity.exe") == "Google Antigravity"
     assert resolve_app_display_name("Code.exe") == "Visual Studio Code"
     assert resolve_app_display_name("WindowsTerminal.exe") == "Windows Terminal"
+    assert resolve_app_display_name("Taskmgr.exe") == "Task Manager"
+    assert resolve_app_display_name("zed.exe") == "Zed"
+    assert resolve_app_display_name("ApplicationFrameHost.exe", "Calculator") == "Calculator"
+    assert resolve_app_display_name("ApplicationFrameHost.exe", "") == "Windows App"
     assert resolve_app_display_name("MyCustomTool.exe") == "MyCustomTool"
     assert (
         resolve_app_display_name("<unknown>", "runner.py - Clea - Antigravity")

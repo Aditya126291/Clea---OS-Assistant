@@ -72,7 +72,7 @@ from clea.surfaces.voice.memory_hooks import (
     safe_consolidate_voice_call,
     safe_store_voice_transcript,
 )
-from clea.surfaces.voice.screen import ScreenCaptureService
+from clea.surfaces.voice.screen import ScreenCaptureService, is_window_blocked
 from clea.surfaces.voice.screen_indicator import ScreenIndicator
 from clea.surfaces.voice.wake_word import WakeWordDetector, WakeWordModelNotFoundError
 from clea.surfaces.voice.win32 import (
@@ -1058,7 +1058,10 @@ class VoiceRunner:
                     monitor = int(raw_monitor)
 
             initial_bounds: tuple[int, int, int, int] | None = None
-            if sys.platform == "win32" or getattr(self._screen_service, "_api", None) is not None:
+            has_api = getattr(self._screen_service, "_has_injected_api", False)
+            if (
+                sys.platform == "win32" and getattr(self._screen_service, "_grabber", None) is None
+            ) or has_api:
                 with contextlib.suppress(Exception):
                     mon = get_target_monitor(
                         monitor=monitor,
@@ -1068,9 +1071,14 @@ class VoiceRunner:
                         initial_bounds = mon.bounds
 
             # Show red bar when capture begins (excluded from capture via WDA_EXCLUDEFROMCAPTURE).
-            self._screen_indicator.pulse(initial_bounds, duration_seconds=1.5)
+            if not self._screen_indicator.is_watching:
+                self._screen_indicator.pulse(initial_bounds, duration_seconds=1.5)
 
-            res = self._screen_service.capture(target=target, monitor=monitor)
+            res = await asyncio.to_thread(
+                self._screen_service.capture,
+                target=target,
+                monitor=monitor,
+            )
 
             if res.blocked:
                 if not self._screen_indicator.is_watching:
@@ -1095,29 +1103,68 @@ class VoiceRunner:
                 return
 
             if res.image_bytes is not None:
-                if res.monitor_bounds is not None and res.monitor_bounds != initial_bounds:
+                if (
+                    res.monitor_bounds is not None
+                    and res.monitor_bounds != initial_bounds
+                    and not self._screen_indicator.is_watching
+                ):
                     self._screen_indicator.pulse(res.monitor_bounds, duration_seconds=1.5)
 
                 await backend.send_video_frame(res.image_bytes, mime_type=res.mime_type)
+                frames_sent = 1
+                active_res = None
+
+                # When full-screen context is requested alongside an active window on the same
+                # display, also send a 1:1 native-resolution active-window crop so small text
+                # and UI elements remain sharp.
+                if target == "full_screen" and res.window_bounds is not None:
+                    wl, wt, wr, wb = res.window_bounds
+                    if wr > wl and wb > wt:
+                        active_overlaps_target = True
+                        if res.monitor_bounds is not None:
+                            ml, mt, mr, mb = res.monitor_bounds
+                            active_overlaps_target = min(mr, wr) > max(ml, wl) and min(
+                                mb, wb
+                            ) > max(mt, wt)
+                        if active_overlaps_target:
+                            candidate = await asyncio.to_thread(
+                                self._screen_service.capture,
+                                target="active_window",
+                            )
+                            if not candidate.blocked and candidate.image_bytes is not None:
+                                active_res = candidate
+                                await backend.send_video_frame(
+                                    active_res.image_bytes,
+                                    mime_type=active_res.mime_type,
+                                )
+                                frames_sent += 1
+
+                payload: dict[str, Any] = {
+                    "status": "success",
+                    "target": target,
+                    "frames_sent": frames_sent,
+                    "mime_type": res.mime_type,
+                    "width": res.width,
+                    "height": res.height,
+                    "capture_seq": res.capture_seq,
+                    "captured_at": res.captured_at,
+                    "window_title": res.window_title,
+                    "active_window_title": res.window_title,
+                    "active_process_name": res.process_name,
+                    "active_app_name": res.app_name,
+                    "window_bounds": list(res.window_bounds) if res.window_bounds else None,
+                    "monitor_index": res.monitor_index,
+                    "monitor_bounds": list(res.monitor_bounds) if res.monitor_bounds else None,
+                }
+                if active_res is not None:
+                    payload["active_window_mime_type"] = active_res.mime_type
+                    payload["active_window_width"] = active_res.width
+                    payload["active_window_height"] = active_res.height
+
                 resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
-                    response={
-                        "status": "success",
-                        "target": target,
-                        "mime_type": res.mime_type,
-                        "width": res.width,
-                        "height": res.height,
-                        "capture_seq": res.capture_seq,
-                        "captured_at": res.captured_at,
-                        "window_title": res.window_title,
-                        "active_window_title": res.window_title,
-                        "active_process_name": res.process_name,
-                        "active_app_name": res.app_name,
-                        "window_bounds": list(res.window_bounds) if res.window_bounds else None,
-                        "monitor_index": res.monitor_index,
-                        "monitor_bounds": list(res.monitor_bounds) if res.monitor_bounds else None,
-                    },
+                    response=payload,
                     scheduling="when_idle",
                 )
             else:
@@ -1172,9 +1219,34 @@ class VoiceRunner:
 
             initial_bounds: tuple[int, int, int, int] | None = None
             win_info = self._screen_service.get_active_window_info()
+            service_blocklist = getattr(self._screen_service, "blocklist", None)
+            if win_info is not None and (
+                is_window_blocked(win_info.title, win_info.process_name, self.config.blocklist)
+                or (
+                    service_blocklist is not None
+                    and is_window_blocked(win_info.title, win_info.process_name, service_blocklist)
+                )
+            ):
+                if not self._screen_indicator.is_watching:
+                    self._screen_indicator.hide()
+                resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={
+                        "status": "blocked",
+                        "error": "Active window is protected by privacy blocklist.",
+                    },
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+                await backend.send_tool_responses([resp])
+                return
+
             if win_info is not None and win_info.monitor_bounds is not None:
                 initial_bounds = win_info.monitor_bounds
-            elif sys.platform == "win32" or getattr(self._screen_service, "_api", None) is not None:
+            elif (
+                sys.platform == "win32" and getattr(self._screen_service, "_grabber", None) is None
+            ) or getattr(self._screen_service, "_has_injected_api", False):
                 with contextlib.suppress(Exception):
                     mon = get_target_monitor(api=getattr(self._screen_service, "_api", None))
                     if mon is not None:
@@ -1230,7 +1302,10 @@ class VoiceRunner:
         )
         try:
             while time.monotonic() < t_end and self._call_state == "active":
-                res = self._screen_service.capture(target=target)
+                res = await asyncio.to_thread(
+                    self._screen_service.capture,
+                    target=target,
+                )
                 if res.monitor_bounds is not None:
                     self._screen_indicator.update_watch_bounds(res.monitor_bounds)
                 if res.image_bytes is not None and not res.blocked:

@@ -416,20 +416,29 @@ class GeminiLiveBackend(VoiceBackend):
         mime_type: str = "image/jpeg",
     ) -> None:
         """Stream an encoded screen capture frame."""
-        if self._session is None or self._closed:
+        session = self._session
+        if session is None or self._closed:
             return
         blob = types.Blob(data=image_bytes, mime_type=mime_type)
-        await self._session.send_realtime_input(video=blob)
+        try:
+            await session.send_realtime_input(video=blob)
+        except Exception as exc:
+            if self._closed or self._session is not session:
+                logger.debug("Ignoring send_video_frame failure during close/reconnect: %s", exc)
+                return
+            raise
 
     async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
         """Send a text prompt or system notification to the live session."""
-        if self._session is None or self._closed:
+        session = self._session
+        if session is None or self._closed:
             return
-        await self._session.send_realtime_input(text=text)
+        await session.send_realtime_input(text=text)
 
     async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
         """Send tool execution responses back to the Live model."""
-        if self._session is None or self._closed or not responses:
+        session = self._session
+        if session is None or self._closed or not responses:
             return
 
         formatted: list[types.FunctionResponse] = []
@@ -451,7 +460,16 @@ class GeminiLiveBackend(VoiceBackend):
                     scheduling=sched,
                 )
             )
-        await self._session.send_tool_response(function_responses=formatted)
+        try:
+            await session.send_tool_response(function_responses=formatted)
+        except Exception as exc:
+            if self._closed or self._session is not session:
+                logger.debug(
+                    "Ignoring send_tool_responses failure during close/reconnect: %s",
+                    exc,
+                )
+                return
+            raise
 
     async def events(self) -> AsyncIterator[VoiceBackendEvent]:
         """Yield normalized VoiceBackendEvent stream for active session."""
