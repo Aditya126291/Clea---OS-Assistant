@@ -38,6 +38,8 @@ from clea.core.protocol import (
     CallStartedEvent,
     CallState,
     ConsolidationSessionStatus,
+    ConversationCreatedData,
+    ConversationCreatedEvent,
     ConversationDeletedData,
     ConversationDeletedEvent,
     ConversationResumeMessage,
@@ -50,6 +52,8 @@ from clea.core.protocol import (
     MemoryArchiveItem,
     MemoryFactItem,
     MemorySectionItem,
+    MemoryUpdatedData,
+    MemoryUpdatedEvent,
     PermissionTierInfo,
     ResponseFrame,
     ScreenCaptureTarget,
@@ -63,6 +67,8 @@ from clea.core.protocol import (
     ToolInfo,
     TranscriptMessageItem,
     TranscriptSummaryItem,
+    UiNavigateData,
+    UiNavigateEvent,
     VoiceHistoryMessageItem,
     VoiceState,
     VoiceStateData,
@@ -72,7 +78,7 @@ from clea.core.protocol import (
 )
 from clea.core.sessions import Session, SessionManager
 from clea.memory.consolidation import ConsolidationManager
-from clea.memory.store import VOICE_COMPANION_SESSION_ID, MemoryStore
+from clea.memory.store import FIXED_SECTIONS, VOICE_COMPANION_SESSION_ID, MemoryStore
 from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
@@ -104,6 +110,47 @@ def _validate_localhost(host: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+_MEMORY_CATEGORY_ALIASES: dict[str, str] = {
+    "profile": "Profile",
+    "personal": "Profile",
+    "user": "Profile",
+    "identity": "Profile",
+    "preference": "Preferences",
+    "preferences": "Preferences",
+    "pref": "Preferences",
+    "prefs": "Preferences",
+    "environment": "Environment",
+    "env": "Environment",
+    "setup": "Environment",
+    "system": "Environment",
+    "tools": "Environment",
+    "project": "Projects",
+    "projects": "Projects",
+    "decision": "Decisions",
+    "decisions": "Decisions",
+    "open thread": "Open Threads",
+    "open threads": "Open Threads",
+    "open_thread": "Open Threads",
+    "open_threads": "Open Threads",
+    "thread": "Open Threads",
+    "threads": "Open Threads",
+    "todo": "Open Threads",
+}
+
+
+def _resolve_memory_section(category: str | None) -> str:
+    """Resolve an arbitrary category string into one of MemoryStore FIXED_SECTIONS."""
+    if not category or not category.strip():
+        return "Preferences"
+    norm = " ".join(category.strip().lower().replace("-", " ").split())
+    if norm in _MEMORY_CATEGORY_ALIASES:
+        return _MEMORY_CATEGORY_ALIASES[norm]
+    for sec in FIXED_SECTIONS:
+        if sec.lower() == norm:
+            return sec
+    return "Preferences"
 
 
 class _Connection:
@@ -200,6 +247,9 @@ class CleaDaemon:
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._consolidation_tasks: dict[str, asyncio.Task[None]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._active_task_handles: dict[str, asyncio.Task[Any]] = {}
+        self._task_metadata: dict[str, dict[str, Any]] = {}
+        self._cancelled_task_ids: set[str] = set()
         self._task_started_at: dict[str, str] = {}
         self._consolidation_task_terminal: dict[str, bool] = {}
         self._ended_voice_call_ids: set[str] = set()
@@ -304,6 +354,9 @@ class CleaDaemon:
         self._idle_tasks.clear()
         self._consolidation_tasks.clear()
         self._background_tasks.clear()
+        self._active_task_handles.clear()
+        self._task_metadata.clear()
+        self._cancelled_task_ids.clear()
         with contextlib.suppress(Exception):
             self.agent.memory.reconcile_orphaned_background_tasks(
                 reason="Interrupted by daemon shutdown"
@@ -482,8 +535,9 @@ class CleaDaemon:
         if existing_now is not None and not existing_now.done():
             return existing_now
 
+        task_id = f"cons-{session_id}"
+
         async def _run() -> None:
-            task_id = f"cons-{session_id}"
             try:
                 await self.consolidation.consolidate_session(
                     session_id,
@@ -494,9 +548,12 @@ class CleaDaemon:
                 )
             except asyncio.CancelledError:
                 if self._consolidation_task_terminal.get(task_id) is False:
+                    was_cancelled = task_id in self._cancelled_task_ids
                     with contextlib.suppress(Exception):
                         await self._emit_consolidation_task_status(
-                            session_id, "failed", "Cancelled"
+                            session_id,
+                            "cancelled" if was_cancelled else "failed",
+                            "Cancelled by user" if was_cancelled else "Cancelled",
                         )
             except Exception as exc:
                 logger.exception("Error consolidating session %s on end/switch", session_id)
@@ -509,11 +566,22 @@ class CleaDaemon:
                         await self._emit_consolidation_task_status(
                             session_id, "failed", "Consolidation did not complete cleanly"
                         )
+                if self._active_task_handles.get(task_id) is asyncio.current_task():
+                    self._active_task_handles.pop(task_id, None)
+                    self._task_metadata.pop(task_id, None)
+                self._cancelled_task_ids.discard(task_id)
                 if self._consolidation_tasks.get(session_id) is asyncio.current_task():
                     self._consolidation_tasks.pop(session_id, None)
 
         task = self._spawn_background_task(_run(), name=f"cons-now-{session_id}")
         self._consolidation_tasks[session_id] = task
+        self._active_task_handles[task_id] = task
+        self._task_metadata[task_id] = {
+            "title": self._format_session_consolidation_title(session_id),
+            "kind": "background_task",
+            "started_at": _now_iso(),
+            "session_id": session_id,
+        }
         return task
 
     async def _handle_connection(self, ws: ServerConnection) -> None:
@@ -889,6 +957,10 @@ class CleaDaemon:
             ) or self.consolidation.load_state().get("sessions", {}).get(sid, {})
             current_status = state_info.get("status", "completed" if ok else "failed")
             err = state_info.get("last_error") or state_info.get("error") if not ok else None
+            if ok:
+                await self._broadcast(
+                    MemoryUpdatedEvent(data=MemoryUpdatedData(action="updated"))
+                )
             await self._respond(
                 ws,
                 req,
@@ -904,6 +976,16 @@ class CleaDaemon:
             removed = self.agent.memory.remove_entries(target)
             if not removed and req.params.id and req.params.query:
                 removed = self.agent.memory.remove_entries(req.params.query)
+            if removed:
+                await self._broadcast(
+                    MemoryUpdatedEvent(
+                        data=MemoryUpdatedData(
+                            action="deleted",
+                            removed_count=len(removed),
+                            removed_ids=[e.id for e in removed],
+                        )
+                    )
+                )
             await self._respond(
                 ws,
                 req,
@@ -1162,31 +1244,13 @@ class CleaDaemon:
                 return
             delete_episodes = req.params.delete_episodes
             try:
-                self.agent.memory.delete_transcript(session_id, delete_episodes=delete_episodes)
+                await self._perform_conversation_delete(
+                    session_id, delete_episodes=delete_episodes
+                )
             except (ValueError, FileNotFoundError) as exc:
                 await self._respond(ws, req, error=str(exc))
                 return
 
-            self._audit_log(
-                "conversation_delete",
-                session_id=session_id,
-                delete_episodes=delete_episodes,
-            )
-            self.sessions._sessions.pop(session_id, None)
-            if self._active_conversation_id == session_id:
-                self._active_conversation_id = None
-            for c in list(self._connections):
-                if c.current_session_id == session_id:
-                    c.current_session_id = None
-
-            self._schedule_trash_purge(delay_seconds=15.0)
-
-            await self._broadcast(
-                ConversationDeletedEvent(
-                    session_id=session_id,
-                    data=ConversationDeletedData(session_ids=[session_id], all=False),
-                )
-            )
             await self._respond(
                 ws,
                 req,
@@ -1511,6 +1575,658 @@ class CleaDaemon:
                         message=f"Failed to post to active chat: {exc}",
                     ),
                 )
+        elif method == "ui.navigate":
+            await self._handle_ui_navigate(conn, req)
+        elif method == "chat.create_and_open":
+            await self._handle_chat_create_and_open(conn, req)
+        elif method == "chat.send_from_voice":
+            await self._handle_chat_send_from_voice(conn, req)
+        elif method == "chat.rename":
+            await self._handle_chat_rename(conn, req)
+        elif method == "chat.delete":
+            await self._handle_chat_delete(conn, req)
+        elif method == "memory.add_fact":
+            await self._handle_memory_add_fact(conn, req)
+        elif method == "memory.delete_fact":
+            await self._handle_memory_delete_fact(conn, req)
+        elif method == "activity.list":
+            await self._handle_activity_list(conn, req)
+        elif method == "activity.cancel":
+            await self._handle_activity_cancel(conn, req)
+
+    async def _perform_conversation_delete(
+        self,
+        session_id: str,
+        *,
+        delete_episodes: bool = False,
+    ) -> None:
+        """Delete transcript and clean up daemon/connection session state."""
+        idle_task = self._idle_tasks.pop(session_id, None)
+        if idle_task is not None and not idle_task.done():
+            idle_task.cancel()
+        self.agent.memory.delete_transcript(session_id, delete_episodes=delete_episodes)
+        self._audit_log(
+            "conversation_delete",
+            session_id=session_id,
+            delete_episodes=delete_episodes,
+        )
+        self.sessions._sessions.pop(session_id, None)
+        if self._active_conversation_id == session_id:
+            self._active_conversation_id = None
+        for c in list(self._connections):
+            if c.current_session_id == session_id:
+                c.current_session_id = None
+
+        self._schedule_trash_purge(delay_seconds=15.0)
+        await self._broadcast(
+            ConversationDeletedEvent(
+                session_id=session_id,
+                data=ConversationDeletedData(session_ids=[session_id], all=False),
+            )
+        )
+
+    def _set_ui_session_focus(self, session_id: str | None) -> None:
+        """Update active_conversation_id and non-voice UI connections' current_session_id."""
+        self._active_conversation_id = session_id
+        for c in list(self._connections):
+            if not c.is_voice:
+                c.current_session_id = session_id
+
+    async def _handle_ui_navigate(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        view = req.params.view
+        raw_cid = (req.params.conversation_id or "").strip() or None
+        open_palette = bool(req.params.open_command_palette)
+        resolved_cid: str | None = None
+
+        if raw_cid == VOICE_COMPANION_SESSION_ID:
+            view = "voice"
+            resolved_cid = None
+            self._active_conversation_id = None
+        elif raw_cid is not None:
+            try:
+                self.agent.memory.validate_session_id(raw_cid)
+                candidate = self.agent.memory.resolve_session_id(raw_cid)
+                has_transcript = self.agent.memory.transcript_path(candidate).exists()
+                has_session = self.sessions.get(candidate) is not None
+                if not has_transcript and not has_session:
+                    await self._respond(ws, req, error=f"Conversation '{raw_cid}' not found.")
+                    return
+                resolved_cid = candidate
+            except ValueError as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+            view = "chat"
+            self._set_ui_session_focus(resolved_cid)
+        elif view != "chat" and not open_palette:
+            self._active_conversation_id = None
+
+        await self._broadcast(
+            UiNavigateEvent(
+                session_id=self._active_conversation_id,
+                data=UiNavigateData(
+                    view=view,
+                    conversation_id=resolved_cid,
+                    open_command_palette=open_palette,
+                ),
+            )
+        )
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["ui.navigate"](
+                ok=True,
+                view=view,
+                active_conversation_id=self._active_conversation_id,
+                open_command_palette=open_palette,
+            ),
+            session_id=resolved_cid,
+        )
+
+    async def _handle_chat_create_and_open(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        session = self.sessions.create()
+        try:
+            meta = self.agent.memory.create_conversation(
+                session_id=session.id,
+                title=req.params.title,
+                initial_assistant_message=req.params.content,
+            )
+        except ValueError as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+
+        initial_msg = meta["message"]
+        if initial_msg:
+            session.messages.append(Message(role="assistant", content=initial_msg))
+
+        self._active_conversation_id = session.id
+        if req.params.open_in_ui:
+            self._set_ui_session_focus(session.id)
+
+        await self._broadcast(
+            ConversationCreatedEvent(
+                session_id=session.id,
+                data=ConversationCreatedData(
+                    session_id=session.id,
+                    title=meta["title"],
+                    started_at=meta["started_at"],
+                    updated_at=meta["updated_at"],
+                    turns=meta["turns"],
+                    initial_message=initial_msg or None,
+                    open_in_ui=req.params.open_in_ui,
+                ),
+            )
+        )
+        await self._broadcast(
+            ConversationUpdatedEvent(
+                session_id=session.id,
+                data=ConversationUpdatedData(
+                    session_id=session.id,
+                    title=meta["title"],
+                    updated_at=meta["updated_at"],
+                    turns=meta["turns"],
+                ),
+            )
+        )
+        if req.params.open_in_ui:
+            await self._broadcast(
+                UiNavigateEvent(
+                    session_id=session.id,
+                    data=UiNavigateData(
+                        view="chat",
+                        conversation_id=session.id,
+                        open_command_palette=False,
+                    ),
+                )
+            )
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["chat.create_and_open"](
+                ok=True,
+                session_id=session.id,
+                title=meta["title"],
+                message=initial_msg,
+                open_in_ui=req.params.open_in_ui,
+            ),
+            session_id=session.id,
+        )
+
+    async def _handle_chat_send_from_voice(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        prompt = req.params.prompt.strip()
+        if not prompt:
+            await self._respond(ws, req, error="Prompt must not be empty.")
+            return
+
+        raw_cid = (req.params.conversation_id or "").strip() or None
+        raw_title = (req.params.title or "").strip() or None
+
+        if raw_cid == VOICE_COMPANION_SESSION_ID:
+            await self._respond(
+                ws, req, error="Cannot send chat messages to the Voice Companion stream."
+            )
+            return
+
+        created_new = False
+        created_meta: dict[str, Any] | None = None
+        if raw_cid is not None:
+            try:
+                self.agent.memory.validate_session_id(raw_cid)
+                resolved_cid = self.agent.memory.resolve_session_id(raw_cid)
+            except ValueError as exc:
+                await self._respond(ws, req, error=str(exc))
+                return
+            if resolved_cid == VOICE_COMPANION_SESSION_ID:
+                await self._respond(
+                    ws, req, error="Cannot send chat messages to the Voice Companion stream."
+                )
+                return
+            if resolved_cid in self._busy_sessions:
+                await self._respond(
+                    ws,
+                    req,
+                    error="A turn is already running for this session.",
+                    session_id=resolved_cid,
+                )
+                return
+            existing_sess = self.sessions.get(resolved_cid)
+            existing_tr = self.agent.memory.get_transcript(resolved_cid)
+            if existing_sess is None and existing_tr is None:
+                await self._respond(ws, req, error=f"Conversation '{raw_cid}' not found.")
+                return
+            session = existing_sess or self._resume_session_from_transcript(resolved_cid)
+            if existing_tr is None:
+                created_meta = self.agent.memory.create_conversation(
+                    session_id=session.id,
+                    title=raw_title or prompt[:60],
+                )
+                chat_title = created_meta["title"]
+            elif raw_title:
+                header = self.agent.memory.update_transcript_header(session.id, title=raw_title)
+                chat_title = str(header.get("title") or raw_title)
+            else:
+                chat_title = str(existing_tr.get("title") or raw_title or prompt[:60])
+        else:
+            created_new = True
+            session = self.sessions.create()
+            created_meta = self.agent.memory.create_conversation(
+                session_id=session.id,
+                title=raw_title or prompt[:60],
+            )
+            chat_title = created_meta["title"]
+
+        if session.id in self._busy_sessions:
+            await self._respond(
+                ws,
+                req,
+                error="A turn is already running for this session.",
+                session_id=session.id,
+            )
+            return
+
+        self._set_ui_session_focus(session.id)
+        turn_req_id = f"voice-chat-{new_id()[:8]}"
+
+        if created_new and created_meta is not None:
+            await self._broadcast(
+                ConversationCreatedEvent(
+                    session_id=session.id,
+                    data=ConversationCreatedData(
+                        session_id=session.id,
+                        title=chat_title,
+                        started_at=created_meta["started_at"],
+                        updated_at=created_meta["updated_at"],
+                        turns=created_meta["turns"],
+                        initial_message=None,
+                        open_in_ui=True,
+                    ),
+                )
+            )
+
+        await self._broadcast(
+            UiNavigateEvent(
+                session_id=session.id,
+                data=UiNavigateData(
+                    view="chat",
+                    conversation_id=session.id,
+                    open_command_palette=False,
+                ),
+            )
+        )
+        await self._broadcast(
+            ConversationUpdatedEvent(
+                session_id=session.id,
+                request_id=turn_req_id,
+                data=ConversationUpdatedData(
+                    session_id=session.id,
+                    title=chat_title,
+                    updated_at=_now_iso(),
+                    user_message=prompt,
+                    request_id=turn_req_id,
+                ),
+            )
+        )
+
+        self._busy_sessions.add(session.id)
+        try:
+            self._spawn_background_task(
+                self._run_voice_chat_turn(
+                    session=session,
+                    request_id=turn_req_id,
+                    text=prompt,
+                    title=chat_title,
+                ),
+                name=f"voice-chat-{session.id}",
+            )
+        except Exception:
+            self._busy_sessions.discard(session.id)
+            raise
+
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["chat.send_from_voice"](
+                ok=True,
+                session_id=session.id,
+                title=chat_title,
+                request_id=turn_req_id,
+                status="started",
+            ),
+            session_id=session.id,
+        )
+
+    async def _handle_chat_rename(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        raw_id = req.params.conversation_id.strip()
+        if raw_id == VOICE_COMPANION_SESSION_ID:
+            await self._respond(ws, req, error="Cannot rename the Voice Companion stream.")
+            return
+        try:
+            self.agent.memory.validate_session_id(raw_id)
+            sid = self.agent.memory.resolve_session_id(raw_id)
+            if sid == VOICE_COMPANION_SESSION_ID:
+                await self._respond(ws, req, error="Cannot rename the Voice Companion stream.")
+                return
+            header = self.agent.memory.update_transcript_header(sid, title=req.params.new_title)
+        except (ValueError, FileNotFoundError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+
+        clean_title = str(header.get("title", req.params.new_title))
+        await self._broadcast(
+            ConversationUpdatedEvent(
+                session_id=sid,
+                data=ConversationUpdatedData(
+                    session_id=sid,
+                    title=clean_title,
+                    updated_at=str(header.get("updated_at") or _now_iso()),
+                ),
+            )
+        )
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["chat.rename"](ok=True, session_id=sid, title=clean_title),
+            session_id=sid,
+        )
+
+    async def _handle_chat_delete(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        raw_id = req.params.conversation_id.strip()
+        if raw_id == VOICE_COMPANION_SESSION_ID:
+            await self._respond(ws, req, error="Cannot delete the Voice Companion stream.")
+            return
+        if not req.params.confirmed:
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS["chat.delete"](
+                    ok=False,
+                    session_id=raw_id,
+                    deleted=False,
+                    requires_confirmation=True,
+                    episodes_removed=0,
+                    message=(
+                        "Deletion requires explicit verbal confirmation from the user. "
+                        "Ask the user to confirm before calling delete_chat with confirmed=True."
+                    ),
+                ),
+            )
+            return
+
+        try:
+            self.agent.memory.validate_session_id(raw_id)
+            sid = self.agent.memory.resolve_session_id(raw_id)
+        except ValueError as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+
+        if sid == VOICE_COMPANION_SESSION_ID:
+            await self._respond(ws, req, error="Cannot delete the Voice Companion stream.")
+            return
+        if sid in self._busy_sessions:
+            await self._respond(
+                ws, req, error="Cannot delete conversation while a turn is running."
+            )
+            return
+
+        try:
+            await self._perform_conversation_delete(
+                sid, delete_episodes=req.params.delete_episodes
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["chat.delete"](
+                ok=True,
+                session_id=sid,
+                deleted=True,
+                requires_confirmation=False,
+                episodes_removed=0,
+                message=f"Deleted conversation {sid}.",
+            ),
+            session_id=sid,
+        )
+
+    async def _handle_memory_add_fact(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        fact_text = req.params.fact.strip()
+        if not fact_text:
+            await self._respond(ws, req, error="Fact text must not be empty.")
+            return
+        section = _resolve_memory_section(req.params.category)
+        try:
+            entry = self.agent.memory.add_or_update_entry(
+                text=fact_text,
+                section=section,
+                source="stated",
+            )
+        except ValueError as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+
+        await self._broadcast(
+            MemoryUpdatedEvent(
+                data=MemoryUpdatedData(
+                    action="added",
+                    fact_id=entry.id,
+                    section=entry.section,
+                    text=entry.text,
+                )
+            )
+        )
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["memory.add_fact"](
+                ok=True,
+                fact=MemoryFactItem(
+                    id=entry.id,
+                    date=entry.date,
+                    source=entry.source,
+                    text=entry.text,
+                ),
+                section=entry.section,
+            ),
+        )
+
+    async def _handle_memory_delete_fact(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        query_or_id = req.params.query_or_id.strip()
+        if not query_or_id:
+            await self._respond(ws, req, error="query_or_id must not be empty.")
+            return
+
+        removed = self.agent.memory.remove_entries(query_or_id)
+        removed_ids = [e.id for e in removed]
+        if removed:
+            await self._broadcast(
+                MemoryUpdatedEvent(
+                    data=MemoryUpdatedData(
+                        action="deleted",
+                        removed_count=len(removed),
+                        removed_ids=removed_ids,
+                    )
+                )
+            )
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["memory.delete_fact"](
+                ok=True,
+                removed_count=len(removed),
+                removed_ids=removed_ids,
+            ),
+        )
+
+    async def _handle_activity_list(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        limit = getattr(req.params, "limit", 10) or 10
+        raw_tasks = self.agent.memory.load_background_tasks()
+        records: dict[str, dict[str, Any]] = dict(raw_tasks)
+
+        # Include live tracked tasks in case persistence hasn't flushed yet
+        for tid, handle in list(self._active_task_handles.items()):
+            if not handle.done() and tid not in records:
+                meta = self._task_metadata.get(tid, {})
+                records[tid] = {
+                    "task_id": tid,
+                    "title": meta.get("title", tid),
+                    "status": "running",
+                    "kind": meta.get("kind", "background_task"),
+                    "started_at": meta.get("started_at", _now_iso()),
+                    "finished_at": None,
+                    "detail": None,
+                }
+
+        def _sort_key(rec: dict[str, Any]) -> tuple[int, str]:
+            is_active = 1 if rec.get("status") in ("running", "queued") else 0
+            ts = str(rec.get("finished_at") or rec.get("started_at") or "")
+            return (is_active, ts)
+
+        ordered = sorted(records.values(), key=_sort_key, reverse=True)[:limit]
+        tasks: list[TaskStatusData] = []
+        for rec in ordered:
+            tasks.append(
+                TaskStatusData(
+                    task_id=str(rec.get("task_id", "")),
+                    title=str(rec.get("title", "")),
+                    status=rec.get("status", "failed"),  # type: ignore[arg-type]
+                    started_at=str(rec.get("started_at", "")),
+                    kind=rec.get("kind", "background_task"),  # type: ignore[arg-type]
+                    finished_at=rec.get("finished_at"),
+                    next_run_at=rec.get("next_run_at"),
+                    detail=rec.get("detail"),
+                )
+            )
+        await self._respond(ws, req, METHOD_RESULTS["activity.list"](tasks=tasks))
+
+    async def _handle_activity_cancel(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        task_id = req.params.task_id.strip()
+        if not task_id:
+            await self._respond(ws, req, error="task_id must not be empty.")
+            return
+
+        now_iso = _now_iso()
+        handle = self._active_task_handles.get(task_id)
+        if handle is not None and not handle.done():
+            meta = self._task_metadata.get(task_id, {})
+            title = str(meta.get("title") or task_id)
+            kind = str(meta.get("kind") or "background_task")
+            started_at = str(meta.get("started_at") or now_iso)
+            session_id = meta.get("session_id")
+            self._cancelled_task_ids.add(task_id)
+            handle.cancel()
+            with contextlib.suppress(Exception):
+                self.agent.memory.record_background_task(
+                    task_id=task_id,
+                    title=title,
+                    status="cancelled",
+                    started_at=started_at,
+                    finished_at=now_iso,
+                    kind=kind,
+                    detail="Cancelled by user",
+                    session_id=session_id,
+                )
+            await self._broadcast(
+                TaskStatusEvent(
+                    session_id=session_id,
+                    data=TaskStatusData(
+                        task_id=task_id,
+                        title=title,
+                        status="cancelled",
+                        started_at=started_at,
+                        finished_at=now_iso,
+                        kind=kind,  # type: ignore[arg-type]
+                        detail="Cancelled by user",
+                    ),
+                )
+            )
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS["activity.cancel"](
+                    ok=True,
+                    task_id=task_id,
+                    status="cancelled",
+                    message=f"Cancelled task '{task_id}'.",
+                ),
+            )
+            return
+
+        existing = self.agent.memory.load_background_tasks().get(task_id)
+        if existing is not None:
+            prev_status = str(existing.get("status", ""))
+            if prev_status in ("running", "queued"):
+                title = str(existing.get("title") or task_id)
+                kind = str(existing.get("kind") or "background_task")
+                started_at = str(existing.get("started_at") or now_iso)
+                session_id = existing.get("session_id")
+                self.agent.memory.record_background_task(
+                    task_id=task_id,
+                    title=title,
+                    status="cancelled",
+                    started_at=started_at,
+                    finished_at=now_iso,
+                    kind=kind,
+                    detail="Cancelled by user",
+                    session_id=session_id,
+                )
+                await self._broadcast(
+                    TaskStatusEvent(
+                        session_id=session_id,
+                        data=TaskStatusData(
+                            task_id=task_id,
+                            title=title,
+                            status="cancelled",
+                            started_at=started_at,
+                            finished_at=now_iso,
+                            kind=kind,  # type: ignore[arg-type]
+                            detail="Cancelled by user",
+                        ),
+                    )
+                )
+                await self._respond(
+                    ws,
+                    req,
+                    METHOD_RESULTS["activity.cancel"](
+                        ok=True,
+                        task_id=task_id,
+                        status="cancelled",
+                        message=f"Cancelled task '{task_id}'.",
+                    ),
+                )
+                return
+
+            await self._respond(
+                ws,
+                req,
+                METHOD_RESULTS["activity.cancel"](
+                    ok=False,
+                    task_id=task_id,
+                    status=prev_status or "unknown",
+                    message=f"Task '{task_id}' is already {prev_status} and cannot be cancelled.",
+                ),
+            )
+            return
+
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["activity.cancel"](
+                ok=False,
+                task_id=task_id,
+                status="not_found",
+                message=f"Task '{task_id}' not found.",
+            ),
+        )
 
     def _settings(self) -> SettingsGetResult:
         policies = {
@@ -1543,6 +2259,31 @@ class CleaDaemon:
         with contextlib.suppress(ConnectionClosed):
             await self._chat_turn(conn, req, text)
 
+    async def _run_voice_chat_turn(
+        self,
+        *,
+        session: Session,
+        request_id: str,
+        text: str,
+        title: str | None = None,
+    ) -> None:
+        """Run a voice-triggered chat turn asynchronously and stream tokens to UI clients."""
+        try:
+            with contextlib.suppress(ConnectionClosed, asyncio.CancelledError):
+                await self._execute_chat_turn(
+                    session=session,
+                    request_id=request_id,
+                    text=text,
+                    title=title or " ".join(text.split())[:80],
+                    conn=None,
+                    req=None,
+                    broadcast_all_ui=True,
+                    notify_turn_start=False,
+                    busy_already_acquired=True,
+                )
+        finally:
+            self._busy_sessions.discard(session.id)
+
     async def _chat_turn(self, conn: _Connection, req: Any, text: str) -> None:
         ws = conn.ws
         session_id = req.session_id
@@ -1572,43 +2313,105 @@ class CleaDaemon:
                 ws, req, error="A turn is already running for this session.", session_id=session.id
             )
             return
-        self._busy_sessions.add(session.id)
+        await self._execute_chat_turn(
+            session=session,
+            request_id=req.id,
+            text=text,
+            title=" ".join(text.split())[:80],
+            conn=conn,
+            req=req,
+            broadcast_all_ui=False,
+            notify_turn_start=True,
+        )
+
+    async def _execute_chat_turn(
+        self,
+        *,
+        session: Session,
+        request_id: str,
+        text: str,
+        title: str,
+        conn: _Connection | None,
+        req: Any,
+        broadcast_all_ui: bool,
+        notify_turn_start: bool,
+        busy_already_acquired: bool = False,
+    ) -> None:
+        ws = conn.ws if conn is not None else None
+        if not busy_already_acquired:
+            if session.id in self._busy_sessions:
+                if ws is not None and req is not None:
+                    await self._respond(
+                        ws,
+                        req,
+                        error="A turn is already running for this session.",
+                        session_id=session.id,
+                    )
+                return
+            self._busy_sessions.add(session.id)
 
         state = _TurnState()
         started_at = _now_iso()
-        title = " ".join(text.split())[:80]
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_task_handles[request_id] = current_task
+            self._task_metadata[request_id] = {
+                "title": title,
+                "kind": "chat_turn",
+                "started_at": started_at,
+                "session_id": session.id,
+            }
 
         async def broadcast_session_event(event: Any) -> None:
             for c in list(self._connections):
-                if c.current_session_id == session.id or c.ws == ws:
-                    await self._send(c.ws, event)
+                if (
+                    c.current_session_id == session.id
+                    or (ws is not None and c.ws == ws)
+                    or (broadcast_all_ui and not c.is_voice)
+                ):
+                    with contextlib.suppress(ConnectionClosed):
+                        await self._send(c.ws, event)
 
-        # Notify other connections of turn start
-        for c in list(self._connections):
-            if c.ws != ws and c.current_session_id == session.id:
-                await self._send(
-                    c.ws,
-                    ConversationUpdatedEvent(
-                        session_id=session.id,
-                        data=ConversationUpdatedData(
-                            session_id=session.id,
-                            user_message=text,
-                            request_id=req.id,
-                        ),
-                    ),
-                )
+        if notify_turn_start:
+            for c in list(self._connections):
+                if (ws is None or c.ws != ws) and c.current_session_id == session.id:
+                    with contextlib.suppress(ConnectionClosed):
+                        await self._send(
+                            c.ws,
+                            ConversationUpdatedEvent(
+                                session_id=session.id,
+                                data=ConversationUpdatedData(
+                                    session_id=session.id,
+                                    user_message=text,
+                                    request_id=request_id,
+                                ),
+                            ),
+                        )
 
         async def task_status(status: str, detail: str | None = None) -> None:
+            finished_at = None if status == "running" else _now_iso()
+            if broadcast_all_ui:
+                with contextlib.suppress(Exception):
+                    self.agent.memory.record_background_task(
+                        task_id=request_id,
+                        title=title,
+                        status=status,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        kind="chat_turn",
+                        detail=detail,
+                        session_id=session.id,
+                    )
             await broadcast_session_event(
                 TaskStatusEvent(
-                    request_id=req.id,
+                    request_id=request_id,
                     session_id=session.id,
                     data=TaskStatusData(
-                        task_id=req.id,
+                        task_id=request_id,
                         title=title,
                         status=status,  # type: ignore[arg-type]
                         started_at=started_at,
-                        finished_at=None if status == "running" else _now_iso(),
+                        finished_at=finished_at,
                         kind="chat_turn",
                         detail=detail,
                     ),
@@ -1618,7 +2421,9 @@ class CleaDaemon:
         async def on_text_delta(delta: str) -> None:
             await broadcast_session_event(
                 AssistantTokenEvent(
-                    request_id=req.id, session_id=session.id, data=AssistantTokenData(text=delta)
+                    request_id=request_id,
+                    session_id=session.id,
+                    data=AssistantTokenData(text=delta),
                 ),
             )
 
@@ -1634,7 +2439,7 @@ class CleaDaemon:
             state.approval_wait[call.id] = 0.0
             await broadcast_session_event(
                 ToolCallStartedEvent(
-                    request_id=req.id,
+                    request_id=request_id,
                     session_id=session.id,
                     data=ToolCallStartedData(
                         call_id=call.id,
@@ -1650,7 +2455,7 @@ class CleaDaemon:
             elapsed -= state.approval_wait.pop(call.id, 0.0)
             await broadcast_session_event(
                 ToolCallFinishedEvent(
-                    request_id=req.id,
+                    request_id=request_id,
                     session_id=session.id,
                     data=ToolCallFinishedData(
                         call_id=call.id,
@@ -1666,11 +2471,12 @@ class CleaDaemon:
             approval_id = new_id()
             call_id = state.current_call_id
             future: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
-            conn.approvals[approval_id] = future
+            if conn is not None:
+                conn.approvals[approval_id] = future
             self._shared_approvals[approval_id] = future
             await broadcast_session_event(
                 ApprovalRequestedEvent(
-                    request_id=req.id,
+                    request_id=request_id,
                     session_id=session.id,
                     data=ApprovalRequestedData(
                         approval_id=approval_id,
@@ -1690,7 +2496,8 @@ class CleaDaemon:
             except TimeoutError:
                 decision, reason = "deny", "timeout"
             finally:
-                conn.approvals.pop(approval_id, None)
+                if conn is not None:
+                    conn.approvals.pop(approval_id, None)
                 self._shared_approvals.pop(approval_id, None)
                 if call_id is not None:
                     state.approval_wait[call_id] = state.approval_wait.get(call_id, 0.0) + (
@@ -1698,7 +2505,7 @@ class CleaDaemon:
                     )
             await broadcast_session_event(
                 ApprovalResolvedEvent(
-                    request_id=req.id,
+                    request_id=request_id,
                     session_id=session.id,
                     data=ApprovalResolvedData(
                         approval_id=approval_id,
@@ -1720,40 +2527,60 @@ class CleaDaemon:
                     on_tool_end=on_tool_end,
                     confirm=confirm,
                 )
-            except (ConnectionClosed, asyncio.CancelledError):
+            except asyncio.CancelledError:
+                if request_id not in self._cancelled_task_ids:
+                    with contextlib.suppress(Exception):
+                        await task_status("cancelled", "Cancelled by user")
+                with contextlib.suppress(Exception):
+                    await broadcast_session_event(
+                        ErrorEvent(
+                            request_id=request_id,
+                            session_id=session.id,
+                            data=ErrorData(message="Turn cancelled by user", code="cancelled"),
+                        )
+                    )
+                raise
+            except ConnectionClosed:
                 raise
             except Exception as exc:
                 logger.exception("Error while running agent turn")
                 await task_status("failed", str(exc))
                 await broadcast_session_event(
                     ErrorEvent(
-                        request_id=req.id,
+                        request_id=request_id,
                         session_id=session.id,
                         data=ErrorData(message=str(exc), code="turn_failed"),
                     ),
                 )
-                await self._respond(ws, req, error=str(exc), session_id=session.id)
+                if ws is not None and req is not None:
+                    await self._respond(ws, req, error=str(exc), session_id=session.id)
                 return
 
             await task_status("succeeded")
             for c in list(self._connections):
-                if c.ws != ws:
-                    await self._send(
-                        c.ws,
-                        ConversationUpdatedEvent(
-                            session_id=session.id,
-                            data=ConversationUpdatedData(
+                if (ws is None or c.ws != ws) and (not c.is_voice or not broadcast_all_ui):
+                    with contextlib.suppress(ConnectionClosed):
+                        await self._send(
+                            c.ws,
+                            ConversationUpdatedEvent(
                                 session_id=session.id,
-                                assistant_message=reply,
-                                turns=(len(session.messages) + 1) // 2,
-                                request_id=req.id,
+                                data=ConversationUpdatedData(
+                                    session_id=session.id,
+                                    assistant_message=reply,
+                                    turns=(len(session.messages) + 1) // 2,
+                                    request_id=request_id,
+                                ),
                             ),
-                        ),
-                    )
-            await self._respond(
-                ws, req, METHOD_RESULTS["chat.send"](text=reply), session_id=session.id
-            )
+                        )
+            if ws is not None and req is not None:
+                await self._respond(
+                    ws, req, METHOD_RESULTS["chat.send"](text=reply), session_id=session.id
+                )
         finally:
+            if self._active_task_handles.get(request_id) is asyncio.current_task():
+                self._active_task_handles.pop(request_id, None)
+                self._task_metadata.pop(request_id, None)
+            self._cancelled_task_ids.discard(request_id)
             self._busy_sessions.discard(session.id)
             self._reset_session_idle_timer(session.id)
 
@@ -1787,6 +2614,15 @@ class CleaDaemon:
         task_started = False
         task_finished = False
         pending_approval_id: str | None = None
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_task_handles[req.id] = current_task
+            self._task_metadata[req.id] = {
+                "title": title,
+                "kind": "agent_run",
+                "started_at": started_at,
+                "session_id": session.id,
+            }
 
         async def task_status(status: str, detail: str | None = None) -> None:
             finished_at = None if status == "running" else _now_iso()
@@ -1939,8 +2775,10 @@ class CleaDaemon:
                     pending_approval_id = None
                 if task_started and not task_finished:
                     task_finished = True
-                    with contextlib.suppress(Exception):
-                        await task_status("failed", "Cancelled")
+                    was_cancelled = req.id in self._cancelled_task_ids
+                    if not was_cancelled:
+                        with contextlib.suppress(Exception):
+                            await task_status("failed", "Cancelled")
                 raise
             except Exception as exc:
                 logger.exception("Error while running delegated voice task")
@@ -1970,6 +2808,10 @@ class CleaDaemon:
                     session_id=session.id,
                 )
         finally:
+            if self._active_task_handles.get(req.id) is asyncio.current_task():
+                self._active_task_handles.pop(req.id, None)
+                self._task_metadata.pop(req.id, None)
+            self._cancelled_task_ids.discard(req.id)
             self._busy_sessions.discard(session.id)
 
 

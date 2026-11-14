@@ -1,4 +1,8 @@
 import type {
+  ActivityCancelParams,
+  ActivityCancelResult,
+  ActivityListParams,
+  ActivityListResult,
   ApprovalDecision,
   ApprovalReason,
   ApprovalRequestedData,
@@ -8,11 +12,20 @@ import type {
   CallEndedData,
   CallStartedData,
   CallState,
+  ChatCreateAndOpenParams,
+  ChatCreateAndOpenResult,
+  ChatDeleteParams,
+  ChatDeleteResult,
+  ChatRenameParams,
+  ChatRenameResult,
+  ChatSendFromVoiceParams,
+  ChatSendFromVoiceResult,
   ChatSendParams,
   ChatSendResult,
   ChatFocusParams,
   ChatFocusResult,
   ConsolidationSessionStatus,
+  ConversationCreatedData,
   ConversationGetParams,
   ConversationResumeParams,
   ConversationResumeResult,
@@ -40,8 +53,12 @@ import type {
   EpisodeItem,
   Event,
   HealthPingResult,
+  MemoryAddFactParams,
+  MemoryAddFactResult,
   MemoryArchiveItem,
   MemoryArchiveResult,
+  MemoryDeleteFactParams,
+  MemoryDeleteFactResult,
   MemoryEpisodesParams,
   MemoryEpisodesResult,
   MemoryFactItem,
@@ -55,6 +72,7 @@ import type {
   MemoryReconsolidateResult,
   MemorySectionItem,
   MemoryStatusResult,
+  MemoryUpdatedData,
   PermissionTierInfo,
   Request,
   ResponseFrame,
@@ -77,6 +95,10 @@ import type {
   TranscriptsGetResult,
   TranscriptsListParams,
   TranscriptsListResult,
+  UiNavigateData,
+  UiNavigateParams,
+  UiNavigateResult,
+  UiView,
   UsageData,
   VoiceDelegateTaskParams,
   VoiceDelegateTaskResult,
@@ -98,6 +120,10 @@ import type {
 } from "./generated";
 
 export type {
+  ActivityCancelParams,
+  ActivityCancelResult,
+  ActivityListParams,
+  ActivityListResult,
   ApprovalDecision,
   ApprovalReason,
   ApprovalRequestedData,
@@ -107,11 +133,20 @@ export type {
   CallEndedData,
   CallStartedData,
   CallState,
+  ChatCreateAndOpenParams,
+  ChatCreateAndOpenResult,
+  ChatDeleteParams,
+  ChatDeleteResult,
+  ChatRenameParams,
+  ChatRenameResult,
+  ChatSendFromVoiceParams,
+  ChatSendFromVoiceResult,
   ChatSendParams,
   ChatSendResult,
   ChatFocusParams,
   ChatFocusResult,
   ConsolidationSessionStatus,
+  ConversationCreatedData,
   ConversationGetParams,
   ConversationResumeParams,
   ConversationResumeResult,
@@ -139,8 +174,12 @@ export type {
   EpisodeItem,
   Event as CleaEvent,
   HealthPingResult,
+  MemoryAddFactParams,
+  MemoryAddFactResult,
   MemoryArchiveItem,
   MemoryArchiveResult,
+  MemoryDeleteFactParams,
+  MemoryDeleteFactResult,
   MemoryEpisodesParams,
   MemoryEpisodesResult,
   MemoryFactItem,
@@ -154,6 +193,7 @@ export type {
   MemoryReconsolidateResult,
   MemorySectionItem,
   MemoryStatusResult,
+  MemoryUpdatedData,
   PermissionTierInfo,
   Request as CleaRequest,
   ResponseFrame,
@@ -176,6 +216,10 @@ export type {
   TranscriptsGetResult,
   TranscriptsListParams,
   TranscriptsListResult,
+  UiNavigateData,
+  UiNavigateParams,
+  UiNavigateResult,
+  UiView,
   UsageData,
   VoiceDelegateTaskParams,
   VoiceDelegateTaskResult,
@@ -234,6 +278,15 @@ export interface MethodParamsMap {
   "voice.history": VoiceHistoryParams;
   "voice.search_conversations": VoiceSearchConversationsParams;
   "voice.post_to_active_chat": VoicePostToActiveChatParams;
+  "ui.navigate": UiNavigateParams;
+  "chat.create_and_open": ChatCreateAndOpenParams;
+  "chat.send_from_voice": ChatSendFromVoiceParams;
+  "chat.rename": ChatRenameParams;
+  "chat.delete": ChatDeleteParams;
+  "memory.add_fact": MemoryAddFactParams;
+  "memory.delete_fact": MemoryDeleteFactParams;
+  "activity.list": ActivityListParams;
+  "activity.cancel": ActivityCancelParams;
 }
 
 export interface MethodResultMap {
@@ -272,6 +325,15 @@ export interface MethodResultMap {
   "voice.history": VoiceHistoryResult;
   "voice.search_conversations": VoiceSearchConversationsResult;
   "voice.post_to_active_chat": VoicePostToActiveChatResult;
+  "ui.navigate": UiNavigateResult;
+  "chat.create_and_open": ChatCreateAndOpenResult;
+  "chat.send_from_voice": ChatSendFromVoiceResult;
+  "chat.rename": ChatRenameResult;
+  "chat.delete": ChatDeleteResult;
+  "memory.add_fact": MemoryAddFactResult;
+  "memory.delete_fact": MemoryDeleteFactResult;
+  "activity.list": ActivityListResult;
+  "activity.cancel": ActivityCancelResult;
 }
 
 export type ConnectionState =

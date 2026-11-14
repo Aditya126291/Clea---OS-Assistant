@@ -115,6 +115,9 @@ def test_all_required_event_types_exist_and_roundtrip() -> None:
         "error",
         "conversation_updated",
         "conversation_deleted",
+        "conversation_created",
+        "ui.navigate",
+        "memory.updated",
     }
     assert set(EVENT_NAMES) == required
 
@@ -193,6 +196,15 @@ def test_every_method_has_a_result_model() -> None:
             ("voice.history", {}),
             ("voice.search_conversations", {"query": "search query"}),
             ("voice.post_to_active_chat", {"content": "sample content"}),
+            ("ui.navigate", {"view": "chat"}),
+            ("chat.create_and_open", {"title": "New Chat"}),
+            ("chat.send_from_voice", {"prompt": "Hello"}),
+            ("chat.rename", {"conversation_id": "s1", "new_title": "Renamed"}),
+            ("chat.delete", {"conversation_id": "s1", "confirmed": False}),
+            ("memory.add_fact", {"fact": "User likes Python"}),
+            ("memory.delete_fact", {"query_or_id": "fact-1"}),
+            ("activity.list", {}),
+            ("activity.cancel", {"task_id": "task-1"}),
         ]
     }
     assert methods == set(METHOD_RESULTS)

@@ -18,6 +18,8 @@ from pydantic import BaseModel
 
 from clea.core.protocol import (
     METHOD_RESULTS,
+    ActivityCancelRequest,
+    ActivityListRequest,
     ApprovalDecision,
     ApprovalReason,
     ApprovalRequestedEvent,
@@ -27,8 +29,14 @@ from clea.core.protocol import (
     CallEndedEvent,
     CallStartedEvent,
     CallState,
+    ChatCreateAndOpenRequest,
+    ChatDeleteRequest,
     ChatFocusRequest,
+    ChatRenameRequest,
+    ChatSendFromVoiceRequest,
     ChatSendRequest,
+    ConversationCreatedData,
+    ConversationCreatedEvent,
     ConversationDeleteAllRequest,
     ConversationDeletedData,
     ConversationDeletedEvent,
@@ -51,7 +59,9 @@ from clea.core.protocol import (
     ErrorEvent,
     EventFrame,
     HealthPingRequest,
+    MemoryAddFactRequest,
     MemoryArchiveRequest,
+    MemoryDeleteFactRequest,
     MemoryEpisodesRequest,
     MemoryFactsRequest,
     MemoryForgetRequest,
@@ -59,6 +69,8 @@ from clea.core.protocol import (
     MemoryGetRequest,
     MemoryReconsolidateRequest,
     MemoryStatusRequest,
+    MemoryUpdatedData,
+    MemoryUpdatedEvent,
     RequestFrame,
     ResponseFrame,
     RiskTier,
@@ -75,6 +87,10 @@ from clea.core.protocol import (
     TranscriptRole,
     TranscriptsGetRequest,
     TranscriptsListRequest,
+    UiNavigateData,
+    UiNavigateEvent,
+    UiNavigateRequest,
+    UiView,
     UsageEvent,
     VoiceDelegateTaskRequest,
     VoiceEndCallRequest,
@@ -122,6 +138,7 @@ def build_json_schema() -> dict[str, Any]:
         transcript_role: TranscriptRole
         screen_capture_target: ScreenCaptureTarget
         voice_trigger: VoiceTrigger
+        ui_view: UiView
         # Keep individual members explicit so json2ts always emits named interfaces
         health_ping_request: HealthPingRequest
         session_new_request: SessionNewRequest
@@ -160,6 +177,15 @@ def build_json_schema() -> dict[str, Any]:
         voice_history_request: VoiceHistoryRequest
         voice_search_conversations_request: VoiceSearchConversationsRequest
         voice_post_to_active_chat_request: VoicePostToActiveChatRequest
+        ui_navigate_request: UiNavigateRequest
+        chat_create_and_open_request: ChatCreateAndOpenRequest
+        chat_send_from_voice_request: ChatSendFromVoiceRequest
+        chat_rename_request: ChatRenameRequest
+        chat_delete_request: ChatDeleteRequest
+        memory_add_fact_request: MemoryAddFactRequest
+        memory_delete_fact_request: MemoryDeleteFactRequest
+        activity_list_request: ActivityListRequest
+        activity_cancel_request: ActivityCancelRequest
         conversation_search_hit: ConversationSearchHit
         voice_history_message_item: VoiceHistoryMessageItem
         assistant_token_event: AssistantTokenEvent
@@ -177,8 +203,14 @@ def build_json_schema() -> dict[str, Any]:
         error_event: ErrorEvent
         conversation_updated_event: ConversationUpdatedEvent
         conversation_deleted_event: ConversationDeletedEvent
+        ui_navigate_event: UiNavigateEvent
+        conversation_created_event: ConversationCreatedEvent
+        memory_updated_event: MemoryUpdatedEvent
         conversation_updated_data: ConversationUpdatedData
         conversation_deleted_data: ConversationDeletedData
+        ui_navigate_data: UiNavigateData
+        conversation_created_data: ConversationCreatedData
+        memory_updated_data: MemoryUpdatedData
 
     return CleaProtocolSchema.model_json_schema(mode="serialization")
 

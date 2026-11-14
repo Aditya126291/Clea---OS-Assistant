@@ -177,6 +177,225 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="navigate_ui",
+            description=(
+                "Switch the Clea Web UI between top-level views ('chat', 'voice', 'activity', "
+                "'memory', 'settings') or open a specific saved conversation by ID."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "view": {
+                        "type": "string",
+                        "enum": ["chat", "voice", "activity", "memory", "settings"],
+                        "description": "Target UI view to display.",
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional conversation/session ID to open when switching to 'chat'."
+                        ),
+                    },
+                },
+                "required": ["view"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="create_chat",
+            description=(
+                "Create a new titled chat thread (optionally pre-filled with a summary, code, "
+                "or plan) and open it immediately in the Clea Web UI even if no chat was "
+                "previously focused."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Concise title for the new chat conversation.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Optional initial assistant message (markdown summary, code, or plan)."
+                        ),
+                    },
+                    "open_in_ui": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to switch the UI immediately to the created chat "
+                            "(default true)."
+                        ),
+                    },
+                },
+                "required": ["title"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="send_chat_message",
+            description=(
+                "Submit a prompt into a new or existing chat conversation so Clea's text model "
+                "streams a full reasoning, analysis, or code response live on screen."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "User prompt or question to run in the text chat.",
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional existing conversation ID. Creates a new chat if omitted."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional title to use if creating a new chat.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="rename_chat",
+            description="Rename an existing text chat conversation.",
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Conversation/session ID to rename.",
+                    },
+                    "new_title": {
+                        "type": "string",
+                        "description": "New display title for the conversation.",
+                    },
+                },
+                "required": ["conversation_id", "new_title"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="delete_chat",
+            description=(
+                "Delete a saved text chat conversation (voice_companion is protected). Always ask "
+                "the user for verbal confirmation before calling this tool with confirmed=true."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Conversation/session ID to delete.",
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": (
+                            "Must be true only after the user explicitly confirms "
+                            "deletion verbally."
+                        ),
+                    },
+                },
+                "required": ["conversation_id"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="save_memory_fact",
+            description=(
+                "Save a persistent Durable Fact or preference to Clea's long-term Memory store "
+                "and refresh the Memory view."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": (
+                            "Concise fact, preference, project note, or decision to save."
+                        ),
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "Optional category/section (preferences, facts, projects, people, "
+                            "routines, decisions)."
+                        ),
+                    },
+                },
+                "required": ["fact"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="delete_memory_fact",
+            description=(
+                "Remove one or more Durable Facts from Clea's long-term Memory by fact ID or "
+                "matching search query."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query_or_id": {
+                        "type": "string",
+                        "description": "Fact ID or search phrase identifying the fact to remove.",
+                    }
+                },
+                "required": ["query_or_id"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="inspect_activity",
+            description=(
+                "Inspect recent and currently running background Activity tasks with their "
+                "status, description, and timestamps."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum number of tasks to list (default 10).",
+                    }
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="cancel_task",
+            description="Cancel a currently running background Activity task by task ID.",
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "ID of the running Activity task to cancel.",
+                    }
+                },
+                "required": ["task_id"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="open_command_palette",
+            description="Open the quick-switcher command palette overlay in the Clea Web UI.",
+            parameters_schema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="end_call",
             description="End the active voice call politely when the user asks to hang up.",
             parameters_schema={

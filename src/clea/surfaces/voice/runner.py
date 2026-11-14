@@ -21,15 +21,33 @@ from websockets.exceptions import InvalidURI, WebSocketException
 
 from clea.core import auth
 from clea.core.protocol import (
+    ActivityCancelParams,
+    ActivityCancelRequest,
+    ActivityListParams,
+    ActivityListRequest,
     BaseEvent,
     BaseRequest,
     CallEndedData,
     CallEndedEvent,
     CallStartedData,
     CallStartedEvent,
+    ChatCreateAndOpenParams,
+    ChatCreateAndOpenRequest,
+    ChatDeleteParams,
+    ChatDeleteRequest,
+    ChatRenameParams,
+    ChatRenameRequest,
+    ChatSendFromVoiceParams,
+    ChatSendFromVoiceRequest,
+    MemoryAddFactParams,
+    MemoryAddFactRequest,
+    MemoryDeleteFactParams,
+    MemoryDeleteFactRequest,
     ResponseFrame,
     TranscriptData,
     TranscriptEvent,
+    UiNavigateParams,
+    UiNavigateRequest,
     UsageData,
     UsageEvent,
     VoiceDelegateTaskParams,
@@ -1479,33 +1497,22 @@ class VoiceRunner:
             await backend.send_tool_responses([tool_resp])
             return
 
-        # 6. post_to_active_chat tool
-        if event.name == "post_to_active_chat":
-            content = str(event.arguments.get("content", "")).strip()
-            raw_label = event.arguments.get("label")
-            label = (
-                raw_label.strip() if isinstance(raw_label, str) and raw_label.strip() else None
+        async def _send_error(message: str) -> None:
+            await backend.send_tool_responses(
+                [
+                    VoiceToolResponse(
+                        call_id=event.call_id,
+                        name=event.name,
+                        response={"error": message},
+                        is_error=True,
+                        scheduling="when_idle",
+                    )
+                ]
             )
-            if not content:
-                await backend.send_tool_responses(
-                    [
-                        VoiceToolResponse(
-                            call_id=event.call_id,
-                            name=event.name,
-                            response={"error": "Content must not be empty."},
-                            is_error=True,
-                            scheduling="when_idle",
-                        )
-                    ]
-                )
-                return
+
+        async def _execute_rpc_tool(req: BaseRequest, *, error_prefix: str) -> None:
             try:
-                res = await self._rpc(
-                    VoicePostToActiveChatRequest(
-                        params=VoicePostToActiveChatParams(content=content, label=label)
-                    ),
-                    timeout=10.0,
-                )
+                res = await self._rpc(req, timeout=10.0)
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
@@ -1517,24 +1524,198 @@ class VoiceRunner:
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
-                    response={"error": f"Failed to post to active chat: {exc}"},
+                    response={"error": f"{error_prefix}: {exc}"},
                     is_error=True,
                     scheduling="when_idle",
                 )
             await backend.send_tool_responses([tool_resp])
+
+        def _req_str(key: str) -> str | None:
+            val = event.arguments.get(key)
+            if isinstance(val, str):
+                stripped = val.strip()
+                return stripped or None
+            return None
+
+        def _parse_bool(key: str, *, default: bool) -> bool:
+            val = event.arguments.get(key)
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                low = val.strip().lower()
+                if low in {"true", "1", "yes"}:
+                    return True
+                if low in {"false", "0", "no"}:
+                    return False
+            return default
+
+        # 6. post_to_active_chat tool
+        if event.name == "post_to_active_chat":
+            raw_content = event.arguments.get("content")
+            content = "" if raw_content is None else str(raw_content).strip()
+            if not content:
+                await _send_error("Content must not be empty.")
+                return
+            await _execute_rpc_tool(
+                VoicePostToActiveChatRequest(
+                    params=VoicePostToActiveChatParams(
+                        content=content,
+                        label=_req_str("label"),
+                    )
+                ),
+                error_prefix="Failed to post to active chat",
+            )
             return
 
-        await backend.send_tool_responses(
-            [
-                VoiceToolResponse(
-                    call_id=event.call_id,
-                    name=event.name,
-                    response={"error": f"Unsupported voice tool: {event.name}"},
-                    is_error=True,
-                    scheduling="when_idle",
-                )
-            ]
-        )
+        # 7. Clea Web UI self-control tools
+        if event.name == "navigate_ui":
+            raw_view = (_req_str("view") or "").lower()
+            valid_views = ("chat", "voice", "activity", "memory", "settings")
+            if raw_view not in valid_views:
+                await _send_error(f"view must be one of: {', '.join(valid_views)}.")
+                return
+            await _execute_rpc_tool(
+                UiNavigateRequest(
+                    params=UiNavigateParams(
+                        view=raw_view,  # type: ignore[arg-type]
+                        conversation_id=_req_str("conversation_id"),
+                    )
+                ),
+                error_prefix="Failed to navigate UI",
+            )
+            return
+
+        if event.name == "create_chat":
+            title = _req_str("title")
+            if not title:
+                await _send_error("title must not be empty.")
+                return
+            raw_content = event.arguments.get("content")
+            content = raw_content.strip() if isinstance(raw_content, str) else ""
+            await _execute_rpc_tool(
+                ChatCreateAndOpenRequest(
+                    params=ChatCreateAndOpenParams(
+                        title=title,
+                        content=content,
+                        open_in_ui=_parse_bool("open_in_ui", default=True),
+                    )
+                ),
+                error_prefix="Failed to create chat",
+            )
+            return
+
+        if event.name == "send_chat_message":
+            prompt = _req_str("prompt")
+            if not prompt:
+                await _send_error("prompt must not be empty.")
+                return
+            await _execute_rpc_tool(
+                ChatSendFromVoiceRequest(
+                    params=ChatSendFromVoiceParams(
+                        prompt=prompt,
+                        conversation_id=_req_str("conversation_id"),
+                        title=_req_str("title"),
+                    )
+                ),
+                error_prefix="Failed to send chat message",
+            )
+            return
+
+        if event.name == "rename_chat":
+            conversation_id = _req_str("conversation_id")
+            new_title = _req_str("new_title")
+            if not conversation_id or not new_title:
+                await _send_error("conversation_id and new_title must not be empty.")
+                return
+            await _execute_rpc_tool(
+                ChatRenameRequest(
+                    params=ChatRenameParams(
+                        conversation_id=conversation_id,
+                        new_title=new_title,
+                    )
+                ),
+                error_prefix="Failed to rename chat",
+            )
+            return
+
+        if event.name == "delete_chat":
+            conversation_id = _req_str("conversation_id")
+            if not conversation_id:
+                await _send_error("conversation_id must not be empty.")
+                return
+            await _execute_rpc_tool(
+                ChatDeleteRequest(
+                    params=ChatDeleteParams(
+                        conversation_id=conversation_id,
+                        confirmed=_parse_bool("confirmed", default=False),
+                    )
+                ),
+                error_prefix="Failed to delete chat",
+            )
+            return
+
+        if event.name == "save_memory_fact":
+            fact = _req_str("fact")
+            if not fact:
+                await _send_error("fact must not be empty.")
+                return
+            await _execute_rpc_tool(
+                MemoryAddFactRequest(
+                    params=MemoryAddFactParams(
+                        fact=fact,
+                        category=_req_str("category"),
+                    )
+                ),
+                error_prefix="Failed to save memory fact",
+            )
+            return
+
+        if event.name == "delete_memory_fact":
+            query_or_id = _req_str("query_or_id")
+            if not query_or_id:
+                await _send_error("query_or_id must not be empty.")
+                return
+            await _execute_rpc_tool(
+                MemoryDeleteFactRequest(
+                    params=MemoryDeleteFactParams(query_or_id=query_or_id)
+                ),
+                error_prefix="Failed to delete memory fact",
+            )
+            return
+
+        if event.name == "inspect_activity":
+            raw_limit = event.arguments.get("limit", 10)
+            try:
+                limit = 10 if raw_limit is None or isinstance(raw_limit, bool) else int(raw_limit)
+            except (TypeError, ValueError):
+                await _send_error("limit must be an integer between 1 and 100.")
+                return
+            limit = max(1, min(100, limit))
+            await _execute_rpc_tool(
+                ActivityListRequest(params=ActivityListParams(limit=limit)),
+                error_prefix="Failed to inspect activity",
+            )
+            return
+
+        if event.name == "cancel_task":
+            task_id = _req_str("task_id")
+            if not task_id:
+                await _send_error("task_id must not be empty.")
+                return
+            await _execute_rpc_tool(
+                ActivityCancelRequest(params=ActivityCancelParams(task_id=task_id)),
+                error_prefix="Failed to cancel task",
+            )
+            return
+
+        if event.name == "open_command_palette":
+            await _execute_rpc_tool(
+                UiNavigateRequest(params=UiNavigateParams(view="chat", open_command_palette=True)),
+                error_prefix="Failed to open command palette",
+            )
+            return
+
+        await _send_error(f"Unsupported voice tool: {event.name}")
 
     async def _stream_screen_burst(
         self,

@@ -24,6 +24,7 @@ CallState = Literal["idle", "connecting", "active", "ending"]
 TranscriptRole = Literal["user", "assistant"]
 ScreenCaptureTarget = Literal["active_window", "full_screen"]
 VoiceTrigger = Literal["manual", "wake_word", "hotkey", "ui"]
+UiView = Literal["chat", "voice", "activity", "memory", "settings"]
 
 
 def new_id() -> str:
@@ -126,6 +127,52 @@ class VoiceSearchConversationsParams(_Model):
 class VoicePostToActiveChatParams(_Model):
     content: str
     label: str | None = None
+
+
+class UiNavigateParams(_Model):
+    view: UiView = "chat"
+    conversation_id: str | None = None
+    open_command_palette: bool = False
+
+
+class ChatCreateAndOpenParams(_Model):
+    title: str
+    content: str = ""
+    open_in_ui: bool = True
+
+
+class ChatSendFromVoiceParams(_Model):
+    prompt: str
+    conversation_id: str | None = None
+    title: str | None = None
+
+
+class ChatRenameParams(_Model):
+    conversation_id: str
+    new_title: str
+
+
+class ChatDeleteParams(_Model):
+    conversation_id: str
+    confirmed: bool = False
+    delete_episodes: bool = False
+
+
+class MemoryAddFactParams(_Model):
+    fact: str
+    category: str | None = None
+
+
+class MemoryDeleteFactParams(_Model):
+    query_or_id: str
+
+
+class ActivityListParams(_Model):
+    limit: int = Field(default=10, ge=1, le=100)
+
+
+class ActivityCancelParams(_Model):
+    task_id: str
 
 
 class _Request(_Model):
@@ -344,6 +391,51 @@ class VoicePostToActiveChatRequest(_Request):
     params: VoicePostToActiveChatParams
 
 
+class UiNavigateRequest(_Request):
+    method: Literal["ui.navigate"] = "ui.navigate"
+    params: UiNavigateParams = Field(default_factory=UiNavigateParams)
+
+
+class ChatCreateAndOpenRequest(_Request):
+    method: Literal["chat.create_and_open"] = "chat.create_and_open"
+    params: ChatCreateAndOpenParams
+
+
+class ChatSendFromVoiceRequest(_Request):
+    method: Literal["chat.send_from_voice"] = "chat.send_from_voice"
+    params: ChatSendFromVoiceParams
+
+
+class ChatRenameRequest(_Request):
+    method: Literal["chat.rename"] = "chat.rename"
+    params: ChatRenameParams
+
+
+class ChatDeleteRequest(_Request):
+    method: Literal["chat.delete"] = "chat.delete"
+    params: ChatDeleteParams
+
+
+class MemoryAddFactRequest(_Request):
+    method: Literal["memory.add_fact"] = "memory.add_fact"
+    params: MemoryAddFactParams
+
+
+class MemoryDeleteFactRequest(_Request):
+    method: Literal["memory.delete_fact"] = "memory.delete_fact"
+    params: MemoryDeleteFactParams
+
+
+class ActivityListRequest(_Request):
+    method: Literal["activity.list"] = "activity.list"
+    params: ActivityListParams = Field(default_factory=ActivityListParams)
+
+
+class ActivityCancelRequest(_Request):
+    method: Literal["activity.cancel"] = "activity.cancel"
+    params: ActivityCancelParams
+
+
 RequestFrame = Annotated[
     HealthPingRequest
     | SessionNewRequest
@@ -379,7 +471,16 @@ RequestFrame = Annotated[
     | VoiceDelegateTaskRequest
     | VoiceHistoryRequest
     | VoiceSearchConversationsRequest
-    | VoicePostToActiveChatRequest,
+    | VoicePostToActiveChatRequest
+    | UiNavigateRequest
+    | ChatCreateAndOpenRequest
+    | ChatSendFromVoiceRequest
+    | ChatRenameRequest
+    | ChatDeleteRequest
+    | MemoryAddFactRequest
+    | MemoryDeleteFactRequest
+    | ActivityListRequest
+    | ActivityCancelRequest,
     Field(discriminator="method"),
 ]
 """Any client-to-daemon request (discriminated by ``method``)."""
@@ -695,6 +796,67 @@ class VoicePostToActiveChatResult(_Model):
     message: str = ""
 
 
+class UiNavigateResult(_Model):
+    ok: bool = True
+    view: UiView = "chat"
+    active_conversation_id: str | None = None
+    open_command_palette: bool = False
+
+
+class ChatCreateAndOpenResult(_Model):
+    ok: bool = True
+    session_id: str
+    title: str
+    message: str = ""
+    open_in_ui: bool = True
+
+
+class ChatSendFromVoiceResult(_Model):
+    ok: bool = True
+    session_id: str
+    title: str = ""
+    request_id: str = ""
+    status: str = "started"
+
+
+class ChatRenameResult(_Model):
+    ok: bool = True
+    session_id: str
+    title: str
+
+
+class ChatDeleteResult(_Model):
+    ok: bool = True
+    session_id: str
+    deleted: bool = False
+    requires_confirmation: bool = False
+    episodes_removed: int = 0
+    message: str = ""
+
+
+class MemoryAddFactResult(_Model):
+    ok: bool = True
+    fact: MemoryFactItem
+    section: str
+
+
+class MemoryDeleteFactResult(_Model):
+    ok: bool = True
+    removed_count: int = 0
+    removed_ids: list[str] = Field(default_factory=list)
+
+
+class ActivityListResult(_Model):
+    tasks: list[TaskStatusData] = Field(default_factory=list)
+
+
+class ActivityCancelResult(_Model):
+    ok: bool = True
+    task_id: str
+    status: str
+    message: str = ""
+
+
 METHOD_RESULTS: dict[str, type[_Model]] = {
     "health.ping": HealthPingResult,
     "session.new": SessionNewResult,
@@ -731,6 +893,15 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "voice.history": VoiceHistoryResult,
     "voice.search_conversations": VoiceSearchConversationsResult,
     "voice.post_to_active_chat": VoicePostToActiveChatResult,
+    "ui.navigate": UiNavigateResult,
+    "chat.create_and_open": ChatCreateAndOpenResult,
+    "chat.send_from_voice": ChatSendFromVoiceResult,
+    "chat.rename": ChatRenameResult,
+    "chat.delete": ChatDeleteResult,
+    "memory.add_fact": MemoryAddFactResult,
+    "memory.delete_fact": MemoryDeleteFactResult,
+    "activity.list": ActivityListResult,
+    "activity.cancel": ActivityCancelResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""
 
@@ -926,6 +1097,46 @@ class ConversationDeletedEvent(_Event):
     data: ConversationDeletedData
 
 
+class UiNavigateData(_Model):
+    view: UiView = "chat"
+    conversation_id: str | None = None
+    open_command_palette: bool = False
+
+
+class UiNavigateEvent(_Event):
+    event: Literal["ui.navigate"] = "ui.navigate"
+    data: UiNavigateData
+
+
+class ConversationCreatedData(_Model):
+    session_id: str
+    title: str
+    started_at: str = ""
+    updated_at: str = ""
+    turns: int = 0
+    initial_message: str | None = None
+    open_in_ui: bool = True
+
+
+class ConversationCreatedEvent(_Event):
+    event: Literal["conversation_created"] = "conversation_created"
+    data: ConversationCreatedData
+
+
+class MemoryUpdatedData(_Model):
+    action: Literal["added", "deleted", "updated"] = "updated"
+    fact_id: str | None = None
+    section: str | None = None
+    text: str | None = None
+    removed_count: int = 0
+    removed_ids: list[str] = Field(default_factory=list)
+
+
+class MemoryUpdatedEvent(_Event):
+    event: Literal["memory.updated"] = "memory.updated"
+    data: MemoryUpdatedData
+
+
 EventFrame = Annotated[
     AssistantTokenEvent
     | ToolCallStartedEvent
@@ -941,7 +1152,10 @@ EventFrame = Annotated[
     | UsageEvent
     | ErrorEvent
     | ConversationUpdatedEvent
-    | ConversationDeletedEvent,
+    | ConversationDeletedEvent
+    | UiNavigateEvent
+    | ConversationCreatedEvent
+    | MemoryUpdatedEvent,
     Field(discriminator="event"),
 ]
 """Any daemon-to-client event (discriminated by ``event``)."""
@@ -965,6 +1179,9 @@ EVENT_NAMES: tuple[str, ...] = (
     "error",
     "conversation_updated",
     "conversation_deleted",
+    "ui.navigate",
+    "conversation_created",
+    "memory.updated",
 )
 
 
