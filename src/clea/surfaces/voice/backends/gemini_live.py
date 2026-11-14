@@ -186,11 +186,19 @@ class GeminiLiveBackend(VoiceBackend):
         assert self._client is not None
         live_cfg = self._build_live_config(config)
 
-        self._session_ctx = self._client.aio.live.connect(
+        session_ctx = self._client.aio.live.connect(
             model=self._model_name,
             config=live_cfg,
         )
-        self._session = await self._session_ctx.__aenter__()
+        session = await session_ctx.__aenter__()
+        if self._closed:
+            with contextlib.suppress(Exception):
+                await session_ctx.__aexit__(None, None, None)
+            self._session_ctx = None
+            self._session = None
+            return
+        self._session_ctx = session_ctx
+        self._session = session
         self._receive_task = asyncio.create_task(
             self._receive_loop(),
             name="GeminiLiveBackendReceiveLoop",
@@ -202,6 +210,7 @@ class GeminiLiveBackend(VoiceBackend):
         )
 
     async def _receive_loop(self) -> None:
+        should_close_queue = False
         try:
             while not self._closed and self._session is not None:
                 # google-genai's session.receive() stops at the end of each model turn
@@ -214,6 +223,17 @@ class GeminiLiveBackend(VoiceBackend):
                     if self._closed:
                         break
                 if not received_any:
+                    if not self._closed:
+                        logger.warning(
+                            "Gemini Live receive() ended with no messages; closing stream."
+                        )
+                        await self._events_queue.put(
+                            BackendErrorEvent(
+                                message="Live session stream ended unexpectedly.",
+                                recoverable=False,
+                            )
+                        )
+                        should_close_queue = True
                     break
                 # Yield to the event loop between turns so synchronous mocks cannot starve it.
                 await asyncio.sleep(0)
@@ -242,11 +262,13 @@ class GeminiLiveBackend(VoiceBackend):
                         return
                     except Exception as rec_err:
                         logger.error("Reconnection failed: %s", rec_err)
-            await self._events_queue.put(
-                BackendErrorEvent(message=f"Live session closed: {exc}", recoverable=False)
-            )
+            if not self._closed:
+                await self._events_queue.put(
+                    BackendErrorEvent(message=f"Live session closed: {exc}", recoverable=False)
+                )
+                should_close_queue = True
         finally:
-            if self._closed:
+            if self._closed or should_close_queue:
                 await self._events_queue.put(None)
 
     async def reconnect(self) -> None:
@@ -263,13 +285,16 @@ class GeminiLiveBackend(VoiceBackend):
             self._receive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._receive_task
-        self._receive_task = None
-        if self._session_ctx is not None:
+            self._receive_task = None
+        old_ctx = self._session_ctx
+        self._session_ctx = None
+        self._session = None
+        if old_ctx is not None:
             with contextlib.suppress(Exception):
-                await self._session_ctx.__aexit__(None, None, None)
-            self._session_ctx = None
-            self._session = None
-        assert self._config is not None
+                await old_ctx.__aexit__(None, None, None)
+        if self._closed or self._config is None:
+            self._receive_task = None
+            return
         await self._open_session(self._config)
 
     async def _handle_server_message(self, msg: types.LiveServerMessage) -> None:
@@ -308,7 +333,7 @@ class GeminiLiveBackend(VoiceBackend):
                     )
                 )
 
-            if sc.turn_complete:
+            if sc.turn_complete or sc.interaction_status == types.InteractionStatus.IDLE:
                 await self._events_queue.put(TurnCompleteEvent())
 
         # 2. Tool calls
@@ -363,10 +388,17 @@ class GeminiLiveBackend(VoiceBackend):
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
         """Stream a 16 kHz 16-bit mono PCM microphone chunk."""
-        if self._session is None or self._closed:
+        session = self._session
+        if session is None or self._closed:
             return
         blob = types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
-        await self._session.send_realtime_input(audio=blob)
+        try:
+            await session.send_realtime_input(audio=blob)
+        except Exception as exc:
+            if self._closed or self._session is not session:
+                logger.debug("Ignoring send_audio failure during close/reconnect: %s", exc)
+                return
+            raise
 
     async def end_audio_stream(self) -> None:
         """Signal an end/pause of audio streaming (e.g. for half-duplex)."""

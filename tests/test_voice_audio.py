@@ -659,3 +659,32 @@ def test_audio_manager_resumes_capture_after_output_drains() -> None:
     manager._input_stream_callback(mic_block, 1280, None, 0)  # type: ignore[arg-type]
     assert len(received) == 1
     assert len(received[0]) == 2560
+
+
+def test_audio_manager_stop_output_atomic_with_concurrent_output_callback_and_play() -> None:
+    """Concurrent play_audio, _output_stream_callback, and stop_output leave clean state."""
+    manager = AudioManager(mic_mute_while_speaking=True, chunk_size=1280)
+    manager._running = True
+
+    def producer() -> None:
+        for _ in range(200):
+            manager.play_audio(b"\x05\x00" * 160)
+
+    def consumer() -> None:
+        out = np.empty((128, 1), dtype=np.int16)
+        for _ in range(200):
+            manager._output_stream_callback(out, 128, None, 0)  # type: ignore[arg-type]
+
+    def flusher() -> None:
+        for _ in range(100):
+            manager.stop_output()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futs = [pool.submit(producer), pool.submit(consumer), pool.submit(flusher)]
+        for f in futs:
+            f.result()
+
+    manager.stop_output()
+    assert manager.is_speaking is False
+    assert manager._output_queue.empty()
+    assert len(manager._current_output_bytes) == 0

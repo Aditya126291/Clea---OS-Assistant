@@ -456,3 +456,223 @@ async def test_gemini_backend_receives_across_multiple_turns() -> None:
     assert collected[4].pcm_bytes == b"\x33\x00" * 120
 
     await backend.close()
+
+
+async def test_gemini_backend_internal_reconnect_resumes_multi_turn() -> None:
+    """Transient receive error after Turn 1 reconnects internally and continues Turn 2."""
+    from clea.surfaces.voice.backends.base import BackendErrorEvent
+
+    session_num = 0
+    s1_calls = 0
+
+    async def s1_receive() -> Any:
+        nonlocal s1_calls
+        s1_calls += 1
+        if s1_calls == 1:
+            yield types.LiveServerMessage(
+                session_resumption_update=types.LiveServerSessionResumptionUpdate(
+                    new_handle="resume-after-t1",
+                    resumable=True,
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\x11\x00" * 60, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        raise ConnectionError("transient ws drop")
+
+    s2_calls = 0
+
+    async def s2_receive() -> Any:
+        nonlocal s2_calls
+        s2_calls += 1
+        if s2_calls == 1:
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\x22\x00" * 60, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        await asyncio.sleep(10.0)
+
+    s1 = MagicMock()
+    s1.receive.side_effect = s1_receive
+    s2 = MagicMock()
+    s2.receive.side_effect = s2_receive
+
+    def make_ctx(**_kwargs: Any) -> Any:
+        nonlocal session_num
+        session_num += 1
+        ctx = AsyncMock()
+        ctx.__aenter__.return_value = s1 if session_num == 1 else s2
+        ctx.__aexit__.return_value = None
+        return ctx
+
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.side_effect = make_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys", reconnect_limit=2))
+
+    collected: list[Any] = []
+    async for evt in backend.events():
+        collected.append(evt)
+        if len([e for e in collected if isinstance(e, TurnCompleteEvent)]) == 2:
+            break
+
+    assert mock_client.aio.live.connect.call_count == 2
+    second_cfg = mock_client.aio.live.connect.call_args_list[1].kwargs["config"]
+    assert second_cfg.session_resumption.handle == "resume-after-t1"
+    assert any(isinstance(e, BackendErrorEvent) and e.recoverable for e in collected)
+    audio_evts = [e for e in collected if isinstance(e, AudioOutputEvent)]
+    assert [e.pcm_bytes for e in audio_evts] == [b"\x11\x00" * 60, b"\x22\x00" * 60]
+
+    await backend.close()
+
+
+async def test_gemini_backend_empty_receive_emits_error_and_closes_events_stream() -> None:
+    """If session.receive() stops yielding without closing, events() terminates with error."""
+    from clea.surfaces.voice.backends.base import BackendErrorEvent
+
+    async def empty_recv() -> Any:
+        if False:
+            yield None
+
+    mock_session = MagicMock()
+    mock_session.receive.side_effect = empty_recv
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys"))
+
+    events = await asyncio.wait_for(_collect_all(backend), timeout=2.0)
+    assert len(events) == 1
+    assert isinstance(events[0], BackendErrorEvent)
+    assert events[0].recoverable is False
+
+    await backend.close()
+
+
+async def _collect_all(backend: GeminiLiveBackend) -> list[Any]:
+    return [evt async for evt in backend.events()]
+
+
+async def test_gemini_backend_interaction_status_idle_emits_turn_complete() -> None:
+    """interaction_status == IDLE without turn_complete=True still emits TurnCompleteEvent."""
+    delivered = False
+
+    async def recv_idle() -> Any:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    interaction_status=types.InteractionStatus.IDLE
+                )
+            )
+            return
+        await asyncio.sleep(10.0)
+
+    mock_session = MagicMock()
+    mock_session.receive.side_effect = recv_idle
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys"))
+
+    async def take_one() -> Any:
+        async for evt in backend.events():
+            return evt
+        return None
+
+    evt = await asyncio.wait_for(take_one(), timeout=2.0)
+    assert isinstance(evt, TurnCompleteEvent)
+    await backend.close()
+
+
+async def test_gemini_backend_close_while_reconnecting_does_not_leak_session() -> None:
+    """Closing while reconnect is awaiting __aenter__() must exit the newly entered session."""
+    enter_started = asyncio.Event()
+    allow_enter = asyncio.Event()
+    ctx2_exited = asyncio.Event()
+
+    async def hanging_recv() -> Any:
+        await asyncio.sleep(10.0)
+        if False:
+            yield None
+
+    s1 = MagicMock()
+    s1.receive.side_effect = hanging_recv
+    ctx1 = AsyncMock()
+    ctx1.__aenter__.return_value = s1
+    ctx1.__aexit__.return_value = None
+
+    s2 = MagicMock()
+    s2.receive.side_effect = hanging_recv
+    ctx2 = AsyncMock()
+
+    async def slow_enter() -> Any:
+        enter_started.set()
+        await allow_enter.wait()
+        return s2
+
+    async def track_exit(*_args: Any) -> None:
+        ctx2_exited.set()
+
+    ctx2.__aenter__.side_effect = slow_enter
+    ctx2.__aexit__.side_effect = track_exit
+
+    calls = 0
+
+    def make_ctx(**_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return ctx1 if calls == 1 else ctx2
+
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.side_effect = make_ctx
+
+    backend = GeminiLiveBackend(api_key="fake-key", client=mock_client)
+    await backend.connect(VoiceSessionConfig(system_instruction="sys"))
+
+    reconnect_task = asyncio.create_task(backend.reconnect())
+    await asyncio.wait_for(enter_started.wait(), timeout=1.0)
+
+    await backend.close()
+    allow_enter.set()
+    await asyncio.wait_for(reconnect_task, timeout=1.0)
+
+    assert ctx2_exited.is_set()
+    assert backend._session is None

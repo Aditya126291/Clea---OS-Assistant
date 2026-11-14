@@ -640,10 +640,12 @@ class VoiceRunner:
                 await backend.close()
 
         if self._backend_consume_task is not None:
-            self._backend_consume_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._backend_consume_task
+            consume_task = self._backend_consume_task
             self._backend_consume_task = None
+            if consume_task is not asyncio.current_task():
+                consume_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consume_task
 
         # Reset call and voice state
         self._call_state = "idle"
@@ -922,6 +924,14 @@ class VoiceRunner:
                         break
                     else:
                         self._set_voice_state("reconnecting")
+            if self._call_state == "active":
+                logger.warning(
+                    "Backend event stream ended while call %s was active.", self._call_id
+                )
+                await self.end_call(
+                    reason="backend_stream_ended",
+                    error="Voice stream ended unexpectedly.",
+                )
         except asyncio.CancelledError:
             pass
         except Exception as exc:

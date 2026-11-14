@@ -1312,3 +1312,197 @@ async def test_voice_runner_multi_turn_with_gemini_backend_and_audio_manager(
 
     await runner.end_call(reason="test_done")
     await runner.stop()
+
+
+async def test_voice_runner_full_duplex_multi_turn_speech_rms_and_barge_in(
+    tmp_path: Path,
+) -> None:
+    """Default full-duplex mode with speech-level RMS forwards Turn 1, Turn 2, and Turn 3."""
+    from google.genai import types
+
+    from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
+
+    turn_call_count = 0
+    sent_audio_chunks: list[bytes] = []
+    turn1_seen = asyncio.Event()
+    turn2_seen = asyncio.Event()
+    turn3_seen = asyncio.Event()
+
+    async def fake_send_realtime_input(*, audio: Any = None, **_kwargs: Any) -> None:
+        if audio is not None and audio.data:
+            sent_audio_chunks.append(audio.data)
+            sample0 = int.from_bytes(audio.data[:2], "little", signed=True)
+            if sample0 == 1000:
+                turn1_seen.set()
+            elif sample0 == 2000:
+                turn2_seen.set()
+            elif sample0 == 3000:
+                turn3_seen.set()
+
+    async def multi_turn_receive() -> Any:
+        nonlocal turn_call_count
+        turn_call_count += 1
+        current = turn_call_count
+        if current == 1:
+            await turn1_seen.wait()
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\xaa\x00" * 100, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        if current == 2:
+            await turn2_seen.wait()
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\xbb\x00" * 100, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(interrupted=True)
+            )
+            return
+        if current == 3:
+            await turn3_seen.wait()
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(
+                    model_turn=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=b"\xcc\x00" * 100, mime_type="audio/pcm;rate=24000"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+            yield types.LiveServerMessage(
+                server_content=types.LiveServerContent(turn_complete=True)
+            )
+            return
+        await asyncio.sleep(10.0)
+
+    mock_session = MagicMock()
+    mock_session.receive.side_effect = multi_turn_receive
+    mock_session.send_realtime_input = AsyncMock(side_effect=fake_send_realtime_input)
+
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_session
+    mock_ctx.__aexit__.return_value = None
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = mock_ctx
+
+    audio = AudioManager(mic_mute_while_speaking=False, chunk_size=1280)
+    audio.input_sample_rate = 16000
+    audio.input_channels = 1
+    audio.start = MagicMock(side_effect=lambda: setattr(audio, "_running", True))  # type: ignore[method-assign]
+    audio.stop = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda: (setattr(audio, "_running", False), audio.stop_output())
+    )
+
+    cfg = VoiceConfig(
+        silence_timeout_seconds=60.0,
+        stall_timeout_seconds=1.0,
+        stall_speech_rms_threshold=250.0,
+        mic_mute_while_speaking=False,
+    )
+    runner = VoiceRunner(
+        config=cfg,
+        data_dir=tmp_path,
+        backend_factory=lambda: GeminiLiveBackend(api_key="test-key", client=mock_client),
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+
+    await runner.start()
+    await runner.start_call(trigger="test")
+
+    # Turn 1 with speech-level RMS (1000 >= 250)
+    audio._input_stream_callback(np.full((1280, 1), 1000, dtype=np.int16), 1280, None, 0)  # type: ignore[arg-type]
+    for _ in range(40):
+        if audio.is_speaking and runner.voice_state == "listening":
+            break
+        await asyncio.sleep(0.02)
+    assert runner.voice_state == "listening"
+    assert runner._stall_timer_armed is False
+
+    out = np.empty((200, 1), dtype=np.int16)
+    audio._output_stream_callback(out, 200, None, 0)  # type: ignore[arg-type]
+    assert audio.is_speaking is False
+
+    # Turn 2 with speech-level RMS (2000 >= 250), interrupted via barge-in
+    audio._input_stream_callback(np.full((1280, 1), 2000, dtype=np.int16), 1280, None, 0)  # type: ignore[arg-type]
+    for _ in range(40):
+        if turn_call_count >= 3 and runner.voice_state == "listening" and not audio.is_speaking:
+            break
+        await asyncio.sleep(0.02)
+    assert runner.voice_state == "listening"
+    assert audio.is_speaking is False
+
+    # Turn 3 with speech-level RMS (3000 >= 250)
+    audio._input_stream_callback(np.full((1280, 1), 3000, dtype=np.int16), 1280, None, 0)  # type: ignore[arg-type]
+    for _ in range(40):
+        if audio.is_speaking and runner.voice_state == "listening":
+            break
+        await asyncio.sleep(0.02)
+    assert audio.is_speaking is True
+    assert runner.voice_state == "listening"
+    assert runner.call_state == "active"
+
+    audio._output_stream_callback(out, 200, None, 0)  # type: ignore[arg-type]
+    assert np.array_equal(out[:100, 0], np.full(100, 0x00CC, dtype=np.int16))
+    assert audio.is_speaking is False
+
+    await runner.end_call(reason="test_done")
+    await runner.stop()
+
+
+async def test_voice_runner_ends_call_if_backend_events_stream_terminates_unexpectedly(
+    tmp_path: Path,
+) -> None:
+    """If backend.events() ends without BackendErrorEvent while active, runner must end call."""
+    backend = FakeLiveBackend()
+    audio = create_fake_audio_manager()
+    runner = VoiceRunner(
+        config=VoiceConfig(),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio,
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+    )
+    await runner.start()
+    await runner.start_call(trigger="test")
+    assert runner.call_state == "active"
+
+    # Simulate backend event generator terminating without emitting a fatal error
+    await backend.event_queue.put(None)
+    for _ in range(40):
+        if runner.call_state == "idle":
+            break
+        await asyncio.sleep(0.02)
+
+    assert runner.call_state == "idle"
+    assert runner.voice_state == "error"
+    await runner.stop()

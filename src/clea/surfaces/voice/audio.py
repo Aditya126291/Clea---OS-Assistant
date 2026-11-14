@@ -517,8 +517,8 @@ class AudioManager:
 
     def stop_output(self) -> None:
         """Immediately drop all buffered output audio on barge-in."""
-        self._drain_output_queue()
         with self._lock:
+            self._drain_output_queue()
             self._current_output_bytes.clear()
             self._is_speaking.clear()
         logger.debug("AudioManager output buffer cleared (barge-in flush).")
@@ -591,13 +591,12 @@ class AudioManager:
                     del self._current_output_bytes[:take]
                     continue
 
-            # Need more chunks from queue
-            try:
-                chunk = self._output_queue.get_nowait()
-                with self._lock:
+                # Need more chunks from queue (read under lock so stop_output stays atomic)
+                try:
+                    chunk = self._output_queue.get_nowait()
                     self._current_output_bytes.extend(chunk)
-            except queue.Empty:
-                break
+                except queue.Empty:
+                    break
 
         if buf:
             self._is_speaking.set()
