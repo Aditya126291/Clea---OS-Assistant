@@ -893,3 +893,78 @@ async def test_voice_runner_retries_daemon_startup_including_missing_token_and_s
     assert len(fake_ws.sent) >= 1
     assert runner._daemon_ws is None
     assert not (tmp_path / "voice.lock").exists()
+
+
+async def test_voice_runner_connects_to_late_starting_real_daemon(tmp_path: Path) -> None:
+    """VoiceRunner retries against a closed port + stale token, then connects to real CleaDaemon."""
+    import socket
+
+    from clea.core import auth
+    from clea.core.daemon import build_daemon
+    from clea.memory import MemoryStore
+    from clea.providers.base import LLMProvider, Message, StreamChunk
+    from clea.tools import ToolDefinition
+
+    class _DummyProvider(LLMProvider):
+        async def stream_turn(
+            self,
+            *,
+            messages: list[Message],
+            tools: list[ToolDefinition],
+            system_prompt: str,
+        ) -> AsyncIterator[StreamChunk]:
+            if False:
+                yield StreamChunk(type="done")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    # Seed a stale token before daemon boots
+    auth.write_token("stale-preboot-token", auth.token_path(tmp_path))
+
+    runner = VoiceRunner(
+        config=VoiceConfig(),
+        data_dir=tmp_path,
+        daemon_url=f"ws://127.0.0.1:{port}",
+        token=None,
+        backend_factory=lambda: FakeLiveBackend(),
+        audio_manager=create_fake_audio_manager(),
+        wake_word_detector=create_fake_wake_word(),
+        enable_hotkey=False,
+        daemon_retry_delay=0.05,
+    )
+
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=port,
+        provider=_DummyProvider(),
+        memory=MemoryStore(base_dir=tmp_path),
+    )
+
+    runner_task = asyncio.create_task(runner.run_forever())
+    try:
+        # Let VoiceRunner hit ConnectionRefusedError at least once
+        await asyncio.sleep(0.15)
+        assert not runner._daemon_ever_connected
+
+        await daemon.start()
+        try:
+            # Wait for VoiceRunner to pick up the fresh token and connect
+            for _ in range(40):
+                if any(c.is_voice for c in daemon._connections):
+                    break
+                await asyncio.sleep(0.05)
+
+            assert runner._daemon_ever_connected is True
+            assert any(c.is_voice for c in daemon._connections)
+        finally:
+            runner._stop_event.set()
+            await asyncio.wait_for(runner_task, timeout=3.0)
+            await daemon.stop()
+    finally:
+        if not runner_task.done():
+            runner._stop_event.set()
+            await asyncio.wait_for(runner_task, timeout=3.0)
+
+    assert not (tmp_path / "voice.lock").exists()

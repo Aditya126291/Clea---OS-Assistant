@@ -220,3 +220,38 @@ def test_voice_service_headless_pythonw_logging(
         for h in root.handlers:
             h.close()
         root.handlers = old_handlers
+
+
+def test_voice_service_catches_portaudio_error_in_headless_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import logging
+    import sys
+
+    import sounddevice as sd
+
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+    root = logging.getLogger()
+    old_handlers = list(root.handlers)
+    try:
+        monkeypatch.setattr(sys, "stdout", None)
+        monkeypatch.setattr(sys, "stderr", None)
+        with patch("clea.surfaces.cli.voice.VoiceRunner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_forever.side_effect = sd.PortAudioError("WASAPI unavailable")
+            mock_runner_cls.return_value = mock_runner
+
+            with pytest.raises(SystemExit) as exc:
+                run_voice_service()
+            assert exc.value.code == 1
+
+        log_file = tmp_path / "logs" / "voice.log"
+        assert log_file.is_file()
+        log_text = log_file.read_text(encoding="utf-8")
+        assert "Clea daemon session token not found yet" in log_text
+        assert "WASAPI unavailable" in log_text
+    finally:
+        for h in root.handlers:
+            h.close()
+        root.handlers = old_handlers

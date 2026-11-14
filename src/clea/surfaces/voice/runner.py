@@ -218,6 +218,12 @@ class VoiceRunner:
     def call_id(self) -> str | None:
         return self._call_id
 
+    async def _send_daemon_payload(self, ws: ClientConnection, payload: str) -> None:
+        try:
+            await ws.send(payload)
+        except (OSError, WebSocketException) as exc:
+            logger.debug("Could not send VoiceStateEvent to daemon: %s", exc)
+
     def _set_voice_state(self, state: VoiceState, error: str | None = None) -> None:
         """Update voice state and emit a typed VoiceStateEvent."""
         if self._state != state or error is not None:
@@ -231,15 +237,17 @@ class VoiceRunner:
                 and self._loop is not None
                 and not self._loop.is_closed()
             ):
+                ws = self._daemon_ws
+                payload = evt.model_dump_json()
                 try:
                     running_loop = None
                     with contextlib.suppress(RuntimeError):
                         running_loop = asyncio.get_running_loop()
                     if running_loop is self._loop:
-                        self._loop.create_task(self._daemon_ws.send(evt.model_dump_json()))
+                        self._loop.create_task(self._send_daemon_payload(ws, payload))
                     else:
                         asyncio.run_coroutine_threadsafe(
-                            self._daemon_ws.send(evt.model_dump_json()),
+                            self._send_daemon_payload(ws, payload),
                             self._loop,
                         )
                 except Exception as exc:
@@ -1107,7 +1115,24 @@ class VoiceRunner:
                 )
 
                 while not self._stop_event.is_set():
-                    raw = await ws.recv()
+                    recv_task = asyncio.create_task(ws.recv())
+                    stop_task = asyncio.create_task(self._stop_event.wait())
+                    done, pending = await asyncio.wait(
+                        {recv_task, stop_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await task
+                    if recv_task in done:
+                        if self._stop_event.is_set():
+                            with contextlib.suppress(Exception):
+                                recv_task.result()
+                            break
+                        raw = recv_task.result()
+                    else:
+                        break
                     frame = parse_frame(raw)
 
                     if isinstance(frame, CallStartedEvent):

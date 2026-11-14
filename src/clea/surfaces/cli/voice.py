@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 import numpy as np
+import sounddevice as sd
 
 from clea.core import auth
 from clea.paths import default_data_dir
@@ -201,17 +202,22 @@ def run_voice_service(
     """Run the main Clea voice background surface."""
     _configure_voice_service_logging()
     enable_per_monitor_dpi_awareness()
-    config = load_voice_config()
     daemon_url = f"ws://{host}:{port}"
 
-    if not auth.read_token():
-        print(
-            "Note: Clea daemon is not running yet. Starting voice surface;\n"
-            f"it will automatically connect when the daemon starts at {daemon_url}.",
-            file=sys.stderr,
-        )
-
     try:
+        config = load_voice_config()
+        if not auth.read_token():
+            logger.info(
+                "Clea daemon session token not found yet; voice surface will connect when "
+                "daemon starts at %s.",
+                daemon_url,
+            )
+            print(
+                "Note: Clea daemon is not running yet. Starting voice surface;\n"
+                f"it will automatically connect when the daemon starts at {daemon_url}.",
+                file=sys.stderr,
+            )
+
         runner = VoiceRunner(
             config=config,
             daemon_url=daemon_url,
@@ -231,12 +237,15 @@ def run_voice_service(
         logger.error("%s", exc)
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    except (AudioDeviceNotFoundError, AmbiguousAudioDeviceError, OSError) as exc:
+    except (AudioDeviceNotFoundError, AmbiguousAudioDeviceError, sd.PortAudioError, OSError) as exc:
         logger.error("Voice service startup failed: %s", exc)
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except KeyboardInterrupt:
         print("\nClea voice stopped.")
+    except Exception:
+        logger.exception("Clea voice service failed unexpectedly")
+        raise
 
 
 def run_voice_doctor(*, download_models: bool = False) -> None:

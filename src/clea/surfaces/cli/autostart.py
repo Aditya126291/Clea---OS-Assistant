@@ -216,7 +216,7 @@ def status_autostart(
     task_name: str = TASK_NAME,
     runner: object = subprocess.run,
 ) -> AutostartStatus:
-    """Query Windows Task Scheduler for the current status of ``CleaDaemon``."""
+    """Query Windows Task Scheduler for the current status of ``task_name``."""
     _require_windows()
     proc = runner(  # type: ignore[operator]
         ["schtasks", "/Query", "/TN", task_name, "/V", "/FO", "LIST"],
