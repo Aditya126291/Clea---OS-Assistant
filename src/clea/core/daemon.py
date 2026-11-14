@@ -199,6 +199,7 @@ class CleaDaemon:
         self.consolidation_idle_seconds = 900.0
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._consolidation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._consolidation_in_flight: set[str] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._task_started_at: dict[str, str] = {}
         self._consolidation_task_terminal: dict[str, bool] = {}
@@ -286,6 +287,24 @@ class CleaDaemon:
 
     async def stop(self) -> None:
         """Gracefully close the WebSocket server and remove the token and lock files."""
+        for t in list(self._idle_tasks.values()):
+            if not t.done():
+                t.cancel()
+        vc_task = self._consolidation_tasks.get(VOICE_COMPANION_SESSION_ID)
+        flush_timeout = min(self.consolidation.llm_timeout_seconds, 10.0)
+        if vc_task is not None and not vc_task.done():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(vc_task), timeout=flush_timeout)
+        elif self.consolidation.has_unconsolidated_voice_companion():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    self._execute_consolidation(
+                        VOICE_COMPANION_SESSION_ID,
+                        force=True,
+                        log_context="on daemon shutdown",
+                    ),
+                    timeout=flush_timeout,
+                )
         pending_tasks = list(self._background_tasks)
         for t in list(self._idle_tasks.values()):
             if t not in pending_tasks:
@@ -303,6 +322,7 @@ class CleaDaemon:
             self._server = None
         self._idle_tasks.clear()
         self._consolidation_tasks.clear()
+        self._consolidation_in_flight.clear()
         self._background_tasks.clear()
         with contextlib.suppress(Exception):
             self.agent.memory.reconcile_orphaned_background_tasks(
@@ -367,7 +387,9 @@ class CleaDaemon:
                 await conn.ws.send(payload)
 
     def _format_session_consolidation_title(self, session_id: str) -> str:
-        """Generate title like 'Summarising session 18:11' based on session start time."""
+        """Generate Activity task title for session consolidation."""
+        if session_id == VOICE_COMPANION_SESSION_ID:
+            return "Consolidating voice memory"
         time_str = ""
         try:
             tr = self.agent.memory.get_transcript(session_id)
@@ -434,86 +456,146 @@ class CleaDaemon:
         except Exception:
             logger.exception("Error during startup memory consolidation crash recovery")
 
+    async def _execute_consolidation(
+        self,
+        session_id: str,
+        *,
+        force: bool,
+        log_context: str,
+    ) -> None:
+        """Run consolidation for session_id with safe per-invocation terminal status handling."""
+        resolved_sid = self.agent.memory.resolve_session_id(session_id)
+        keys_to_mark = {session_id, resolved_sid}
+        self._consolidation_in_flight.update(keys_to_mark)
+        local_started = False
+        local_terminal = False
+
+        async def _on_status(st: str, det: str | None = None) -> None:
+            nonlocal local_started, local_terminal
+            if st == "running":
+                local_started = True
+            else:
+                local_terminal = True
+            await self._emit_consolidation_task_status(session_id, st, det)
+
+        try:
+            await self.consolidation.consolidate_session(
+                session_id,
+                force=force,
+                on_task_status=_on_status,
+            )
+        except asyncio.CancelledError:
+            if local_started and not local_terminal:
+                local_terminal = True
+                with contextlib.suppress(Exception):
+                    await self._emit_consolidation_task_status(session_id, "failed", "Cancelled")
+        except Exception as exc:
+            logger.exception("Error consolidating session %s %s", session_id, log_context)
+            if local_started and not local_terminal:
+                local_terminal = True
+                with contextlib.suppress(Exception):
+                    await self._emit_consolidation_task_status(session_id, "failed", str(exc))
+        finally:
+            if local_started and not local_terminal:
+                with contextlib.suppress(Exception):
+                    await self._emit_consolidation_task_status(
+                        session_id, "failed", "Consolidation did not complete cleanly"
+                    )
+            self._consolidation_in_flight.difference_update(keys_to_mark)
+            current = asyncio.current_task()
+            for key in keys_to_mark:
+                if self._consolidation_tasks.get(key) is current:
+                    self._consolidation_tasks.pop(key, None)
+
     def _reset_session_idle_timer(self, session_id: str) -> None:
         old_task = self._idle_tasks.pop(session_id, None)
         if old_task is not None and not old_task.done():
             old_task.cancel()
 
         async def _timer() -> None:
-            task_id = f"cons-{session_id}"
             try:
                 await asyncio.sleep(self.consolidation_idle_seconds)
-                await self.consolidation.consolidate_session(
+                resolved_sid = self.agent.memory.resolve_session_id(session_id)
+                if (
+                    session_id in self._consolidation_in_flight
+                    or resolved_sid in self._consolidation_in_flight
+                    or self.consolidation.is_in_flight(session_id)
+                ):
+                    return
+                idle_force = session_id != VOICE_COMPANION_SESSION_ID
+                if not self.consolidation.should_consolidate(session_id, force=idle_force):
+                    return
+                current = asyncio.current_task()
+                if current is not None:
+                    self._consolidation_tasks.setdefault(session_id, current)
+                    if resolved_sid and resolved_sid != session_id:
+                        self._consolidation_tasks.setdefault(resolved_sid, current)
+                await self._execute_consolidation(
                     session_id,
-                    force=True,
-                    on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
-                        session_id, st, det
-                    ),
+                    force=idle_force,
+                    log_context="after idle timeout",
                 )
             except asyncio.CancelledError:
-                if self._consolidation_task_terminal.get(task_id) is False:
-                    with contextlib.suppress(Exception):
-                        await self._emit_consolidation_task_status(
-                            session_id, "failed", "Cancelled"
-                        )
-            except Exception as exc:
-                logger.exception("Error consolidating session %s after idle timeout", session_id)
-                if self._consolidation_task_terminal.get(task_id) is False:
-                    with contextlib.suppress(Exception):
-                        await self._emit_consolidation_task_status(session_id, "failed", str(exc))
+                pass
             finally:
-                if self._consolidation_task_terminal.get(task_id) is False:
-                    with contextlib.suppress(Exception):
-                        await self._emit_consolidation_task_status(
-                            session_id, "failed", "Consolidation did not complete cleanly"
-                        )
-                self._idle_tasks.pop(session_id, None)
+                if self._idle_tasks.get(session_id) is asyncio.current_task():
+                    self._idle_tasks.pop(session_id, None)
 
         self._idle_tasks[session_id] = self._spawn_background_task(
             _timer(),
             name=f"cons-idle-{session_id}",
         )
 
-    def _schedule_consolidation_now(self, session_id: str) -> asyncio.Task[None]:
-        old_task = self._idle_tasks.pop(session_id, None)
-        if old_task is not None and not old_task.done():
-            old_task.cancel()
-        existing_now = self._consolidation_tasks.get(session_id)
+    def _schedule_consolidation_now(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> asyncio.Task[None] | None:
+        resolved_sid = self.agent.memory.resolve_session_id(session_id)
+        existing_now = (
+            self._consolidation_tasks.get(session_id)
+            or self._consolidation_tasks.get(resolved_sid)
+        )
         if existing_now is not None and not existing_now.done():
             return existing_now
 
-        async def _run() -> None:
-            task_id = f"cons-{session_id}"
-            try:
-                await self.consolidation.consolidate_session(
-                    session_id,
-                    force=True,
-                    on_task_status=lambda st, det=None: self._emit_consolidation_task_status(
-                        session_id, st, det
-                    ),
-                )
-            except asyncio.CancelledError:
-                if self._consolidation_task_terminal.get(task_id) is False:
-                    with contextlib.suppress(Exception):
-                        await self._emit_consolidation_task_status(
-                            session_id, "failed", "Cancelled"
-                        )
-            except Exception as exc:
-                logger.exception("Error consolidating session %s on end/switch", session_id)
-                if self._consolidation_task_terminal.get(task_id) is False:
-                    with contextlib.suppress(Exception):
-                        await self._emit_consolidation_task_status(session_id, "failed", str(exc))
-            finally:
-                if self._consolidation_task_terminal.get(task_id) is False:
-                    with contextlib.suppress(Exception):
-                        await self._emit_consolidation_task_status(
-                            session_id, "failed", "Consolidation did not complete cleanly"
-                        )
-                if self._consolidation_tasks.get(session_id) is asyncio.current_task():
-                    self._consolidation_tasks.pop(session_id, None)
+        if (
+            session_id in self._consolidation_in_flight
+            or resolved_sid in self._consolidation_in_flight
+            or self.consolidation.is_in_flight(session_id)
+        ):
+            return None
 
-        task = self._spawn_background_task(_run(), name=f"cons-now-{session_id}")
+        if not force and not self.consolidation.should_consolidate(session_id, force=False):
+            return None
+
+        old_task = self._idle_tasks.pop(session_id, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+
+        keys_to_mark = {session_id, resolved_sid}
+        self._consolidation_in_flight.update(keys_to_mark)
+
+        task = self._spawn_background_task(
+            self._execute_consolidation(
+                session_id,
+                force=force,
+                log_context="on end/switch",
+            ),
+            name=f"cons-now-{session_id}",
+        )
         self._consolidation_tasks[session_id] = task
+        if resolved_sid and resolved_sid != session_id:
+            self._consolidation_tasks[resolved_sid] = task
+
+        def _cleanup_in_flight(done_task: asyncio.Task[None]) -> None:
+            self._consolidation_in_flight.difference_update(keys_to_mark)
+            for key in keys_to_mark:
+                if self._consolidation_tasks.get(key) is done_task:
+                    self._consolidation_tasks.pop(key, None)
+
+        task.add_done_callback(_cleanup_in_flight)
         return task
 
     async def _handle_connection(self, ws: ServerConnection) -> None:

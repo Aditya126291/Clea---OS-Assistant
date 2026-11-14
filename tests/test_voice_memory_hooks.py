@@ -683,6 +683,15 @@ async def test_consolidation_timeout_and_strong_task_refs_transition_to_failed(
     mem = MemoryStore(base_dir=tmp_path)
     mem.ensure_initialized()
     session_id = "hung-session-1"
+
+    # Provider hangs far longer than timeout=0.05s
+    hung_provider = FakeConsolidationProvider(delay_seconds=5.0)
+    daemon = build_daemon(host="127.0.0.1", port=0, provider=hung_provider, memory=mem)
+    daemon.consolidation.min_user_turns = 1
+    await daemon.start()
+    if daemon._startup_task is not None:
+        await asyncio.wait_for(daemon._startup_task, timeout=2.0)
+
     for role, text in [
         ("user", "First question about project architecture."),
         ("assistant", "First answer."),
@@ -690,12 +699,6 @@ async def test_consolidation_timeout_and_strong_task_refs_transition_to_failed(
         ("assistant", "Second answer."),
     ]:
         mem.append_transcript_message(session_id=session_id, role=role, text=text)
-
-    # Provider hangs far longer than timeout=0.05s
-    hung_provider = FakeConsolidationProvider(delay_seconds=5.0)
-    daemon = build_daemon(host="127.0.0.1", port=0, provider=hung_provider, memory=mem)
-    daemon.consolidation.min_user_turns = 1
-    await daemon.start()
 
     try:
         url = f"ws://127.0.0.1:{daemon.bound_port}"

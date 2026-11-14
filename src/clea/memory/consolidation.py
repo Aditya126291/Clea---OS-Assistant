@@ -34,6 +34,9 @@ MAX_CONSOLIDATION_RETRIES = 3
 BACKOFF_DELAYS = [60, 300, 900]  # Backoff in seconds: 1m, 5m, 15m
 DEFAULT_MIN_USER_TURNS = 2
 DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS = 60.0
+VOICE_COMPANION_MIN_NEW_MESSAGES = 2
+VOICE_COMPANION_BATCH_THRESHOLD = 6
+VOICE_COMPANION_DEBOUNCE_SECONDS = 300.0
 
 MemorySection = Literal[
     "Profile",
@@ -202,6 +205,130 @@ class ConsolidationManager:
 
         self.state_file = self.memory.memory_dir / "consolidation_state.json"
         self.pending_file = self.memory.memory_dir / "pending_sessions.json"
+        self.voice_companion_min_new_messages = VOICE_COMPANION_MIN_NEW_MESSAGES
+        self.voice_companion_batch_threshold = VOICE_COMPANION_BATCH_THRESHOLD
+        self.voice_companion_debounce_seconds = VOICE_COMPANION_DEBOUNCE_SECONDS
+        self._in_flight_sessions: set[str] = set()
+        self._session_locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _is_voice_companion(session_id: str, resolved_sid: str | None = None) -> bool:
+        return (
+            session_id == VOICE_COMPANION_SESSION_ID
+            or resolved_sid == VOICE_COMPANION_SESSION_ID
+        )
+
+    @staticmethod
+    def _get_session_checkpoint(entry: dict[str, Any] | None) -> tuple[int, datetime | None]:
+        """Extract (last_consolidated_message_idx, last_consolidated_at) from a session entry."""
+        if not isinstance(entry, dict):
+            return 0, None
+        raw_idx = entry.get("last_consolidated_message_idx")
+        if raw_idx is None:
+            raw_idx = entry.get("last_consolidated_turn_count")
+        if raw_idx is None:
+            raw_idx = entry.get("last_consolidated_turn")
+        try:
+            last_idx = max(0, int(raw_idx)) if raw_idx is not None else 0
+        except (TypeError, ValueError):
+            last_idx = 0
+
+        raw_at = entry.get("last_consolidated_at") or entry.get("consolidated_at")
+        last_at: datetime | None = None
+        if isinstance(raw_at, str) and raw_at.strip():
+            try:
+                parsed = datetime.fromisoformat(raw_at.strip())
+                last_at = parsed if parsed.tzinfo is not None else parsed.astimezone()
+            except ValueError:
+                last_at = None
+        return last_idx, last_at
+
+    @staticmethod
+    def _build_completed_session_data(
+        turn_count: int,
+        now_iso: str,
+        *,
+        trivial: bool | None = None,
+        retry_count: int | None = None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "status": "completed",
+            "consolidated_at": now_iso,
+            "last_consolidated_at": now_iso,
+            "last_consolidated_turn": turn_count,
+            "last_consolidated_turn_count": turn_count,
+            "last_consolidated_message_idx": turn_count,
+        }
+        if trivial is not None:
+            data["trivial"] = trivial
+        if retry_count is not None:
+            data["retry_count"] = retry_count
+        return data
+
+    def is_in_flight(self, session_id: str) -> bool:
+        """Return True if consolidation is currently queued or running for session_id."""
+        resolved = self.memory.resolve_session_id(session_id) or session_id
+        lock = self._session_locks.get(resolved)
+        return (
+            session_id in self._in_flight_sessions
+            or resolved in self._in_flight_sessions
+            or (lock is not None and lock.locked())
+        )
+
+    def has_unconsolidated_voice_companion(self, *, min_new_messages: int | None = None) -> bool:
+        """Return True if voice_companion has at least min_new_messages unconsolidated turns."""
+        threshold = (
+            self.voice_companion_min_new_messages
+            if min_new_messages is None
+            else min_new_messages
+        )
+        transcript = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+        if not transcript:
+            return False
+        messages = transcript.get("messages", [])
+        total_messages = len(messages)
+        if total_messages == 0:
+            return False
+        state = self.load_state()
+        entry = state.get("sessions", {}).get(VOICE_COMPANION_SESSION_ID)
+        last_idx, _ = self._get_session_checkpoint(entry)
+        if last_idx > total_messages:
+            last_idx = 0
+        return (total_messages - last_idx) >= threshold
+
+    def should_consolidate(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        now: datetime | None = None,
+    ) -> bool:
+        """Return True if session_id should be consolidated now."""
+        if force:
+            return True
+        resolved_sid = self.memory.resolve_session_id(session_id)
+        if self._is_voice_companion(session_id, resolved_sid):
+            transcript = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+            if not transcript:
+                return False
+            messages = transcript.get("messages", [])
+            total_messages = len(messages)
+            state = self.load_state()
+            entry = state.get("sessions", {}).get(VOICE_COMPANION_SESSION_ID)
+            last_idx, last_at = self._get_session_checkpoint(entry)
+            if last_idx > total_messages:
+                last_idx = 0
+            new_messages = total_messages - last_idx
+            if new_messages < self.voice_companion_min_new_messages:
+                return False
+            if new_messages >= self.voice_companion_batch_threshold:
+                return True
+            if last_at is None:
+                return True
+            ref_now = now or datetime.now().astimezone()
+            elapsed = (ref_now - last_at).total_seconds()
+            return elapsed >= self.voice_companion_debounce_seconds
+        return not self.is_consolidated(session_id)
 
     def load_pending(self) -> dict[str, Any]:
         """Load pending sessions state file."""
@@ -243,7 +370,11 @@ class ConsolidationManager:
         if not entry or entry.get("status") != "completed":
             return False
 
-        last_turn = entry.get("last_consolidated_turn")
+        last_turn = entry.get("last_consolidated_message_idx")
+        if last_turn is None:
+            last_turn = entry.get("last_consolidated_turn_count")
+        if last_turn is None:
+            last_turn = entry.get("last_consolidated_turn")
         transcript = self.memory.get_transcript(resolved_sid)
         if not transcript:
             return True
@@ -253,6 +384,8 @@ class ConsolidationManager:
             # Backward compatibility: for legacy state entries without turn count,
             # record current transcript turns so future resumed messages trigger consolidation.
             entry["last_consolidated_turn"] = len(messages)
+            entry["last_consolidated_turn_count"] = len(messages)
+            entry["last_consolidated_message_idx"] = len(messages)
             sessions[resolved_sid] = entry
             if session_id != resolved_sid:
                 sessions[session_id] = entry
@@ -389,24 +522,61 @@ class ConsolidationManager:
         """Consolidate a completed or idle session into episodes and MEMORY.md."""
         effective_status_cb = on_task_status or task_callback
         resolved_sid = self.memory.resolve_session_id(session_id)
-        if not force and self.is_consolidated(session_id):
+        lock_key = resolved_sid or session_id
+        lock = self._session_locks.setdefault(lock_key, asyncio.Lock())
+
+        if (
+            session_id in self._in_flight_sessions
+            or lock_key in self._in_flight_sessions
+            or lock.locked()
+        ):
+            logger.debug(
+                "Consolidation already in flight for session %s; coalescing duplicate trigger.",
+                session_id,
+            )
             return True
 
+        keys_to_mark = {session_id, lock_key}
+        self._in_flight_sessions.update(keys_to_mark)
+        try:
+            async with lock:
+                if not self.should_consolidate(session_id, force=force):
+                    return True
+                return await self._consolidate_session_locked(
+                    session_id=session_id,
+                    resolved_sid=resolved_sid,
+                    effective_status_cb=effective_status_cb,
+                )
+        finally:
+            self._in_flight_sessions.difference_update(keys_to_mark)
+
+    async def _consolidate_session_locked(
+        self,
+        *,
+        session_id: str,
+        resolved_sid: str,
+        effective_status_cb: Callable[[str, str | None], Awaitable[None]] | None,
+    ) -> bool:
+        """Execute session consolidation while holding the per-session lock."""
+        is_vc = self._is_voice_companion(session_id, resolved_sid)
+        running_emitted = False
         terminal_emitted = False
         try:
             if effective_status_cb is not None:
+                running_emitted = True
                 await effective_status_cb("running", None)
             # Record in-flight running state on disk so unexpected crashes/restarts can recover.
             running_state = self.load_state()
-            prev_sess_info = running_state.get("sessions", {}).get(session_id, {})
+            sessions_map = running_state.setdefault("sessions", {})
+            prev_sess_info = sessions_map.get(session_id) or sessions_map.get(resolved_sid) or {}
             running_data = {
                 **prev_sess_info,
                 "status": "running",
                 "started_at": datetime.now().astimezone().isoformat(),
             }
-            running_state.setdefault("sessions", {})[session_id] = running_data
+            sessions_map[session_id] = running_data
             if resolved_sid and resolved_sid != session_id:
-                running_state["sessions"][resolved_sid] = running_data
+                sessions_map[resolved_sid] = running_data
             self.save_state(running_state)
 
             transcript = self.memory.get_transcript(session_id)
@@ -414,12 +584,7 @@ class ConsolidationManager:
                 # Empty session: mark completed without calling model
                 state = self.load_state()
                 now_iso = datetime.now().astimezone().isoformat()
-                sess_data = {
-                    "status": "completed",
-                    "consolidated_at": now_iso,
-                    "trivial": True,
-                    "last_consolidated_turn": 0,
-                }
+                sess_data = self._build_completed_session_data(0, now_iso, trivial=True)
                 state.setdefault("sessions", {})[session_id] = sess_data
                 if resolved_sid and resolved_sid != session_id:
                     state["sessions"][resolved_sid] = sess_data
@@ -431,10 +596,17 @@ class ConsolidationManager:
                 terminal_emitted = True
                 return True
 
-            turn_count = len(transcript.get("messages", []))
+            all_messages = transcript.get("messages", [])
+            turn_count = len(all_messages)
+            slice_start = 0
+            if is_vc:
+                last_idx, _ = self._get_session_checkpoint(prev_sess_info)
+                if 0 < last_idx < turn_count:
+                    slice_start = last_idx
+            target_messages = all_messages[slice_start:]
 
             # Trivial session check: fewer than N user turns and no tool use
-            is_trivial, user_turns = self.is_trivial_session(transcript)
+            is_trivial, user_turns = self.is_trivial_session({"messages": target_messages})
             if is_trivial:
                 logger.info(
                     "Skipping LLM consolidation for trivial session %s "
@@ -452,12 +624,7 @@ class ConsolidationManager:
                 state = self.load_state()
                 now_iso = datetime.now().astimezone().isoformat()
                 resolved_sid = self.memory.resolve_session_id(session_id)
-                sess_data = {
-                    "status": "completed",
-                    "consolidated_at": now_iso,
-                    "trivial": True,
-                    "last_consolidated_turn": turn_count,
-                }
+                sess_data = self._build_completed_session_data(turn_count, now_iso, trivial=True)
                 state.setdefault("sessions", {})[session_id] = sess_data
                 if resolved_sid and resolved_sid != session_id:
                     state["sessions"][resolved_sid] = sess_data
@@ -469,14 +636,18 @@ class ConsolidationManager:
                 terminal_emitted = True
                 return True
 
-            # Build prompt from transcript
+            # Build prompt from target transcript slice
             t_lines = [f"Session ID: {session_id}"]
-            started_at = transcript.get("started_at", "")
+            started_at = (
+                target_messages[0].get("timestamp", "")
+                if slice_start > 0 and target_messages
+                else transcript.get("started_at", "")
+            )
             if started_at:
                 t_lines.append(f"Started at: {started_at}")
             t_lines.append("\nConversation:")
 
-            for msg in transcript["messages"]:
+            for msg in target_messages:
                 role = msg.get("role", "unknown")
                 text = msg.get("text", "").strip()
                 tool_calls = msg.get("tool_calls", [])
@@ -535,7 +706,19 @@ class ConsolidationManager:
 
                 self.save_pending(pending_state)
 
+                preserved = {
+                    k: sess_info[k]
+                    for k in (
+                        "last_consolidated_turn",
+                        "last_consolidated_turn_count",
+                        "last_consolidated_message_idx",
+                        "last_consolidated_at",
+                        "consolidated_at",
+                    )
+                    if k in sess_info
+                }
                 fail_data = {
+                    **preserved,
                     "status": "failed",
                     "pending": is_pending,
                     "retry_count": current_retries,
@@ -597,12 +780,11 @@ class ConsolidationManager:
 
             # 3. Mark completed
             resolved_sid = self.memory.resolve_session_id(session_id)
-            sess_data = {
-                "status": "completed",
-                "consolidated_at": now_iso,
-                "retry_count": sess_info.get("retry_count", 0),
-                "last_consolidated_turn": turn_count,
-            }
+            sess_data = self._build_completed_session_data(
+                turn_count,
+                now_iso,
+                retry_count=sess_info.get("retry_count", 0),
+            )
             state.setdefault("sessions", {})[session_id] = sess_data
             if resolved_sid and resolved_sid != session_id:
                 state["sessions"][resolved_sid] = sess_data
@@ -633,7 +815,7 @@ class ConsolidationManager:
                 self.save_state(state)
             except Exception:
                 pass
-            if effective_status_cb is not None and not terminal_emitted:
+            if running_emitted and effective_status_cb is not None and not terminal_emitted:
                 terminal_emitted = True
                 try:
                     await effective_status_cb("failed", "Cancelled")
@@ -660,7 +842,7 @@ class ConsolidationManager:
                 self.save_state(state)
             except Exception:
                 pass
-            if effective_status_cb is not None and not terminal_emitted:
+            if running_emitted and effective_status_cb is not None and not terminal_emitted:
                 terminal_emitted = True
                 try:
                     await effective_status_cb("failed", sanitized_err)
@@ -668,7 +850,7 @@ class ConsolidationManager:
                     logger.warning("Failed to emit failed status for session %s", session_id)
             return False
         finally:
-            if effective_status_cb is not None and not terminal_emitted:
+            if running_emitted and effective_status_cb is not None and not terminal_emitted:
                 try:
                     await effective_status_cb("failed", "Consolidation did not complete cleanly")
                 except BaseException:
@@ -765,11 +947,9 @@ class ConsolidationManager:
         if call_ids and all(
             sessions.get(cid, {}).get("status") == "completed" for cid in call_ids
         ):
-            sessions[VOICE_COMPANION_SESSION_ID] = {
-                "status": "completed",
-                "consolidated_at": now_iso,
-                "last_consolidated_turn": len(vc_msgs),
-            }
+            sessions[VOICE_COMPANION_SESSION_ID] = self._build_completed_session_data(
+                len(vc_msgs), now_iso
+            )
 
     async def run_crash_recovery(
         self,
@@ -801,6 +981,11 @@ class ConsolidationManager:
             if sid == VOICE_COMPANION_SESSION_ID:
                 vc = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
                 vc_msgs = vc.get("messages", []) if vc else []
+                vc_state = state.get("sessions", {}).get(VOICE_COMPANION_SESSION_ID)
+                if vc_state and vc_state.get("status") == "completed":
+                    vc_last_idx, _ = self._get_session_checkpoint(vc_state)
+                    if vc_last_idx >= len(vc_msgs):
+                        continue
                 seen_calls: list[str] = []
                 for m in vc_msgs:
                     cid = str(m.get("call_id") or "").strip() if isinstance(m, dict) else ""
@@ -864,9 +1049,17 @@ class ConsolidationManager:
                         else:
                             should_process = True
             elif session_state.get("status") == "completed":
-                last_turn = session_state.get("last_consolidated_turn")
+                last_turn, _ = self._get_session_checkpoint(session_state)
+                has_idx = any(
+                    session_state.get(k) is not None
+                    for k in (
+                        "last_consolidated_message_idx",
+                        "last_consolidated_turn_count",
+                        "last_consolidated_turn",
+                    )
+                )
                 msg_count = t.get("message_count", 0)
-                if last_turn is not None and msg_count > last_turn:
+                if has_idx and msg_count > last_turn:
                     should_process = True
 
             if should_process:
