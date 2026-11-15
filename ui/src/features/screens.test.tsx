@@ -253,11 +253,19 @@ describe("UI screens & navigation", () => {
 
     render(<App />);
     const composerContainer = screen.getByTestId("chat-composer-container");
+    expect(composerContainer.className).toContain("px-6");
     expect(composerContainer.className).not.toContain("pr-68");
+
+    const footer = screen.getByTestId("sidebar-footer");
+    expect(footer).toHaveClass("shrink-0");
+    const voiceBtn = screen.getByRole("button", { name: /^Voice$/i });
+    expect(voiceBtn).toHaveClass("h-7", "shrink-0");
 
     act(() => {
       useCleaStore.setState({ callOverlayOpen: true });
     });
+    expect(composerContainer.className).toContain("pl-6");
     expect(composerContainer.className).toContain("pr-68");
+    expect(composerContainer.className).not.toContain("px-6");
   });
 });

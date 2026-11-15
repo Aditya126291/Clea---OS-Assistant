@@ -264,8 +264,8 @@ export function ChatView() {
       <div
         data-testid="chat-composer-container"
         className={cn(
-          "border-t border-[var(--border)] bg-[var(--bg)] px-6 py-4 transition-[padding]",
-          callOverlayOpen && "pr-68",
+          "border-t border-[var(--border)] bg-[var(--bg)] py-4 transition-[padding]",
+          callOverlayOpen ? "pl-6 pr-68" : "px-6",
         )}
       >
         <form
@@ -283,7 +283,7 @@ export function ChatView() {
             onKeyDown={handleKeyDown}
             placeholder="Message Clea…"
             aria-label="Message Clea"
-            className="max-h-40 min-h-[38px] flex-1 resize-none bg-transparent px-2 py-2 text-sm text-[var(--text)] placeholder:text-[var(--text-subtle)] focus:outline-none"
+            className="max-h-40 min-h-[38px] min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-[var(--text)] placeholder:text-[var(--text-subtle)] focus:outline-none"
           />
           <Button
             type="submit"

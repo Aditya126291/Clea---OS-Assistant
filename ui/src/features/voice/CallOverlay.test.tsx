@@ -9,7 +9,12 @@ import { DevVoiceMockPanel } from "./DevVoiceMockPanel";
 
 describe("CallOverlay", () => {
   beforeEach(() => {
-    useCleaStore.setState({ callOverlayOpen: true, voiceState: "idle" });
+    useCleaStore.setState({
+      callOverlayOpen: true,
+      voiceState: "idle",
+      voiceError: null,
+      tasks: [],
+    });
   });
 
   it("renders all voice_state events and resets on End Call", () => {
@@ -246,27 +251,39 @@ describe("CallOverlay", () => {
 
   it("sanitizes <script> tags, on* attributes, and javascript: URIs while keeping SVG filters and animations", () => {
     const untrustedSvg = [
-      '<svg viewBox="0 0 100 100" width="100" height="100" onload="alert(1)">',
+      '<svg/onload="alert(1)" viewBox="0 0 100 100" width="100" height="100">',
       "<style>@keyframes glitch { 0% { opacity: 1; } }</style>",
       '<filter id="fR"><feColorMatrix type="matrix"/></filter>',
-      "<script>window.pwned = true;</script>",
-      '<circle cx="50" cy="50" r="40" onclick="evil()" onmouseover=\'evil2()\' />',
+      "<script>window.pwned = true;</script >",
+      "<scr<script></script>ipt>window.nested = true;</script>",
+      '<circle id="c"onclick="evil()" onmouseover=\'evil2()\' cx="50" cy="50" r="40" />',
       '<use href="javascript:alert(2)" xlink:href="#art" />',
+      '<use href="&#106;avascript:alert(3)" xlink:href="java&#x09;script:alert(4)" />',
+      '<set attributeName="onload" to="alert(5)" />',
+      '<animate attributeName="xlink:href" to="javascript:alert(6)" />',
       "</svg>",
     ].join("");
 
     const cleaned = sanitizeSvg(untrustedSvg);
     expect(cleaned).not.toContain("<script");
+    expect(cleaned).not.toContain("window.pwned");
+    expect(cleaned).not.toContain("window.nested");
     expect(cleaned).not.toContain("onload=");
     expect(cleaned).not.toContain("onclick=");
     expect(cleaned).not.toContain("onmouseover=");
     expect(cleaned).not.toContain("javascript:");
+    expect(cleaned).not.toContain("&#106;avascript:");
+    expect(cleaned).not.toContain("alert(");
     expect(cleaned).toContain("@keyframes glitch");
     expect(cleaned).toContain('<filter id="fR">');
     expect(cleaned).toContain('width="100%" height="100%"');
 
     const { container } = render(<CleaAvatar svgMarkup={untrustedSvg} />);
     expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("set")).toBeNull();
+    expect(container.querySelector("animate")).toBeNull();
+    expect(container.querySelector("svg")?.getAttribute("onload")).toBeNull();
+    expect(container.querySelector("circle")?.getAttribute("onclick")).toBeNull();
     expect(container.querySelector("filter#fR")).not.toBeNull();
   });
 

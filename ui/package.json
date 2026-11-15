@@ -6,7 +6,7 @@
   "main": "./out/main/main.js",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && electron-vite build",
     "preview": "vite preview",
     "desktop:dev": "electron-vite dev",
     "desktop:build": "tsc -b tsconfig.electron.json && electron-vite build",
