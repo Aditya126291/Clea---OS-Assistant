@@ -556,9 +556,145 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                         "minimum": 1,
                         "maximum": 100000,
                         "description": "Maximum characters to return (default 8000).",
-                    }
+                    },
+                    "include_history": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to include recent clipboard history items (default false)."
+                        ),
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": (
+                            "Maximum history items to inspect when include_history is true "
+                            "(default 10)."
+                        ),
+                    },
                 },
                 "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="select_clipboard_item",
+            description=(
+                "Restore a specific item from Windows clipboard history by zero-based index "
+                "onto the active clipboard."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Zero-based index of the clipboard history item to restore."
+                        ),
+                    },
+                },
+                "required": ["index"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="open_url",
+            description=(
+                "Validate and open an http/https URL or common site shorthand (e.g. 'github', "
+                "'youtube', 'docs') in the default or specified browser."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Web URL (http:// or https://) or site shorthand to open.",
+                    },
+                    "browser": {
+                        "type": "string",
+                        "description": (
+                            "Optional browser name or executable (e.g., 'chrome', 'edge', "
+                            "'firefox')."
+                        ),
+                    },
+                },
+                "required": ["url"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="control_system",
+            description=(
+                "Control Windows display brightness, window state (minimize/maximize/restore/"
+                "close), screen lock, or open allowlisted Windows Settings pages."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "get_brightness",
+                            "set_brightness",
+                            "step_brightness",
+                            "brightness_up",
+                            "brightness_down",
+                            "minimize_window",
+                            "maximize_window",
+                            "restore_window",
+                            "close_window",
+                            "lock_screen",
+                            "open_settings",
+                        ],
+                        "description": "System control action to perform.",
+                    },
+                    "level": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": (
+                            "Target brightness level (0-100); required when action is "
+                            "'set_brightness'."
+                        ),
+                    },
+                    "step": {
+                        "type": "integer",
+                        "description": (
+                            "Relative brightness step increment/decrement; used with "
+                            "'step_brightness'."
+                        ),
+                    },
+                    "window_action": {
+                        "type": "string",
+                        "enum": ["minimize", "maximize", "restore", "close"],
+                        "description": "Optional window action when action is window-related.",
+                    },
+                    "window_title": {
+                        "type": "string",
+                        "description": "Window title or substring to target for window actions.",
+                    },
+                    "hwnd": {
+                        "type": "integer",
+                        "description": "Optional window handle (HWND) for window actions.",
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Optional application name to target for window actions.",
+                    },
+                    "page": {
+                        "type": "string",
+                        "description": (
+                            "Windows Settings sub-page (e.g. 'display', 'sound', 'network', "
+                            "'appsfeatures', 'windowsupdate') when action is 'open_settings'."
+                        ),
+                    },
+                    "uri": {
+                        "type": "string",
+                        "description": "Direct ms-settings: URI when action is 'open_settings'.",
+                    },
+                },
+                "required": ["action"],
             },
             behavior="non_blocking",
         ),

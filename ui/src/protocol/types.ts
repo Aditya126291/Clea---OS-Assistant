@@ -128,12 +128,19 @@ import type {
   VoiceStatusResult,
   VoiceTrigger,
   MediaVolumeAction,
+  ClipboardItem,
   OsOpenOrFocusAppParams,
   OsOpenOrFocusAppResult,
   OsControlMediaVolumeParams,
   OsControlMediaVolumeResult,
   OsReadClipboardParams,
   OsReadClipboardResult,
+  OsSelectClipboardItemParams,
+  OsSelectClipboardItemResult,
+  OsOpenUrlParams,
+  OsOpenUrlResult,
+  OsControlSystemParams,
+  OsControlSystemResult,
   OsWriteClipboardParams,
   OsWriteClipboardResult,
   GitWorktreeItem,
@@ -272,12 +279,19 @@ export type {
   VoiceStatusResult,
   VoiceTrigger,
   MediaVolumeAction,
+  ClipboardItem,
   OsOpenOrFocusAppParams,
   OsOpenOrFocusAppResult,
   OsControlMediaVolumeParams,
   OsControlMediaVolumeResult,
   OsReadClipboardParams,
   OsReadClipboardResult,
+  OsSelectClipboardItemParams,
+  OsSelectClipboardItemResult,
+  OsOpenUrlParams,
+  OsOpenUrlResult,
+  OsControlSystemParams,
+  OsControlSystemResult,
   OsWriteClipboardParams,
   OsWriteClipboardResult,
   GitWorktreeItem,
@@ -339,6 +353,9 @@ export interface MethodParamsMap {
   "os.open_or_focus_app": OsOpenOrFocusAppParams;
   "os.control_media_volume": OsControlMediaVolumeParams;
   "os.read_clipboard": OsReadClipboardParams;
+  "os.select_clipboard_item": OsSelectClipboardItemParams;
+  "os.open_url": OsOpenUrlParams;
+  "os.control_system": OsControlSystemParams;
   "os.write_clipboard": OsWriteClipboardParams;
   "workspace.git_inspect": WorkspaceGitInspectParams;
 }
@@ -394,6 +411,9 @@ export interface MethodResultMap {
   "os.open_or_focus_app": OsOpenOrFocusAppResult;
   "os.control_media_volume": OsControlMediaVolumeResult;
   "os.read_clipboard": OsReadClipboardResult;
+  "os.select_clipboard_item": OsSelectClipboardItemResult;
+  "os.open_url": OsOpenUrlResult;
+  "os.control_system": OsControlSystemResult;
   "os.write_clipboard": OsWriteClipboardResult;
   "workspace.git_inspect": WorkspaceGitInspectResult;
 }

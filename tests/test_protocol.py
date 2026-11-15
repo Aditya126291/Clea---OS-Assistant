@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -23,15 +25,26 @@ from clea.core.protocol import (
     CallStartedEvent,
     ChatSendParams,
     ChatSendRequest,
+    ClipboardItem,
     DevEmitSampleTaskRequest,
     MemoryEpisodesRequest,
     MemoryForgetRequest,
     OsControlMediaVolumeParams,
     OsControlMediaVolumeRequest,
+    OsControlSystemParams,
+    OsControlSystemRequest,
+    OsControlSystemResult,
     OsOpenOrFocusAppParams,
     OsOpenOrFocusAppRequest,
+    OsOpenUrlParams,
+    OsOpenUrlRequest,
+    OsOpenUrlResult,
     OsReadClipboardParams,
     OsReadClipboardRequest,
+    OsReadClipboardResult,
+    OsSelectClipboardItemParams,
+    OsSelectClipboardItemRequest,
+    OsSelectClipboardItemResult,
     OsWriteClipboardParams,
     OsWriteClipboardRequest,
     ResponseFrame,
@@ -221,6 +234,9 @@ def test_every_method_has_a_result_model() -> None:
             ("os.open_or_focus_app", {"app_name": "vscode"}),
             ("os.control_media_volume", {"action": "mute"}),
             ("os.read_clipboard", {}),
+            ("os.select_clipboard_item", {"index": 0}),
+            ("os.open_url", {"url": "https://example.com"}),
+            ("os.control_system", {"action": "lock"}),
             ("os.write_clipboard", {"text": "hello"}),
             ("workspace.git_inspect", {}),
         ]
@@ -234,7 +250,19 @@ def test_windows_os_and_git_protocol_roundtrip() -> None:
         OsControlMediaVolumeRequest(
             params=OsControlMediaVolumeParams(action="set_volume", level=42)
         ),
-        OsReadClipboardRequest(params=OsReadClipboardParams(max_chars=512)),
+        OsReadClipboardRequest(
+            params=OsReadClipboardParams(
+                max_chars=512,
+                include_history=True,
+                max_items=5,
+                include_image_bytes=True,
+            )
+        ),
+        OsSelectClipboardItemRequest(params=OsSelectClipboardItemParams(index=2)),
+        OsOpenUrlRequest(params=OsOpenUrlParams(url="https://example.com", browser="chrome")),
+        OsControlSystemRequest(
+            params=OsControlSystemParams(action="set_brightness", level=75, step=5)
+        ),
         OsWriteClipboardRequest(params=OsWriteClipboardParams(text="copied snippet")),
         WorkspaceGitInspectRequest(
             params=WorkspaceGitInspectParams(include_diff=True, diff_stat_only=False)
@@ -252,6 +280,21 @@ def test_windows_os_and_git_protocol_roundtrip() -> None:
 
     with pytest.raises(ValidationError):
         OsReadClipboardParams(max_chars=0)
+
+    with pytest.raises(ValidationError):
+        OsReadClipboardParams(max_items=0)
+
+    with pytest.raises(ValidationError):
+        OsReadClipboardParams(max_items=101)
+
+    with pytest.raises(ValidationError):
+        OsSelectClipboardItemParams(index=-1)
+
+    with pytest.raises(ValidationError):
+        OsControlSystemParams(action="set_brightness", level=101)
+
+    with pytest.raises(ValidationError):
+        OsControlSystemParams(action="set_brightness", level=-1)
 
 
 def test_risk_tiers_match_registry_risk_levels() -> None:
@@ -446,3 +489,541 @@ def test_memory_forget_request_and_result() -> None:
     assert res.ok is True
     assert res.removed_count == 1
     assert res.removed_ids == ["pref-1"]
+
+
+def test_clipboard_history_protocol_models() -> None:
+    # Default params
+    params_default = OsReadClipboardParams()
+    assert params_default.max_chars == 8000
+    assert params_default.include_history is False
+    assert params_default.max_items == 10
+    assert params_default.include_image_bytes is False
+
+    # Custom params
+    req = OsReadClipboardRequest(
+        params=OsReadClipboardParams(
+            max_chars=4000,
+            include_history=True,
+            max_items=25,
+            include_image_bytes=True,
+        )
+    )
+    raw = req.model_dump_json()
+    parsed = parse_frame(raw)
+    assert isinstance(parsed, OsReadClipboardRequest)
+    assert parsed.params.include_history is True
+    assert parsed.params.max_items == 25
+    assert parsed.params.include_image_bytes is True
+
+    # Result with history and image item
+    item = ClipboardItem(
+        index=0,
+        id="hist-001",
+        timestamp="2026-11-15T10:00:00Z",
+        kind="image",
+        text="Screenshot preview",
+        width=1920,
+        height=1080,
+        format="png",
+        image_bytes_base64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        size_bytes=68,
+    )
+    result = OsReadClipboardResult(
+        ok=True,
+        text="",
+        history_enabled=True,
+        total_items=1,
+        items=[item],
+    )
+    result_raw = result.model_dump_json()
+    parsed_result = OsReadClipboardResult.model_validate_json(result_raw)
+    assert parsed_result.history_enabled is True
+    assert parsed_result.total_items == 1
+    assert len(parsed_result.items) == 1
+    assert parsed_result.items[0].kind == "image"
+    assert parsed_result.items[0].width == 1920
+    assert parsed_result.items[0].size_bytes == 68
+
+    # Also test image item with text=None and image dictionary
+    item_none_text = ClipboardItem(
+        index=1,
+        id="hist-002",
+        kind="image",
+        text=None,
+        image={"width": 100, "height": 100, "format": "png", "bytes": "abc"},
+    )
+    assert item_none_text.text is None or item_none_text.text == ""
+    assert item_none_text.image == {"width": 100, "height": 100, "format": "png", "bytes": "abc"}
+
+    # Also test text item with image=None
+    item_text_none_img = ClipboardItem(
+        index=2,
+        id="hist-003",
+        kind="text",
+        text="plain text",
+        image=None,
+    )
+    assert item_text_none_img.image is None
+    assert item_text_none_img.text == "plain text"
+
+
+def test_select_clipboard_item_protocol_models() -> None:
+    req = OsSelectClipboardItemRequest(params=OsSelectClipboardItemParams(index=4))
+    raw = req.model_dump_json()
+    parsed = parse_frame(raw)
+    assert isinstance(parsed, OsSelectClipboardItemRequest)
+    assert parsed.method == "os.select_clipboard_item"
+    assert parsed.params.index == 4
+
+    # Validation
+    with pytest.raises(ValidationError):
+        OsSelectClipboardItemParams(index=-1)
+
+    # Result model
+    assert "os.select_clipboard_item" in METHOD_RESULTS
+    res = METHOD_RESULTS["os.select_clipboard_item"](
+        ok=True, success=True, status="selected", index=4, item_id="hist-004"
+    )
+    assert isinstance(res, OsSelectClipboardItemResult)
+    assert res.ok is True
+    assert res.success is True
+    assert res.status == "selected"
+    assert res.index == 4
+
+
+def test_open_url_protocol_models() -> None:
+    req = OsOpenUrlRequest(
+        params=OsOpenUrlParams(url="https://github.com/project", browser="chrome")
+    )
+    raw = req.model_dump_json()
+    parsed = parse_frame(raw)
+    assert isinstance(parsed, OsOpenUrlRequest)
+    assert parsed.method == "os.open_url"
+    assert parsed.params.url == "https://github.com/project"
+    assert parsed.params.browser == "chrome"
+
+    # Result model
+    assert "os.open_url" in METHOD_RESULTS
+    res = METHOD_RESULTS["os.open_url"](
+        ok=True,
+        success=True,
+        status="opened",
+        url="https://github.com/project",
+        browser="chrome",
+    )
+    assert isinstance(res, OsOpenUrlResult)
+    assert res.ok is True
+    assert res.url == "https://github.com/project"
+    assert res.browser == "chrome"
+
+
+def test_control_system_protocol_models() -> None:
+    # Brightness control
+    req_bright = OsControlSystemRequest(
+        params=OsControlSystemParams(action="set_brightness", level=80, step=10)
+    )
+    parsed_bright = parse_frame(req_bright.model_dump_json())
+    assert isinstance(parsed_bright, OsControlSystemRequest)
+    assert parsed_bright.params.action == "set_brightness"
+    assert parsed_bright.params.level == 80
+
+    # Window control
+    req_win = OsControlSystemRequest(
+        params=OsControlSystemParams(
+            action="minimize_window",
+            window_action="minimize",
+            window_title="Visual Studio Code",
+            hwnd=65538,
+        )
+    )
+    parsed_win = parse_frame(req_win.model_dump_json())
+    assert isinstance(parsed_win, OsControlSystemRequest)
+    assert parsed_win.params.hwnd == 65538
+
+    # Title alias
+    req_title_alias = OsControlSystemRequest(
+        params=OsControlSystemParams(action="minimize", title="Notepad")
+    )
+    assert req_title_alias.params.title == "Notepad"
+
+    # Screen lock
+    req_lock = OsControlSystemRequest(params=OsControlSystemParams(action="lock"))
+    parsed_lock = parse_frame(req_lock.model_dump_json())
+    assert isinstance(parsed_lock, OsControlSystemRequest)
+    assert parsed_lock.params.action == "lock"
+
+    # Settings navigation
+    req_set = OsControlSystemRequest(
+        params=OsControlSystemParams(
+            action="open_settings", page="display", uri="ms-settings:display"
+        )
+    )
+    parsed_set = parse_frame(req_set.model_dump_json())
+    assert isinstance(parsed_set, OsControlSystemRequest)
+    assert parsed_set.params.page == "display"
+
+    # Validation
+    with pytest.raises(ValidationError):
+        OsControlSystemParams(action="set_brightness", level=101)
+
+    with pytest.raises(ValidationError):
+        OsControlSystemParams(action="set_brightness", level=-1)
+
+    # Result model
+    assert "os.control_system" in METHOD_RESULTS
+    res = METHOD_RESULTS["os.control_system"](
+        ok=True,
+        success=True,
+        action="set_brightness",
+        status="success",
+        level=80,
+        current_brightness=80,
+    )
+    assert isinstance(res, OsControlSystemResult)
+    assert res.ok is True
+    assert res.action == "set_brightness"
+    assert res.level == 80
+
+
+@pytest.mark.asyncio
+async def test_daemon_windows_os_rpc_handlers(tmp_path: Path) -> None:
+    from clea.core.daemon import CleaDaemon, _Connection
+
+    mock_agent = MagicMock()
+    mock_agent.memory.base_dir = tmp_path
+    mock_agent.memory.resolve_session_id.side_effect = lambda sid: sid
+    mock_agent.provider.provider_name = "test"
+    mock_agent.provider.model_name = "test-model"
+    mock_agent.registry.list_definitions.return_value = []
+
+    daemon = CleaDaemon(
+        agent=mock_agent,
+        token="test-token",
+        token_file=tmp_path / "token",
+        lock_file=tmp_path / "lock",
+    )
+
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    conn = _Connection(ws)
+
+    # 1. os.read_clipboard
+    clipboard_mock_data = {
+        "ok": True,
+        "text": "test content",
+        "truncated": False,
+        "char_count": 12,
+        "total_chars": 12,
+        "history_enabled": True,
+        "total_items": 1,
+        "items": [
+            {
+                "index": 0,
+                "id": "item-1",
+                "timestamp": "2026-11-15T10:00:00Z",
+                "kind": "text",
+                "text": "test content",
+            }
+        ],
+    }
+    with patch("clea.core.daemon.read_clipboard", return_value=clipboard_mock_data) as mock_read:
+        req = OsReadClipboardRequest(
+            params=OsReadClipboardParams(
+                max_chars=4000,
+                include_history=True,
+                max_items=5,
+                include_image_bytes=True,
+            )
+        )
+        await daemon._dispatch_request(conn, req)
+        mock_read.assert_called_once_with(
+            max_chars=4000,
+            include_history=True,
+            max_items=5,
+            include_image_bytes=True,
+        )
+        payload = json.loads(ws.send.call_args[0][0])
+        assert payload["id"] == req.id
+        assert payload["ok"] is True
+        assert payload["result"]["history_enabled"] is True
+        assert payload["result"]["total_items"] == 1
+        assert len(payload["result"]["items"]) == 1
+
+    # 2. os.select_clipboard_item
+    select_mock_data = {
+        "ok": True,
+        "success": True,
+        "status": "selected",
+        "index": 3,
+        "item_id": "hist-3",
+    }
+    with patch("clea.core.daemon.select_clipboard_item", return_value=select_mock_data) as mock_sel:
+        req_sel = OsSelectClipboardItemRequest(params=OsSelectClipboardItemParams(index=3))
+        await daemon._dispatch_request(conn, req_sel)
+        mock_sel.assert_called_once_with(3)
+        payload_sel = json.loads(ws.send.call_args[0][0])
+        assert payload_sel["id"] == req_sel.id
+        assert payload_sel["ok"] is True
+        assert payload_sel["result"]["success"] is True
+        assert payload_sel["result"]["index"] == 3
+
+    # 3. os.open_url
+    url_mock_data = {
+        "ok": True,
+        "success": True,
+        "status": "opened",
+        "url": "https://example.org",
+        "browser": "edge",
+    }
+    with patch("clea.core.daemon.open_url", return_value=url_mock_data) as mock_url:
+        req_url = OsOpenUrlRequest(
+            params=OsOpenUrlParams(url="https://example.org", browser="edge")
+        )
+        await daemon._dispatch_request(conn, req_url)
+        mock_url.assert_called_once_with("https://example.org", "edge")
+        payload_url = json.loads(ws.send.call_args[0][0])
+        assert payload_url["id"] == req_url.id
+        assert payload_url["ok"] is True
+        assert payload_url["result"]["url"] == "https://example.org"
+        assert payload_url["result"]["browser"] == "edge"
+
+    # 4. os.control_system
+    ctrl_mock_data = {
+        "ok": True,
+        "success": True,
+        "action": "set_brightness",
+        "status": "success",
+        "level": 90,
+    }
+    with patch("clea.core.daemon.control_system", return_value=ctrl_mock_data) as mock_ctrl:
+        req_ctrl = OsControlSystemRequest(
+            params=OsControlSystemParams(action="set_brightness", level=90)
+        )
+        await daemon._dispatch_request(conn, req_ctrl)
+        mock_ctrl.assert_called_once_with("set_brightness", level=90)
+        payload_ctrl = json.loads(ws.send.call_args[0][0])
+        assert payload_ctrl["id"] == req_ctrl.id
+        assert payload_ctrl["ok"] is True
+        assert payload_ctrl["result"]["action"] == "set_brightness"
+        assert payload_ctrl["result"]["level"] == 90
+
+
+@pytest.mark.asyncio
+async def test_daemon_windows_os_rpc_error_handling(tmp_path: Path) -> None:
+    from clea.core.daemon import CleaDaemon, _Connection
+
+    mock_agent = MagicMock()
+    mock_agent.memory.base_dir = tmp_path
+    mock_agent.memory.resolve_session_id.side_effect = lambda sid: sid
+    mock_agent.provider.provider_name = "test"
+    mock_agent.provider.model_name = "test-model"
+    mock_agent.registry.list_definitions.return_value = []
+
+    daemon = CleaDaemon(
+        agent=mock_agent,
+        token="test-token",
+        token_file=tmp_path / "token",
+        lock_file=tmp_path / "lock",
+    )
+
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    conn = _Connection(ws)
+
+    # Tool raises ValueError
+    with patch(
+        "clea.core.daemon.open_url",
+        side_effect=ValueError("Invalid URL scheme 'ftp': only http/https allowed."),
+    ):
+        req = OsOpenUrlRequest(params=OsOpenUrlParams(url="ftp://malicious.com"))
+        await daemon._dispatch_request(conn, req)
+        payload = json.loads(ws.send.call_args[0][0])
+        assert payload["id"] == req.id
+        assert payload["ok"] is False
+        assert "Invalid URL scheme 'ftp'" in payload["error"]
+
+    # Tool raises TypeError (e.g. unexpected keyword argument)
+    with patch(
+        "clea.core.daemon.control_system",
+        side_effect=TypeError("control_system() got an unexpected keyword argument 'unknown_arg'"),
+    ):
+        req_ctrl = OsControlSystemRequest(
+            params=OsControlSystemParams(action="minimize", window_title="Notepad")
+        )
+        await daemon._dispatch_request(conn, req_ctrl)
+        payload_ctrl = json.loads(ws.send.call_args[0][0])
+        assert payload_ctrl["id"] == req_ctrl.id
+        assert payload_ctrl["ok"] is False
+        assert "unexpected keyword argument" in payload_ctrl["error"]
+
+
+@pytest.mark.asyncio
+async def test_daemon_windows_os_clipboard_history_real_items(tmp_path: Path) -> None:
+    from clea.core.daemon import CleaDaemon, _Connection
+
+    mock_agent = MagicMock()
+    mock_agent.memory.base_dir = tmp_path
+    mock_agent.memory.resolve_session_id.side_effect = lambda sid: sid
+    mock_agent.provider.provider_name = "test"
+    mock_agent.provider.model_name = "test-model"
+    mock_agent.registry.list_definitions.return_value = []
+
+    daemon = CleaDaemon(
+        agent=mock_agent,
+        token="test-token",
+        token_file=tmp_path / "token",
+        lock_file=tmp_path / "lock",
+    )
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    conn = _Connection(ws)
+
+    # Real windows_os.py clipboard history structure with text and image items
+    real_clipboard_history = {
+        "ok": True,
+        "text": "first text item",
+        "truncated": False,
+        "char_count": 15,
+        "total_chars": 15,
+        "history_enabled": True,
+        "total_items": 2,
+        "items": [
+            {
+                "index": 0,
+                "id": "{A1B2C3D4-0001}",
+                "timestamp": "2026-11-15T10:00:00.000Z",
+                "kind": "text",
+                "text": "first text item",
+                "truncated": False,
+                "image": None,
+            },
+            {
+                "index": 1,
+                "id": "{A1B2C3D4-0002}",
+                "timestamp": "2026-11-15T10:01:00.000Z",
+                "kind": "image",
+                "text": None,
+                "truncated": False,
+                "image": {
+                    "width": 640,
+                    "height": 480,
+                    "format": "png",
+                    "bytes": "iVBORw0KGgoAAAANSUhEUgAAAA==",
+                },
+            },
+        ],
+    }
+
+    with patch("clea.core.daemon.read_clipboard", return_value=real_clipboard_history):
+        req = OsReadClipboardRequest(
+            params=OsReadClipboardParams(include_history=True, max_items=10)
+        )
+        await daemon._dispatch_request(conn, req)
+
+    payload = json.loads(ws.send.call_args[0][0])
+    assert payload["id"] == req.id
+    assert payload["ok"] is True
+    result = payload["result"]
+    assert result["history_enabled"] is True
+    assert result["total_items"] == 2
+    items = result["items"]
+    assert len(items) == 2
+
+    # Item 0: text item
+    assert items[0]["kind"] == "text"
+    assert items[0]["text"] == "first text item"
+    assert items[0]["image"] is None
+
+    # Item 1: image item
+    assert items[1]["kind"] == "image"
+    assert items[1]["text"] == ""
+    assert items[1]["width"] == 640
+    assert items[1]["height"] == 480
+    assert items[1]["format"] == "png"
+    assert items[1]["image_bytes_base64"] == "iVBORw0KGgoAAAANSUhEUgAAAA=="
+    assert items[1]["image"]["width"] == 640
+
+
+@pytest.mark.asyncio
+async def test_daemon_windows_os_control_system_window_actions(tmp_path: Path) -> None:
+    from clea.core.daemon import CleaDaemon, _Connection
+
+    mock_agent = MagicMock()
+    mock_agent.memory.base_dir = tmp_path
+    mock_agent.memory.resolve_session_id.side_effect = lambda sid: sid
+    mock_agent.provider.provider_name = "test"
+    mock_agent.provider.model_name = "test-model"
+    mock_agent.registry.list_definitions.return_value = []
+
+    daemon = CleaDaemon(
+        agent=mock_agent,
+        token="test-token",
+        token_file=tmp_path / "token",
+        lock_file=tmp_path / "lock",
+    )
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    conn = _Connection(ws)
+
+    # 1. Dispatch with window_title="Notepad" and action="minimize"
+    with patch(
+        "clea.core.daemon.control_system",
+        return_value={"ok": True, "success": True, "action": "minimize_window", "hwnd": 12345},
+    ) as mock_ctrl:
+        req = OsControlSystemRequest(
+            params=OsControlSystemParams(action="minimize", window_title="Notepad")
+        )
+        await daemon._dispatch_request(conn, req)
+
+        # control_system should be called with action and title
+        assert mock_ctrl.call_count == 1
+        call_args, call_kwargs = mock_ctrl.call_args
+        assert call_args[0] == "minimize"
+        assert call_kwargs.get("title") == "Notepad"
+
+        payload = json.loads(ws.send.call_args[0][0])
+        assert payload["id"] == req.id
+        assert payload["ok"] is True
+        assert payload["result"]["window_title"] == "Notepad"
+
+    # 2. Dispatch with action="window", window_action="minimize", window_title="Notepad"
+    with patch(
+        "clea.core.daemon.control_system",
+        return_value={"ok": True, "success": True, "action": "minimize_window", "hwnd": 12345},
+    ) as mock_ctrl:
+        req = OsControlSystemRequest(
+            params=OsControlSystemParams(
+                action="window", window_action="minimize", window_title="Notepad"
+            )
+        )
+        await daemon._dispatch_request(conn, req)
+
+        assert mock_ctrl.call_count == 1
+        call_args, call_kwargs = mock_ctrl.call_args
+        assert call_args[0] == "minimize"
+        assert call_kwargs.get("title") == "Notepad"
+
+        payload = json.loads(ws.send.call_args[0][0])
+        assert payload["id"] == req.id
+        assert payload["ok"] is True
+
+    # 3. Dispatch with title="Notepad" (alias)
+    with patch(
+        "clea.core.daemon.control_system",
+        return_value={"ok": True, "success": True, "action": "minimize_window", "hwnd": 12345},
+    ) as mock_ctrl:
+        req = OsControlSystemRequest(
+            params=OsControlSystemParams(action="minimize_window", title="Notepad")
+        )
+        await daemon._dispatch_request(conn, req)
+
+        assert mock_ctrl.call_count == 1
+        call_args, call_kwargs = mock_ctrl.call_args
+        assert call_args[0] == "minimize_window"
+        assert call_kwargs.get("title") == "Notepad"
+
+        payload = json.loads(ws.send.call_args[0][0])
+        assert payload["id"] == req.id
+        assert payload["ok"] is True
+        assert payload["result"]["window_title"] == "Notepad"
+

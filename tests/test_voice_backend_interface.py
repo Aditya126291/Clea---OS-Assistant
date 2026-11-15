@@ -47,6 +47,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 VOICE_SURFACE_DIR = REPO_ROOT / "src" / "clea" / "surfaces" / "voice"
 
 
+@pytest.fixture(autouse=True)
+def _sandbox_clea_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+
+
 def test_voice_backend_is_abstract() -> None:
     with pytest.raises(TypeError):
         VoiceBackend()  # type: ignore[abstract]
@@ -80,6 +85,9 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "read_clipboard",
         "write_clipboard",
         "inspect_git_workspace",
+        "select_clipboard_item",
+        "open_url",
+        "control_system",
     }
     for tool in tools:
         assert tool.behavior == "non_blocking"
@@ -133,8 +141,90 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "previous_track",
     ]
     assert by_name["read_clipboard"].parameters_schema.get("required", []) == []
+    assert "include_history" in by_name["read_clipboard"].parameters_schema["properties"]
+    assert "max_items" in by_name["read_clipboard"].parameters_schema["properties"]
     assert by_name["write_clipboard"].parameters_schema["required"] == ["text"]
     assert by_name["inspect_git_workspace"].parameters_schema.get("required", []) == []
+
+    assert by_name["select_clipboard_item"].parameters_schema["required"] == ["index"]
+    assert (
+        by_name["select_clipboard_item"].parameters_schema["properties"]["index"]["type"]
+        == "integer"
+    )
+    assert (
+        by_name["select_clipboard_item"].parameters_schema["properties"]["index"]["minimum"]
+        == 0
+    )
+
+    assert by_name["open_url"].parameters_schema["required"] == ["url"]
+    assert by_name["open_url"].parameters_schema["properties"]["url"]["type"] == "string"
+    assert "browser" in by_name["open_url"].parameters_schema["properties"]
+
+    assert by_name["control_system"].parameters_schema["required"] == ["action"]
+    cs_actions = by_name["control_system"].parameters_schema["properties"]["action"]["enum"]
+    for expected_action in (
+        "get_brightness",
+        "set_brightness",
+        "step_brightness",
+        "brightness_up",
+        "brightness_down",
+        "minimize_window",
+        "maximize_window",
+        "restore_window",
+        "close_window",
+        "lock_screen",
+        "open_settings",
+    ):
+        assert expected_action in cs_actions
+    assert (
+        by_name["control_system"].parameters_schema["properties"]["level"]["minimum"] == 0
+    )
+    assert (
+        by_name["control_system"].parameters_schema["properties"]["level"]["maximum"] == 100
+    )
+
+
+def test_new_windows_os_voice_tools_registration_and_schemas() -> None:
+    tools = {t.name: t for t in default_voice_tools()}
+
+    # 1. select_clipboard_item
+    assert "select_clipboard_item" in tools
+    sel_tool = tools["select_clipboard_item"]
+    assert sel_tool.behavior == "non_blocking"
+    assert "clipboard history" in sel_tool.description
+    assert sel_tool.parameters_schema["type"] == "object"
+    assert sel_tool.parameters_schema["required"] == ["index"]
+    assert sel_tool.parameters_schema["properties"]["index"]["type"] == "integer"
+    assert sel_tool.parameters_schema["properties"]["index"]["minimum"] == 0
+
+    # 2. open_url
+    assert "open_url" in tools
+    url_tool = tools["open_url"]
+    assert url_tool.behavior == "non_blocking"
+    assert "browser" in url_tool.description
+    assert url_tool.parameters_schema["type"] == "object"
+    assert url_tool.parameters_schema["required"] == ["url"]
+    assert url_tool.parameters_schema["properties"]["url"]["type"] == "string"
+    assert url_tool.parameters_schema["properties"]["browser"]["type"] == "string"
+
+    # 3. control_system
+    assert "control_system" in tools
+    sys_tool = tools["control_system"]
+    assert sys_tool.behavior == "non_blocking"
+    assert "brightness" in sys_tool.description
+    assert sys_tool.parameters_schema["type"] == "object"
+    assert sys_tool.parameters_schema["required"] == ["action"]
+    sys_props = sys_tool.parameters_schema["properties"]
+    assert "get_brightness" in sys_props["action"]["enum"]
+    assert "set_brightness" in sys_props["action"]["enum"]
+    assert "lock_screen" in sys_props["action"]["enum"]
+    assert "open_settings" in sys_props["action"]["enum"]
+    assert sys_props["level"]["minimum"] == 0
+    assert sys_props["level"]["maximum"] == 100
+    assert "page" in sys_props
+    assert "uri" in sys_props
+    assert "window_action" in sys_props
+    assert "window_title" in sys_props
 
 
 def test_voice_session_config_defaults_and_language_code_omitted() -> None:

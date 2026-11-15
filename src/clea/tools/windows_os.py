@@ -13,6 +13,7 @@ import ctypes
 import difflib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -116,6 +117,8 @@ _SITE_SHORTCUTS: dict[str, str] = {
     "twitter": "https://x.com",
     "x": "https://x.com",
     "gmail": "https://mail.google.com",
+    "mail": "https://mail.google.com",
+    "docs": "https://docs.google.com",
     "chatgpt": "https://chatgpt.com",
     "wikipedia": "https://www.wikipedia.org",
 }
@@ -138,6 +141,8 @@ VALID_SYSTEM_ACTIONS: tuple[str, ...] = (
     "lock",
     "open_settings",
     "settings",
+    "window",
+    "window_action",
 )
 
 VALID_MEDIA_VOLUME_ACTIONS: tuple[str, ...] = (
@@ -695,6 +700,33 @@ _INSTALLED_APPS_CACHE_TIME: float = 0.0
 _APP_CACHE_TTL: float = 300.0  # 5 minutes
 
 
+def _is_disallowed_shell_app(name: str, appid: str) -> bool:
+    """Return True if an application is a disallowed shell binary or script interpreter."""
+    low_name = name.strip().lower()
+    low_appid = appid.strip().lower()
+
+    # If AppID contains a file path, inspect only the executable filename and stem
+    if "\\" in low_appid or "/" in low_appid:
+        raw_target = low_appid.strip('"')
+        exe_name = Path(raw_target).name.lower()
+        if (
+            exe_name in _DISALLOWED_SHELL_BINARIES
+            or Path(exe_name).stem.lower() in _DISALLOWED_SHELL_BINARIES
+        ):
+            return True
+    else:
+        if low_appid in _DISALLOWED_SHELL_BINARIES:
+            return True
+
+    # Check whole-word / isolated token matches on app name (e.g. 'cmd', 'powershell', 'bash')
+    for dis in _DISALLOWED_SHELL_BINARIES:
+        pattern = rf"\b{re.escape(dis)}(\.exe)?\b"
+        if re.search(pattern, low_name):
+            return True
+
+    return False
+
+
 def get_installed_apps(
     *,
     force_refresh: bool = False,
@@ -747,9 +779,7 @@ def get_installed_apps(
             name = str(item["Name"]).strip()
             appid = str(item["AppID"]).strip()
             if name and appid:
-                low_name = name.lower()
-                low_appid = appid.lower()
-                if any(dis in low_name or dis in low_appid for dis in _DISALLOWED_SHELL_BINARIES):
+                if _is_disallowed_shell_app(name, appid):
                     continue
                 cleaned.append({"Name": name, "AppID": appid})
 
@@ -1126,7 +1156,24 @@ def _open_clipboard(user32: Any, *, retries: int = 5, retry_delay: float = 0.02)
             user32.CloseClipboard()
 
 
-_POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT = r"""
+_WINRT_CLIPBOARD_TYPE = (
+    "[Windows.ApplicationModel.DataTransfer.Clipboard, "
+    "Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]"
+)
+_WINRT_CLIPBOARD_RESULT_TYPE = (
+    "[Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult, "
+    "Windows.ApplicationModel, ContentType = WindowsRuntime]"
+)
+_WINRT_STREAM_REF_TYPE = (
+    "[Windows.Storage.Streams.RandomAccessStreamReference, "
+    "Windows.Storage.Streams, ContentType = WindowsRuntime]"
+)
+_WINRT_STREAM_TYPE = (
+    "[Windows.Storage.Streams.IRandomAccessStreamWithContentType, "
+    "Windows.Storage.Streams, ContentType = WindowsRuntime]"
+)
+
+_POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT_TEMPLATE = r"""
 param(
     [int]$MaxItems = 10,
     [int]$MaxChars = 8000,
@@ -1138,38 +1185,39 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 Add-Type -AssemblyName System.Drawing
 
-function Await-AsyncOp($asyncOp) {
+function Await-AsyncOp($asyncOp, $targetType = $null) {
     $asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
         $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethodDefinition
     } | Select-Object -First 1
     if (-not $asTaskGeneric) {
         throw "Could not find AsTask generic method"
     }
-    $targetType = $asyncOp.GetType().GetGenericArguments()[0]
+    if (-not $targetType -and $asyncOp.GetType().GetGenericArguments().Count -gt 0) {
+        $targetType = $asyncOp.GetType().GetGenericArguments()[0]
+    }
     $asTask = $asTaskGeneric.MakeGenericMethod($targetType)
     $task = $asTask.Invoke($null, @($asyncOp))
-    $task.Wait(5000)
+    [void]$task.Wait(5000)
     return $task.Result
 }
 
 $historyEnabled = $false
 try {
-    $clip = [Windows.ApplicationModel.DataTransfer.Clipboard,
-        Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]
+    $clip = __WINRT_CLIPBOARD_TYPE__
     $historyEnabled = $clip::IsHistoryEnabled()
 } catch {
     $historyEnabled = $false
 }
 
-$historyOp = [Windows.ApplicationModel.DataTransfer.Clipboard,
-    Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]::GetHistoryItemsAsync()
-$historyResult = Await-AsyncOp $historyOp
+$historyOp = __WINRT_CLIPBOARD_TYPE__::GetHistoryItemsAsync()
+$historyResultType = __WINRT_CLIPBOARD_RESULT_TYPE__
+$historyResult = Await-AsyncOp $historyOp $historyResultType
 
-$rawItems = $historyResult.Items
-$totalItems = 0
-if ($rawItems) {
-    $totalItems = $rawItems.Count
+$rawItems = @()
+if ($historyResult -and $historyResult.Items) {
+    $rawItems = @($historyResult.Items)
 }
+$totalItems = $rawItems.Count
 
 $limit = [Math]::Min($totalItems, $MaxItems)
 $outItems = @()
@@ -1197,7 +1245,7 @@ for ($i = 0; $i -lt $limit; $i++) {
         $txtFmt = [Windows.ApplicationModel.DataTransfer.StandardDataFormats]::Text
         if ($content.Contains($txtFmt)) {
             $textOp = $content.GetTextAsync()
-            $text = Await-AsyncOp $textOp
+            $text = Await-AsyncOp $textOp ([string])
             $truncated = $false
             if ($text -and $text.Length -gt $MaxChars) {
                 $text = $text.Substring(0, $MaxChars)
@@ -1217,10 +1265,12 @@ for ($i = 0; $i -lt $limit; $i++) {
             $bmpFmt = [Windows.ApplicationModel.DataTransfer.StandardDataFormats]::Bitmap
             if ($content.Contains($bmpFmt)) {
                 $bitmapOp = $content.GetBitmapAsync()
-                $streamRef = Await-AsyncOp $bitmapOp
+                $streamRefType = __WINRT_STREAM_REF_TYPE__
+                $streamRef = Await-AsyncOp $bitmapOp $streamRefType
                 if ($streamRef) {
                     $streamOp = $streamRef.OpenReadAsync()
-                    $raStream = Await-AsyncOp $streamOp
+                    $streamType = __WINRT_STREAM_TYPE__
+                    $raStream = Await-AsyncOp $streamOp $streamType
                     $streamExt = [System.IO.WindowsRuntimeStreamExtensions]
                     $netStream = $streamExt::AsStreamForRead($raStream)
                     $img = [System.Drawing.Image]::FromStream($netStream)
@@ -1264,7 +1314,17 @@ $output = [ordered]@{
 $output | ConvertTo-Json -Depth 5 -Compress
 """
 
-_POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT = r"""
+_POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT = (
+    _POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT_TEMPLATE.replace(
+        "__WINRT_CLIPBOARD_TYPE__",
+        _WINRT_CLIPBOARD_TYPE,
+    )
+    .replace("__WINRT_CLIPBOARD_RESULT_TYPE__", _WINRT_CLIPBOARD_RESULT_TYPE)
+    .replace("__WINRT_STREAM_REF_TYPE__", _WINRT_STREAM_REF_TYPE)
+    .replace("__WINRT_STREAM_TYPE__", _WINRT_STREAM_TYPE)
+)
+
+_POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT_TEMPLATE = r"""
 param(
     [int]$ItemIndex
 )
@@ -1273,34 +1333,38 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
-function Await-AsyncOp($asyncOp) {
+function Await-AsyncOp($asyncOp, $targetType = $null) {
     $asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
         $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethodDefinition
     } | Select-Object -First 1
     if (-not $asTaskGeneric) {
         throw "Could not find AsTask generic method"
     }
-    $targetType = $asyncOp.GetType().GetGenericArguments()[0]
+    if (-not $targetType -and $asyncOp.GetType().GetGenericArguments().Count -gt 0) {
+        $targetType = $asyncOp.GetType().GetGenericArguments()[0]
+    }
     $asTask = $asTaskGeneric.MakeGenericMethod($targetType)
     $task = $asTask.Invoke($null, @($asyncOp))
-    $task.Wait(5000)
+    [void]$task.Wait(5000)
     return $task.Result
 }
 
-$historyOp = [Windows.ApplicationModel.DataTransfer.Clipboard,
-    Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]::GetHistoryItemsAsync()
-$historyResult = Await-AsyncOp $historyOp
+$historyOp = __WINRT_CLIPBOARD_TYPE__::GetHistoryItemsAsync()
+$historyResultType = __WINRT_CLIPBOARD_RESULT_TYPE__
+$historyResult = Await-AsyncOp $historyOp $historyResultType
 
-if (-not $historyResult.Items -or $ItemIndex -lt 0 -or $ItemIndex -ge $historyResult.Items.Count) {
-    $cnt = 0
-    if ($historyResult.Items) { $cnt = $historyResult.Items.Count }
+$rawItems = @()
+if ($historyResult -and $historyResult.Items) {
+    $rawItems = @($historyResult.Items)
+}
+
+if ($rawItems.Count -eq 0 -or $ItemIndex -lt 0 -or $ItemIndex -ge $rawItems.Count) {
+    $cnt = $rawItems.Count
     throw "Index $ItemIndex is out of range (history items count: $cnt)"
 }
 
-$targetItem = $historyResult.Items[$ItemIndex]
-$status = [Windows.ApplicationModel.DataTransfer.Clipboard,
-    Windows.ApplicationModel.DataTransfer,
-    ContentType = WindowsRuntime]::SetHistoryItemAsContent($targetItem)
+$targetItem = $rawItems[$ItemIndex]
+$status = __WINRT_CLIPBOARD_TYPE__::SetHistoryItemAsContent($targetItem)
 
 $successEnum = [Windows.ApplicationModel.DataTransfer.SetHistoryItemAsContentStatus]::Success
 $out = [ordered]@{
@@ -1312,6 +1376,13 @@ $out = [ordered]@{
 
 $out | ConvertTo-Json -Compress
 """
+
+_POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT = (
+    _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT_TEMPLATE.replace(
+        "__WINRT_CLIPBOARD_TYPE__",
+        _WINRT_CLIPBOARD_TYPE,
+    ).replace("__WINRT_CLIPBOARD_RESULT_TYPE__", _WINRT_CLIPBOARD_RESULT_TYPE)
+)
 
 
 def _read_clipboard_win32(
@@ -1594,9 +1665,30 @@ def open_url(
     if any(lower_stripped.startswith(prefix) for prefix in _DANGEROUS_SCHEME_PREFIXES):
         raise ValueError(f"Disallowed URL scheme in {url!r}. Only http and https URLs are allowed.")
 
+    # Reject local Windows drive paths (e.g. C:\..., C:/..., C:calc.exe)
+    if re.match(r"^[A-Za-z]:", stripped):
+        raise ValueError(
+            f"Local file paths and Windows drive paths are not permitted in open_url: {url!r}"
+        )
+
+    # Reject UNC paths (\\server\... or //server/...) and leading slashes/backslashes
+    if re.search(r"^[\\/]", stripped):
+        raise ValueError(f"Leading slashes/backslashes are not allowed in URL: {url!r}")
+
+    # Reject command lines or shell binaries (e.g. 'cmd.exe /c calc', 'powershell ...')
+    first_token = re.split(r"[\s/\\?#]", lower_stripped)[0]
+    if first_token in _DISALLOWED_SHELL_BINARIES:
+        raise ValueError(f"Disallowed command or shell binary in URL: {url!r}")
+
+    # If URL has no scheme, the host portion before path cannot have unencoded spaces
+    if "://" not in stripped:
+        host_candidate = stripped.split("/")[0].split("\\")[0]
+        if any(ch.isspace() for ch in host_candidate):
+            raise ValueError(f"Invalid host with whitespace in URL: {url!r}")
+
     if lower_stripped in _SITE_SHORTCUTS:
         target_url = _SITE_SHORTCUTS[lower_stripped]
-    elif "://" not in stripped and not stripped.startswith(("//", "\\\\")):
+    elif "://" not in stripped:
         target_url = f"https://{stripped}"
     else:
         target_url = stripped
@@ -1608,7 +1700,7 @@ def open_url(
             f"Invalid URL scheme '{parsed.scheme}'. Only http and https URLs are allowed."
         )
 
-    if not parsed.netloc:
+    if not parsed.netloc or any(ch.isspace() for ch in parsed.netloc):
         raise ValueError(f"Invalid URL: host/domain is required in {url!r}")
 
     if browser is None:
@@ -1799,6 +1891,8 @@ def control_system(
     hwnd: int | None = None,
     app_name: str | None = None,
     title: str | None = None,
+    window_title: str | None = None,
+    window_action: str | None = None,
     user32: Any = None,
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
@@ -1807,11 +1901,22 @@ def control_system(
     startfile_fn: Callable[[str], Any] | None = None,
     popen_fn: Callable[..., Any] = subprocess.Popen,
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Control Windows display brightness, window state, screen lock, or settings navigation."""
     if not isinstance(action, str):
         raise ValueError("action must be a string.")
     normalized = action.strip().lower()
+
+    if normalized in ("window", "window_action") and window_action:
+        w_act = window_action.strip().lower()
+        if w_act in ("minimize", "maximize", "restore", "close"):
+            normalized = f"{w_act}_window"
+        elif w_act in ("minimize_window", "maximize_window", "restore_window", "close_window"):
+            normalized = w_act
+        else:
+            normalized = w_act
+
     if normalized not in VALID_SYSTEM_ACTIONS:
         actions_str = ", ".join(VALID_SYSTEM_ACTIONS)
         raise ValueError(
@@ -1836,9 +1941,11 @@ def control_system(
             raise ValueError("level (0..100) is required when action is 'set_brightness'.")
         if isinstance(level, bool):
             raise ValueError("level must be an integer between 0 and 100.")
+        if isinstance(level, (int, float)) and not math.isfinite(level):
+            raise ValueError("level must be a finite number between 0 and 100.")
         try:
             parsed_level = int(level)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("level must be an integer between 0 and 100.") from exc
         clamped = max(0, min(100, parsed_level))
         setter = wmi_brightness_setter or (
@@ -1856,9 +1963,11 @@ def control_system(
         if step is not None:
             if isinstance(step, bool):
                 raise ValueError("step must be an integer.")
+            if isinstance(step, (int, float)) and not math.isfinite(step):
+                raise ValueError("step must be a finite integer.")
             try:
                 st = int(step)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError("step must be an integer.") from exc
         else:
             st = -10 if normalized == "brightness_down" else 10
@@ -1892,10 +2001,11 @@ def control_system(
         "close_window",
         "close",
     ):
+        effective_title = window_title if title is None else title
         target_hwnd = _resolve_window_hwnd(
             hwnd=hwnd,
             app_name=app_name,
-            title=title,
+            title=effective_title,
             user32=user32,
             kernel32=kernel32,
             window_enumerator=window_enumerator,

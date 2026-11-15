@@ -35,6 +35,7 @@ from clea.core.protocol import (
     ChatRenameRequest,
     ChatSendFromVoiceRequest,
     ChatSendRequest,
+    ClipboardItem,
     ConversationCreatedData,
     ConversationCreatedEvent,
     ConversationDeleteAllRequest,
@@ -77,8 +78,11 @@ from clea.core.protocol import (
     MemoryUpdatedData,
     MemoryUpdatedEvent,
     OsControlMediaVolumeRequest,
+    OsControlSystemRequest,
     OsOpenOrFocusAppRequest,
+    OsOpenUrlRequest,
     OsReadClipboardRequest,
+    OsSelectClipboardItemRequest,
     OsWriteClipboardRequest,
     RequestFrame,
     ResponseFrame,
@@ -210,7 +214,11 @@ def build_json_schema() -> dict[str, Any]:
         os_open_or_focus_app_request: OsOpenOrFocusAppRequest
         os_control_media_volume_request: OsControlMediaVolumeRequest
         os_read_clipboard_request: OsReadClipboardRequest
+        os_select_clipboard_item_request: OsSelectClipboardItemRequest
+        os_open_url_request: OsOpenUrlRequest
+        os_control_system_request: OsControlSystemRequest
         os_write_clipboard_request: OsWriteClipboardRequest
+        clipboard_item: ClipboardItem
         workspace_git_inspect_request: WorkspaceGitInspectRequest
         git_worktree_item: GitWorktreeItem
         git_commit_item: GitCommitItem

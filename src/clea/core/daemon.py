@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import logging.handlers
 import os
@@ -96,8 +97,11 @@ from clea.tools.git_workspace import inspect_git_workspace
 from clea.tools.registry import ToolDefinition
 from clea.tools.windows_os import (
     control_media_volume,
+    control_system,
     open_or_focus_app,
+    open_url,
     read_clipboard,
+    select_clipboard_item,
     write_clipboard,
 )
 
@@ -1814,6 +1818,12 @@ class CleaDaemon:
             await self._handle_os_control_media_volume(conn, req)
         elif method == "os.read_clipboard":
             await self._handle_os_read_clipboard(conn, req)
+        elif method == "os.select_clipboard_item":
+            await self._handle_os_select_clipboard_item(conn, req)
+        elif method == "os.open_url":
+            await self._handle_os_open_url(conn, req)
+        elif method == "os.control_system":
+            await self._handle_os_control_system(conn, req)
         elif method == "os.write_clipboard":
             await self._handle_os_write_clipboard(conn, req)
         elif method == "workspace.git_inspect":
@@ -2492,7 +2502,16 @@ class CleaDaemon:
     async def _handle_os_read_clipboard(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         try:
-            res = await asyncio.to_thread(read_clipboard, req.params.max_chars)
+            try:
+                res = await asyncio.to_thread(
+                    read_clipboard,
+                    max_chars=req.params.max_chars,
+                    include_history=req.params.include_history,
+                    max_items=req.params.max_items,
+                    include_image_bytes=req.params.include_image_bytes,
+                )
+            except TypeError:
+                res = await asyncio.to_thread(read_clipboard, req.params.max_chars)
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
             return
@@ -2500,8 +2519,155 @@ class CleaDaemon:
             "os_read_clipboard",
             char_count=res.get("char_count"),
             truncated=res.get("truncated"),
+            history_enabled=res.get("history_enabled"),
+            total_items=res.get("total_items"),
         )
-        await self._respond(ws, req, METHOD_RESULTS["os.read_clipboard"](**res))
+        model_cls = METHOD_RESULTS["os.read_clipboard"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        raw_items = res.get("items")
+        if isinstance(raw_items, list):
+            normalized_items: list[dict[str, Any]] = []
+            for it in raw_items:
+                if not isinstance(it, dict):
+                    continue
+                item = dict(it)
+                img = item.get("image")
+                if isinstance(img, dict):
+                    if item.get("width") is None:
+                        item["width"] = img.get("width")
+                    if item.get("height") is None:
+                        item["height"] = img.get("height")
+                    if item.get("format") is None:
+                        item["format"] = img.get("format")
+                    if item.get("image_bytes_base64") is None:
+                        item["image_bytes_base64"] = img.get("bytes") or img.get(
+                            "image_bytes_base64"
+                        )
+                if item.get("text") is None:
+                    item["text"] = ""
+                normalized_items.append(item)
+            filtered["items"] = normalized_items
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_select_clipboard_item(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(select_clipboard_item, req.params.index)
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_select_clipboard_item",
+            index=req.params.index,
+            status=res.get("status"),
+        )
+        model_cls = METHOD_RESULTS["os.select_clipboard_item"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        if "ok" not in filtered:
+            filtered["ok"] = res.get("success", True)
+        if "index" not in filtered:
+            filtered["index"] = req.params.index
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_open_url(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            if req.params.browser is not None:
+                res = await asyncio.to_thread(open_url, req.params.url, req.params.browser)
+            else:
+                res = await asyncio.to_thread(open_url, req.params.url)
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_open_url",
+            url=req.params.url,
+            browser=req.params.browser,
+            status=res.get("status"),
+        )
+        model_cls = METHOD_RESULTS["os.open_url"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        if "ok" not in filtered:
+            filtered["ok"] = res.get("success", True)
+        if "url" not in filtered:
+            filtered["url"] = req.params.url
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_control_system(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        p_dict = req.params.model_dump()
+        action = req.params.action
+        if action in ("window", "window_action") and req.params.window_action:
+            action = req.params.window_action
+
+        target_title = req.params.window_title or getattr(req.params, "title", None)
+
+        try:
+            sig = inspect.signature(control_system)
+            param_names = set(sig.parameters.keys())
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+        except (ValueError, TypeError):
+            param_names = set()
+            accepts_kwargs = True
+
+        kwargs: dict[str, Any] = {}
+        for k in ("level", "step", "hwnd", "app_name", "page", "uri"):
+            if p_dict.get(k) is not None:
+                kwargs[k] = p_dict[k]
+
+        if target_title is not None:
+            kwargs["title"] = target_title
+            if "window_title" in param_names or accepts_kwargs:
+                kwargs["window_title"] = target_title
+
+        if req.params.window_action is not None:
+            if "window_action" in param_names or accepts_kwargs:
+                kwargs["window_action"] = req.params.window_action
+
+        try:
+            try:
+                res = await asyncio.to_thread(control_system, action, **kwargs)
+            except TypeError:
+                # If control_system did not accept window_title or window_action,
+                # retry with title only
+                fallback_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in ("window_title", "window_action")
+                }
+                if target_title is not None and "title" not in fallback_kwargs:
+                    fallback_kwargs["title"] = target_title
+                res = await asyncio.to_thread(control_system, action, **fallback_kwargs)
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_control_system",
+            system_action=action,
+            status=res.get("status"),
+        )
+        model_cls = METHOD_RESULTS["os.control_system"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        if "ok" not in filtered:
+            filtered["ok"] = res.get("success", True)
+        if "action" not in filtered:
+            filtered["action"] = action
+        if "window_title" not in filtered and target_title:
+            filtered["window_title"] = target_title
+        await self._respond(ws, req, model_cls(**filtered))
 
     async def _handle_os_write_clipboard(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws

@@ -212,6 +212,41 @@ class OsControlMediaVolumeParams(_Model):
 
 class OsReadClipboardParams(_Model):
     max_chars: int = Field(default=8000, ge=1, le=100_000)
+    include_history: bool = False
+    max_items: int = Field(default=10, ge=1, le=100)
+    include_image_bytes: bool = False
+
+
+class OsSelectClipboardItemParams(_Model):
+    index: int = Field(
+        ge=0, description="Zero-based index of the clipboard history item to restore"
+    )
+
+
+class OsOpenUrlParams(_Model):
+    url: str = Field(description="URL to open (http or https)")
+    browser: str | None = Field(default=None, description="Optional browser executable or name")
+
+
+class OsControlSystemParams(_Model):
+    action: str = Field(description="System control action (brightness, window, lock, settings)")
+    level: int | None = Field(
+        default=None, ge=0, le=100, description="Display brightness level (0-100)"
+    )
+    step: int | None = Field(default=None, description="Display brightness relative step")
+    window_action: str | None = Field(
+        default=None, description="Window action: minimize, maximize, restore, close"
+    )
+    window_title: str | None = Field(default=None, description="Window title or substring")
+    title: str | None = Field(
+        default=None, description="Window title or substring (alias for window_title)"
+    )
+    hwnd: int | None = Field(default=None, description="Window handle (HWND)")
+    app_name: str | None = Field(default=None, description="Application name for window action")
+    page: str | None = Field(
+        default=None, description="Windows Settings sub-page (e.g. 'display', 'sound')"
+    )
+    uri: str | None = Field(default=None, description="Direct ms-settings: URI")
 
 
 class OsWriteClipboardParams(_Model):
@@ -515,6 +550,21 @@ class OsReadClipboardRequest(_Request):
     params: OsReadClipboardParams = Field(default_factory=OsReadClipboardParams)
 
 
+class OsSelectClipboardItemRequest(_Request):
+    method: Literal["os.select_clipboard_item"] = "os.select_clipboard_item"
+    params: OsSelectClipboardItemParams
+
+
+class OsOpenUrlRequest(_Request):
+    method: Literal["os.open_url"] = "os.open_url"
+    params: OsOpenUrlParams
+
+
+class OsControlSystemRequest(_Request):
+    method: Literal["os.control_system"] = "os.control_system"
+    params: OsControlSystemParams
+
+
 class OsWriteClipboardRequest(_Request):
     method: Literal["os.write_clipboard"] = "os.write_clipboard"
     params: OsWriteClipboardParams
@@ -576,6 +626,9 @@ RequestFrame = Annotated[
     | OsOpenOrFocusAppRequest
     | OsControlMediaVolumeRequest
     | OsReadClipboardRequest
+    | OsSelectClipboardItemRequest
+    | OsOpenUrlRequest
+    | OsControlSystemRequest
     | OsWriteClipboardRequest
     | WorkspaceGitInspectRequest,
     Field(discriminator="method"),
@@ -1077,12 +1130,64 @@ class OsControlMediaVolumeResult(_Model):
     level: int | None = None
 
 
+class ClipboardItem(_Model):
+    index: int = 0
+    id: str = ""
+    timestamp: str = ""
+    kind: str = "text"
+    text: str | None = ""
+    truncated: bool = False
+    char_count: int = 0
+    total_chars: int = 0
+    width: int | None = None
+    height: int | None = None
+    format: str | None = None
+    image_bytes_base64: str | None = None
+    size_bytes: int | None = None
+    image: dict[str, Any] | None = None
+
+
 class OsReadClipboardResult(_Model):
     ok: bool = True
     text: str = ""
     truncated: bool = False
     char_count: int = 0
     total_chars: int = 0
+    history_enabled: bool = False
+    total_items: int = 0
+    items: list[ClipboardItem] = Field(default_factory=list)
+
+
+class OsSelectClipboardItemResult(_Model):
+    ok: bool = True
+    success: bool = True
+    status: str = "selected"
+    index: int = 0
+    item_id: str | None = None
+    message: str | None = None
+
+
+class OsOpenUrlResult(_Model):
+    ok: bool = True
+    success: bool = True
+    status: str = "opened"
+    url: str
+    browser: str | None = None
+    message: str | None = None
+
+
+class OsControlSystemResult(_Model):
+    ok: bool = True
+    success: bool = True
+    action: str = ""
+    status: str = "success"
+    level: int | None = None
+    current_brightness: int | None = None
+    window_title: str | None = None
+    hwnd: int | None = None
+    page: str | None = None
+    uri: str | None = None
+    message: str | None = None
 
 
 class OsWriteClipboardResult(_Model):
@@ -1168,6 +1273,9 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "os.open_or_focus_app": OsOpenOrFocusAppResult,
     "os.control_media_volume": OsControlMediaVolumeResult,
     "os.read_clipboard": OsReadClipboardResult,
+    "os.select_clipboard_item": OsSelectClipboardItemResult,
+    "os.open_url": OsOpenUrlResult,
+    "os.control_system": OsControlSystemResult,
     "os.write_clipboard": OsWriteClipboardResult,
     "workspace.git_inspect": WorkspaceGitInspectResult,
 }

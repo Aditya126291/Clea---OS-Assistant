@@ -47,10 +47,16 @@ from clea.core.protocol import (
     MemoryDeleteFactRequest,
     OsControlMediaVolumeParams,
     OsControlMediaVolumeRequest,
+    OsControlSystemParams,
+    OsControlSystemRequest,
     OsOpenOrFocusAppParams,
     OsOpenOrFocusAppRequest,
+    OsOpenUrlParams,
+    OsOpenUrlRequest,
     OsReadClipboardParams,
     OsReadClipboardRequest,
+    OsSelectClipboardItemParams,
+    OsSelectClipboardItemRequest,
     OsWriteClipboardParams,
     OsWriteClipboardRequest,
     ResponseFrame,
@@ -1981,9 +1987,128 @@ class VoiceRunner:
             except (TypeError, ValueError):
                 await _send_error("max_chars must be an integer between 1 and 100000.")
                 return
+
+            include_history = _parse_bool("include_history", default=False)
+            raw_items = event.arguments.get("max_items", 10)
+            try:
+                if raw_items is None:
+                    max_items = 10
+                elif isinstance(raw_items, bool):
+                    raise ValueError("bool is not valid")
+                else:
+                    max_items = max(1, min(100, int(raw_items)))
+            except (TypeError, ValueError):
+                await _send_error("max_items must be an integer between 1 and 100.")
+                return
+
             await _execute_rpc_tool(
-                OsReadClipboardRequest(params=OsReadClipboardParams(max_chars=max_chars)),
+                OsReadClipboardRequest(
+                    params=OsReadClipboardParams(
+                        max_chars=max_chars,
+                        include_history=include_history,
+                        max_items=max_items,
+                    )
+                ),
                 error_prefix="Failed to read clipboard",
+            )
+            return
+
+        if event.name == "select_clipboard_item":
+            raw_index = event.arguments.get("index")
+            if raw_index is None or isinstance(raw_index, bool):
+                await _send_error("index must be an integer >= 0.")
+                return
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                await _send_error("index must be an integer >= 0.")
+                return
+            if index < 0:
+                await _send_error("index must be non-negative.")
+                return
+            await _execute_rpc_tool(
+                OsSelectClipboardItemRequest(
+                    params=OsSelectClipboardItemParams(index=index)
+                ),
+                error_prefix="Failed to select clipboard item",
+            )
+            return
+
+        if event.name == "open_url":
+            raw_url = event.arguments.get("url")
+            url = "" if raw_url is None else str(raw_url).strip()
+            if not url:
+                await _send_error("url must not be empty.")
+                return
+            browser = _req_str("browser")
+            await _execute_rpc_tool(
+                OsOpenUrlRequest(
+                    params=OsOpenUrlParams(
+                        url=url,
+                        browser=browser,
+                    )
+                ),
+                error_prefix="Failed to open URL",
+            )
+            return
+
+        if event.name == "control_system":
+            action = (_req_str("action") or "").lower()
+            if not action:
+                await _send_error("action must not be empty.")
+                return
+
+            raw_level = event.arguments.get("level")
+            level: int | None = None
+            if raw_level is not None:
+                if isinstance(raw_level, bool):
+                    await _send_error("level must be an integer between 0 and 100.")
+                    return
+                try:
+                    level = max(0, min(100, int(raw_level)))
+                except (TypeError, ValueError):
+                    await _send_error("level must be an integer between 0 and 100.")
+                    return
+
+            raw_step = event.arguments.get("step")
+            step: int | None = None
+            if raw_step is not None:
+                if isinstance(raw_step, bool):
+                    await _send_error("step must be an integer.")
+                    return
+                try:
+                    step = int(raw_step)
+                except (TypeError, ValueError):
+                    await _send_error("step must be an integer.")
+                    return
+
+            raw_hwnd = event.arguments.get("hwnd")
+            hwnd: int | None = None
+            if raw_hwnd is not None:
+                if isinstance(raw_hwnd, bool):
+                    await _send_error("hwnd must be an integer.")
+                    return
+                try:
+                    hwnd = int(raw_hwnd)
+                except (TypeError, ValueError):
+                    await _send_error("hwnd must be an integer.")
+                    return
+
+            await _execute_rpc_tool(
+                OsControlSystemRequest(
+                    params=OsControlSystemParams(
+                        action=action,
+                        level=level,
+                        step=step,
+                        window_action=_req_str("window_action"),
+                        window_title=_req_str("window_title"),
+                        hwnd=hwnd,
+                        app_name=_req_str("app_name"),
+                        page=_req_str("page"),
+                        uri=_req_str("uri"),
+                    )
+                ),
+                error_prefix="Failed to control system",
             )
             return
 

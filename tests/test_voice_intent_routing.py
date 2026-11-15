@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from websockets.asyncio.client import connect
 
 from clea.core import auth
@@ -41,6 +42,12 @@ from clea.surfaces.voice.memory_hooks import (
 )
 from clea.surfaces.voice.runner import VoiceRunner
 from clea.surfaces.voice.wake_word import WakeWordDetector
+from clea.tools.registry import AuditLogger, ToolRegistry
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_clea_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
 
 
 class _FakeLiveBackend(VoiceBackend):
@@ -146,6 +153,39 @@ def test_base_voice_system_instruction_partitions_intents_and_blocks_screen_bias
         assert tool.name in prompt
     assert "delete_chat(..., confirmed=True)" in prompt
     assert "create_chat" in prompt
+
+
+def test_route_4_system_instruction_covers_general_windows_os_tools() -> None:
+    prompt = BASE_VOICE_SYSTEM_INSTRUCTION
+
+    # Route 4 heading covers all Windows OS tools
+    assert "4. Windows OS & Git Workspace Control" in prompt
+    assert "open_or_focus_app" in prompt
+    assert "open_url" in prompt
+    assert "control_system" in prompt
+    assert "control_media_volume" in prompt
+    assert "read_clipboard" in prompt
+    assert "select_clipboard_item" in prompt
+    assert "write_clipboard" in prompt
+    assert "inspect_git_workspace" in prompt
+
+    # Route 4 directs model not to call look_at_screen first for OS tools
+    assert "do NOT call `look_at_screen` first" in prompt
+
+    # Specific routing rules
+    assert "open_url(url, browser?)" in prompt
+    assert "select_clipboard_item(index)" in prompt
+    assert "control_system(action" in prompt
+    assert "get_brightness" in prompt
+    assert "set_brightness" in prompt
+    assert "step_brightness" in prompt
+    assert "minimize_window" in prompt
+    assert "maximize_window" in prompt
+    assert "restore_window" in prompt
+    assert "close_window" in prompt
+    assert "lock_screen" in prompt
+    assert "open_settings" in prompt
+    assert "read_clipboard(max_chars?, include_history?, max_items?)" in prompt
 
 
 # --- 2. Tool Schema Negative Constraints & Gemini Live Propagation ---
@@ -317,11 +357,13 @@ async def test_voice_runner_injects_live_daemon_focus_state_for_hotkey_and_daemo
         timestamp=datetime.now().astimezone(),
     )
 
+    reg = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
     daemon: CleaDaemon = build_daemon(
         host="127.0.0.1",
         port=0,
         provider=_FakeProvider(),
         memory=mem,
+        registry=reg,
     )
     await daemon.start()
     url = f"ws://127.0.0.1:{daemon.bound_port}"
@@ -514,11 +556,13 @@ async def test_voice_runner_daemon_event_works_when_focused_chat_busy_and_empty_
         encoding="utf-8",
     )
 
+    reg = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
     daemon: CleaDaemon = build_daemon(
         host="127.0.0.1",
         port=0,
         provider=_FakeProvider(),
         memory=mem,
+        registry=reg,
     )
     await daemon.start()
     url = f"ws://127.0.0.1:{daemon.bound_port}"

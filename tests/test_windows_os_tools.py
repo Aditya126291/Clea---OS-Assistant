@@ -20,10 +20,21 @@ from clea.core.daemon import CleaDaemon, build_daemon
 from clea.core.protocol import (
     METHOD_RESULTS,
     OsControlMediaVolumeResult,
+    OsControlSystemParams,
+    OsControlSystemRequest,
+    OsControlSystemResult,
     OsOpenOrFocusAppResult,
+    OsOpenUrlParams,
+    OsOpenUrlRequest,
+    OsOpenUrlResult,
     OsReadClipboardResult,
+    OsSelectClipboardItemParams,
+    OsSelectClipboardItemRequest,
+    OsSelectClipboardItemResult,
     OsWriteClipboardResult,
+    ResponseFrame,
     WorkspaceGitInspectResult,
+    parse_frame,
 )
 from clea.memory import MemoryStore
 from clea.providers.base import LLMProvider, Message, StreamChunk, TokenUsage
@@ -40,7 +51,10 @@ from clea.surfaces.voice.runner import VoiceRunner
 from clea.surfaces.voice.wake_word import WakeWordDetector
 from clea.tools import ToolDefinition
 from clea.tools.git_workspace import MAX_DIFF_CHARS, inspect_git_workspace
+from clea.tools.registry import AuditLogger, ToolRegistry
 from clea.tools.windows_os import (
+    _POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT,
+    _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT,
     CF_UNICODETEXT,
     KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP,
@@ -70,6 +84,14 @@ from clea.tools.windows_os import (
 )
 
 # --------------------------------------------------------------------------- Test Doubles
+
+
+@pytest.fixture(autouse=True)
+def _isolate_clea_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure all test executions are strictly isolated from %LOCALAPPDATA%\\clea."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
 
 
 class _FakeClipboardWin32:
@@ -280,11 +302,15 @@ async def _running_voice_daemon_env(
 ) -> AsyncIterator[tuple[CleaDaemon, VoiceRunner, _FakeLiveBackend]]:
     mem = MemoryStore(base_dir=tmp_path)
     mem.ensure_initialized()
+    log_file = tmp_path / "logs" / "audit.jsonl"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    reg = ToolRegistry(audit_logger=AuditLogger(log_file))
     daemon = build_daemon(
         host="127.0.0.1",
         port=0,
         provider=_FakeProvider(),
         memory=mem,
+        registry=reg,
     )
     await daemon.start()
     url = f"ws://127.0.0.1:{daemon.bound_port}"
@@ -681,6 +707,9 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
         "read_clip": [],
         "write_clip": [],
         "git": [],
+        "select_clip": [],
+        "open_url": [],
+        "control_sys": [],
     }
 
     def _fake_open(app_name: str, target_path: str | None = None) -> dict[str, Any]:
@@ -699,7 +728,12 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
         calls["volume"].append((action, level))
         return {"ok": True, "action": action, "level": level}
 
-    def _fake_read_clip(max_chars: int = 8000) -> dict[str, Any]:
+    def _fake_read_clip(
+        max_chars: int = 8000,
+        include_history: bool = False,
+        max_items: int = 10,
+        include_image_bytes: bool = False,
+    ) -> dict[str, Any]:
         calls["read_clip"].append(max_chars)
         return {
             "ok": True,
@@ -707,11 +741,49 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
             "truncated": False,
             "char_count": 11,
             "total_chars": 11,
+            "history_enabled": include_history,
+            "total_items": 1 if include_history else 0,
+            "items": [],
         }
 
     def _fake_write_clip(text: str) -> dict[str, Any]:
         calls["write_clip"].append(text)
         return {"ok": True, "char_count": len(text)}
+
+    def _fake_select_clip(index: int) -> dict[str, Any]:
+        calls["select_clip"].append(index)
+        return {
+            "ok": True,
+            "success": True,
+            "status": "selected",
+            "index": index,
+            "item_id": f"item-{index}",
+            "message": f"Selected item {index}",
+        }
+
+    def _fake_open_url(url: str, browser: str | None = None) -> dict[str, Any]:
+        calls["open_url"].append((url, browser))
+        return {
+            "ok": True,
+            "success": True,
+            "status": "opened",
+            "url": url,
+            "browser": browser,
+            "message": f"Opened {url}",
+        }
+
+    def _fake_control_system(action: str, **kwargs: Any) -> dict[str, Any]:
+        calls["control_sys"].append((action, kwargs))
+        res: dict[str, Any] = {
+            "ok": True,
+            "success": True,
+            "action": action,
+            "status": "success",
+        }
+        for k in ("level", "step", "window_title", "hwnd", "page", "uri"):
+            if k in kwargs and kwargs[k] is not None:
+                res[k] = kwargs[k]
+        return res
 
     def _fake_git(
         repo_path: str | None = None,
@@ -754,6 +826,9 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
     monkeypatch.setattr(daemon_mod, "read_clipboard", _fake_read_clip)
     monkeypatch.setattr(windows_os_mod, "read_clipboard", _fake_read_clip)
     monkeypatch.setattr(daemon_mod, "write_clipboard", _fake_write_clip)
+    monkeypatch.setattr(daemon_mod, "select_clipboard_item", _fake_select_clip)
+    monkeypatch.setattr(daemon_mod, "open_url", _fake_open_url)
+    monkeypatch.setattr(daemon_mod, "control_system", _fake_control_system)
     monkeypatch.setattr(daemon_mod, "inspect_git_workspace", _fake_git)
 
     async with _running_voice_daemon_env(tmp_path) as (_daemon, _runner, backend):
@@ -812,6 +887,64 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
         assert git_model.diff == "daemon.py | 5 +++++"
         assert calls["git"] == [(None, True, True)]
 
+        r6 = await _invoke_voice_tool(
+            backend,
+            call_id="c-select-clip",
+            name="select_clipboard_item",
+            arguments={"index": 2},
+        )
+        assert r6.is_error is False
+        sel_model = OsSelectClipboardItemResult.model_validate(r6.response)
+        assert sel_model.status == "selected"
+        assert sel_model.index == 2
+        assert calls["select_clip"] == [2]
+
+        r7 = await _invoke_voice_tool(
+            backend,
+            call_id="c-open-url",
+            name="open_url",
+            arguments={"url": "https://github.com", "browser": "chrome"},
+        )
+        assert r7.is_error is False
+        url_model = OsOpenUrlResult.model_validate(r7.response)
+        assert url_model.status == "opened"
+        assert url_model.url == "https://github.com"
+        assert url_model.browser == "chrome"
+        assert calls["open_url"] == [("https://github.com", "chrome")]
+
+        r8 = await _invoke_voice_tool(
+            backend,
+            call_id="c-sys-bright",
+            name="control_system",
+            arguments={"action": "set_brightness", "level": 75},
+        )
+        assert r8.is_error is False
+        sys_b_model = OsControlSystemResult.model_validate(r8.response)
+        assert sys_b_model.action == "set_brightness"
+        assert sys_b_model.level == 75
+
+        r9 = await _invoke_voice_tool(
+            backend,
+            call_id="c-sys-win",
+            name="control_system",
+            arguments={"action": "minimize_window", "window_title": "Visual Studio Code"},
+        )
+        assert r9.is_error is False
+        sys_w_model = OsControlSystemResult.model_validate(r9.response)
+        assert sys_w_model.action == "minimize_window"
+        assert sys_w_model.window_title == "Visual Studio Code"
+
+        r10 = await _invoke_voice_tool(
+            backend,
+            call_id="c-sys-set",
+            name="control_system",
+            arguments={"action": "open_settings", "page": "display"},
+        )
+        assert r10.is_error is False
+        sys_s_model = OsControlSystemResult.model_validate(r10.response)
+        assert sys_s_model.action == "open_settings"
+        assert sys_s_model.page == "display"
+
         # Invalid arguments return tool error response cleanly.
         r_bad = await _invoke_voice_tool(
             backend,
@@ -822,13 +955,142 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
         assert r_bad.is_error is True
         assert "level" in str(r_bad.response.get("error", ""))
 
+        r_bad_sel = await _invoke_voice_tool(
+            backend,
+            call_id="c-bad-sel",
+            name="select_clipboard_item",
+            arguments={"index": -1},
+        )
+        assert r_bad_sel.is_error is True
+        assert "non-negative" in str(r_bad_sel.response.get("error", ""))
+
+        r_bad_url = await _invoke_voice_tool(
+            backend,
+            call_id="c-bad-url",
+            name="open_url",
+            arguments={"url": "   "},
+        )
+        assert r_bad_url.is_error is True
+        assert "url" in str(r_bad_url.response.get("error", ""))
+
+        r_bad_sys = await _invoke_voice_tool(
+            backend,
+            call_id="c-bad-sys",
+            name="control_system",
+            arguments={"action": "   "},
+        )
+        assert r_bad_sys.is_error is True
+        assert "action" in str(r_bad_sys.response.get("error", ""))
+
     assert set(METHOD_RESULTS) >= {
         "os.open_or_focus_app",
         "os.control_media_volume",
         "os.read_clipboard",
         "os.write_clipboard",
+        "os.select_clipboard_item",
+        "os.open_url",
+        "os.control_system",
         "workspace.git_inspect",
     }
+
+
+async def test_daemon_direct_rpc_e2e_for_new_windows_os_methods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from websockets.asyncio.client import connect
+
+    from clea.core import auth
+
+    calls: dict[str, list[Any]] = {
+        "select": [],
+        "open_url": [],
+        "control": [],
+    }
+
+    def _fake_select(index: int) -> dict[str, Any]:
+        calls["select"].append(index)
+        return {"ok": True, "success": True, "status": "selected", "index": index}
+
+    def _fake_url(url: str, browser: str | None = None) -> dict[str, Any]:
+        calls["open_url"].append((url, browser))
+        return {"ok": True, "success": True, "status": "opened", "url": url, "browser": browser}
+
+    def _fake_control(action: str, **kwargs: Any) -> dict[str, Any]:
+        calls["control"].append((action, kwargs))
+        return {"ok": True, "success": True, "action": action, "status": "success", **kwargs}
+
+    monkeypatch.setattr(daemon_mod, "select_clipboard_item", _fake_select)
+    monkeypatch.setattr(daemon_mod, "open_url", _fake_url)
+    monkeypatch.setattr(daemon_mod, "control_system", _fake_control)
+
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    log_file = tmp_path / "logs" / "audit.jsonl"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    reg = ToolRegistry(audit_logger=AuditLogger(log_file))
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=_FakeProvider(),
+        memory=mem,
+        registry=reg,
+    )
+    await daemon.start()
+    token = daemon.token
+
+    try:
+        async with connect(
+            f"ws://127.0.0.1:{daemon.bound_port}",
+            subprotocols=auth.client_subprotocols(token),
+        ) as ws:
+            # 1. os.select_clipboard_item
+            req_sel = OsSelectClipboardItemRequest(
+                params=OsSelectClipboardItemParams(index=3)
+            )
+            await ws.send(req_sel.model_dump_json())
+            raw_sel = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            frame_sel = parse_frame(raw_sel)
+            assert isinstance(frame_sel, ResponseFrame)
+            assert frame_sel.id == req_sel.id
+            assert frame_sel.error is None
+            res_sel = OsSelectClipboardItemResult.model_validate(frame_sel.result)
+            assert res_sel.status == "selected"
+            assert res_sel.index == 3
+            assert calls["select"] == [3]
+
+            # 2. os.open_url
+            req_url = OsOpenUrlRequest(
+                params=OsOpenUrlParams(url="https://docs.python.org", browser="edge")
+            )
+            await ws.send(req_url.model_dump_json())
+            raw_url = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            frame_url = parse_frame(raw_url)
+            assert isinstance(frame_url, ResponseFrame)
+            assert frame_url.id == req_url.id
+            assert frame_url.error is None
+            res_url = OsOpenUrlResult.model_validate(frame_url.result)
+            assert res_url.status == "opened"
+            assert res_url.url == "https://docs.python.org"
+            assert res_url.browser == "edge"
+            assert calls["open_url"] == [("https://docs.python.org", "edge")]
+
+            # 3. os.control_system
+            req_ctrl = OsControlSystemRequest(
+                params=OsControlSystemParams(action="set_brightness", level=80)
+            )
+            await ws.send(req_ctrl.model_dump_json())
+            raw_ctrl = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            frame_ctrl = parse_frame(raw_ctrl)
+            assert isinstance(frame_ctrl, ResponseFrame)
+            assert frame_ctrl.id == req_ctrl.id
+            assert frame_ctrl.error is None
+            res_ctrl = OsControlSystemResult.model_validate(frame_ctrl.result)
+            assert res_ctrl.action == "set_brightness"
+            assert res_ctrl.level == 80
+            assert len(calls["control"]) == 1
+    finally:
+        await daemon.stop()
 
 
 # ----------------------------------------------------------- 6. WinRT Clipboard History
@@ -896,6 +1158,27 @@ def test_read_clipboard_winrt_text_and_image_items() -> None:
     assert "powershell.exe" in runner_calls[0][0]
     assert "-MaxItems 5" in cmd_str
     assert "-IncludeImageBytes" in cmd_str
+
+    parsed_model = OsReadClipboardResult(**res)
+    assert isinstance(parsed_model.text, str)
+    assert parsed_model.text == "WinRT text content"
+
+
+def test_read_clipboard_history_deserialization_live() -> None:
+    """Verify live read_clipboard(include_history=True) produces str text
+    and deserializes cleanly into OsReadClipboardResult.
+    """
+    res = read_clipboard(include_history=True)
+    assert res["ok"] is True
+    assert isinstance(res["text"], str)
+    assert not isinstance(res["text"], list)
+    if res.get("items"):
+        for item in res["items"]:
+            if item.get("text") is not None:
+                assert isinstance(item["text"], str)
+                assert not isinstance(item["text"], list)
+    parsed = OsReadClipboardResult(**res)
+    assert isinstance(parsed.text, str)
 
 
 def test_read_clipboard_winrt_fallback_to_win32_on_error() -> None:
@@ -1093,6 +1376,16 @@ def test_open_url_success_and_shortcuts() -> None:
     assert res2["url"] == "https://github.com"
     assert startfile_urls[-1] == "https://github.com"
 
+    # Site shortcut resolution: 'docs' -> 'https://docs.google.com'
+    res_docs = open_url("docs", startfile_fn=startfile_urls.append)
+    assert res_docs["url"] == "https://docs.google.com"
+    assert startfile_urls[-1] == "https://docs.google.com"
+
+    # Site shortcut resolution: 'mail' -> 'https://mail.google.com'
+    res_mail = open_url("mail", startfile_fn=startfile_urls.append)
+    assert res_mail["url"] == "https://mail.google.com"
+    assert startfile_urls[-1] == "https://mail.google.com"
+
     # Domain shorthand: 'docs.python.org' -> 'https://docs.python.org'
     res3 = open_url("docs.python.org", startfile_fn=startfile_urls.append)
     assert res3["url"] == "https://docs.python.org"
@@ -1123,6 +1416,18 @@ def test_open_url_success_and_shortcuts() -> None:
         "http://",
         "https://",
         "https://example.com\nwith-newline",
+        "cmd.exe /c calc",
+        "powershell -c calc",
+        r"C:\windows\notepad.exe",
+        r"D:/photos/image.png",
+        "C:calc.exe",
+        "D:script.bat",
+        "c:relative/path",
+        r"\\server\share\calc.exe",
+        r"//server/share/file",
+        "/root/etc/passwd",
+        r"\windows\system32",
+        "notepad.exe notes.txt",
     ],
 )
 def test_open_url_rejects_dangerous_or_malformed_urls(bad_url: str) -> None:
@@ -1279,3 +1584,122 @@ def test_control_system_lock_and_settings() -> None:
     assert "get_brightness" in VALID_SYSTEM_ACTIONS
     assert "lock_screen" in VALID_SYSTEM_ACTIONS
     assert "open_settings" in VALID_SYSTEM_ACTIONS
+
+
+def test_powershell_winrt_single_line_type_literals() -> None:
+    expected_literal = (
+        "[Windows.ApplicationModel.DataTransfer.Clipboard, "
+        "Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]"
+    )
+    assert expected_literal in _POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT
+    assert expected_literal in _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT
+
+    # Verify no line break splits the WinRT type literal
+    for script in (
+        _POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT,
+        _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT,
+    ):
+        for line in script.splitlines():
+            if "Windows.ApplicationModel.DataTransfer.Clipboard" in line:
+                assert "ContentType = WindowsRuntime]" in line
+
+
+def test_get_installed_apps_preserves_apps_containing_sh_and_cmd() -> None:
+    raw_catalog = [
+        {"Name": "Adobe Photoshop 2024", "AppID": "Photoshop"},
+        {"Name": "Microsoft Publisher", "AppID": "Microsoft.Publisher"},
+        {"Name": "Wireshark", "AppID": "Wireshark"},
+        {"Name": "ShareX", "AppID": "ShareX"},
+        {"Name": "Genshin Impact", "AppID": "GenshinImpact"},
+        {"Name": "Git GUI", "AppID": r"C:\Program Files\Git\cmd\git-gui.exe"},
+        {"Name": "Command Prompt", "AppID": r"C:\Windows\System32\cmd.exe"},
+        {"Name": "PowerShell 7", "AppID": "pwsh.exe"},
+        {"Name": "Git Bash", "AppID": "bash.exe"},
+        {"Name": "sh", "AppID": "sh"},
+    ]
+    apps = get_installed_apps(force_refresh=True, app_catalog_fetcher=lambda: raw_catalog)
+    app_names = [a["Name"] for a in apps]
+    assert "Adobe Photoshop 2024" in app_names
+    assert "Microsoft Publisher" in app_names
+    assert "Wireshark" in app_names
+    assert "ShareX" in app_names
+    assert "Genshin Impact" in app_names
+    assert "Git GUI" in app_names
+    assert "Command Prompt" not in app_names
+    assert "PowerShell 7" not in app_names
+    assert "Git Bash" not in app_names
+    assert "sh" not in app_names
+
+
+def test_control_system_window_title_window_action_and_extra_kwargs() -> None:
+    user32 = _FakeWindowUser32()
+
+    # Pass window_title (alias for title) with extra kwargs
+    res1 = control_system(
+        "minimize_window",
+        window_title="Notepad",
+        hwnd=77,
+        user32=user32,
+        extra_field="ignored",
+    )
+    assert res1["ok"] is True
+    assert res1["hwnd"] == 77
+    assert (77, SW_MINIMIZE) in user32.show_calls
+
+    # Pass action="window" with window_action="maximize"
+    res2 = control_system(
+        "window",
+        window_action="maximize",
+        window_title="Notepad",
+        hwnd=88,
+        user32=user32,
+    )
+    assert res2["ok"] is True
+    assert res2["action"] == "maximize_window"
+    assert res2["hwnd"] == 88
+    assert (88, SW_MAXIMIZE) in user32.show_calls
+
+    # Pass action="window_action" with window_action="restore"
+    res3 = control_system(
+        "window_action",
+        window_action="restore",
+        window_title="Notepad",
+        hwnd=99,
+        user32=user32,
+    )
+    assert res3["ok"] is True
+    assert res3["action"] == "restore_window"
+    assert res3["hwnd"] == 99
+    assert (99, SW_RESTORE) in user32.show_calls
+
+
+def test_control_system_float_infinity_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        control_system(
+            "set_brightness",
+            level=float("inf"),
+            wmi_brightness_setter=lambda _x: None,
+        )
+
+    with pytest.raises(ValueError, match="finite"):
+        control_system(
+            "set_brightness",
+            level=float("-inf"),
+            wmi_brightness_setter=lambda _x: None,
+        )
+
+    with pytest.raises(ValueError, match="finite"):
+        control_system(
+            "step_brightness",
+            step=float("inf"),
+            wmi_brightness_getter=lambda: 50,
+            wmi_brightness_setter=lambda _x: None,
+        )
+
+    with pytest.raises(ValueError, match="finite"):
+        control_system(
+            "step_brightness",
+            step=float("-inf"),
+            wmi_brightness_getter=lambda: 50,
+            wmi_brightness_setter=lambda _x: None,
+        )
