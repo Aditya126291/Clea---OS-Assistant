@@ -59,7 +59,10 @@ from clea.core.protocol import (
     DevEmitSampleTaskRequest,
     ErrorEvent,
     EventFrame,
+    GitCommitItem,
+    GitWorktreeItem,
     HealthPingRequest,
+    MediaVolumeAction,
     MemoryAddFactRequest,
     MemoryArchiveRequest,
     MemoryDeleteFactRequest,
@@ -73,6 +76,10 @@ from clea.core.protocol import (
     MemoryStatusRequest,
     MemoryUpdatedData,
     MemoryUpdatedEvent,
+    OsControlMediaVolumeRequest,
+    OsOpenOrFocusAppRequest,
+    OsReadClipboardRequest,
+    OsWriteClipboardRequest,
     RequestFrame,
     ResponseFrame,
     RiskTier,
@@ -110,6 +117,7 @@ from clea.core.protocol import (
     VoiceStateEvent,
     VoiceStatusRequest,
     VoiceTrigger,
+    WorkspaceGitInspectRequest,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +154,7 @@ def build_json_schema() -> dict[str, Any]:
         screen_capture_target: ScreenCaptureTarget
         voice_trigger: VoiceTrigger
         ui_view: UiView
+        media_volume_action: MediaVolumeAction
         # Keep individual members explicit so json2ts always emits named interfaces
         health_ping_request: HealthPingRequest
         session_new_request: SessionNewRequest
@@ -198,6 +207,13 @@ def build_json_schema() -> dict[str, Any]:
         memory_delete_fact_request: MemoryDeleteFactRequest
         activity_list_request: ActivityListRequest
         activity_cancel_request: ActivityCancelRequest
+        os_open_or_focus_app_request: OsOpenOrFocusAppRequest
+        os_control_media_volume_request: OsControlMediaVolumeRequest
+        os_read_clipboard_request: OsReadClipboardRequest
+        os_write_clipboard_request: OsWriteClipboardRequest
+        workspace_git_inspect_request: WorkspaceGitInspectRequest
+        git_worktree_item: GitWorktreeItem
+        git_commit_item: GitCommitItem
         conversation_search_hit: ConversationSearchHit
         voice_conversation_turn_item: VoiceConversationTurnItem
         memory_search_hit: MemorySearchHit

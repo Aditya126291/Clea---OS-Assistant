@@ -75,6 +75,11 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "inspect_activity",
         "cancel_task",
         "open_command_palette",
+        "open_or_focus_app",
+        "control_media_volume",
+        "read_clipboard",
+        "write_clipboard",
+        "inspect_git_workspace",
     }
     for tool in tools:
         assert tool.behavior == "non_blocking"
@@ -114,6 +119,22 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert by_name["inspect_activity"].parameters_schema["required"] == []
     assert by_name["cancel_task"].parameters_schema["required"] == ["task_id"]
     assert by_name["open_command_palette"].parameters_schema["required"] == []
+    assert by_name["open_or_focus_app"].parameters_schema["required"] == ["app_name"]
+    assert by_name["control_media_volume"].parameters_schema["required"] == ["action"]
+    assert by_name["control_media_volume"].parameters_schema["properties"]["action"]["enum"] == [
+        "mute",
+        "unmute",
+        "toggle_mute",
+        "volume_up",
+        "volume_down",
+        "set_volume",
+        "play_pause",
+        "next_track",
+        "previous_track",
+    ]
+    assert by_name["read_clipboard"].parameters_schema.get("required", []) == []
+    assert by_name["write_clipboard"].parameters_schema["required"] == ["text"]
+    assert by_name["inspect_git_workspace"].parameters_schema.get("required", []) == []
 
 
 def test_voice_session_config_defaults_and_language_code_omitted() -> None:

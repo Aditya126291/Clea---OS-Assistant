@@ -7,6 +7,7 @@ import contextlib
 import logging
 import logging.handlers
 import os
+import subprocess
 import time
 from collections.abc import Awaitable, Coroutine, Iterable
 from datetime import UTC, datetime
@@ -91,7 +92,14 @@ from clea.tools import (
     register_memory_tools,
     requires_approval,
 )
+from clea.tools.git_workspace import inspect_git_workspace
 from clea.tools.registry import ToolDefinition
+from clea.tools.windows_os import (
+    control_media_volume,
+    open_or_focus_app,
+    read_clipboard,
+    write_clipboard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1800,6 +1808,16 @@ class CleaDaemon:
             await self._handle_activity_list(conn, req)
         elif method == "activity.cancel":
             await self._handle_activity_cancel(conn, req)
+        elif method == "os.open_or_focus_app":
+            await self._handle_os_open_or_focus_app(conn, req)
+        elif method == "os.control_media_volume":
+            await self._handle_os_control_media_volume(conn, req)
+        elif method == "os.read_clipboard":
+            await self._handle_os_read_clipboard(conn, req)
+        elif method == "os.write_clipboard":
+            await self._handle_os_write_clipboard(conn, req)
+        elif method == "workspace.git_inspect":
+            await self._handle_workspace_git_inspect(conn, req)
 
     async def _perform_conversation_delete(
         self,
@@ -2434,6 +2452,86 @@ class CleaDaemon:
                 message=f"Task '{task_id}' not found.",
             ),
         )
+
+    async def _handle_os_open_or_focus_app(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                open_or_focus_app,
+                req.params.app_name,
+                req.params.target_path,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_open_or_focus_app",
+            app=res.get("app"),
+            status=res.get("status"),
+        )
+        await self._respond(ws, req, METHOD_RESULTS["os.open_or_focus_app"](**res))
+
+    async def _handle_os_control_media_volume(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                control_media_volume,
+                req.params.action,
+                req.params.level,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_control_media_volume",
+            media_action=res.get("action"),
+            level=res.get("level"),
+        )
+        await self._respond(ws, req, METHOD_RESULTS["os.control_media_volume"](**res))
+
+    async def _handle_os_read_clipboard(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(read_clipboard, req.params.max_chars)
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_read_clipboard",
+            char_count=res.get("char_count"),
+            truncated=res.get("truncated"),
+        )
+        await self._respond(ws, req, METHOD_RESULTS["os.read_clipboard"](**res))
+
+    async def _handle_os_write_clipboard(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(write_clipboard, req.params.text)
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log("os_write_clipboard", char_count=res.get("char_count"))
+        await self._respond(ws, req, METHOD_RESULTS["os.write_clipboard"](**res))
+
+    async def _handle_workspace_git_inspect(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                inspect_git_workspace,
+                req.params.repo_path,
+                req.params.include_diff,
+                req.params.diff_stat_only,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError, subprocess.SubprocessError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "workspace_git_inspect",
+            repo_path=res.get("repo_path"),
+            branch=res.get("branch"),
+            is_clean=res.get("is_clean"),
+        )
+        await self._respond(ws, req, METHOD_RESULTS["workspace.git_inspect"](**res))
 
     def _settings(self) -> SettingsGetResult:
         policies = {

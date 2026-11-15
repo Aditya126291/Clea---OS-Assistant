@@ -25,6 +25,17 @@ TranscriptRole = Literal["user", "assistant"]
 ScreenCaptureTarget = Literal["active_window", "full_screen"]
 VoiceTrigger = Literal["manual", "wake_word", "hotkey", "ui"]
 UiView = Literal["chat", "voice", "activity", "memory", "settings"]
+MediaVolumeAction = Literal[
+    "mute",
+    "unmute",
+    "toggle_mute",
+    "volume_up",
+    "volume_down",
+    "set_volume",
+    "play_pause",
+    "next_track",
+    "previous_track",
+]
 
 
 def new_id() -> str:
@@ -187,6 +198,30 @@ class ActivityListParams(_Model):
 
 class ActivityCancelParams(_Model):
     task_id: str
+
+
+class OsOpenOrFocusAppParams(_Model):
+    app_name: str
+    target_path: str | None = None
+
+
+class OsControlMediaVolumeParams(_Model):
+    action: MediaVolumeAction
+    level: int | None = Field(default=None, ge=0, le=100)
+
+
+class OsReadClipboardParams(_Model):
+    max_chars: int = Field(default=8000, ge=1, le=100_000)
+
+
+class OsWriteClipboardParams(_Model):
+    text: str
+
+
+class WorkspaceGitInspectParams(_Model):
+    repo_path: str | None = None
+    include_diff: bool = False
+    diff_stat_only: bool = True
 
 
 class _Request(_Model):
@@ -465,6 +500,31 @@ class ActivityCancelRequest(_Request):
     params: ActivityCancelParams
 
 
+class OsOpenOrFocusAppRequest(_Request):
+    method: Literal["os.open_or_focus_app"] = "os.open_or_focus_app"
+    params: OsOpenOrFocusAppParams
+
+
+class OsControlMediaVolumeRequest(_Request):
+    method: Literal["os.control_media_volume"] = "os.control_media_volume"
+    params: OsControlMediaVolumeParams
+
+
+class OsReadClipboardRequest(_Request):
+    method: Literal["os.read_clipboard"] = "os.read_clipboard"
+    params: OsReadClipboardParams = Field(default_factory=OsReadClipboardParams)
+
+
+class OsWriteClipboardRequest(_Request):
+    method: Literal["os.write_clipboard"] = "os.write_clipboard"
+    params: OsWriteClipboardParams
+
+
+class WorkspaceGitInspectRequest(_Request):
+    method: Literal["workspace.git_inspect"] = "workspace.git_inspect"
+    params: WorkspaceGitInspectParams = Field(default_factory=WorkspaceGitInspectParams)
+
+
 RequestFrame = Annotated[
     HealthPingRequest
     | SessionNewRequest
@@ -512,7 +572,12 @@ RequestFrame = Annotated[
     | MemoryAddFactRequest
     | MemoryDeleteFactRequest
     | ActivityListRequest
-    | ActivityCancelRequest,
+    | ActivityCancelRequest
+    | OsOpenOrFocusAppRequest
+    | OsControlMediaVolumeRequest
+    | OsReadClipboardRequest
+    | OsWriteClipboardRequest
+    | WorkspaceGitInspectRequest,
     Field(discriminator="method"),
 ]
 """Any client-to-daemon request (discriminated by ``method``)."""
@@ -996,6 +1061,62 @@ class ActivityCancelResult(_Model):
     message: str = ""
 
 
+class OsOpenOrFocusAppResult(_Model):
+    ok: bool = True
+    status: Literal["focused", "launched"]
+    app: str
+    window_title: str | None = None
+    hwnd: int | None = None
+    executable: str | None = None
+    target_path: str | None = None
+
+
+class OsControlMediaVolumeResult(_Model):
+    ok: bool = True
+    action: MediaVolumeAction
+    level: int | None = None
+
+
+class OsReadClipboardResult(_Model):
+    ok: bool = True
+    text: str = ""
+    truncated: bool = False
+    char_count: int = 0
+    total_chars: int = 0
+
+
+class OsWriteClipboardResult(_Model):
+    ok: bool = True
+    char_count: int = 0
+
+
+class GitWorktreeItem(_Model):
+    path: str
+    head: str = ""
+    branch: str = ""
+
+
+class GitCommitItem(_Model):
+    sha: str
+    subject: str
+    oneline: str
+
+
+class WorkspaceGitInspectResult(_Model):
+    ok: bool = True
+    repo_path: str
+    branch: str
+    is_clean: bool = True
+    status: str = ""
+    staged: list[str] = Field(default_factory=list)
+    unstaged: list[str] = Field(default_factory=list)
+    untracked: list[str] = Field(default_factory=list)
+    worktrees: list[GitWorktreeItem] = Field(default_factory=list)
+    recent_commits: list[GitCommitItem] = Field(default_factory=list)
+    diff: str | None = None
+    diff_truncated: bool = False
+
+
 METHOD_RESULTS: dict[str, type[_Model]] = {
     "health.ping": HealthPingResult,
     "session.new": SessionNewResult,
@@ -1044,6 +1165,11 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "memory.delete_fact": MemoryDeleteFactResult,
     "activity.list": ActivityListResult,
     "activity.cancel": ActivityCancelResult,
+    "os.open_or_focus_app": OsOpenOrFocusAppResult,
+    "os.control_media_volume": OsControlMediaVolumeResult,
+    "os.read_clipboard": OsReadClipboardResult,
+    "os.write_clipboard": OsWriteClipboardResult,
+    "workspace.git_inspect": WorkspaceGitInspectResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""
 

@@ -476,6 +476,140 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="open_or_focus_app",
+            description=(
+                "Focus an already-open Windows application window if visible, or safely launch "
+                "a known developer or desktop application (e.g., vscode, terminal, chrome, edge, "
+                "explorer, cursor, antigravity, notepad, settings, taskmgr)."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": (
+                            "Application name or alias (e.g., vscode, code, terminal, wt, "
+                            "chrome, edge, explorer, cursor, antigravity, notepad, settings, "
+                            "taskmgr)."
+                        ),
+                    },
+                    "target_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional existing local file or directory path to open when "
+                            "launching the application."
+                        ),
+                    },
+                },
+                "required": ["app_name"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="control_media_volume",
+            description=(
+                "Control Windows system audio volume or media playback without shell execution."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "mute",
+                            "unmute",
+                            "toggle_mute",
+                            "volume_up",
+                            "volume_down",
+                            "set_volume",
+                            "play_pause",
+                            "next_track",
+                            "previous_track",
+                        ],
+                        "description": "Volume or media playback action to perform.",
+                    },
+                    "level": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": (
+                            "Target volume percentage (0-100); required when action is "
+                            "'set_volume'."
+                        ),
+                    },
+                },
+                "required": ["action"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="read_clipboard",
+            description=(
+                "Read plain text from the Windows clipboard, truncated to max_chars to keep "
+                "voice context bounded."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100000,
+                        "description": "Maximum characters to return (default 8000).",
+                    }
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="write_clipboard",
+            description="Write plain text to the Windows clipboard.",
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Plain text content to place on the Windows clipboard.",
+                    }
+                },
+                "required": ["text"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="inspect_git_workspace",
+            description=(
+                "Inspect a local Git repository or sibling worktree strictly read-only: current "
+                "branch, working tree status, worktrees, recent commits, and optional diff."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional repository or sibling worktree path. Defaults to the Clea "
+                            "workspace root."
+                        ),
+                    },
+                    "include_diff": {
+                        "type": "boolean",
+                        "description": "Whether to include working-tree diff output.",
+                    },
+                    "diff_stat_only": {
+                        "type": "boolean",
+                        "description": (
+                            "When include_diff is true, return diff --stat summary instead of "
+                            "full patch (default true)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="end_call",
             description="End the active voice call politely when the user asks to hang up.",
             parameters_schema={

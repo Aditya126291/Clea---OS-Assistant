@@ -127,6 +127,19 @@ import type {
   VoiceState,
   VoiceStatusResult,
   VoiceTrigger,
+  MediaVolumeAction,
+  OsOpenOrFocusAppParams,
+  OsOpenOrFocusAppResult,
+  OsControlMediaVolumeParams,
+  OsControlMediaVolumeResult,
+  OsReadClipboardParams,
+  OsReadClipboardResult,
+  OsWriteClipboardParams,
+  OsWriteClipboardResult,
+  GitWorktreeItem,
+  GitCommitItem,
+  WorkspaceGitInspectParams,
+  WorkspaceGitInspectResult,
 } from "./generated";
 
 export type {
@@ -258,6 +271,19 @@ export type {
   VoiceState,
   VoiceStatusResult,
   VoiceTrigger,
+  MediaVolumeAction,
+  OsOpenOrFocusAppParams,
+  OsOpenOrFocusAppResult,
+  OsControlMediaVolumeParams,
+  OsControlMediaVolumeResult,
+  OsReadClipboardParams,
+  OsReadClipboardResult,
+  OsWriteClipboardParams,
+  OsWriteClipboardResult,
+  GitWorktreeItem,
+  GitCommitItem,
+  WorkspaceGitInspectParams,
+  WorkspaceGitInspectResult,
 };
 
 export type CleaMethod = NonNullable<Request["method"]>;
@@ -310,6 +336,11 @@ export interface MethodParamsMap {
   "memory.delete_fact": MemoryDeleteFactParams;
   "activity.list": ActivityListParams;
   "activity.cancel": ActivityCancelParams;
+  "os.open_or_focus_app": OsOpenOrFocusAppParams;
+  "os.control_media_volume": OsControlMediaVolumeParams;
+  "os.read_clipboard": OsReadClipboardParams;
+  "os.write_clipboard": OsWriteClipboardParams;
+  "workspace.git_inspect": WorkspaceGitInspectParams;
 }
 
 export interface MethodResultMap {
@@ -360,6 +391,11 @@ export interface MethodResultMap {
   "memory.delete_fact": MemoryDeleteFactResult;
   "activity.list": ActivityListResult;
   "activity.cancel": ActivityCancelResult;
+  "os.open_or_focus_app": OsOpenOrFocusAppResult;
+  "os.control_media_volume": OsControlMediaVolumeResult;
+  "os.read_clipboard": OsReadClipboardResult;
+  "os.write_clipboard": OsWriteClipboardResult;
+  "workspace.git_inspect": WorkspaceGitInspectResult;
 }
 
 export type ConnectionState =

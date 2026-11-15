@@ -131,7 +131,8 @@ def test_base_voice_system_instruction_partitions_intents_and_blocks_screen_bias
     assert "1. Visual / Active Screen Intent" in prompt
     assert "2. Memory / Past Conversation Recall Intent" in prompt
     assert "3. Clea App, Chat Output & Task Action Intent" in prompt
-    assert "4. General Spoken Q&A" in prompt
+    assert "4. Windows OS & Git Workspace Control" in prompt
+    assert "5. General Spoken Q&A" in prompt
 
     # Hard negative rules against screen-first bias for recall / focus
     assert "NEVER call `look_at_screen`" in prompt

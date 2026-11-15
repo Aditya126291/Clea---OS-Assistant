@@ -45,6 +45,14 @@ from clea.core.protocol import (
     MemoryAddFactRequest,
     MemoryDeleteFactParams,
     MemoryDeleteFactRequest,
+    OsControlMediaVolumeParams,
+    OsControlMediaVolumeRequest,
+    OsOpenOrFocusAppParams,
+    OsOpenOrFocusAppRequest,
+    OsReadClipboardParams,
+    OsReadClipboardRequest,
+    OsWriteClipboardParams,
+    OsWriteClipboardRequest,
     ResponseFrame,
     TranscriptData,
     TranscriptEvent,
@@ -73,6 +81,8 @@ from clea.core.protocol import (
     VoiceState,
     VoiceStateData,
     VoiceStateEvent,
+    WorkspaceGitInspectParams,
+    WorkspaceGitInspectRequest,
     new_id,
     parse_frame,
 )
@@ -1898,6 +1908,107 @@ class VoiceRunner:
             await _execute_rpc_tool(
                 UiNavigateRequest(params=UiNavigateParams(view="chat", open_command_palette=True)),
                 error_prefix="Failed to open command palette",
+            )
+            return
+
+        # 8. Windows OS & read-only Git workspace tools
+        if event.name == "open_or_focus_app":
+            app_name = _req_str("app_name")
+            if not app_name:
+                await _send_error("app_name must not be empty.")
+                return
+            await _execute_rpc_tool(
+                OsOpenOrFocusAppRequest(
+                    params=OsOpenOrFocusAppParams(
+                        app_name=app_name,
+                        target_path=_req_str("target_path"),
+                    )
+                ),
+                error_prefix="Failed to open or focus app",
+            )
+            return
+
+        if event.name == "control_media_volume":
+            action = (_req_str("action") or "").lower()
+            valid_actions = (
+                "mute",
+                "unmute",
+                "toggle_mute",
+                "volume_up",
+                "volume_down",
+                "set_volume",
+                "play_pause",
+                "next_track",
+                "previous_track",
+            )
+            if action not in valid_actions:
+                await _send_error("action must be one of: " + ", ".join(valid_actions) + ".")
+                return
+            raw_level = event.arguments.get("level")
+            level: int | None = None
+            if raw_level is not None:
+                if isinstance(raw_level, bool):
+                    await _send_error("level must be an integer between 0 and 100.")
+                    return
+                try:
+                    level = max(0, min(100, int(raw_level)))
+                except (TypeError, ValueError):
+                    await _send_error("level must be an integer between 0 and 100.")
+                    return
+            if action == "set_volume" and level is None:
+                await _send_error("level (0..100) is required when action is 'set_volume'.")
+                return
+            await _execute_rpc_tool(
+                OsControlMediaVolumeRequest(
+                    params=OsControlMediaVolumeParams(
+                        action=action,  # type: ignore[arg-type]
+                        level=level,
+                    )
+                ),
+                error_prefix="Failed to control media/volume",
+            )
+            return
+
+        if event.name == "read_clipboard":
+            raw_max = event.arguments.get("max_chars", 8000)
+            try:
+                if raw_max is None:
+                    max_chars = 8000
+                elif isinstance(raw_max, bool):
+                    raise ValueError("bool is not valid")
+                else:
+                    max_chars = max(1, min(100_000, int(raw_max)))
+            except (TypeError, ValueError):
+                await _send_error("max_chars must be an integer between 1 and 100000.")
+                return
+            await _execute_rpc_tool(
+                OsReadClipboardRequest(params=OsReadClipboardParams(max_chars=max_chars)),
+                error_prefix="Failed to read clipboard",
+            )
+            return
+
+        if event.name == "write_clipboard":
+            raw_text = event.arguments.get("text")
+            if raw_text is None:
+                await _send_error("text is required.")
+                return
+            text = raw_text if isinstance(raw_text, str) else str(raw_text)
+            await _execute_rpc_tool(
+                OsWriteClipboardRequest(params=OsWriteClipboardParams(text=text)),
+                error_prefix="Failed to write clipboard",
+            )
+            return
+
+        if event.name == "inspect_git_workspace":
+            await _execute_rpc_tool(
+                WorkspaceGitInspectRequest(
+                    params=WorkspaceGitInspectParams(
+                        repo_path=_req_str("repo_path"),
+                        include_diff=_parse_bool("include_diff", default=False),
+                        diff_stat_only=_parse_bool("diff_stat_only", default=True),
+                    )
+                ),
+                error_prefix="Failed to inspect Git workspace",
             )
             return
 

@@ -26,6 +26,14 @@ from clea.core.protocol import (
     DevEmitSampleTaskRequest,
     MemoryEpisodesRequest,
     MemoryForgetRequest,
+    OsControlMediaVolumeParams,
+    OsControlMediaVolumeRequest,
+    OsOpenOrFocusAppParams,
+    OsOpenOrFocusAppRequest,
+    OsReadClipboardParams,
+    OsReadClipboardRequest,
+    OsWriteClipboardParams,
+    OsWriteClipboardRequest,
     ResponseFrame,
     ScreenCaptureStateData,
     ScreenCaptureStateEvent,
@@ -45,6 +53,8 @@ from clea.core.protocol import (
     VoiceStateData,
     VoiceStateEvent,
     VoiceStatusRequest,
+    WorkspaceGitInspectParams,
+    WorkspaceGitInspectRequest,
     parse_frame,
 )
 from clea.tools import RiskLevel
@@ -208,9 +218,40 @@ def test_every_method_has_a_result_model() -> None:
             ("memory.delete_fact", {"query_or_id": "fact-1"}),
             ("activity.list", {}),
             ("activity.cancel", {"task_id": "task-1"}),
+            ("os.open_or_focus_app", {"app_name": "vscode"}),
+            ("os.control_media_volume", {"action": "mute"}),
+            ("os.read_clipboard", {}),
+            ("os.write_clipboard", {"text": "hello"}),
+            ("workspace.git_inspect", {}),
         ]
     }
     assert methods == set(METHOD_RESULTS)
+
+
+def test_windows_os_and_git_protocol_roundtrip() -> None:
+    frames = [
+        OsOpenOrFocusAppRequest(params=OsOpenOrFocusAppParams(app_name="vscode")),
+        OsControlMediaVolumeRequest(
+            params=OsControlMediaVolumeParams(action="set_volume", level=42)
+        ),
+        OsReadClipboardRequest(params=OsReadClipboardParams(max_chars=512)),
+        OsWriteClipboardRequest(params=OsWriteClipboardParams(text="copied snippet")),
+        WorkspaceGitInspectRequest(
+            params=WorkspaceGitInspectParams(include_diff=True, diff_stat_only=False)
+        ),
+    ]
+    for frame in frames:
+        parsed = parse_frame(frame.model_dump_json())
+        assert type(parsed) is type(frame)
+
+    with pytest.raises(ValidationError):
+        OsControlMediaVolumeParams(action="invalid_action")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        OsControlMediaVolumeParams(action="set_volume", level=101)
+
+    with pytest.raises(ValidationError):
+        OsReadClipboardParams(max_chars=0)
 
 
 def test_risk_tiers_match_registry_risk_levels() -> None:
