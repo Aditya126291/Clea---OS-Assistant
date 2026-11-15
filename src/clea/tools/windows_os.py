@@ -3059,12 +3059,24 @@ def clear_ui_ref_store() -> None:
     _LAST_UI_WINDOW_TITLE = ""
 
 
-def set_ui_snapshot_state(snapshot: dict[str, Any]) -> None:
+def set_ui_snapshot_state(snapshot: Any) -> None:
     """Explicitly cache a snapshot dictionary and populate element refs."""
     global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
     _UI_REF_STORE.clear()
-    raw_elements = snapshot.get("elements") or []
-    for idx, el in enumerate(raw_elements):
+    if hasattr(snapshot, "model_dump"):
+        snap_dict = snapshot.model_dump()
+    elif isinstance(snapshot, dict):
+        snap_dict = snapshot
+    else:
+        snap_dict = {}
+
+    raw_elements = snap_dict.get("elements") or []
+    for idx, raw_el in enumerate(raw_elements):
+        el = (
+            raw_el.model_dump()
+            if hasattr(raw_el, "model_dump")
+            else (dict(raw_el) if isinstance(raw_el, dict) else {})
+        )
         ref = str(el.get("ref") or f"e{idx}")
         _UI_REF_STORE[ref] = {
             "ref": ref,
@@ -3078,12 +3090,12 @@ def set_ui_snapshot_state(snapshot: dict[str, Any]) -> None:
         }
     _LAST_UI_SNAPSHOT = {
         "ok": True,
-        "window_title": str(snapshot.get("window_title") or ""),
+        "window_title": str(snap_dict.get("window_title") or ""),
         "count": len(_UI_REF_STORE),
         "elements": list(_UI_REF_STORE.values()),
     }
     _LAST_UI_SNAPSHOT_TIME = time.time()
-    _LAST_UI_WINDOW_TITLE = str(snapshot.get("window_title") or "")
+    _LAST_UI_WINDOW_TITLE = str(snap_dict.get("window_title") or "")
 
 
 def _get_foreground_window_title(user32: Any = None) -> str:
@@ -3167,10 +3179,21 @@ def ui_snapshot(
     return snapshot
 
 
-def compute_ui_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+def compute_ui_diff(before: Any, after: Any) -> dict[str, Any]:
     """Compute structural UI diff between two snapshots generically across apps and browsers."""
-    before_dict = before if isinstance(before, dict) else {}
-    after_dict = after if isinstance(after, dict) else {}
+    if hasattr(before, "model_dump"):
+        before_dict = before.model_dump()
+    elif isinstance(before, dict):
+        before_dict = before
+    else:
+        before_dict = {}
+
+    if hasattr(after, "model_dump"):
+        after_dict = after.model_dump()
+    elif isinstance(after, dict):
+        after_dict = after
+    else:
+        after_dict = {}
 
     before_title = str(before_dict.get("window_title") or "")
     after_title = str(after_dict.get("window_title") or "")
@@ -3194,52 +3217,70 @@ def compute_ui_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
         aid_a = str(a.get("automation_id") or "").strip()
         if not aid_a:
             continue
-        role_a = str(a.get("role") or "").strip().lower()
+        role_a = str(a.get("role") or a.get("control_type") or "").strip().lower()
         for i, b in enumerate(before_els):
             if i in matched_before:
                 continue
             aid_b = str(b.get("automation_id") or "").strip()
-            role_b = str(b.get("role") or "").strip().lower()
+            role_b = str(b.get("role") or b.get("control_type") or "").strip().lower()
             if aid_a == aid_b and (not role_a or not role_b or role_a == role_b):
                 matched_before.add(i)
                 matched_after.add(j)
                 pairs.append((i, j))
                 break
 
-    # 2. Match by (role, name) when name is non-empty
+    # 2. Match by (role, name) when name is non-empty (favoring closest spatial coordinates)
     for j, a in enumerate(after_els):
         if j in matched_after:
             continue
         name_a = str(a.get("name") or "").strip().lower()
-        role_a = str(a.get("role") or "").strip().lower()
+        role_a = str(a.get("role") or a.get("control_type") or "").strip().lower()
         if not name_a:
             continue
+        xa = int(a.get("x", 0))
+        ya = int(a.get("y", 0))
+
+        best_i: int | None = None
+        best_dist = float("inf")
         for i, b in enumerate(before_els):
             if i in matched_before:
                 continue
             name_b = str(b.get("name") or "").strip().lower()
-            role_b = str(b.get("role") or "").strip().lower()
+            role_b = str(b.get("role") or b.get("control_type") or "").strip().lower()
             if name_a == name_b and (not role_a or not role_b or role_a == role_b):
-                matched_before.add(i)
-                matched_after.add(j)
-                pairs.append((i, j))
-                break
+                xb = int(b.get("x", 0))
+                yb = int(b.get("y", 0))
+                dist = abs(xa - xb) + abs(ya - yb)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_i = i
+
+        if best_i is not None:
+            matched_before.add(best_i)
+            matched_after.add(j)
+            pairs.append((best_i, j))
 
     # 3. Match by (role, position) within 15px (e.g. dynamic text readouts or edited fields)
     for j, a in enumerate(after_els):
         if j in matched_after:
             continue
-        role_a = str(a.get("role") or "").strip().lower()
+        role_a = str(a.get("role") or a.get("control_type") or "").strip().lower()
         xa = int(a.get("x", 0))
         ya = int(a.get("y", 0))
+        has_pos_a = xa > 0 or ya > 0
+        if not role_a or not has_pos_a:
+            continue
         for i, b in enumerate(before_els):
             if i in matched_before:
                 continue
-            role_b = str(b.get("role") or "").strip().lower()
+            role_b = str(b.get("role") or b.get("control_type") or "").strip().lower()
             xb = int(b.get("x", 0))
             yb = int(b.get("y", 0))
+            has_pos_b = xb > 0 or yb > 0
             if (
-                (not role_a or not role_b or role_a == role_b)
+                role_b
+                and role_a == role_b
+                and has_pos_b
                 and abs(xa - xb) <= 15
                 and abs(ya - yb) <= 15
             ):
@@ -3259,14 +3300,17 @@ def compute_ui_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
         role = str(a.get("role") or b.get("role") or "")
         role_lower = role.lower()
 
-        if b_val != a_val:
+        b_val_clean = str(b_val) if b_val is not None else None
+        a_val_clean = str(a_val) if a_val is not None else None
+
+        if b_val_clean != a_val_clean:
             changed_values.append(
                 {
                     "ref": str(a.get("ref") or b.get("ref") or ""),
                     "role": role,
                     "name": a_name or b_name,
-                    "old_value": str(b_val) if b_val is not None else None,
-                    "new_value": str(a_val) if a_val is not None else None,
+                    "old_value": b_val_clean,
+                    "new_value": a_val_clean,
                 }
             )
         elif b_name != a_name and (
@@ -3288,7 +3332,7 @@ def compute_ui_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
         if j not in matched_after:
             added_elements.append(
                 {
-                    "ref": str(a.get("ref") or ""),
+                    "ref": str(a.get("ref") or f"e{j}"),
                     "role": str(a.get("role") or a.get("control_type") or "").strip().lower(),
                     "name": str(a.get("name") or ""),
                     "value": str(a["value"]) if a.get("value") is not None else None,
@@ -3299,7 +3343,7 @@ def compute_ui_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
                 }
             )
     added_elements = added_elements[:25]
-    removed_count = len(before_els) - len(matched_before)
+    removed_count = max(0, len(before_els) - len(matched_before))
 
     return {
         "window_changed": window_changed,
@@ -3338,7 +3382,8 @@ def ui_act(
 
     global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME
     if not _UI_REF_STORE:
-        snap_runner(user32=user32)
+        snap = snap_runner(user32=user32)
+        set_ui_snapshot_state(snap)
 
     if cleaned_ref not in _UI_REF_STORE:
         avail = ", ".join(sorted(_UI_REF_STORE.keys())[:25]) or "none"
@@ -3383,6 +3428,7 @@ def ui_act(
         }
 
     after_snap = snap_runner(user32=user32)
+    set_ui_snapshot_state(after_snap)
     diff = compute_ui_diff(before_snap, after_snap)
     return {
         "ok": True,
@@ -3431,6 +3477,12 @@ def ui_batch(
                 raise ValueError(
                     f"Unsupported action {act!r} in step {idx} 'act'. Must be one of {valid_acts}."
                 )
+            if act == "type":
+                val = s_dict.get("value")
+                if val is None or not isinstance(val, str):
+                    raise ValueError(
+                        f"Step {idx} 'act' with action 'type' requires string 'value'."
+                    )
         elif op == "press_keys":
             keys = s_dict.get("keys")
             if not isinstance(keys, list) or len(keys) == 0:
@@ -3439,6 +3491,17 @@ def ui_batch(
             delta = s_dict.get("delta")
             if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
                 raise ValueError(f"Step {idx} 'scroll' requires non-zero integer 'delta'.")
+        elif op == "wait":
+            sec = s_dict.get("seconds", 0.5)
+            if (
+                isinstance(sec, bool)
+                or not isinstance(sec, (int, float))
+                or not math.isfinite(float(sec))
+                or float(sec) < 0
+            ):
+                raise ValueError(
+                    f"Step {idx} 'wait' requires non-negative finite number for 'seconds'."
+                )
         elif op == "click_at":
             x = s_dict.get("x")
             y = s_dict.get("y")
@@ -3455,6 +3518,18 @@ def ui_batch(
                 raise ValueError(
                     f"Step {idx} 'click_at' requires non-negative integer 'x' and 'y'."
                 )
+            btn = s_dict.get("button", "left")
+            if btn is not None and str(btn).strip().lower() not in VALID_CLICK_BUTTONS:
+                valid_btns = sorted(VALID_CLICK_BUTTONS)
+                raise ValueError(
+                    f"Step {idx} 'click_at' unsupported button {btn!r}. "
+                    f"Must be one of {valid_btns}."
+                )
+            clicks = s_dict.get("clicks", 1)
+            if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1 or clicks > 3:
+                raise ValueError(
+                    f"Step {idx} 'click_at' clicks must be an integer between 1 and 3."
+                )
 
     snap_runner = ui_snapshot_fn or ui_snapshot
     action_runner = gui_action_fn or gui_action
@@ -3463,6 +3538,7 @@ def ui_batch(
     is_stale = (time.time() - _LAST_UI_SNAPSHOT_TIME) > 60.0
     if not _UI_REF_STORE or _LAST_UI_SNAPSHOT is None or is_stale:
         before_snapshot = snap_runner(user32=user32)
+        set_ui_snapshot_state(before_snapshot)
     else:
         before_snapshot = _LAST_UI_SNAPSHOT
 
@@ -3576,7 +3652,7 @@ def ui_batch(
             current_title = ""
             with contextlib.suppress(Exception):
                 current_title = title_getter()
-            if current_title and initial_title and current_title != initial_title:
+            if current_title and current_title != initial_title:
                 status = "stopped_on_window_change"
                 break
 
@@ -3584,6 +3660,7 @@ def ui_batch(
         status = "partial_error"
 
     after_snapshot = snap_runner(user32=user32)
+    set_ui_snapshot_state(after_snapshot)
     diff = compute_ui_diff(before_snapshot, after_snapshot)
 
     return {

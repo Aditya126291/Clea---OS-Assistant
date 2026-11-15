@@ -2712,6 +2712,164 @@ def test_ui_batch_validates_step_constraints() -> None:
     with pytest.raises(ValueError, match="Unsupported batch op 'teleport'"):
         ui_batch([{"op": "teleport"}])
 
+    with pytest.raises(ValueError, match="requires non-negative finite number for 'seconds'"):
+        ui_batch([{"op": "wait", "seconds": -5}])
+
+    with pytest.raises(ValueError, match="requires non-negative finite number for 'seconds'"):
+        ui_batch([{"op": "wait", "seconds": "invalid"}])
+
+    with pytest.raises(ValueError, match="requires string 'value'"):
+        ui_batch([{"op": "act", "ref": "e0", "action": "type", "value": None}])
+
+    with pytest.raises(ValueError, match="unsupported button 'middle_click'"):
+        ui_batch([{"op": "click_at", "x": 10, "y": 10, "button": "middle_click"}])
+
+
+def test_compute_ui_diff_with_pydantic_snapshot_models() -> None:
+    from clea.core.protocol import OsUiSnapshotResult, UiSnapshotElement
+
+    before = OsUiSnapshotResult(
+        ok=True,
+        window_title="Settings - Network",
+        count=1,
+        elements=[
+            UiSnapshotElement(
+                ref="e0",
+                role="edit",
+                name="SSID",
+                value="HomeWifi",
+                x=100,
+                y=100,
+                automation_id="txtSSID",
+            )
+        ],
+    )
+    after = OsUiSnapshotResult(
+        ok=True,
+        window_title="Settings - Network",
+        count=1,
+        elements=[
+            UiSnapshotElement(
+                ref="e0",
+                role="edit",
+                name="SSID",
+                value="OfficeWifi",
+                x=100,
+                y=100,
+                automation_id="txtSSID",
+            )
+        ],
+    )
+    diff = compute_ui_diff(before, after)
+    assert diff["window_changed"] is False
+    assert diff["window_title"] == "Settings - Network"
+    assert len(diff["changed_values"]) == 1
+    assert diff["changed_values"][0]["old_value"] == "HomeWifi"
+    assert diff["changed_values"][0]["new_value"] == "OfficeWifi"
+
+
+def test_compute_ui_diff_unpositioned_elements_different_names_not_matched() -> None:
+    b = {"window_title": "App", "elements": [{"ref": "e0", "name": "Item A"}]}
+    a = {"window_title": "App", "elements": [{"ref": "e1", "name": "Item B"}]}
+    diff = compute_ui_diff(b, a)
+    assert diff["changed_values"] == []
+    assert diff["removed_count"] == 1
+    assert len(diff["added_elements"]) == 1
+    assert diff["added_elements"][0]["name"] == "Item B"
+
+
+def test_compute_ui_diff_spatial_proximity_for_duplicate_labels() -> None:
+    before = {
+        "window_title": "List",
+        "elements": [
+            {"ref": "e0", "role": "button", "name": "Delete", "x": 100, "y": 50},
+            {"ref": "e1", "role": "button", "name": "Delete", "x": 100, "y": 150},
+        ],
+    }
+    after = {
+        "window_title": "List",
+        "elements": [
+            {"ref": "e0", "role": "button", "name": "Delete", "x": 100, "y": 150},
+        ],
+    }
+    diff = compute_ui_diff(before, after)
+    assert diff["removed_count"] == 1
+    assert diff["added_elements"] == []
+
+
+def test_ui_batch_and_ui_act_populates_ref_store_from_custom_snapshot_fn() -> None:
+    clear_ui_ref_store()
+    u32 = _FakeInputUser32()
+
+    init_snap = {
+        "window_title": "Form",
+        "elements": [
+            {"ref": "e0", "role": "edit", "name": "Field", "value": "old", "x": 50, "y": 50}
+        ],
+    }
+    after_snap = {
+        "window_title": "Form",
+        "elements": [
+            {"ref": "e0", "role": "edit", "name": "Field", "value": "new", "x": 50, "y": 50}
+        ],
+    }
+
+    call_count = 0
+
+    def _mock_snap(**_kw: Any) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        return init_snap if call_count == 1 else after_snap
+
+    # Verify ui_batch with custom snapshot runner populates store from empty
+    res_batch = ui_batch(
+        [{"op": "act", "ref": "e0", "action": "click"}],
+        ui_snapshot_fn=_mock_snap,
+        user32=u32,
+    )
+    assert res_batch["status"] == "completed"
+    assert res_batch["steps_executed"] == 1
+
+    # Verify ui_act with custom snapshot runner populates store from empty
+    clear_ui_ref_store()
+    call_count = 0
+    res_act = ui_act(
+        "e0",
+        "click",
+        ui_snapshot_fn=_mock_snap,
+        user32=u32,
+    )
+    assert res_act["status"] == "completed"
+
+
+def test_ui_batch_window_change_from_empty_initial_title() -> None:
+    clear_ui_ref_store()
+    set_ui_snapshot_state(
+        {
+            "window_title": "",
+            "elements": [{"ref": "e0", "role": "button", "name": "Open Dialog", "x": 10, "y": 10}],
+        }
+    )
+
+    # Initial title is empty string; after click, window title transitions to "Save As"
+    titles = ["", "Save As"]
+
+    def _dynamic_title() -> str:
+        return titles.pop(0) if titles else "Save As"
+
+    res = ui_batch(
+        [
+            {"op": "act", "ref": "e0", "action": "click"},
+            {"op": "wait", "seconds": 0.5},
+        ],
+        stop_on_window_change=True,
+        window_title_fn=_dynamic_title,
+        ui_snapshot_fn=lambda **_kw: {"window_title": "Save As", "elements": []},
+        user32=_FakeInputUser32(),
+    )
+    assert res["status"] == "stopped_on_window_change"
+    assert res["steps_executed"] == 1
+
 
 @pytest.mark.asyncio
 async def test_voice_runner_to_daemon_e2e_ui_snapshot_act_batch(
@@ -2932,3 +3090,17 @@ async def test_voice_runner_to_daemon_e2e_ui_snapshot_act_batch(
         )
         assert r_err_batch.is_error is True
         assert "non-empty list" in str(r_err_batch.response.get("error", ""))
+
+        # 6. Verify boolean strings parsed correctly in ui_batch
+        r_batch_bool = await _invoke_voice_tool(
+            backend,
+            call_id="c-batch-bool",
+            name="ui_batch",
+            arguments={
+                "steps": [{"op": "wait", "seconds": 0.1}],
+                "stop_on_error": "false",
+                "stop_on_window_change": "false",
+            },
+        )
+        assert r_batch_bool.is_error is False
+        assert batch_calls[-1] == (1, False, False)

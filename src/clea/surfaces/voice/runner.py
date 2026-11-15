@@ -2306,8 +2306,8 @@ class VoiceRunner:
             if len(raw_steps) > 20:
                 await _send_error("steps cannot exceed 20 operations.")
                 return
-            stop_on_error = bool(event.arguments.get("stop_on_error", True))
-            stop_on_win_change = bool(event.arguments.get("stop_on_window_change", True))
+            stop_on_error = _parse_bool("stop_on_error", default=True)
+            stop_on_win_change = _parse_bool("stop_on_window_change", default=True)
             try:
                 steps = [
                     UiBatchStep.model_validate(s) if isinstance(s, dict) else s
