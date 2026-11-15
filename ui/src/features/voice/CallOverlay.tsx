@@ -1,38 +1,39 @@
 import { PhoneOff } from "lucide-react";
 import { useEffect, useState, type ComponentType } from "react";
 import { Button } from "@/components/ui/button";
+import { CleaAvatar } from "@/components/ui/clea-avatar";
 import { cn } from "@/lib/utils";
 import { useCleaStore } from "@/protocol/store";
 import type { VoiceState } from "@/protocol/types";
 
 const ORB_STYLE: Record<VoiceState, { ring: string; label: string; anim: string }> = {
   idle: {
-    ring: "from-zinc-400/80 to-zinc-600/80 dark:from-zinc-300/80 dark:to-zinc-500/80",
+    ring: "ring-2 ring-zinc-400/50 dark:ring-zinc-500/50",
     label: "Idle",
     anim: "clea-orb-idle",
   },
   listening: {
-    ring: "from-sky-400 to-blue-600",
+    ring: "ring-2 ring-cyan-400 shadow-[0_0_16px_rgba(34,211,238,0.42)]",
     label: "Listening",
     anim: "clea-orb-listening",
   },
   thinking: {
-    ring: "from-amber-300 via-orange-400 to-amber-500",
+    ring: "ring-2 ring-violet-400 shadow-[0_0_16px_rgba(167,139,250,0.45)]",
     label: "Thinking",
     anim: "clea-orb-thinking",
   },
   speaking: {
-    ring: "from-emerald-400 to-teal-500",
+    ring: "ring-2 ring-amber-400 shadow-[0_0_18px_rgba(251,146,60,0.5)]",
     label: "Speaking",
     anim: "clea-orb-speaking",
   },
   reconnecting: {
-    ring: "from-amber-400 via-yellow-500 to-amber-600",
+    ring: "ring-2 ring-amber-400/80 shadow-[0_0_14px_rgba(251,191,36,0.35)]",
     label: "Reconnecting",
     anim: "clea-orb-thinking",
   },
   error: {
-    ring: "from-rose-500 to-red-700",
+    ring: "ring-2 ring-rose-500 shadow-[0_0_16px_rgba(244,63,94,0.45)]",
     label: "Error",
     anim: "clea-orb-error",
   },
@@ -42,6 +43,7 @@ export function CallOverlay() {
   const open = useCleaStore((s) => s.callOverlayOpen);
   const voiceState = useCleaStore((s) => s.voiceState);
   const voiceError = useCleaStore((s) => s.voiceError);
+  const hasRunningTools = useCleaStore((s) => s.tasks.some((t) => t.status === "running"));
   const endVoiceCall = useCleaStore((s) => s.endVoiceCall);
   const setActiveView = useCleaStore((s) => s.setActiveView);
 
@@ -63,6 +65,10 @@ export function CallOverlay() {
   if (!open) return null;
 
   const current = ORB_STYLE[voiceState] ?? ORB_STYLE.idle;
+  const effectiveRing =
+    voiceState === "idle" && hasRunningTools ? ORB_STYLE.thinking.ring : current.ring;
+  const effectiveAnim =
+    voiceState === "idle" && hasRunningTools ? ORB_STYLE.thinking.anim : current.anim;
 
   const handleEndCall = () => {
     void endVoiceCall();
@@ -71,19 +77,24 @@ export function CallOverlay() {
   return (
     <aside
       aria-label="Voice call overlay"
-      className="clea-glass fixed bottom-5 right-5 z-40 w-60 rounded-2xl p-4 shadow-2xl"
+      className="clea-glass fixed bottom-24 right-5 z-40 w-60 rounded-2xl p-4 shadow-2xl"
     >
       <div className="flex flex-col items-center text-center">
-        <div className="relative my-3 flex h-20 w-20 items-center justify-center">
+        <div className="relative my-2.5 flex h-20 w-20 items-center justify-center">
           <div
             data-voice-state={voiceState}
-            aria-hidden="true"
+            data-testid="voice-avatar-ring"
             className={cn(
-              "h-14 w-14 rounded-full bg-gradient-to-br shadow-lg",
-              current.ring,
-              current.anim,
+              "flex h-16 w-16 items-center justify-center rounded-full p-0.5 transition-all",
+              effectiveRing,
+              effectiveAnim,
             )}
-          />
+          >
+            <CleaAvatar
+              data-testid="voice-call-avatar"
+              className="h-14 w-14 rounded-full overflow-hidden"
+            />
+          </div>
         </div>
 
         <div className="text-xs font-medium text-[var(--text)]" aria-live="polite">

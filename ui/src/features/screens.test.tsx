@@ -214,4 +214,58 @@ describe("UI screens & navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: /Dismiss error/i }));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it("renders circular inline SVG avatar in Sidebar with emerald status ring when connected and muted gray when disconnected", () => {
+    useCleaStore.setState({ connectionState: "connected" });
+    const { rerender } = render(
+      <ThemeProvider>
+        <Sidebar />
+      </ThemeProvider>,
+    );
+
+    const avatar = screen.getByTestId("sidebar-avatar");
+    expect(avatar).toHaveClass("w-5", "h-5", "rounded-full", "overflow-hidden", "ring-emerald-500");
+    expect(avatar.querySelector("svg")).not.toBeNull();
+
+    act(() => {
+      useCleaStore.setState({ connectionState: "daemon_offline" });
+    });
+    rerender(
+      <ThemeProvider>
+        <Sidebar />
+      </ThemeProvider>,
+    );
+
+    expect(avatar).not.toHaveClass("ring-emerald-500");
+    expect(avatar.className).toContain("ring-zinc-500/60");
+  });
+
+  it("clears horizontal space on the ChatView composer when the voice call overlay is open", () => {
+    const connectSpy = vi.fn();
+    const disconnectSpy = vi.fn();
+    useCleaStore.setState({
+      connect: connectSpy,
+      disconnect: disconnectSpy,
+      connectionState: "connected",
+      activeView: "chat",
+      callOverlayOpen: false,
+    });
+
+    render(<App />);
+    const composerContainer = screen.getByTestId("chat-composer-container");
+    expect(composerContainer.className).toContain("px-6");
+    expect(composerContainer.className).not.toContain("pr-68");
+
+    const footer = screen.getByTestId("sidebar-footer");
+    expect(footer).toHaveClass("shrink-0");
+    const voiceBtn = screen.getByRole("button", { name: /^Voice$/i });
+    expect(voiceBtn).toHaveClass("h-7", "shrink-0");
+
+    act(() => {
+      useCleaStore.setState({ callOverlayOpen: true });
+    });
+    expect(composerContainer.className).toContain("pl-6");
+    expect(composerContainer.className).toContain("pr-68");
+    expect(composerContainer.className).not.toContain("px-6");
+  });
 });

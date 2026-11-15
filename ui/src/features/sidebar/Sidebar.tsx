@@ -19,6 +19,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { CleaAvatar } from "@/components/ui/clea-avatar";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { useTheme } from "@/lib/theme-context";
@@ -34,6 +35,7 @@ const NAV_ITEMS: { id: AppView; label: string; icon: typeof MessageSquare }[] = 
 ];
 
 export function Sidebar() {
+  const connectionState = useCleaStore((s) => s.connectionState);
   const activeView = useCleaStore((s) => s.activeView);
   const setActiveView = useCleaStore((s) => s.setActiveView);
   const conversations = useCleaStore((s) => s.conversations);
@@ -276,9 +278,18 @@ export function Sidebar() {
       aria-label="Sidebar"
       className="flex h-full w-64 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--bg-subtle)]"
     >
-      <div className="flex items-center justify-between px-4 py-3.5">
+      <div className="flex shrink-0 items-center justify-between px-4 py-3.5">
         <div className="flex items-center gap-2">
-          <span className="h-2 w-2 rounded-full bg-[var(--success)]" aria-hidden="true" />
+          <CleaAvatar
+            data-testid="sidebar-avatar"
+            data-connection-state={connectionState}
+            className={cn(
+              "w-5 h-5 rounded-full overflow-hidden ring-[1.5px]",
+              connectionState === "connected"
+                ? "ring-emerald-500"
+                : "ring-zinc-500/60 dark:ring-zinc-600",
+            )}
+          />
           <span className="text-sm font-semibold tracking-tight text-[var(--text)]">Clea</span>
         </div>
         <Button
@@ -294,7 +305,7 @@ export function Sidebar() {
         </Button>
       </div>
 
-      <div className="px-3 pb-2">
+      <div className="shrink-0 px-3 pb-2">
         <Button
           variant="outline"
           size="sm"
@@ -306,7 +317,7 @@ export function Sidebar() {
         </Button>
       </div>
 
-      <nav aria-label="Main sections" className="space-y-0.5 px-3 py-1">
+      <nav aria-label="Main sections" className="shrink-0 space-y-0.5 px-3 py-1">
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
           const active = activeView === item.id && !(item.id === "chat" && selectedConversation);
@@ -335,9 +346,9 @@ export function Sidebar() {
         })}
       </nav>
 
-      <Separator className="my-2" />
+      <Separator className="my-2 shrink-0" />
 
-      <div className="flex-1 overflow-y-auto px-3 py-1">
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-1">
         <div className="flex items-center justify-between px-2 pb-1.5">
           <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-subtle)]">
             History
@@ -409,10 +420,13 @@ export function Sidebar() {
         )}
       </div>
 
-      <Separator />
+      <Separator className="shrink-0" />
 
-      <div className="flex items-center justify-between gap-1 px-3 py-2.5">
-        <div className="flex items-center gap-1">
+      <div
+        data-testid="sidebar-footer"
+        className="flex shrink-0 items-center justify-between gap-1.5 px-3 py-2.5"
+      >
+        <div className="flex min-w-0 items-center gap-1">
           <Button
             size="sm"
             variant={callOverlayOpen ? "default" : "ghost"}
@@ -424,10 +438,10 @@ export function Sidebar() {
               }
             }}
             aria-pressed={callOverlayOpen}
-            className="text-xs"
+            className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
           >
-            <AudioLines className="h-3.5 w-3.5" aria-hidden="true" />
-            Voice
+            <AudioLines className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span>Voice</span>
           </Button>
 
           <Button
@@ -436,7 +450,7 @@ export function Sidebar() {
             onClick={() => setActiveView("voice")}
             title="Open Voice Companion Transcript"
             aria-label="Open Voice Companion Transcript"
-            className="text-xs px-2"
+            className="h-7 shrink-0 px-2 text-xs"
           >
             Log
           </Button>
@@ -448,9 +462,9 @@ export function Sidebar() {
           onClick={cycleTheme}
           aria-label={`Theme: ${preference}. Click to switch`}
           title={`Theme: ${preference}`}
-          className="text-xs capitalize"
+          className="h-7 shrink-0 gap-1.5 px-2 text-xs capitalize"
         >
-          <ThemeIcon className="h-3.5 w-3.5" aria-hidden="true" />
+          <ThemeIcon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
           <span>{preference}</span>
         </Button>
       </div>

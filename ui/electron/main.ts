@@ -21,6 +21,7 @@ import {
   buildLoginItemConfig,
   readDaemonConnection,
   readDesktopConfig,
+  resolveActiveRendererDir,
   resolveDaemonLauncher,
   resolveRendererAssetPath,
   shouldStartHidden,
@@ -30,6 +31,7 @@ import { createTrayIconPngBuffer } from "./tray-icon";
 const APP_ORIGIN = "clea-app://app";
 const DEV_RENDERER_URL = process.env.ELECTRON_RENDERER_URL;
 const RENDERER_DIR = path.resolve(import.meta.dirname, "../renderer");
+const DIST_RENDERER_DIR = path.resolve(import.meta.dirname, "../../dist");
 const PRELOAD_PATH = path.resolve(import.meta.dirname, "../preload/preload.cjs");
 
 // Must run before app.whenReady(). Allows Fetch/WebSocket from clea-app://app.
@@ -112,7 +114,8 @@ function registerCsp(): void {
 
 function registerAppProtocol(): void {
   protocol.handle("clea-app", async (request) => {
-    const resolved = resolveRendererAssetPath(RENDERER_DIR, request.url);
+    const activeRendererDir = resolveActiveRendererDir(RENDERER_DIR, DIST_RENDERER_DIR);
+    const resolved = resolveRendererAssetPath(activeRendererDir, request.url);
     if (!resolved) {
       return new Response("Forbidden", { status: 403 });
     }

@@ -1,14 +1,20 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CleaAvatar, sanitizeSvg } from "@/components/ui/clea-avatar";
+import { CallOverlay as ComponentCallOverlay } from "@/components/voice/CallOverlay";
 import { useCleaStore } from "@/protocol/store";
 import type { VoiceState } from "@/protocol/types";
 import { CallOverlay } from "./CallOverlay";
-import { CallOverlay as ComponentCallOverlay } from "@/components/voice/CallOverlay";
 import { DevVoiceMockPanel } from "./DevVoiceMockPanel";
 
 describe("CallOverlay", () => {
   beforeEach(() => {
-    useCleaStore.setState({ callOverlayOpen: true, voiceState: "idle" });
+    useCleaStore.setState({
+      callOverlayOpen: true,
+      voiceState: "idle",
+      voiceError: null,
+      tasks: [],
+    });
   });
 
   it("renders all voice_state events and resets on End Call", () => {
@@ -194,5 +200,118 @@ describe("CallOverlay", () => {
     expect(useCleaStore.getState().callOverlayOpen).toBe(false);
     expect(useCleaStore.getState().voiceState).toBe("idle");
     expect(useCleaStore.getState().voiceError).toBeNull();
+  });
+
+  it("renders inline animated SVG avatar with preserved <style> keyframes and <filter> glitch effects and state-reactive outer ring", () => {
+    useCleaStore.setState({ callOverlayOpen: true, voiceState: "listening", tasks: [] });
+    const { container } = render(<CallOverlay />);
+
+    const avatar = screen.getByTestId("voice-call-avatar");
+    expect(avatar).toHaveClass("rounded-full", "overflow-hidden");
+    expect(avatar).toHaveAttribute("data-avatar-src", "/clea-avatar.svg");
+
+    const svg = avatar.querySelector("svg");
+    expect(svg).not.toBeNull();
+    expect(svg?.querySelector("style")?.textContent).toContain("@keyframes");
+    expect(svg?.querySelector("filter#fR")).not.toBeNull();
+    expect(svg?.querySelector("filter#fC")).not.toBeNull();
+
+    const ring = screen.getByTestId("voice-avatar-ring");
+    expect(ring.className).toContain("ring-cyan-400");
+
+    act(() => {
+      useCleaStore.setState({ voiceState: "thinking" });
+    });
+    expect(ring.className).toContain("ring-violet-400");
+
+    act(() => {
+      useCleaStore.setState({ voiceState: "speaking" });
+    });
+    expect(ring.className).toContain("ring-amber-400");
+
+    // Running tools while idle also activates the violet ring
+    act(() => {
+      useCleaStore.setState({
+        voiceState: "idle",
+        tasks: [
+          {
+            task_id: "tool-1",
+            title: "Run search",
+            status: "running",
+            started_at: "2026-11-15T10:00:00Z",
+            finished_at: null,
+            detail: null,
+          },
+        ],
+      });
+    });
+    expect(ring.className).toContain("ring-violet-400");
+    expect(container.querySelector("aside")?.className).toContain("bottom-24");
+  });
+
+  it("sanitizes <script> tags, on* attributes, and javascript: URIs while keeping SVG filters and animations", () => {
+    const untrustedSvg = [
+      '<svg/onload="alert(1)" aria-label="a > b" viewBox="0 0 100 100" width="100" height="100">',
+      '<style>@import "https://evil.example/x.css"; @keyframes glitch { 0% { opacity: 1; } } .bad { background: url(java/**/script:alert(7)); } .bad2 { background: url("\\6a avascript:alert(8)"); }</style>',
+      '<filter id="fR"><feColorMatrix type="matrix"/></filter>',
+      "<script>window.pwned = true;</script >",
+      '<script data-x=">">window.attrGt = true;</script>',
+      "<scr<script></script>ipt>window.nested = true;</script>",
+      '<circle id="c"onclick="evil()" onmouseover=\'evil2()\' cx="50" cy="50" r="40" />',
+      '<use href="javascript:alert(2)" xlink:href="#art" />',
+      '<use href="&#106;avascript:alert(3)" xlink:href="java&#x09;script:alert(4)" />',
+      '<set attributeName="onload" to="alert(5)">smil-body</set>',
+      '<animate data-x=">" attributeName="href" to="javascript:alert(6)" />',
+      '<animate attributeName="opacity" values="0;1;0" dur="3s" repeatCount="indefinite" />',
+      "</svg>",
+    ].join("");
+
+    const cleaned = sanitizeSvg(untrustedSvg);
+    expect(cleaned).not.toContain("<script");
+    expect(cleaned).not.toContain("window.pwned");
+    expect(cleaned).not.toContain("window.attrGt");
+    expect(cleaned).not.toContain("window.nested");
+    expect(cleaned).not.toContain("onload=");
+    expect(cleaned).not.toContain("onclick=");
+    expect(cleaned).not.toContain("onmouseover=");
+    expect(cleaned).not.toContain("javascript:");
+    expect(cleaned).not.toContain("&#106;avascript:");
+    expect(cleaned).not.toContain("alert(");
+    expect(cleaned).not.toContain("@import");
+    expect(cleaned).not.toContain("smil-body");
+    expect(cleaned).not.toContain("</set>");
+    expect(cleaned).toContain("@keyframes glitch");
+    expect(cleaned).toContain('<animate attributeName="opacity"');
+    expect(cleaned).toContain('<filter id="fR">');
+    expect(cleaned).toContain('width="100%" height="100%"');
+    expect(cleaned).toContain('aria-label="a > b"');
+
+    const { container } = render(<CleaAvatar svgMarkup={untrustedSvg} />);
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("set")).toBeNull();
+    expect(container.querySelectorAll("animate")).toHaveLength(1);
+    expect(container.querySelector("animate")?.getAttribute("attributeName")).toBe("opacity");
+    expect(container.querySelector("svg")?.getAttribute("onload")).toBeNull();
+    expect(container.querySelector("circle")?.getAttribute("onclick")).toBeNull();
+    expect(container.querySelector("filter#fR")).not.toBeNull();
+  });
+
+  it("sanitizes dynamically fetched /clea-avatar.svg markup when fetch is mocked", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      text: async () =>
+        '<svg viewBox="0 0 24 24" onload="evil()"><script>evil()</script><circle id="fetched-node" cx="12" cy="12" r="10"/></svg>',
+    });
+
+    try {
+      const { container } = render(<CleaAvatar />);
+      await waitFor(() => {
+        expect(container.querySelector("#fetched-node")).not.toBeNull();
+      });
+      expect(container.querySelector("script")).toBeNull();
+      expect(container.querySelector("svg")?.getAttribute("onload")).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
