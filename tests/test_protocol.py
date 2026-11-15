@@ -942,6 +942,29 @@ async def test_daemon_windows_os_rpc_error_handling(tmp_path: Path) -> None:
         assert payload_ctrl["ok"] is False
         assert "unexpected keyword argument" in payload_ctrl["error"]
 
+    # UIA TimeoutError returns clean JSON-RPC error frame
+    with patch(
+        "clea.core.daemon.inspect_ui_elements",
+        side_effect=TimeoutError("UI Automation inspection timed out after 5.0s."),
+    ):
+        req_insp = OsInspectUiElementsRequest(params=OsInspectUiElementsParams(app_name="Calc"))
+        await daemon._dispatch_request(conn, req_insp)
+        payload_insp = json.loads(ws.send.call_args[0][0])
+        assert payload_insp["id"] == req_insp.id
+        assert payload_insp["ok"] is False
+        assert "timed out" in payload_insp["error"]
+
+    with patch(
+        "clea.core.daemon.click_ui_element",
+        side_effect=TimeoutError("UI Automation click timed out after 5.0s."),
+    ):
+        req_clk = OsClickUiElementRequest(params=OsClickUiElementParams(name="Equals"))
+        await daemon._dispatch_request(conn, req_clk)
+        payload_clk = json.loads(ws.send.call_args[0][0])
+        assert payload_clk["id"] == req_clk.id
+        assert payload_clk["ok"] is False
+        assert "timed out" in payload_clk["error"]
+
 
 @pytest.mark.asyncio
 async def test_daemon_windows_os_clipboard_history_real_items(tmp_path: Path) -> None:

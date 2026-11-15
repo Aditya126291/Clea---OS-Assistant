@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import logging.handlers
+import math
 import sys
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -2195,6 +2196,8 @@ class VoiceRunner:
                 if isinstance(raw_sec, bool):
                     raise ValueError("seconds must be a number.")
                 seconds_val = float(raw_sec) if raw_sec is not None else 1.0
+                if not math.isfinite(seconds_val):
+                    raise ValueError("seconds must be finite.")
             except (TypeError, ValueError) as exc:
                 await _send_error(str(exc))
                 return

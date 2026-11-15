@@ -1876,6 +1876,15 @@ def _resolve_window_hwnd(
         target_title = (title or "").lower().strip()
         target_app = (app_name or "").lower().strip()
 
+        if target_app and not target_title:
+            normalized_app = " ".join(target_app.split())
+            canonical = _APP_ALIASES.get(normalized_app)
+            if canonical is not None:
+                spec = _KNOWN_APPS[canonical]
+                for win in windows:
+                    if _window_matches_spec(win, spec):
+                        return int(win.hwnd)
+
         for win in windows:
             if not win.is_visible:
                 continue
@@ -2265,22 +2274,27 @@ _POWERSHELL_UIA_RESOLVE_WINDOW = (
     "[System.Windows.Automation.ControlType]::Window); "
     "  $wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $winCond); "
     "  foreach ($w in $wins) { "
-    "    $wn = [string]$w.Current.Name; "
-    "    if ($wn -and $wn.IndexOf($AppName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { "
-    "      $win = $w; break "
+    "    try { "
+    "      $wn = [string]$w.Current.Name; "
+    "      if ($wn -and $wn.IndexOf($AppName, "
+    "[System.StringComparison]::OrdinalIgnoreCase) -ge 0) { "
+    "        $win = $w; break "
+    "      } "
+    "    } catch { continue } "
+    "  } "
+    "} "
+    "if ($win -eq $null -and $AppName -eq '') { "
+    "  try { "
+    "    $cur = [System.Windows.Automation.AutomationElement]::FocusedElement; "
+    "    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker; "
+    "    while ($cur -ne $null -and $cur -ne $root) { "
+    "      $p = $walker.GetParent($cur); "
+    "      if ($p -eq $null -or $p -eq $root) { $win = $cur; break } "
+    "      $cur = $p "
     "    } "
-    "  } "
+    "  } catch { $win = $null } "
     "} "
-    "if ($win -eq $null) { "
-    "  $cur = [System.Windows.Automation.AutomationElement]::FocusedElement; "
-    "  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker; "
-    "  while ($cur -ne $null -and $cur -ne $root) { "
-    "    $p = $walker.GetParent($cur); "
-    "    if ($p -eq $null -or $p -eq $root) { $win = $cur; break } "
-    "    $cur = $p "
-    "  } "
-    "} "
-    "if ($win -eq $null) { "
+    "if ($win -eq $null -and $AppName -eq '') { "
     "  $win = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, "
     "[System.Windows.Automation.Condition]::TrueCondition) "
     "} "
@@ -2314,40 +2328,45 @@ _POWERSHELL_INSPECT_UI_SCRIPT = (
     "} else { '' }; "
     + _POWERSHELL_UIA_RESOLVE_WINDOW
     + _POWERSHELL_UIA_TYPES_COND
-    + "$winTitle = if ($win -ne $null) { [string]$win.Current.Name } else { '' }; "
+    + "$winTitle = if ($win -ne $null) { "
+    "try { [string]$win.Current.Name } catch { '' } } else { '' }; "
     "$items = New-Object System.Collections.ArrayList; "
     "if ($win -ne $null) { "
     "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $typeCond); "
     "  foreach ($el in $all) { "
-    "    $cur = $el.Current; "
-    "    if ($cur.IsOffscreen) { continue } "
-    "    $r = $cur.BoundingRectangle; "
-    "    if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
+    "    try { "
+    "      $cur = $el.Current; "
+    "      if ($cur.IsOffscreen) { continue } "
+    "      $r = $cur.BoundingRectangle; "
+    "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
     "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
     "-or $r.Width -le 0 -or $r.Height -le 0) { continue } "
-    "    $elName = [string]$cur.Name; "
-    "    $elAid = [string]$cur.AutomationId; "
-    "    $elVal = $null; "
-    "    $vp = $null; "
-    "    if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
+    "      $elName = [string]$cur.Name; "
+    "      $elAid = [string]$cur.AutomationId; "
+    "      $elVal = $null; "
+    "      $vp = $null; "
+    "      try { "
+    "        if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
     "[ref]$vp)) { "
-    "      $elVal = [string]$vp.Current.Value "
-    "    } "
-    "    if ([string]::IsNullOrWhiteSpace($elName) -and [string]::IsNullOrWhiteSpace($elAid) "
-    "-and [string]::IsNullOrEmpty($elVal)) { continue } "
-    "    $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
-    "    $cx = [int][Math]::Round($r.Left + ($r.Width / 2.0)); "
-    "    $cy = [int][Math]::Round($r.Top + ($r.Height / 2.0)); "
-    "    [void]$items.Add(@{ "
-    "      index = $items.Count; "
-    "      name = $elName; "
-    "      automation_id = $elAid; "
-    "      control_type = $ctName; "
-    "      value = $elVal; "
-    "      x = $cx; "
-    "      y = $cy "
-    "    }); "
-    "    if ($items.Count -ge $MaxElements) { break } "
+    "          $elVal = [string]$vp.Current.Value "
+    "        } "
+    "      } catch { $elVal = $null } "
+    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
+    "      if ($ctName -eq 'Text' -and [string]::IsNullOrWhiteSpace($elName) "
+    "-and [string]::IsNullOrWhiteSpace($elAid) -and [string]::IsNullOrEmpty($elVal)) { continue } "
+    "      $cx = [int][Math]::Round($r.Left + ($r.Width / 2.0)); "
+    "      $cy = [int][Math]::Round($r.Top + ($r.Height / 2.0)); "
+    "      [void]$items.Add(@{ "
+    "        index = $items.Count; "
+    "        name = $elName; "
+    "        automation_id = $elAid; "
+    "        control_type = $ctName; "
+    "        value = $elVal; "
+    "        x = $cx; "
+    "        y = $cy "
+    "      }); "
+    "      if ($items.Count -ge $MaxElements) { break } "
+    "    } catch { continue } "
     "  } "
     "} "
     "@{ window_title = $winTitle; count = $items.Count; elements = [object[]]$items.ToArray() } "
@@ -2373,37 +2392,44 @@ _POWERSHELL_CLICK_UI_SCRIPT = (
     "[System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ctProp) "
     "  } "
     "} "
-    "$exactMatch = $null; $subMatch = $null; $aidMatch = $null; "
+    "$exactMatch = $null; $exactIsText = $false; "
+    "$subMatch = $null; $subIsText = $false; $aidMatch = $null; "
     "$avail = New-Object System.Collections.ArrayList; "
     "if ($win -ne $null) { "
     "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $searchCond); "
     "  foreach ($el in $all) { "
-    "    $cur = $el.Current; "
-    "    if ($cur.IsOffscreen) { continue } "
-    "    $r = $cur.BoundingRectangle; "
-    "    if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
+    "    try { "
+    "      $cur = $el.Current; "
+    "      if ($cur.IsOffscreen) { continue } "
+    "      $r = $cur.BoundingRectangle; "
+    "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
     "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
     "-or $r.Width -le 0 -or $r.Height -le 0) { continue } "
-    "    $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
-    "    if ($ControlTypeFilter -ne '' -and "
+    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
+    "      if ($ControlTypeFilter -ne '' -and "
     "-not $ctName.Equals($ControlTypeFilter, [System.StringComparison]::OrdinalIgnoreCase)) { "
-    "      continue "
-    "    } "
-    "    $elName = [string]$cur.Name; "
-    "    $elAid = [string]$cur.AutomationId; "
-    "    if (-not [string]::IsNullOrWhiteSpace($elName) -and $avail.Count -lt 40) { "
-    "      if (-not $avail.Contains($elName)) { [void]$avail.Add($elName) } "
-    "    } "
-    "    if ($exactMatch -eq $null -and "
-    "$elName.Equals($TargetName, [System.StringComparison]::OrdinalIgnoreCase)) { "
-    "      $exactMatch = $el "
-    "    } elseif ($subMatch -eq $null -and -not [string]::IsNullOrEmpty($elName) -and "
+    "        continue "
+    "      } "
+    "      $elName = [string]$cur.Name; "
+    "      $elAid = [string]$cur.AutomationId; "
+    "      if (-not [string]::IsNullOrWhiteSpace($elName) -and $avail.Count -lt 40) { "
+    "        if (-not $avail.Contains($elName)) { [void]$avail.Add($elName) } "
+    "      } "
+    "      $isText = ($ctName -eq 'Text'); "
+    "      if ($elName.Equals($TargetName, [System.StringComparison]::OrdinalIgnoreCase)) { "
+    "        if ($exactMatch -eq $null -or ($exactIsText -and -not $isText)) { "
+    "          $exactMatch = $el; $exactIsText = $isText "
+    "        } "
+    "      } elseif (-not [string]::IsNullOrEmpty($elName) -and "
     "$elName.IndexOf($TargetName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { "
-    "      $subMatch = $el "
-    "    } elseif ($aidMatch -eq $null -and -not [string]::IsNullOrEmpty($elAid) -and "
+    "        if ($subMatch -eq $null -or ($subIsText -and -not $isText)) { "
+    "          $subMatch = $el; $subIsText = $isText "
+    "        } "
+    "      } elseif ($aidMatch -eq $null -and -not [string]::IsNullOrEmpty($elAid) -and "
     "$elAid.Equals($TargetName, [System.StringComparison]::OrdinalIgnoreCase)) { "
-    "      $aidMatch = $el "
-    "    } "
+    "        $aidMatch = $el "
+    "      } "
+    "    } catch { continue } "
     "  } "
     "} "
     "$chosen = if ($exactMatch -ne $null) { $exactMatch } "
@@ -2420,10 +2446,12 @@ _POWERSHELL_CLICK_UI_SCRIPT = (
     "  $mName = if (-not [string]::IsNullOrEmpty($cc.Name)) { [string]$cc.Name } "
     "else { [string]$cc.AutomationId }; "
     "  $invPat = $null; $didInvoke = $false; "
-    "  if ($chosen.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, "
+    "  try { "
+    "    if ($chosen.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, "
     "[ref]$invPat)) { "
-    "    $invPat.Invoke(); $didInvoke = $true "
-    "  } "
+    "      $invPat.Invoke(); $didInvoke = $true "
+    "    } "
+    "  } catch { $didInvoke = $false } "
     "  @{ found = $true; invoked = $didInvoke; name = $mName; "
     "control_type = $mType; x = $cx; y = $cy } | ConvertTo-Json -Depth 4 -Compress "
     "}"
@@ -2487,7 +2515,7 @@ def _send_win32_inputs(u32: Any, inputs: list[_INPUT]) -> int:
     arr = (_INPUT * len(inputs))(*inputs)
     if hasattr(u32, "SendInput"):
         sent = int(u32.SendInput(len(inputs), arr, ctypes.sizeof(_INPUT)))
-        if sent == 0 and u32 is getattr(ctypes, "windll", None) and hasattr(u32, "user32"):
+        if sent == 0:
             raise RuntimeError("Win32 SendInput failed to inject input events.")
         return sent
     raise RuntimeError("Win32 SendInput API is unavailable.")
@@ -2503,7 +2531,9 @@ def _perform_mouse_click(
 ) -> None:
     u32 = _get_win32_user32(user32)
     if hasattr(u32, "SetCursorPos"):
-        u32.SetCursorPos(int(x), int(y))
+        moved = u32.SetCursorPos(int(x), int(y))
+        if moved is not None and not moved:
+            raise RuntimeError(f"Win32 SetCursorPos({x}, {y}) failed.")
 
     actual_clicks = 2 if button == "double" and clicks == 1 else clicks
     if button in {"left", "double"}:
@@ -2575,16 +2605,21 @@ def inspect_ui_elements(
             f"-TargetHwnd {hwnd} -MaxElements {clamped_max} -AppNameBase64 '{app_b64}'"
         ),
     ]
-    proc = runner(
-        cmd,
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
-        check=False,
-    )
+    try:
+        proc = runner(
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"UI Automation inspection timed out after {UI_AUTOMATION_TIMEOUT_SECONDS}s."
+        ) from exc
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"UI Automation inspection failed: {err}")
@@ -2593,7 +2628,10 @@ def inspect_ui_elements(
     if not raw:
         raise RuntimeError("UI Automation inspection returned empty output.")
 
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"UI Automation inspection returned invalid JSON: {exc}") from exc
     window_title = str(data.get("window_title") or "")
     raw_elements = data.get("elements") or []
     if isinstance(raw_elements, dict):
@@ -2716,16 +2754,21 @@ def click_ui_element(
             f"-ControlTypeFilter '{ct_arg}' -AppNameBase64 '{app_b64}'"
         ),
     ]
-    proc = runner(
-        cmd,
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
-        check=False,
-    )
+    try:
+        proc = runner(
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"UI Automation click timed out after {UI_AUTOMATION_TIMEOUT_SECONDS}s."
+        ) from exc
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"UI Automation click failed: {err}")
@@ -2734,7 +2777,10 @@ def click_ui_element(
     if not raw:
         raise RuntimeError("UI Automation click returned empty output.")
 
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"UI Automation click returned invalid JSON: {exc}") from exc
 
     if "elements" in data and "found" not in data:
         raw_elements = data.get("elements") or []
@@ -2957,7 +3003,9 @@ def gui_action(
         if x < 0 or y < 0:
             raise ValueError("x and y must be non-negative integers for 'scroll'.")
         if hasattr(u32, "SetCursorPos"):
-            u32.SetCursorPos(x, y)
+            moved = u32.SetCursorPos(x, y)
+            if moved is not None and not moved:
+                raise RuntimeError(f"Win32 SetCursorPos({x}, {y}) failed.")
 
     clamped_delta = max(-12000, min(12000, delta))
     scroll_input = _INPUT(

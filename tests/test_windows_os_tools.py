@@ -1848,6 +1848,84 @@ def test_inspect_ui_elements_validation_and_error_paths() -> None:
     with pytest.raises(RuntimeError, match="UIA error"):
         inspect_ui_elements(powershell_runner=_failing_runner)
 
+    def _timeout_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=5.0)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        inspect_ui_elements(powershell_runner=_timeout_runner)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        click_ui_element("One", powershell_runner=_timeout_runner)
+
+    def _bad_json_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="not-json", stderr="")
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        inspect_ui_elements(powershell_runner=_bad_json_runner)
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        click_ui_element("One", powershell_runner=_bad_json_runner)
+
+
+def test_inspect_ui_elements_resolves_known_app_alias_hwnd() -> None:
+    captured_cmds: list[list[str]] = []
+    u32 = _FakeInputUser32()
+    windows = [
+        EnumeratedWindow(
+            hwnd=909,
+            title="Clea - Visual Studio Code",
+            process_name="Code.exe",
+            is_visible=True,
+        )
+    ]
+
+    def _mock_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_cmds.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"window_title": "Clea - Visual Studio Code", "elements": []}),
+            stderr="",
+        )
+
+    res = inspect_ui_elements(
+        app_name="vscode",
+        powershell_runner=_mock_runner,
+        user32=u32,
+        window_enumerator=lambda: windows,
+    )
+    assert res["window_title"] == "Clea - Visual Studio Code"
+    assert "-TargetHwnd 909" in captured_cmds[0][4]
+    assert u32.foreground_calls == [909]
+
+
+def test_gui_action_raises_on_win32_sendinput_or_setcursorpos_failure() -> None:
+    class _FailingSendInputUser32(_FakeInputUser32):
+        def SendInput(self, count: int, ptr: Any, cb_size: int) -> int:
+            return 0
+
+    class _FailingCursorUser32(_FakeInputUser32):
+        def SetCursorPos(self, x: int, y: int) -> int:
+            return 0
+
+    with pytest.raises(RuntimeError, match="SendInput failed"):
+        gui_action("click_at", x=10, y=20, user32=_FailingSendInputUser32())
+
+    with pytest.raises(RuntimeError, match="SendInput failed"):
+        gui_action("type_text", text="hi", user32=_FailingSendInputUser32())
+
+    with pytest.raises(RuntimeError, match="SendInput failed"):
+        gui_action("press_keys", keys=["enter"], user32=_FailingSendInputUser32())
+
+    with pytest.raises(RuntimeError, match="SendInput failed"):
+        gui_action("scroll", delta=-120, user32=_FailingSendInputUser32())
+
+    with pytest.raises(RuntimeError, match="SetCursorPos"):
+        gui_action("click_at", x=10, y=20, user32=_FailingCursorUser32())
+
+    with pytest.raises(RuntimeError, match="SetCursorPos"):
+        gui_action("scroll", x=10, y=20, delta=-120, user32=_FailingCursorUser32())
+
 
 def test_click_ui_element_invoke_fallback_matching_and_errors() -> None:
     # 1. InvokePattern supported -> no mouse click needed
@@ -2192,6 +2270,16 @@ async def test_voice_runner_to_daemon_e2e_gui_multistep_tools(
         )
         assert r_blocked.is_error is True
         assert "Blocked dangerous key combination" in str(r_blocked.response.get("error", ""))
+
+        # Non-finite seconds is rejected cleanly before RPC serialization
+        r_inf = await _invoke_voice_tool(
+            backend,
+            call_id="c-inf",
+            name="gui_action",
+            arguments={"action": "wait", "seconds": float("inf")},
+        )
+        assert r_inf.is_error is True
+        assert "finite" in str(r_inf.response.get("error", ""))
 
     assert set(METHOD_RESULTS) >= {
         "os.inspect_ui_elements",
