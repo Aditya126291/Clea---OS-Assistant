@@ -287,12 +287,14 @@ UiBatchOp = Literal["act", "press_keys", "scroll", "wait", "click_at"]
 class OsUiSnapshotParams(_Model):
     app_name: str | None = None
     max_elements: int = 60
+    interactive_only: bool = False
 
 
 class OsUiActParams(_Model):
     ref: str
     action: UiActAction
     value: str | None = None
+    interval_ms: int = 12
 
 
 class UiBatchStep(_Model):
@@ -307,6 +309,7 @@ class UiBatchStep(_Model):
     y: int | None = None
     clicks: int | None = None
     button: GuiClickButton | None = None
+    interval_ms: int | None = None
 
 
 class OsUiBatchParams(_Model):
@@ -1343,12 +1346,16 @@ class UiSnapshotElement(_Model):
     y: int = 0
     automation_id: str = ""
     control_type: str = ""
+    enabled: bool = True
+    focused: bool = False
 
 
 class OsUiSnapshotResult(_Model):
     ok: bool = True
+    snapshot_id: str = ""
     window_title: str = ""
     count: int = 0
+    element_count: int | None = None
     elements: list[UiSnapshotElement] = Field(default_factory=list)
 
 
@@ -1371,8 +1378,16 @@ class UiDiff(_Model):
 class OsUiActResult(_Model):
     ok: bool = True
     status: str = "completed"
+    snapshot_id: str = ""
     action: str = ""
     ref: str = ""
+    role: str = ""
+    name: str = ""
+    method: str = ""
+    x: int | None = None
+    y: int | None = None
+    char_count: int | None = None
+    interval_ms: int | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
 

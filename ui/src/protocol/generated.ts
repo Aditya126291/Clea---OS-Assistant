@@ -461,6 +461,7 @@ export type SessionId67 = string | null;
 export type Method57 = "os.ui_snapshot";
 export type AppName4 = string | null;
 export type MaxElements1 = number;
+export type InteractiveOnly = boolean;
 export type FrameType58 = "request";
 export type Id59 = string;
 export type SessionId68 = string | null;
@@ -468,6 +469,7 @@ export type Method58 = "os.ui_act";
 export type Ref = string;
 export type Action3 = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click";
 export type Value = string | null;
+export type IntervalMs = number;
 export type FrameType59 = "request";
 export type Id60 = string;
 export type SessionId69 = string | null;
@@ -483,6 +485,7 @@ export type X1 = number | null;
 export type Y1 = number | null;
 export type Clicks1 = number | null;
 export type Button1 = ("left" | "right" | "double") | null;
+export type IntervalMs1 = number | null;
 export type Steps = UiBatchStep[];
 export type StopOnError = boolean;
 export type StopOnWindowChange = boolean;
@@ -1004,8 +1007,10 @@ export type Keys2 = string[] | null;
 export type Delta2 = number | null;
 export type Seconds2 = number | null;
 export type Ok22 = boolean;
+export type SnapshotId = string;
 export type WindowTitle4 = string;
 export type Count1 = number;
+export type ElementCount = number | null;
 export type Ref2 = string;
 export type Role7 = string;
 export type Name7 = string;
@@ -1014,16 +1019,26 @@ export type X5 = number;
 export type Y5 = number;
 export type AutomationId1 = string;
 export type ControlType3 = string;
+export type Enabled = boolean;
+export type Focused = boolean;
 export type Elements1 = UiSnapshotElement[];
 export type Ok23 = boolean;
 export type Status14 = string;
+export type SnapshotId1 = string;
 export type Action9 = string;
 export type Ref3 = string;
+export type Role8 = string;
+export type Name8 = string;
+export type Method62 = string;
+export type X6 = number | null;
+export type Y6 = number | null;
+export type CharCount4 = number | null;
+export type IntervalMs2 = number | null;
 export type WindowChanged = boolean;
 export type WindowTitle5 = string;
 export type Ref4 = string;
-export type Role8 = string;
-export type Name8 = string;
+export type Role9 = string;
+export type Name9 = string;
 export type OldValue = string | null;
 export type NewValue = string | null;
 export type ChangedValues = UiDiffChangedValue[];
@@ -1811,6 +1826,7 @@ export interface OsUiSnapshotRequest {
 export interface OsUiSnapshotParams {
   app_name?: AppName4;
   max_elements?: MaxElements1;
+  interactive_only?: InteractiveOnly;
 }
 export interface OsUiActRequest {
   frame_type?: FrameType58;
@@ -1823,6 +1839,7 @@ export interface OsUiActParams {
   ref: Ref;
   action: Action3;
   value?: Value;
+  interval_ms?: IntervalMs;
 }
 export interface OsUiBatchRequest {
   frame_type?: FrameType59;
@@ -1848,6 +1865,7 @@ export interface UiBatchStep {
   y?: Y1;
   clicks?: Clicks1;
   button?: Button1;
+  interval_ms?: IntervalMs1;
 }
 export interface WorkspaceGitInspectRequest {
   frame_type?: FrameType60;
@@ -2657,8 +2675,10 @@ export interface OsGuiActionResult {
 }
 export interface OsUiSnapshotResult {
   ok?: Ok22;
+  snapshot_id?: SnapshotId;
   window_title?: WindowTitle4;
   count?: Count1;
+  element_count?: ElementCount;
   elements?: Elements1;
 }
 export interface UiSnapshotElement {
@@ -2670,12 +2690,22 @@ export interface UiSnapshotElement {
   y?: Y5;
   automation_id?: AutomationId1;
   control_type?: ControlType3;
+  enabled?: Enabled;
+  focused?: Focused;
 }
 export interface OsUiActResult {
   ok?: Ok23;
   status?: Status14;
+  snapshot_id?: SnapshotId1;
   action?: Action9;
   ref?: Ref3;
+  role?: Role8;
+  name?: Name8;
+  method?: Method62;
+  x?: X6;
+  y?: Y6;
+  char_count?: CharCount4;
+  interval_ms?: IntervalMs2;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
 }
@@ -2688,8 +2718,8 @@ export interface UiDiff {
 }
 export interface UiDiffChangedValue {
   ref?: Ref4;
-  role?: Role8;
-  name?: Name8;
+  role?: Role9;
+  name?: Name9;
   old_value?: OldValue;
   new_value?: NewValue;
 }

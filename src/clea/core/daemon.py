@@ -2773,11 +2773,19 @@ class CleaDaemon:
     async def _handle_os_ui_snapshot(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         try:
-            res = await asyncio.to_thread(
-                ui_snapshot,
-                req.params.app_name,
-                req.params.max_elements,
-            )
+            try:
+                res = await asyncio.to_thread(
+                    ui_snapshot,
+                    req.params.app_name,
+                    req.params.max_elements,
+                    interactive_only=req.params.interactive_only,
+                )
+            except TypeError:
+                res = await asyncio.to_thread(
+                    ui_snapshot,
+                    req.params.app_name,
+                    req.params.max_elements,
+                )
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
             return
@@ -2787,18 +2795,29 @@ class CleaDaemon:
             count=res.get("count"),
         )
         model_cls = METHOD_RESULTS["os.ui_snapshot"]
-        await self._respond(ws, req, model_cls.model_validate(res))
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_os_ui_act(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         p = req.params
         try:
-            res = await asyncio.to_thread(
-                ui_act,
-                p.ref,
-                p.action,
-                p.value,
-            )
+            try:
+                res = await asyncio.to_thread(
+                    ui_act,
+                    p.ref,
+                    p.action,
+                    p.value,
+                    interval_ms=p.interval_ms,
+                )
+            except TypeError:
+                res = await asyncio.to_thread(
+                    ui_act,
+                    p.ref,
+                    p.action,
+                    p.value,
+                )
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
             return
@@ -2809,7 +2828,9 @@ class CleaDaemon:
             status=res.get("status"),
         )
         model_cls = METHOD_RESULTS["os.ui_act"]
-        await self._respond(ws, req, model_cls.model_validate(res))
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_os_ui_batch(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
@@ -2834,7 +2855,9 @@ class CleaDaemon:
             status=res.get("status"),
         )
         model_cls = METHOD_RESULTS["os.ui_batch"]
-        await self._respond(ws, req, model_cls.model_validate(res))
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_workspace_git_inspect(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws

@@ -2252,11 +2252,13 @@ class VoiceRunner:
             if raw_max is not None and not isinstance(raw_max, bool):
                 with contextlib.suppress(TypeError, ValueError):
                     max_elements = int(raw_max)
+            interactive_only = _parse_bool("interactive_only", default=False)
             await _execute_rpc_tool(
                 OsUiSnapshotRequest(
                     params=OsUiSnapshotParams(
                         app_name=_req_str("app_name"),
                         max_elements=max_elements,
+                        interactive_only=interactive_only,
                     )
                 ),
                 error_prefix="Failed to capture UI snapshot",
@@ -2286,12 +2288,18 @@ class VoiceRunner:
                 return
             raw_val = event.arguments.get("value")
             val_str = str(raw_val) if raw_val is not None else None
+            raw_interval = event.arguments.get("interval_ms", 12)
+            interval_ms = 12
+            if raw_interval is not None and not isinstance(raw_interval, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    interval_ms = int(raw_interval)
             await _execute_rpc_tool(
                 OsUiActRequest(
                     params=OsUiActParams(
                         ref=ref,
                         action=action_norm,  # type: ignore[arg-type]
                         value=val_str,
+                        interval_ms=interval_ms,
                     )
                 ),
                 error_prefix="Failed to execute ui_act",

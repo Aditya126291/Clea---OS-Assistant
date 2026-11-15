@@ -3552,7 +3552,15 @@ def ui_act(
                 button="left",
                 user32=user32,
             )
-            action_runner(action="type_text", text=value, user32=user32)
+            try:
+                action_runner(
+                    action="type_text",
+                    text=value,
+                    interval_ms=clamped_interval,
+                    user32=user32,
+                )
+            except TypeError:
+                action_runner(action="type_text", text=value, user32=user32)
             method = "type"
         elif norm_action == "set_value":
             val_str = str(value) if value is not None else ""
@@ -3567,7 +3575,15 @@ def ui_act(
             action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
             action_runner(action="press_keys", keys=["backspace"], user32=user32)
             if val_str:
-                action_runner(action="type_text", text=val_str, user32=user32)
+                try:
+                    action_runner(
+                        action="type_text",
+                        text=val_str,
+                        interval_ms=clamped_interval,
+                        user32=user32,
+                    )
+                except TypeError:
+                    action_runner(action="type_text", text=val_str, user32=user32)
             method = "set_value"
     else:
         acted_via_uia = False
@@ -4311,6 +4327,8 @@ def compute_ui_diff(before: Any, after: Any) -> dict[str, Any]:
                     "y": int(a.get("y", 0)),
                     "automation_id": str(a.get("automation_id") or ""),
                     "control_type": str(a.get("control_type") or a.get("role") or ""),
+                    "enabled": bool(a.get("enabled", True)),
+                    "focused": bool(a.get("focused", False)),
                 }
             )
     added_elements = added_elements[:25]
@@ -4445,14 +4463,21 @@ def ui_batch(
                 ref = str(s_dict.get("ref") or "").strip()
                 action = str(s_dict.get("action") or "").strip().lower()
                 val = s_dict.get("value")
+                step_interval = s_dict.get("interval_ms")
+                act_kwargs: dict[str, Any] = {
+                    "ui_snapshot_fn": snap_runner,
+                    "gui_action_fn": action_runner,
+                    "user32": user32,
+                    "_capture_snapshot": False,
+                }
+                if step_interval is not None and not isinstance(step_interval, bool):
+                    with contextlib.suppress(TypeError, ValueError):
+                        act_kwargs["interval_ms"] = int(step_interval)
                 ui_act(
                     ref,
                     action,
                     val,
-                    ui_snapshot_fn=snap_runner,
-                    gui_action_fn=action_runner,
-                    user32=user32,
-                    _capture_snapshot=False,
+                    **act_kwargs,
                 )
                 step_results.append(
                     {

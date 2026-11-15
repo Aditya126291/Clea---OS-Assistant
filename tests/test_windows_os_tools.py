@@ -3665,3 +3665,69 @@ async def test_voice_runner_to_daemon_e2e_ui_snapshot_act_batch(
         )
         assert r_batch_bool.is_error is False
         assert batch_calls[-1] == (1, False, False)
+
+
+@pytest.mark.asyncio
+async def test_daemon_rpc_validation_with_real_tool_outputs() -> None:
+    """Verify that real ui_snapshot, ui_act, and ui_batch validate against protocol models."""
+    from clea.core.protocol import (
+        METHOD_RESULTS,
+        OsUiActResult,
+        OsUiBatchResult,
+        OsUiSnapshotResult,
+    )
+
+    u32 = _FakeInputUser32(hwnd=777)
+
+    def _mock_ps(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(_sample_mixed_uia_payload()),
+            stderr="",
+        )
+
+    # 1. Real ui_snapshot output validated by OsUiSnapshotResult
+    snap_out = ui_snapshot(
+        powershell_runner=_mock_ps,
+        user32=u32,
+        interactive_only=False,
+    )
+    assert snap_out["ok"] is True
+    validated_snap = METHOD_RESULTS["os.ui_snapshot"].model_validate(snap_out)
+    assert isinstance(validated_snap, OsUiSnapshotResult)
+    assert validated_snap.count == 12
+    assert validated_snap.snapshot_id == snap_out["snapshot_id"]
+    assert len(validated_snap.elements) == 12
+    assert validated_snap.elements[0].ref == "e1"
+    assert validated_snap.elements[0].enabled is True
+
+    # 2. Real ui_act output validated by OsUiActResult
+    act_out = ui_act(
+        "e1",
+        "click",
+        powershell_runner=_mock_ps,
+        user32=u32,
+    )
+    assert act_out["ok"] is True
+    validated_act = METHOD_RESULTS["os.ui_act"].model_validate(act_out)
+    assert isinstance(validated_act, OsUiActResult)
+    assert validated_act.ref == "e1"
+    assert validated_act.action == "click"
+    assert validated_act.status == "completed"
+    assert validated_act.snapshot is not None
+    assert validated_act.diff is not None
+
+    # 3. Real ui_batch output validated by OsUiBatchResult
+    batch_out = ui_batch(
+        [{"op": "wait", "seconds": 0.1}],
+        ui_snapshot_fn=lambda **_kw: snap_out,
+        user32=u32,
+    )
+    assert batch_out["ok"] is True
+    validated_batch = METHOD_RESULTS["os.ui_batch"].model_validate(batch_out)
+    assert isinstance(validated_batch, OsUiBatchResult)
+    assert validated_batch.status == "completed"
+    assert validated_batch.steps_executed == 1
+    assert validated_batch.diff is not None
+    assert validated_batch.snapshot is not None
