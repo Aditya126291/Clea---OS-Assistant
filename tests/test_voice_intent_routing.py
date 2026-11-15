@@ -167,10 +167,12 @@ def test_route_4_system_instruction_covers_general_windows_os_tools() -> None:
     assert "read_clipboard" in prompt
     assert "select_clipboard_item" in prompt
     assert "write_clipboard" in prompt
+    assert "ui_snapshot" in prompt
+    assert "ui_act" in prompt
+    assert "ui_batch" in prompt
     assert "inspect_ui_elements" in prompt
     assert "click_ui_element" in prompt
     assert "gui_action" in prompt
-    assert "Open -> Wait -> Inspect -> Act -> Verify" in prompt
     assert "inspect_git_workspace" in prompt
 
     # Route 4 directs model not to call look_at_screen first for OS tools
@@ -190,6 +192,101 @@ def test_route_4_system_instruction_covers_general_windows_os_tools() -> None:
     assert "lock_screen" in prompt
     assert "open_settings" in prompt
     assert "read_clipboard(max_chars?, include_history?, max_items?)" in prompt
+    assert "ui_snapshot(app_name?, max_elements?, interactive_only?)" in prompt
+    assert "ui_act(ref, action, value?, interval_ms?)" in prompt
+    assert "ui_batch(steps, stop_on_error?, stop_on_window_change?)" in prompt
+    assert "ui_batch(actions" not in prompt
+
+
+def test_route_4_universal_semantic_first_and_authentic_execution_rules() -> None:
+    prompt = BASE_VOICE_SYSTEM_INSTRUCTION
+
+    # Universal Desktop & Browser UI Execution Policy is general-purpose and app-agnostic
+    assert "Universal Desktop & Browser UI Execution Policy" in prompt
+
+    # 1. Semantic Accessibility Grounding First (`ui_snapshot` -> `e#`)
+    assert "Semantic Accessibility Grounding First (`ui_snapshot` -> `e#`)" in prompt
+    assert "call `ui_snapshot` first" in prompt
+    assert "short reference IDs (`e1`, `e2`, ...)" in prompt
+    assert "act via `ui_act` or `ui_batch` using those exact `ref` IDs" in prompt
+    assert "rather than guessing screen coordinates or calling `look_at_screen`" in prompt
+    assert "hidden behind a mode, menu, or overflow toggle" in prompt
+
+    # 2. Authentic UI Execution (Never Simulate or Pre-Compute Results)
+    assert "Authentic UI Execution (Never Simulate or Pre-Compute Results)" in prompt
+    assert "NEVER compute the final output mentally and type the answer into the app" in prompt
+    assert "clear or reset any stale prior state first if needed" in prompt
+    assert "trigger the application's real controls/buttons (`ui_act` / `ui_batch`)" in prompt
+    assert "read back the resulting output from the returned state diff" in prompt
+
+    # 3. Direct Navigation & Speculative Batching
+    assert "Direct Navigation & Speculative Batching" in prompt
+    assert (
+        "Open target apps (`open_or_focus_app`) or direct destination URLs (`open_url`) in one step"
+        in prompt
+    )
+    assert (
+        "NEVER stop after only opening an app or URL when the user asked you to perform an "
+        "action inside it" in prompt
+    )
+    assert "chain the interaction through completion" in prompt
+    assert "Group consecutive deterministic steps on the current screen" in prompt
+    assert "single `ui_batch` call rather than separate one-action-per-turn round-trips" in prompt
+
+    # 4. Diff-Driven Verification (Vision Only as Last Resort)
+    assert "Diff-Driven Verification (Vision Only as Last Resort)" in prompt
+    assert "Verify step outcomes from the structural `diff`" in prompt
+    assert "`window_changed`" in prompt
+    assert "`changed_values`" in prompt
+    assert "`added_elements`" in prompt
+    assert "updated `snapshot` returned automatically by `ui_act` and `ui_batch`" in prompt
+    assert (
+        "Only call `look_at_screen` when an application exposes no useful semantic elements"
+        in prompt
+    )
+    assert "<canvas>" in prompt
+
+    # App-agnostic invariant: no hardcoded specific app workflows in policy
+    assert "compute 10 factorial" not in prompt
+    assert "play the first video" not in prompt
+
+
+def test_all_route_invariants_and_guardrails_preserved() -> None:
+    prompt = BASE_VOICE_SYSTEM_INSTRUCTION
+
+    # Route 1: Screen-only intent guardrails
+    assert "1. Visual / Active Screen Intent (`look_at_screen`, `watch_screen`)" in prompt
+    assert "Trigger ONLY when the user explicitly asks about what is currently visible" in prompt
+    assert "NEVER answer questions about what is currently on the screen" in prompt
+    assert "Trust the structured ground-truth window metadata" in prompt
+
+    # Route 2: Memory & conversation recall guardrails
+    assert "2. Memory / Past Conversation Recall Intent" in prompt
+    assert "HARD NEGATIVE RULE: NEVER call `look_at_screen` or `watch_screen` for memory" in prompt
+    assert (
+        "NEVER tell the user to open or focus a chat on screen in order to read its history"
+        in prompt
+    )
+
+    # Route 3: Clea App, Chat Output & Task Action Intent
+    assert "3. Clea App, Chat Output & Task Action Intent" in prompt
+    assert "route directly to `post_to_active_chat` rather than checking the screen first" in prompt
+    assert (
+        "CRITICAL: ALWAYS ask the user for explicit verbal confirmation before calling "
+        "`delete_chat(..., confirmed=True)`" in prompt
+    )
+
+    # Route 4: Windows OS & Git Workspace Control
+    assert "4. Windows OS & Git Workspace Control" in prompt
+    assert "do NOT call `look_at_screen` first" in prompt
+    assert "Universal Desktop & Browser UI Execution Policy" in prompt
+
+    # Route 5: General Spoken Q&A
+    assert "5. General Spoken Q&A:" in prompt
+    assert (
+        "Answer directly without calling any tool when neither screen vision, stored "
+        "history, nor app/system actions are needed." in prompt
+    )
 
 
 # --- 2. Tool Schema Negative Constraints & Gemini Live Propagation ---
