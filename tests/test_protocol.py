@@ -29,11 +29,17 @@ from clea.core.protocol import (
     DevEmitSampleTaskRequest,
     MemoryEpisodesRequest,
     MemoryForgetRequest,
+    OsClickUiElementParams,
+    OsClickUiElementRequest,
     OsControlMediaVolumeParams,
     OsControlMediaVolumeRequest,
     OsControlSystemParams,
     OsControlSystemRequest,
     OsControlSystemResult,
+    OsGuiActionParams,
+    OsGuiActionRequest,
+    OsInspectUiElementsParams,
+    OsInspectUiElementsRequest,
     OsOpenOrFocusAppParams,
     OsOpenOrFocusAppRequest,
     OsOpenUrlParams,
@@ -238,6 +244,9 @@ def test_every_method_has_a_result_model() -> None:
             ("os.open_url", {"url": "https://example.com"}),
             ("os.control_system", {"action": "lock"}),
             ("os.write_clipboard", {"text": "hello"}),
+            ("os.inspect_ui_elements", {}),
+            ("os.click_ui_element", {"name": "Equals"}),
+            ("os.gui_action", {"action": "wait", "seconds": 0.5}),
             ("workspace.git_inspect", {}),
         ]
     }
@@ -264,6 +273,17 @@ def test_windows_os_and_git_protocol_roundtrip() -> None:
             params=OsControlSystemParams(action="set_brightness", level=75, step=5)
         ),
         OsWriteClipboardRequest(params=OsWriteClipboardParams(text="copied snippet")),
+        OsInspectUiElementsRequest(
+            params=OsInspectUiElementsParams(app_name="Calculator", max_elements=45)
+        ),
+        OsClickUiElementRequest(
+            params=OsClickUiElementParams(
+                name="Equals", control_type="Button", app_name="Calculator"
+            )
+        ),
+        OsGuiActionRequest(
+            params=OsGuiActionParams(action="press_keys", keys=["ctrl", "l"])
+        ),
         WorkspaceGitInspectRequest(
             params=WorkspaceGitInspectParams(include_diff=True, diff_stat_only=False)
         ),
@@ -806,6 +826,72 @@ async def test_daemon_windows_os_rpc_handlers(tmp_path: Path) -> None:
         assert payload_ctrl["ok"] is True
         assert payload_ctrl["result"]["action"] == "set_brightness"
         assert payload_ctrl["result"]["level"] == 90
+
+    # 5. os.inspect_ui_elements
+    inspect_mock_data = {
+        "ok": True,
+        "window_title": "Calculator",
+        "count": 1,
+        "elements": [
+            {
+                "index": 0,
+                "name": "One",
+                "automation_id": "num1Button",
+                "control_type": "Button",
+                "value": None,
+                "x": 120,
+                "y": 400,
+            }
+        ],
+    }
+    with patch("clea.core.daemon.inspect_ui_elements", return_value=inspect_mock_data) as m_insp:
+        req_insp = OsInspectUiElementsRequest(
+            params=OsInspectUiElementsParams(app_name="Calculator", max_elements=30)
+        )
+        await daemon._dispatch_request(conn, req_insp)
+        m_insp.assert_called_once_with("Calculator", 30)
+        payload_insp = json.loads(ws.send.call_args[0][0])
+        assert payload_insp["id"] == req_insp.id
+        assert payload_insp["ok"] is True
+        assert payload_insp["result"]["window_title"] == "Calculator"
+        assert payload_insp["result"]["elements"][0]["name"] == "One"
+
+    # 6. os.click_ui_element
+    click_mock_data = {
+        "ok": True,
+        "status": "clicked",
+        "name": "One",
+        "control_type": "Button",
+        "x": 120,
+        "y": 400,
+        "method": "invoke",
+    }
+    with patch("clea.core.daemon.click_ui_element", return_value=click_mock_data) as m_clk:
+        req_clk = OsClickUiElementRequest(
+            params=OsClickUiElementParams(name="One", control_type="Button", app_name="Calculator")
+        )
+        await daemon._dispatch_request(conn, req_clk)
+        m_clk.assert_called_once_with("One", "Button", "Calculator")
+        payload_clk = json.loads(ws.send.call_args[0][0])
+        assert payload_clk["id"] == req_clk.id
+        assert payload_clk["ok"] is True
+        assert payload_clk["result"]["status"] == "clicked"
+
+    # 7. os.gui_action
+    gui_mock_data = {
+        "ok": True,
+        "status": "completed",
+        "action": "type_text",
+        "char_count": 3,
+    }
+    with patch("clea.core.daemon.gui_action", return_value=gui_mock_data) as m_gui:
+        req_gui = OsGuiActionRequest(params=OsGuiActionParams(action="type_text", text="10!"))
+        await daemon._dispatch_request(conn, req_gui)
+        m_gui.assert_called_once_with("type_text", None, None, "10!", None, 1, "left", 0, 1.0)
+        payload_gui = json.loads(ws.send.call_args[0][0])
+        assert payload_gui["id"] == req_gui.id
+        assert payload_gui["ok"] is True
+        assert payload_gui["result"]["char_count"] == 3
 
 
 @pytest.mark.asyncio

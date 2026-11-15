@@ -167,6 +167,10 @@ def test_route_4_system_instruction_covers_general_windows_os_tools() -> None:
     assert "read_clipboard" in prompt
     assert "select_clipboard_item" in prompt
     assert "write_clipboard" in prompt
+    assert "inspect_ui_elements" in prompt
+    assert "click_ui_element" in prompt
+    assert "gui_action" in prompt
+    assert "Open -> Wait -> Inspect -> Act -> Verify" in prompt
     assert "inspect_git_workspace" in prompt
 
     # Route 4 directs model not to call look_at_screen first for OS tools

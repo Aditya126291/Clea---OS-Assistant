@@ -88,6 +88,9 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "select_clipboard_item",
         "open_url",
         "control_system",
+        "inspect_ui_elements",
+        "click_ui_element",
+        "gui_action",
     }
     for tool in tools:
         assert tool.behavior == "non_blocking"
@@ -144,6 +147,16 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert "include_history" in by_name["read_clipboard"].parameters_schema["properties"]
     assert "max_items" in by_name["read_clipboard"].parameters_schema["properties"]
     assert by_name["write_clipboard"].parameters_schema["required"] == ["text"]
+    assert by_name["inspect_ui_elements"].parameters_schema.get("required", []) == []
+    assert by_name["click_ui_element"].parameters_schema["required"] == ["name"]
+    assert by_name["gui_action"].parameters_schema["required"] == ["action"]
+    assert by_name["gui_action"].parameters_schema["properties"]["action"]["enum"] == [
+        "click_at",
+        "type_text",
+        "press_keys",
+        "scroll",
+        "wait",
+    ]
     assert by_name["inspect_git_workspace"].parameters_schema.get("required", []) == []
 
     assert by_name["select_clipboard_item"].parameters_schema["required"] == ["index"]

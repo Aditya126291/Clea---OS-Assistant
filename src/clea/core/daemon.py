@@ -96,8 +96,11 @@ from clea.tools import (
 from clea.tools.git_workspace import inspect_git_workspace
 from clea.tools.registry import ToolDefinition
 from clea.tools.windows_os import (
+    click_ui_element,
     control_media_volume,
     control_system,
+    gui_action,
+    inspect_ui_elements,
     open_or_focus_app,
     open_url,
     read_clipboard,
@@ -1826,6 +1829,12 @@ class CleaDaemon:
             await self._handle_os_control_system(conn, req)
         elif method == "os.write_clipboard":
             await self._handle_os_write_clipboard(conn, req)
+        elif method == "os.inspect_ui_elements":
+            await self._handle_os_inspect_ui_elements(conn, req)
+        elif method == "os.click_ui_element":
+            await self._handle_os_click_ui_element(conn, req)
+        elif method == "os.gui_action":
+            await self._handle_os_gui_action(conn, req)
         elif method == "workspace.git_inspect":
             await self._handle_workspace_git_inspect(conn, req)
 
@@ -2678,6 +2687,79 @@ class CleaDaemon:
             return
         self._audit_log("os_write_clipboard", char_count=res.get("char_count"))
         await self._respond(ws, req, METHOD_RESULTS["os.write_clipboard"](**res))
+
+    async def _handle_os_inspect_ui_elements(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                inspect_ui_elements,
+                req.params.app_name,
+                req.params.max_elements,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_inspect_ui_elements",
+            app_name=req.params.app_name,
+            count=res.get("count"),
+        )
+        model_cls = METHOD_RESULTS["os.inspect_ui_elements"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_click_ui_element(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                click_ui_element,
+                req.params.name,
+                req.params.control_type,
+                req.params.app_name,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_click_ui_element",
+            name=res.get("name"),
+            control_type=res.get("control_type"),
+            method=res.get("method"),
+        )
+        model_cls = METHOD_RESULTS["os.click_ui_element"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_gui_action(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        p = req.params
+        try:
+            res = await asyncio.to_thread(
+                gui_action,
+                p.action,
+                p.x,
+                p.y,
+                p.text,
+                p.keys,
+                p.clicks,
+                p.button,
+                p.delta,
+                p.seconds,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_gui_action",
+            gui_action=p.action,
+            status=res.get("status"),
+        )
+        model_cls = METHOD_RESULTS["os.gui_action"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls(**filtered))
 
     async def _handle_workspace_git_inspect(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws

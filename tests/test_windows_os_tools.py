@@ -19,10 +19,13 @@ import clea.core.daemon as daemon_mod
 from clea.core.daemon import CleaDaemon, build_daemon
 from clea.core.protocol import (
     METHOD_RESULTS,
+    OsClickUiElementResult,
     OsControlMediaVolumeResult,
     OsControlSystemParams,
     OsControlSystemRequest,
     OsControlSystemResult,
+    OsGuiActionResult,
+    OsInspectUiElementsResult,
     OsOpenOrFocusAppResult,
     OsOpenUrlParams,
     OsOpenUrlRequest,
@@ -53,11 +56,22 @@ from clea.tools import ToolDefinition
 from clea.tools.git_workspace import MAX_DIFF_CHARS, inspect_git_workspace
 from clea.tools.registry import AuditLogger, ToolRegistry
 from clea.tools.windows_os import (
+    _INPUT,
+    _POWERSHELL_CLICK_UI_SCRIPT,
+    _POWERSHELL_INSPECT_UI_SCRIPT,
     _POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT,
     _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT,
     CF_UNICODETEXT,
+    INPUT_KEYBOARD,
+    INPUT_MOUSE,
     KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE,
+    MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_WHEEL,
     SW_MAXIMIZE,
     SW_MINIMIZE,
     SW_RESTORE,
@@ -71,10 +85,13 @@ from clea.tools.windows_os import (
     VK_VOLUME_UP,
     WM_CLOSE,
     EnumeratedWindow,
+    click_ui_element,
     control_media_volume,
     control_system,
     find_matching_start_app,
     get_installed_apps,
+    gui_action,
+    inspect_ui_elements,
     open_or_focus_app,
     open_url,
     read_clipboard,
@@ -1703,3 +1720,481 @@ def test_control_system_float_infinity_raises_value_error() -> None:
             wmi_brightness_getter=lambda: 50,
             wmi_brightness_setter=lambda _x: None,
         )
+
+
+# ------------------------------------------------------------ UI Automation & GUI Input Tests
+
+
+class _FakeInputUser32:
+    """Minimal user32 double capturing cursor positioning and Win32 SendInput payloads."""
+
+    def __init__(self, *, hwnd: int = 101) -> None:
+        self.hwnd = hwnd
+        self.cursor_moves: list[tuple[int, int]] = []
+        self.sent_inputs: list[_INPUT] = []
+        self.show_calls: list[tuple[int, int]] = []
+        self.foreground_calls: list[int] = []
+
+    def GetForegroundWindow(self) -> int:
+        return self.hwnd
+
+    def IsIconic(self, _hwnd: int) -> int:
+        return 0
+
+    def ShowWindow(self, hwnd: int, cmd: int) -> int:
+        self.show_calls.append((hwnd, cmd))
+        return 1
+
+    def SetForegroundWindow(self, hwnd: int) -> int:
+        self.foreground_calls.append(hwnd)
+        return 1
+
+    def SetCursorPos(self, x: int, y: int) -> int:
+        self.cursor_moves.append((x, y))
+        return 1
+
+    def SendInput(self, count: int, ptr: Any, cb_size: int) -> int:
+        assert cb_size == ctypes.sizeof(_INPUT)
+        arr = ctypes.cast(ptr, ctypes.POINTER(_INPUT * count)).contents
+        for idx in range(count):
+            copied = _INPUT()
+            ctypes.memmove(ctypes.byref(copied), ctypes.byref(arr[idx]), ctypes.sizeof(_INPUT))
+            self.sent_inputs.append(copied)
+        return count
+
+
+def test_inspect_ui_elements_parses_powershell_json_and_clamps_max_elements() -> None:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def _mock_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((cmd, kwargs))
+        payload = {
+            "window_title": "Calculator",
+            "count": 2,
+            "elements": [
+                {
+                    "index": 0,
+                    "name": "Display is 3628800",
+                    "automation_id": "CalculatorResults",
+                    "control_type": "Text",
+                    "value": "3628800",
+                    "x": 240,
+                    "y": 120,
+                },
+                {
+                    "index": 1,
+                    "name": "One",
+                    "automation_id": "num1Button",
+                    "control_type": "Button",
+                    "value": None,
+                    "x": 110,
+                    "y": 420,
+                },
+                {
+                    "index": 2,
+                    "name": "Zero",
+                    "automation_id": "num0Button",
+                    "control_type": "Button",
+                    "value": None,
+                    "x": 180,
+                    "y": 480,
+                },
+            ],
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    res = inspect_ui_elements(
+        app_name="Calculator",
+        max_elements=999,
+        powershell_runner=_mock_runner,
+    )
+    assert res["ok"] is True
+    assert res["window_title"] == "Calculator"
+    assert res["count"] == 3
+    assert res["elements"][0]["value"] == "3628800"
+    assert res["elements"][1]["x"] == 110
+    assert res["elements"][1]["y"] == 420
+
+    assert len(calls) == 1
+    cmd, kwargs = calls[0]
+    assert kwargs["shell"] is False
+    assert kwargs["timeout"] == 5.0
+    assert cmd[1:4] == ["-NoProfile", "-NonInteractive", "-Command"]
+    assert "UIAutomationClient" in cmd[4]
+    assert "UIAutomationTypes" in cmd[4]
+    assert "-MaxElements 150" in cmd[4]
+
+    # Lower-bound clamp to 1 truncates returned elements as well
+    res_low = inspect_ui_elements(max_elements=0, powershell_runner=_mock_runner)
+    assert "-MaxElements 1" in calls[1][0][4]
+    assert res_low["count"] == 1
+
+    # Verify PS script contains required UIA assemblies and control types
+    for ctype in ("Button", "Edit", "MenuItem", "TabItem", "Hyperlink", "ListItem", "CheckBox"):
+        assert ctype in _POWERSHELL_INSPECT_UI_SCRIPT
+    assert "InvokePattern" in _POWERSHELL_CLICK_UI_SCRIPT
+
+
+def test_inspect_ui_elements_validation_and_error_paths() -> None:
+    with pytest.raises(ValueError, match="app_name"):
+        inspect_ui_elements(app_name="   ")
+
+    with pytest.raises(ValueError, match="max_elements"):
+        inspect_ui_elements(max_elements=True)  # type: ignore[arg-type]
+
+    def _failing_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="UIA error")
+
+    with pytest.raises(RuntimeError, match="UIA error"):
+        inspect_ui_elements(powershell_runner=_failing_runner)
+
+
+def test_click_ui_element_invoke_fallback_matching_and_errors() -> None:
+    # 1. InvokePattern supported -> no mouse click needed
+    u32_invoke = _FakeInputUser32()
+
+    def _invoke_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert kwargs["shell"] is False
+        assert kwargs["timeout"] == 5.0
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {
+                    "found": True,
+                    "invoked": True,
+                    "name": "Equals",
+                    "control_type": "Button",
+                    "x": 320,
+                    "y": 480,
+                }
+            ),
+            stderr="",
+        )
+
+    res_inv = click_ui_element(
+        "Equals",
+        control_type="Button",
+        app_name="Calculator",
+        powershell_runner=_invoke_runner,
+        user32=u32_invoke,
+        window_enumerator=lambda: [
+            EnumeratedWindow(
+                hwnd=101,
+                title="Calculator",
+                process_name="ApplicationFrameHost.exe",
+                is_visible=True,
+            )
+        ],
+    )
+    assert res_inv["status"] == "clicked"
+    assert res_inv["name"] == "Equals"
+    assert res_inv["control_type"] == "Button"
+    assert res_inv["x"] == 320
+    assert res_inv["y"] == 480
+    assert res_inv["method"] == "invoke"
+    assert u32_invoke.cursor_moves == []
+    assert u32_invoke.sent_inputs == []
+
+    # 2. InvokePattern unsupported -> SetCursorPos + SendInput left click fallback
+    u32_click = _FakeInputUser32()
+
+    def _no_invoke_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {
+                    "found": True,
+                    "invoked": False,
+                    "name": "History Tab",
+                    "control_type": "TabItem",
+                    "x": 150,
+                    "y": 90,
+                }
+            ),
+            stderr="",
+        )
+
+    res_clk = click_ui_element(
+        "History",
+        control_type="TabItem",
+        powershell_runner=_no_invoke_runner,
+        user32=u32_click,
+    )
+    assert res_clk["status"] == "clicked"
+    assert res_clk["method"] == "click"
+    assert u32_click.cursor_moves == [(150, 90)]
+    assert len(u32_click.sent_inputs) == 2
+    assert u32_click.sent_inputs[0].type == INPUT_MOUSE
+    assert u32_click.sent_inputs[0].union.mi.dwFlags == MOUSEEVENTF_LEFTDOWN
+    assert u32_click.sent_inputs[1].union.mi.dwFlags == MOUSEEVENTF_LEFTUP
+
+    # 3. Exact match beats substring match in elements fallback & control_type filters
+    u32_match = _FakeInputUser32()
+
+    def _elements_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {
+                    "elements": [
+                        {"name": "Play All", "control_type": "Button", "x": 10, "y": 20},
+                        {"name": "Play", "control_type": "MenuItem", "x": 30, "y": 40},
+                        {"name": "Play", "control_type": "Button", "x": 50, "y": 60},
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+    res_exact = click_ui_element("play", powershell_runner=_elements_runner, user32=u32_match)
+    assert res_exact["x"] == 30
+    assert res_exact["y"] == 40
+
+    res_ct = click_ui_element(
+        "play",
+        control_type="Button",
+        powershell_runner=_elements_runner,
+        user32=u32_match,
+    )
+    assert res_ct["x"] == 50
+    assert res_ct["y"] == 60
+
+    # 4. Missing element raises ValueError listing available names
+    def _missing_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"found": False, "available": ["One", "Two", "Clear"]}),
+            stderr="",
+        )
+
+    with pytest.raises(ValueError, match="One, Two, Clear"):
+        click_ui_element("Factorial", powershell_runner=_missing_runner)
+
+
+def test_gui_action_click_type_keys_scroll_and_wait() -> None:
+    u32 = _FakeInputUser32()
+
+    # click_at right click
+    r_click = gui_action("click_at", x=400, y=300, button="right", clicks=1, user32=u32)
+    assert r_click["status"] == "completed"
+    assert r_click["clicks"] == 1
+    assert u32.cursor_moves == [(400, 300)]
+    assert [inp.union.mi.dwFlags for inp in u32.sent_inputs] == [
+        MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP,
+    ]
+
+    # click_at double click
+    u32.cursor_moves.clear()
+    u32.sent_inputs.clear()
+    r_dbl = gui_action("click_at", x=10, y=20, button="double", user32=u32)
+    assert r_dbl["clicks"] == 2
+    assert [inp.union.mi.dwFlags for inp in u32.sent_inputs] == [
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+    ]
+
+    # click_at invalid coords
+    with pytest.raises(ValueError, match="non-negative"):
+        gui_action("click_at", x=-1, y=10, user32=u32)
+
+    # type_text Unicode SendInput
+    u32.sent_inputs.clear()
+    r_type = gui_action("type_text", text="10!", user32=u32)
+    assert r_type["char_count"] == 3
+    assert len(u32.sent_inputs) == 6
+    assert all(inp.type == INPUT_KEYBOARD for inp in u32.sent_inputs)
+    scans = [(inp.union.ki.wScan, inp.union.ki.dwFlags) for inp in u32.sent_inputs]
+    assert scans == [
+        (ord("1"), KEYEVENTF_UNICODE),
+        (ord("1"), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+        (ord("0"), KEYEVENTF_UNICODE),
+        (ord("0"), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+        (ord("!"), KEYEVENTF_UNICODE),
+        (ord("!"), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+    ]
+
+    with pytest.raises(ValueError, match="non-empty"):
+        gui_action("type_text", text="", user32=u32)
+    with pytest.raises(ValueError, match="2000"):
+        gui_action("type_text", text="x" * 2001, user32=u32)
+
+    # press_keys chord + blocked combos
+    u32.sent_inputs.clear()
+    r_keys = gui_action("press_keys", keys=["ctrl", "l"], user32=u32)
+    assert r_keys["keys"] == ["ctrl", "l"]
+    vk_seq = [(inp.union.ki.wVk, inp.union.ki.dwFlags) for inp in u32.sent_inputs]
+    assert vk_seq == [
+        (0x11, 0),
+        (0x4C, 0),
+        (0x4C, KEYEVENTF_KEYUP),
+        (0x11, KEYEVENTF_KEYUP),
+    ]
+
+    for blocked in (
+        ["alt", "f4"],
+        ["ctrl", "alt", "delete"],
+        ["control", "alt", "del"],
+        ["ctrl", "shift", "escape"],
+        ["ctrl", "shift", "esc"],
+    ):
+        with pytest.raises(ValueError, match="Blocked dangerous key combination"):
+            gui_action("press_keys", keys=blocked, user32=u32)
+
+    with pytest.raises(ValueError, match="disallowed key"):
+        gui_action("press_keys", keys=["win"], user32=u32)
+
+    # scroll
+    u32.cursor_moves.clear()
+    u32.sent_inputs.clear()
+    r_scroll = gui_action("scroll", x=500, y=600, delta=-360, user32=u32)
+    assert r_scroll["delta"] == -360
+    assert u32.cursor_moves == [(500, 600)]
+    assert len(u32.sent_inputs) == 1
+    assert u32.sent_inputs[0].union.mi.dwFlags == MOUSEEVENTF_WHEEL
+    assert u32.sent_inputs[0].union.mi.mouseData == (-360 & 0xFFFFFFFF)
+
+    # wait clamping
+    slept: list[float] = []
+    assert gui_action("wait", seconds=0.01, sleep_fn=slept.append)["seconds"] == 0.1
+    assert gui_action("wait", seconds=99.0, sleep_fn=slept.append)["seconds"] == 10.0
+    assert slept == [0.1, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_voice_runner_to_daemon_e2e_gui_multistep_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspect_calls: list[tuple[str | None, int]] = []
+    click_calls: list[tuple[str, str | None, str | None]] = []
+    gui_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def _fake_inspect(app_name: str | None = None, max_elements: int = 60) -> dict[str, Any]:
+        inspect_calls.append((app_name, max_elements))
+        return {
+            "ok": True,
+            "window_title": app_name or "Calculator",
+            "count": 1,
+            "elements": [
+                {
+                    "index": 0,
+                    "name": "Display is 3628800",
+                    "automation_id": "CalculatorResults",
+                    "control_type": "Text",
+                    "value": "3628800",
+                    "x": 200,
+                    "y": 100,
+                }
+            ],
+        }
+
+    def _fake_click(
+        name: str,
+        control_type: str | None = None,
+        app_name: str | None = None,
+    ) -> dict[str, Any]:
+        click_calls.append((name, control_type, app_name))
+        return {
+            "ok": True,
+            "status": "clicked",
+            "name": name,
+            "control_type": control_type or "Button",
+            "x": 150,
+            "y": 350,
+            "method": "invoke",
+        }
+
+    def _fake_gui(
+        action: str,
+        x: int | None = None,
+        y: int | None = None,
+        text: str | None = None,
+        keys: list[str] | None = None,
+        clicks: int = 1,
+        button: str = "left",
+        delta: int = 0,
+        seconds: float = 1.0,
+    ) -> dict[str, Any]:
+        gui_calls.append((action, (x, y, text, keys, clicks, button, delta, seconds)))
+        return gui_action(
+            action,
+            x=x,
+            y=y,
+            text=text,
+            keys=keys,
+            clicks=clicks,
+            button=button,
+            delta=delta,
+            seconds=seconds,
+            user32=_FakeInputUser32(),
+            sleep_fn=lambda _s: None,
+        )
+
+    monkeypatch.setattr(daemon_mod, "inspect_ui_elements", _fake_inspect)
+    monkeypatch.setattr(daemon_mod, "click_ui_element", _fake_click)
+    monkeypatch.setattr(daemon_mod, "gui_action", _fake_gui)
+
+    async with _running_voice_daemon_env(tmp_path) as (_daemon, _runner, backend):
+        r_wait = await _invoke_voice_tool(
+            backend,
+            call_id="c-wait",
+            name="gui_action",
+            arguments={"action": "wait", "seconds": 1.5},
+        )
+        assert r_wait.is_error is False
+        assert r_wait.response["seconds"] == 1.5
+
+        r_insp = await _invoke_voice_tool(
+            backend,
+            call_id="c-insp",
+            name="inspect_ui_elements",
+            arguments={"app_name": "Calculator", "max_elements": 40},
+        )
+        assert r_insp.is_error is False
+        parsed_insp = OsInspectUiElementsResult(**r_insp.response)
+        assert parsed_insp.window_title == "Calculator"
+        assert parsed_insp.elements[0].value == "3628800"
+        assert inspect_calls == [("Calculator", 40)]
+
+        r_clk = await _invoke_voice_tool(
+            backend,
+            call_id="c-clk",
+            name="click_ui_element",
+            arguments={"name": "Factorial", "control_type": "Button", "app_name": "Calculator"},
+        )
+        assert r_clk.is_error is False
+        parsed_clk = OsClickUiElementResult(**r_clk.response)
+        assert parsed_clk.status == "clicked"
+        assert click_calls == [("Factorial", "Button", "Calculator")]
+
+        r_type = await _invoke_voice_tool(
+            backend,
+            call_id="c-type",
+            name="gui_action",
+            arguments={"action": "type_text", "text": "10!"},
+        )
+        assert r_type.is_error is False
+        assert OsGuiActionResult(**r_type.response).char_count == 3
+
+        # Blocked chord flows back as tool error
+        r_blocked = await _invoke_voice_tool(
+            backend,
+            call_id="c-blocked",
+            name="gui_action",
+            arguments={"action": "press_keys", "keys": ["alt", "f4"]},
+        )
+        assert r_blocked.is_error is True
+        assert "Blocked dangerous key combination" in str(r_blocked.response.get("error", ""))
+
+    assert set(METHOD_RESULTS) >= {
+        "os.inspect_ui_elements",
+        "os.click_ui_element",
+        "os.gui_action",
+    }

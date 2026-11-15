@@ -714,6 +714,136 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="inspect_ui_elements",
+            description=(
+                "Inspect visible interactive and readout UI Automation controls (buttons, "
+                "inputs, menu items, tabs, links, text values, and screen coordinates) in a "
+                "Windows application or the active foreground window."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": (
+                            "Optional application or window title to target and focus (e.g. "
+                            "'Calculator', 'Notepad'). Defaults to the foreground window."
+                        ),
+                    },
+                    "max_elements": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum number of visible UI elements to return (clamped 1..150, "
+                            "default 60)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="click_ui_element",
+            description=(
+                "Find and invoke or left-click a visible UI control by name in a Windows "
+                "application (case-insensitive exact match, then substring match)."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Visible label or name of the UI control to click (e.g. 'One', "
+                            "'Equals', 'Factorial', 'Open Navigation')."
+                        ),
+                    },
+                    "control_type": {
+                        "type": "string",
+                        "description": (
+                            "Optional UI Automation control type filter such as 'Button', "
+                            "'MenuItem', 'Edit', 'TabItem', or 'Hyperlink'."
+                        ),
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": (
+                            "Optional target application or window title. Defaults to the "
+                            "active foreground window."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="gui_action",
+            description=(
+                "Perform a low-level desktop GUI input or wait step: click_at screen coordinates, "
+                "type_text via Unicode keystrokes, press_keys (single key or chord like "
+                "['ctrl', 'l']), scroll wheel at optional coordinates, or wait for UI/page loads."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["click_at", "type_text", "press_keys", "scroll", "wait"],
+                        "description": "GUI input or wait action to execute.",
+                    },
+                    "x": {
+                        "type": "integer",
+                        "description": (
+                            "Horizontal screen coordinate (>= 0) for click_at or scroll."
+                        ),
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Vertical screen coordinate (>= 0) for click_at or scroll.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Unicode text (1..2000 chars) to type into the focused control for "
+                            "'type_text'."
+                        ),
+                    },
+                    "keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "List of key names for 'press_keys' (e.g. ['enter'], ['ctrl', 'l'], "
+                            "['ctrl', 'a']). System termination chords are blocked."
+                        ),
+                    },
+                    "clicks": {
+                        "type": "integer",
+                        "description": "Click count (1..3, default 1) for 'click_at'.",
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "double"],
+                        "description": "Mouse button for 'click_at' (default 'left').",
+                    },
+                    "delta": {
+                        "type": "integer",
+                        "description": (
+                            "Mouse wheel scroll delta for 'scroll' (e.g. -360 down, 360 up)."
+                        ),
+                    },
+                    "seconds": {
+                        "type": "number",
+                        "description": (
+                            "Wait duration in seconds for 'wait' (clamped 0.1..10.0, default 1.0)."
+                        ),
+                    },
+                },
+                "required": ["action"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="inspect_git_workspace",
             description=(
                 "Inspect a local Git repository or sibling worktree strictly read-only: current "

@@ -77,8 +77,11 @@ from clea.core.protocol import (
     MemoryStatusRequest,
     MemoryUpdatedData,
     MemoryUpdatedEvent,
+    OsClickUiElementRequest,
     OsControlMediaVolumeRequest,
     OsControlSystemRequest,
+    OsGuiActionRequest,
+    OsInspectUiElementsRequest,
     OsOpenOrFocusAppRequest,
     OsOpenUrlRequest,
     OsReadClipboardRequest,
@@ -100,6 +103,7 @@ from clea.core.protocol import (
     TranscriptRole,
     TranscriptsGetRequest,
     TranscriptsListRequest,
+    UiElementItem,
     UiNavigateData,
     UiNavigateEvent,
     UiNavigateRequest,
@@ -218,7 +222,11 @@ def build_json_schema() -> dict[str, Any]:
         os_open_url_request: OsOpenUrlRequest
         os_control_system_request: OsControlSystemRequest
         os_write_clipboard_request: OsWriteClipboardRequest
+        os_inspect_ui_elements_request: OsInspectUiElementsRequest
+        os_click_ui_element_request: OsClickUiElementRequest
+        os_gui_action_request: OsGuiActionRequest
         clipboard_item: ClipboardItem
+        ui_element_item: UiElementItem
         workspace_git_inspect_request: WorkspaceGitInspectRequest
         git_worktree_item: GitWorktreeItem
         git_commit_item: GitCommitItem

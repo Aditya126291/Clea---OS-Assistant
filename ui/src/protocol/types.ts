@@ -143,6 +143,13 @@ import type {
   OsControlSystemResult,
   OsWriteClipboardParams,
   OsWriteClipboardResult,
+  UiElementItem,
+  OsInspectUiElementsParams,
+  OsInspectUiElementsResult,
+  OsClickUiElementParams,
+  OsClickUiElementResult,
+  OsGuiActionParams,
+  OsGuiActionResult,
   GitWorktreeItem,
   GitCommitItem,
   WorkspaceGitInspectParams,
@@ -294,6 +301,13 @@ export type {
   OsControlSystemResult,
   OsWriteClipboardParams,
   OsWriteClipboardResult,
+  UiElementItem,
+  OsInspectUiElementsParams,
+  OsInspectUiElementsResult,
+  OsClickUiElementParams,
+  OsClickUiElementResult,
+  OsGuiActionParams,
+  OsGuiActionResult,
   GitWorktreeItem,
   GitCommitItem,
   WorkspaceGitInspectParams,
@@ -357,6 +371,9 @@ export interface MethodParamsMap {
   "os.open_url": OsOpenUrlParams;
   "os.control_system": OsControlSystemParams;
   "os.write_clipboard": OsWriteClipboardParams;
+  "os.inspect_ui_elements": OsInspectUiElementsParams;
+  "os.click_ui_element": OsClickUiElementParams;
+  "os.gui_action": OsGuiActionParams;
   "workspace.git_inspect": WorkspaceGitInspectParams;
 }
 
@@ -415,6 +432,9 @@ export interface MethodResultMap {
   "os.open_url": OsOpenUrlResult;
   "os.control_system": OsControlSystemResult;
   "os.write_clipboard": OsWriteClipboardResult;
+  "os.inspect_ui_elements": OsInspectUiElementsResult;
+  "os.click_ui_element": OsClickUiElementResult;
+  "os.gui_action": OsGuiActionResult;
   "workspace.git_inspect": WorkspaceGitInspectResult;
 }
 

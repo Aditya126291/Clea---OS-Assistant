@@ -45,10 +45,16 @@ from clea.core.protocol import (
     MemoryAddFactRequest,
     MemoryDeleteFactParams,
     MemoryDeleteFactRequest,
+    OsClickUiElementParams,
+    OsClickUiElementRequest,
     OsControlMediaVolumeParams,
     OsControlMediaVolumeRequest,
     OsControlSystemParams,
     OsControlSystemRequest,
+    OsGuiActionParams,
+    OsGuiActionRequest,
+    OsInspectUiElementsParams,
+    OsInspectUiElementsRequest,
     OsOpenOrFocusAppParams,
     OsOpenOrFocusAppRequest,
     OsOpenUrlParams,
@@ -2121,6 +2127,112 @@ class VoiceRunner:
             await _execute_rpc_tool(
                 OsWriteClipboardRequest(params=OsWriteClipboardParams(text=text)),
                 error_prefix="Failed to write clipboard",
+            )
+            return
+
+        if event.name == "inspect_ui_elements":
+            raw_max = event.arguments.get("max_elements", 60)
+            if isinstance(raw_max, bool):
+                await _send_error("max_elements must be an integer.")
+                return
+            try:
+                max_elements = int(raw_max) if raw_max is not None else 60
+            except (TypeError, ValueError):
+                await _send_error("max_elements must be an integer.")
+                return
+            await _execute_rpc_tool(
+                OsInspectUiElementsRequest(
+                    params=OsInspectUiElementsParams(
+                        app_name=_req_str("app_name"),
+                        max_elements=max_elements,
+                    )
+                ),
+                error_prefix="Failed to inspect UI elements",
+            )
+            return
+
+        if event.name == "click_ui_element":
+            name = _req_str("name")
+            if not name:
+                await _send_error("name is required.")
+                return
+            await _execute_rpc_tool(
+                OsClickUiElementRequest(
+                    params=OsClickUiElementParams(
+                        name=name,
+                        control_type=_req_str("control_type"),
+                        app_name=_req_str("app_name"),
+                    )
+                ),
+                error_prefix="Failed to click UI element",
+            )
+            return
+
+        if event.name == "gui_action":
+            action = _req_str("action")
+            if not action:
+                await _send_error("action is required.")
+                return
+            action_norm = action.lower()
+            if action_norm not in {"click_at", "type_text", "press_keys", "scroll", "wait"}:
+                await _send_error(f"Unsupported gui_action: {action!r}")
+                return
+
+            def _opt_int(key: str) -> int | None:
+                raw = event.arguments.get(key)
+                if raw is None:
+                    return None
+                if isinstance(raw, bool):
+                    raise ValueError(f"{key} must be an integer.")
+                return int(raw)
+
+            try:
+                x_val = _opt_int("x")
+                y_val = _opt_int("y")
+                clicks_val = _opt_int("clicks")
+                delta_val = _opt_int("delta")
+                raw_sec = event.arguments.get("seconds", 1.0)
+                if isinstance(raw_sec, bool):
+                    raise ValueError("seconds must be a number.")
+                seconds_val = float(raw_sec) if raw_sec is not None else 1.0
+            except (TypeError, ValueError) as exc:
+                await _send_error(str(exc))
+                return
+
+            raw_text = event.arguments.get("text")
+            text_val: str | None = None
+            if raw_text is not None:
+                text_val = raw_text if isinstance(raw_text, str) else str(raw_text)
+
+            raw_keys = event.arguments.get("keys")
+            keys_val: list[str] | None = None
+            if raw_keys is not None:
+                if not isinstance(raw_keys, list):
+                    await _send_error("keys must be a list of key names.")
+                    return
+                keys_val = [str(k) for k in raw_keys]
+
+            raw_button = _req_str("button") or "left"
+            btn_norm = raw_button.lower()
+            if btn_norm not in {"left", "right", "double"}:
+                await _send_error(f"Unsupported mouse button: {raw_button!r}")
+                return
+
+            await _execute_rpc_tool(
+                OsGuiActionRequest(
+                    params=OsGuiActionParams(
+                        action=action_norm,  # type: ignore[arg-type]
+                        x=x_val,
+                        y=y_val,
+                        text=text_val,
+                        keys=keys_val,
+                        clicks=clicks_val if clicks_val is not None else 1,
+                        button=btn_norm,  # type: ignore[arg-type]
+                        delta=delta_val if delta_val is not None else 0,
+                        seconds=seconds_val,
+                    )
+                ),
+                error_prefix="Failed to execute GUI action",
             )
             return
 

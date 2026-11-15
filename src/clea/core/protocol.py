@@ -253,6 +253,33 @@ class OsWriteClipboardParams(_Model):
     text: str
 
 
+GuiActionType = Literal["click_at", "type_text", "press_keys", "scroll", "wait"]
+GuiClickButton = Literal["left", "right", "double"]
+
+
+class OsInspectUiElementsParams(_Model):
+    app_name: str | None = None
+    max_elements: int = 60
+
+
+class OsClickUiElementParams(_Model):
+    name: str
+    control_type: str | None = None
+    app_name: str | None = None
+
+
+class OsGuiActionParams(_Model):
+    action: GuiActionType
+    x: int | None = None
+    y: int | None = None
+    text: str | None = None
+    keys: list[str] | None = None
+    clicks: int = 1
+    button: GuiClickButton = "left"
+    delta: int = 0
+    seconds: float = 1.0
+
+
 class WorkspaceGitInspectParams(_Model):
     repo_path: str | None = None
     include_diff: bool = False
@@ -570,6 +597,21 @@ class OsWriteClipboardRequest(_Request):
     params: OsWriteClipboardParams
 
 
+class OsInspectUiElementsRequest(_Request):
+    method: Literal["os.inspect_ui_elements"] = "os.inspect_ui_elements"
+    params: OsInspectUiElementsParams = Field(default_factory=OsInspectUiElementsParams)
+
+
+class OsClickUiElementRequest(_Request):
+    method: Literal["os.click_ui_element"] = "os.click_ui_element"
+    params: OsClickUiElementParams
+
+
+class OsGuiActionRequest(_Request):
+    method: Literal["os.gui_action"] = "os.gui_action"
+    params: OsGuiActionParams
+
+
 class WorkspaceGitInspectRequest(_Request):
     method: Literal["workspace.git_inspect"] = "workspace.git_inspect"
     params: WorkspaceGitInspectParams = Field(default_factory=WorkspaceGitInspectParams)
@@ -630,6 +672,9 @@ RequestFrame = Annotated[
     | OsOpenUrlRequest
     | OsControlSystemRequest
     | OsWriteClipboardRequest
+    | OsInspectUiElementsRequest
+    | OsClickUiElementRequest
+    | OsGuiActionRequest
     | WorkspaceGitInspectRequest,
     Field(discriminator="method"),
 ]
@@ -1195,6 +1240,47 @@ class OsWriteClipboardResult(_Model):
     char_count: int = 0
 
 
+class UiElementItem(_Model):
+    index: int
+    name: str = ""
+    automation_id: str = ""
+    control_type: str = ""
+    value: str | None = None
+    x: int = 0
+    y: int = 0
+
+
+class OsInspectUiElementsResult(_Model):
+    ok: bool = True
+    window_title: str = ""
+    count: int = 0
+    elements: list[UiElementItem] = Field(default_factory=list)
+
+
+class OsClickUiElementResult(_Model):
+    ok: bool = True
+    status: str = "clicked"
+    name: str = ""
+    control_type: str = ""
+    x: int = 0
+    y: int = 0
+    method: str = "invoke"
+
+
+class OsGuiActionResult(_Model):
+    ok: bool = True
+    status: str = "completed"
+    action: str = ""
+    x: int | None = None
+    y: int | None = None
+    clicks: int | None = None
+    button: str | None = None
+    char_count: int | None = None
+    keys: list[str] | None = None
+    delta: int | None = None
+    seconds: float | None = None
+
+
 class GitWorktreeItem(_Model):
     path: str
     head: str = ""
@@ -1277,6 +1363,9 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "os.open_url": OsOpenUrlResult,
     "os.control_system": OsControlSystemResult,
     "os.write_clipboard": OsWriteClipboardResult,
+    "os.inspect_ui_elements": OsInspectUiElementsResult,
+    "os.click_ui_element": OsClickUiElementResult,
+    "os.gui_action": OsGuiActionResult,
     "workspace.git_inspect": WorkspaceGitInspectResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""
