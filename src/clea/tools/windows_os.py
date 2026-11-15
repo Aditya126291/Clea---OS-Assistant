@@ -20,8 +20,10 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -2142,6 +2144,9 @@ UI_AUTOMATION_TIMEOUT_SECONDS: float = 5.0
 VALID_GUI_ACTIONS: frozenset[str] = frozenset(
     {"click_at", "type_text", "press_keys", "scroll", "wait"}
 )
+VALID_UI_ACT_ACTIONS: frozenset[str] = frozenset(
+    {"click", "double_click", "right_click", "set_value", "type", "clear"}
+)
 VALID_CLICK_BUTTONS: frozenset[str] = frozenset({"left", "right", "double"})
 VALID_UI_CONTROL_TYPES: tuple[str, ...] = (
     "Button",
@@ -2155,6 +2160,139 @@ VALID_UI_CONTROL_TYPES: tuple[str, ...] = (
     "ComboBox",
     "Text",
 )
+
+_CONTROL_TYPE_TO_ROLE: dict[str, str] = {
+    "button": "button",
+    "splitbutton": "button",
+    "edit": "input",
+    "input": "input",
+    "hyperlink": "link",
+    "link": "link",
+    "tabitem": "tab",
+    "tab": "tab",
+    "menuitem": "menu_item",
+    "menu_item": "menu_item",
+    "checkbox": "checkbox",
+    "radiobutton": "radio",
+    "radio": "radio",
+    "combobox": "combo",
+    "combo": "combo",
+    "listitem": "list_item",
+    "list_item": "list_item",
+    "text": "text",
+}
+
+_ROLE_TO_CONTROL_TYPE: dict[str, str] = {
+    "button": "Button",
+    "input": "Edit",
+    "link": "Hyperlink",
+    "tab": "TabItem",
+    "menu_item": "MenuItem",
+    "checkbox": "CheckBox",
+    "radio": "RadioButton",
+    "combo": "ComboBox",
+    "list_item": "ListItem",
+    "text": "Text",
+}
+
+INTERACTIVE_UI_ROLES: frozenset[str] = frozenset(
+    {
+        "button",
+        "input",
+        "link",
+        "tab",
+        "menu_item",
+        "checkbox",
+        "radio",
+        "combo",
+        "list_item",
+    }
+)
+
+
+def _normalize_ui_role(raw_control_type: str) -> str:
+    """Normalize a UI Automation ControlType name into a semantic role."""
+    cleaned = raw_control_type.strip().lower()
+    if cleaned.startswith("controltype."):
+        cleaned = cleaned[len("controltype.") :]
+    return _CONTROL_TYPE_TO_ROLE.get(cleaned, cleaned or "text")
+
+
+def _normalize_ref_id(ref: str) -> str:
+    """Normalize an element reference (case-insensitive, optional single leading '@')."""
+    if not isinstance(ref, str):
+        raise ValueError("ref must be a non-empty string.")
+    cleaned = ref.strip()
+    if cleaned.startswith("@"):
+        cleaned = cleaned[1:].strip()
+    cleaned = cleaned.lower()
+    if not cleaned:
+        raise ValueError("ref must be a non-empty element reference (e.g. 'e1' or '@e1').")
+    return cleaned
+
+
+class _UiRefStore:
+    """Thread-safe module-level store holding the most recent UI snapshot and element refs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.snapshot_id: str | None = None
+        self.window_title: str = ""
+        self.hwnd: int = 0
+        self.elements_by_ref: dict[str, dict[str, Any]] = {}
+
+    def update(
+        self,
+        *,
+        snapshot_id: str,
+        window_title: str,
+        hwnd: int,
+        elements_by_ref: dict[str, dict[str, Any]],
+    ) -> None:
+        """Replace the stored snapshot and ref table atomically."""
+        with self._lock:
+            self.snapshot_id = snapshot_id
+            self.window_title = window_title
+            self.hwnd = hwnd
+            self.elements_by_ref = {k: dict(v) for k, v in elements_by_ref.items()}
+
+    def clear(self) -> None:
+        """Clear the stored snapshot and ref table."""
+        with self._lock:
+            self.snapshot_id = None
+            self.window_title = ""
+            self.hwnd = 0
+            self.elements_by_ref = {}
+
+    def resolve(self, ref: str) -> tuple[str, str, int, dict[str, Any]]:
+        """Look up a ref (supporting optional leading '@' and case-insensitivity)."""
+        norm_ref = _normalize_ref_id(ref)
+        with self._lock:
+            if not self.snapshot_id or not self.elements_by_ref:
+                raise ValueError(
+                    f"Unknown or stale UI ref {ref!r}: no active snapshot. "
+                    "Call ui_snapshot() first."
+                )
+            entry = self.elements_by_ref.get(norm_ref)
+            if entry is None:
+                avail = ", ".join(list(self.elements_by_ref.keys())[:20])
+                raise ValueError(
+                    f"Unknown or stale UI ref {ref!r} in snapshot {self.snapshot_id}. "
+                    f"Available refs: {avail or 'none'}."
+                )
+            return (
+                self.snapshot_id,
+                self.window_title,
+                self.hwnd,
+                {
+                    **entry,
+                    "bounds": dict(entry["bounds"]),
+                    "center": dict(entry["center"]),
+                },
+            )
+
+
+_UI_REF_STORE = _UiRefStore()
 
 _EXTENDED_VK_KEYS: frozenset[str] = frozenset(
     {
@@ -2457,6 +2595,188 @@ _POWERSHELL_CLICK_UI_SCRIPT = (
     "}"
 )
 
+_POWERSHELL_SNAPSHOT_UI_SCRIPT = (
+    "param([long]$TargetHwnd = 0, [int]$MaxElements = 80, "
+    "[int]$InteractiveOnly = 0, [string]$AppNameBase64 = '') "
+    "$AppName = if ($AppNameBase64) { "
+    "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($AppNameBase64)) "
+    "} else { '' }; "
+    + _POWERSHELL_UIA_RESOLVE_WINDOW
+    + _POWERSHELL_UIA_TYPES_COND
+    + "$winTitle = if ($win -ne $null) { "
+    "try { [string]$win.Current.Name } catch { '' } } else { '' }; "
+    "$winHwnd = if ($win -ne $null) { "
+    "try { [long]$win.Current.NativeWindowHandle } catch { 0 } } else { 0 }; "
+    "$items = New-Object System.Collections.ArrayList; "
+    "if ($win -ne $null) { "
+    "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $typeCond); "
+    "  foreach ($el in $all) { "
+    "    try { "
+    "      $cur = $el.Current; "
+    "      if ($cur.IsOffscreen) { continue } "
+    "      $r = $cur.BoundingRectangle; "
+    "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
+    "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
+    "-or $r.Width -le 0 -or $r.Height -le 0) { continue } "
+    "      $bx = [int][Math]::Round($r.Left); "
+    "      $by = [int][Math]::Round($r.Top); "
+    "      $bw = [int][Math]::Round($r.Width); "
+    "      $bh = [int][Math]::Round($r.Height); "
+    "      if ($bw -le 0 -or $bh -le 0) { continue } "
+    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
+    "      $isEnabled = [bool]$cur.IsEnabled; "
+    "      $isFocused = [bool]$cur.HasKeyboardFocus; "
+    "      if ($InteractiveOnly -ne 0 -and ($ctName -eq 'Text' -or -not $isEnabled)) { continue } "
+    "      $elName = [string]$cur.Name; "
+    "      $elAid = [string]$cur.AutomationId; "
+    "      $elVal = $null; "
+    "      $vp = $null; "
+    "      try { "
+    "        if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
+    "[ref]$vp)) { "
+    "          $elVal = [string]$vp.Current.Value "
+    "        } "
+    "      } catch { $elVal = $null } "
+    "      if ($elVal -eq $null) { "
+    "        $rvp = $null; "
+    "        try { "
+    "          if ($el.TryGetCurrentPattern("
+    "[System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$rvp)) { "
+    "            $elVal = [string]$rvp.Current.Value "
+    "          } "
+    "        } catch { $elVal = $null } "
+    "      } "
+    "      if ($ctName -eq 'Text' -and [string]::IsNullOrWhiteSpace($elName) "
+    "-and [string]::IsNullOrWhiteSpace([string]$elVal)) { continue } "
+    "      $cx = [int][Math]::Round($r.Left + ($r.Width / 2.0)); "
+    "      $cy = [int][Math]::Round($r.Top + ($r.Height / 2.0)); "
+    "      [void]$items.Add(@{ "
+    "        name = $elName; "
+    "        automation_id = $elAid; "
+    "        control_type = $ctName; "
+    "        value = $elVal; "
+    "        enabled = $isEnabled; "
+    "        focused = $isFocused; "
+    "        bounds = @{ x = $bx; y = $by; width = $bw; height = $bh }; "
+    "        center = @{ cx = $cx; cy = $cy } "
+    "      }); "
+    "      if ($items.Count -ge $MaxElements) { break } "
+    "    } catch { continue } "
+    "  } "
+    "} "
+    "@{ window_title = $winTitle; hwnd = $winHwnd; count = $items.Count; "
+    "elements = [object[]]$items.ToArray() } | ConvertTo-Json -Depth 5 -Compress"
+)
+
+_POWERSHELL_UI_ACT_SCRIPT = (
+    "param([long]$TargetHwnd = 0, [string]$WindowTitleBase64 = '', "
+    "[string]$Action = 'click', [string]$AutomationIdBase64 = '', "
+    "[string]$NameBase64 = '', [string]$ControlType = '', "
+    "[int]$ExpectedX = 0, [int]$ExpectedY = 0, [int]$ExpectedW = 0, [int]$ExpectedH = 0, "
+    "[int]$CenterX = 0, [int]$CenterY = 0, [string]$ValueBase64 = '') "
+    "$AppName = if ($WindowTitleBase64) { "
+    "[System.Text.Encoding]::UTF8.GetString("
+    "[System.Convert]::FromBase64String($WindowTitleBase64)) "
+    "} else { '' }; "
+    "$TargetAid = if ($AutomationIdBase64) { "
+    "[System.Text.Encoding]::UTF8.GetString("
+    "[System.Convert]::FromBase64String($AutomationIdBase64)) "
+    "} else { '' }; "
+    "$TargetName = if ($NameBase64) { "
+    "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($NameBase64)) "
+    "} else { '' }; "
+    "$TargetValue = if ($ValueBase64) { "
+    "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ValueBase64)) "
+    "} else { '' }; "
+    + _POWERSHELL_UIA_RESOLVE_WINDOW
+    + _POWERSHELL_UIA_TYPES_COND
+    + "$searchCond = $typeCond; "
+    "if ($ControlType -ne '') { "
+    "  $ctProp = $null; "
+    "  try { $ctProp = [System.Windows.Automation.ControlType]::$ControlType } "
+    "catch { $ctProp = $null }; "
+    "  if ($ctProp -ne $null) { "
+    "    $searchCond = New-Object System.Windows.Automation.PropertyCondition("
+    "[System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ctProp) "
+    "  } "
+    "} "
+    "$chosen = $null; $bestScore = -1; $bestDist = [int]::MaxValue; "
+    "$chosenCx = $CenterX; $chosenCy = $CenterY; "
+    "if ($win -ne $null) { "
+    "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $searchCond); "
+    "  foreach ($el in $all) { "
+    "    try { "
+    "      $cur = $el.Current; "
+    "      if ($cur.IsOffscreen) { continue } "
+    "      $r = $cur.BoundingRectangle; "
+    "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
+    "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
+    "-or $r.Width -le 0 -or $r.Height -le 0) { continue } "
+    "      $bx = [int][Math]::Round($r.Left); $by = [int][Math]::Round($r.Top); "
+    "      $bw = [int][Math]::Round($r.Width); $bh = [int][Math]::Round($r.Height); "
+    "      $cx = [int][Math]::Round($r.Left + ($r.Width / 2.0)); "
+    "      $cy = [int][Math]::Round($r.Top + ($r.Height / 2.0)); "
+    "      $elName = [string]$cur.Name; $elAid = [string]$cur.AutomationId; "
+    "      $dist = [Math]::Abs($cx - $CenterX) + [Math]::Abs($cy - $CenterY); "
+    "      $boxDist = [Math]::Abs($bx - $ExpectedX) + [Math]::Abs($by - $ExpectedY) "
+    "+ [Math]::Abs($bw - $ExpectedW) + [Math]::Abs($bh - $ExpectedH); "
+    "      $score = 0; "
+    "      if ($TargetAid -ne '' -and $elAid -eq $TargetAid) { $score += 100 } "
+    "      if ($TargetName -ne '' -and $elName -eq $TargetName) { $score += 50 } "
+    "      if ($ExpectedW -gt 0 -and $ExpectedH -gt 0 -and $boxDist -le 12) { $score += 40 } "
+    "      elseif ($dist -le 10) { $score += 30 } "
+    "      if ($score -lt 50 -and -not ($TargetAid -eq '' -and $TargetName -eq '' "
+    "-and $ExpectedW -gt 0 -and $boxDist -le 12)) { continue } "
+    "      if ($score -gt $bestScore -or ($score -eq $bestScore -and $dist -lt $bestDist)) { "
+    "        $bestScore = $score; $bestDist = $dist; $chosen = $el; "
+    "        $chosenCx = $cx; $chosenCy = $cy "
+    "      } "
+    "    } catch { continue } "
+    "  } "
+    "} "
+    "if ($chosen -eq $null) { "
+    "  @{ found = $false; acted = $false; method = ''; cx = $CenterX; cy = $CenterY } "
+    "| ConvertTo-Json -Depth 4 -Compress "
+    "} else { "
+    "  $method = ''; "
+    "  if ($Action -eq 'click') { "
+    "    $pat = $null; "
+    "    try { "
+    "      if ($chosen.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, "
+    "[ref]$pat)) { $pat.Invoke(); $method = 'invoke' } "
+    "      elseif ($chosen.TryGetCurrentPattern("
+    "[System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pat)) { "
+    "        $pat.Select(); $method = 'select' "
+    "      } "
+    "      elseif ($chosen.TryGetCurrentPattern("
+    "[System.Windows.Automation.TogglePattern]::Pattern, [ref]$pat)) { "
+    "        $pat.Toggle(); $method = 'toggle' "
+    "      } "
+    "      elseif ($chosen.TryGetCurrentPattern("
+    "[System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$pat)) { "
+    "        if ($pat.Current.ExpandCollapseState -eq "
+    "[System.Windows.Automation.ExpandCollapseState]::Expanded) { $pat.Collapse() } "
+    "        else { $pat.Expand() }; "
+    "        $method = 'expand_collapse' "
+    "      } "
+    "    } catch { $method = '' } "
+    "  } elseif ($Action -eq 'set_value') { "
+    "    try { $chosen.SetFocus() } catch {} "
+    "    $vp = $null; "
+    "    try { "
+    "      if ($chosen.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
+    "[ref]$vp)) { "
+    "        if (-not $vp.Current.IsReadOnly) { "
+    "          $vp.SetValue($TargetValue); $method = 'value_pattern' "
+    "        } "
+    "      } "
+    "    } catch { $method = '' } "
+    "  } "
+    "  @{ found = $true; acted = ($method -ne ''); method = $method; "
+    "cx = $chosenCx; cy = $chosenCy } | ConvertTo-Json -Depth 4 -Compress "
+    "}"
+)
+
 
 def _resolve_target_hwnd_optional(
     app_name: str | None,
@@ -2559,6 +2879,481 @@ def _perform_mouse_click(
             u32.mouse_event(up_flag, 0, 0, 0, 0)
     else:
         raise RuntimeError("Win32 SendInput/mouse_event is unavailable.")
+
+
+def _run_powershell_uia_json(
+    ps_command: str,
+    *,
+    operation: str,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> dict[str, Any]:
+    """Execute a PowerShell 5.1 UIA command with shell=False and parse its JSON output."""
+    ps_exe = _resolve_powershell_exe(powershell_runner)
+    runner = powershell_runner or subprocess.run
+    cmd = [
+        ps_exe,
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        ps_command,
+    ]
+    try:
+        proc = runner(
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"{operation} timed out after {UI_AUTOMATION_TIMEOUT_SECONDS}s."
+        ) from exc
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"{operation} failed: {err}")
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        raise RuntimeError(f"{operation} returned empty output.")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{operation} returned invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{operation} returned non-object JSON payload.")
+    return data
+
+
+def _ensure_window_foreground(hwnd: int, u32: Any) -> None:
+    """Restore and foreground the target window when it is not currently active."""
+    if hwnd <= 0:
+        return
+    if hasattr(u32, "GetForegroundWindow"):
+        try:
+            if int(u32.GetForegroundWindow()) == hwnd:
+                return
+        except (TypeError, ValueError):
+            pass
+    if hasattr(u32, "IsIconic") and u32.IsIconic(hwnd):
+        u32.ShowWindow(hwnd, SW_RESTORE)
+    if hasattr(u32, "SetForegroundWindow"):
+        u32.SetForegroundWindow(hwnd)
+
+
+def _send_key_chord(u32: Any, keys: list[str]) -> list[str]:
+    """Validate and dispatch a key chord via Win32 SendInput."""
+    if not isinstance(keys, list) or len(keys) == 0:
+        raise ValueError("keys must be a non-empty list of key names for 'press_keys'.")
+    if len(keys) > 6:
+        raise ValueError("keys chord cannot exceed 6 keys.")
+    normalized_keys = [_normalize_key_name(k) for k in keys]
+    combo_set = frozenset(normalized_keys)
+    for blocked in _BLOCKED_KEY_COMBOS:
+        if blocked.issubset(combo_set):
+            raise ValueError(
+                f"Blocked dangerous key combination: {'+'.join(normalized_keys)}"
+            )
+    events: list[_INPUT] = []
+    for k_name in normalized_keys:
+        vk = _ALLOWED_VK_MAP[k_name]
+        ext = KEYEVENTF_EXTENDEDKEY if k_name in _EXTENDED_VK_KEYS else 0
+        events.append(
+            _INPUT(
+                type=INPUT_KEYBOARD,
+                union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=ext)),
+            )
+        )
+    for k_name in reversed(normalized_keys):
+        vk = _ALLOWED_VK_MAP[k_name]
+        ext = KEYEVENTF_EXTENDEDKEY if k_name in _EXTENDED_VK_KEYS else 0
+        events.append(
+            _INPUT(
+                type=INPUT_KEYBOARD,
+                union=_INPUT_UNION(
+                    ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=ext | KEYEVENTF_KEYUP)
+                ),
+            )
+        )
+    _send_win32_inputs(u32, events)
+    return normalized_keys
+
+
+def _send_unicode_text(
+    u32: Any,
+    text: str,
+    *,
+    interval_ms: int = 12,
+    sleep_fn: Callable[[float], None] | None = None,
+) -> int:
+    """Send Unicode text via Win32 SendInput with clamped inter-character pacing."""
+    if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
+        raise ValueError("interval_ms must be an integer.")
+    clamped_interval = max(0, min(200, interval_ms))
+    if not text:
+        return clamped_interval
+
+    def _encode_char_events(chunk: str) -> list[_INPUT]:
+        utf16_bytes = chunk.encode("utf-16-le")
+        chunk_events: list[_INPUT] = []
+        for idx in range(0, len(utf16_bytes), 2):
+            code_unit = int.from_bytes(utf16_bytes[idx : idx + 2], "little")
+            chunk_events.append(
+                _INPUT(
+                    type=INPUT_KEYBOARD,
+                    union=_INPUT_UNION(
+                        ki=_KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)
+                    ),
+                )
+            )
+            chunk_events.append(
+                _INPUT(
+                    type=INPUT_KEYBOARD,
+                    union=_INPUT_UNION(
+                        ki=_KEYBDINPUT(
+                            wVk=0,
+                            wScan=code_unit,
+                            dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                        )
+                    ),
+                )
+            )
+        return chunk_events
+
+    if clamped_interval == 0:
+        _send_win32_inputs(u32, _encode_char_events(text))
+        return clamped_interval
+
+    sleeper = sleep_fn or time.sleep
+    delay_s = clamped_interval / 1000.0
+    last_idx = len(text) - 1
+    for char_idx, ch in enumerate(text):
+        _send_win32_inputs(u32, _encode_char_events(ch))
+        if char_idx < last_idx:
+            sleeper(delay_s)
+    return clamped_interval
+
+
+def _extract_element_geometry(item: dict[str, Any]) -> tuple[dict[str, int], dict[str, int]]:
+    """Extract normalized bounds and center dicts from a parsed UIA element item."""
+    raw_bounds = item.get("bounds")
+    if isinstance(raw_bounds, dict):
+        bx = int(raw_bounds.get("x", 0))
+        by = int(raw_bounds.get("y", 0))
+        bw = int(raw_bounds.get("width", 0))
+        bh = int(raw_bounds.get("height", 0))
+    else:
+        bx = int(item.get("x", 0))
+        by = int(item.get("y", 0))
+        bw = int(item.get("width", 0))
+        bh = int(item.get("height", 0))
+
+    raw_center = item.get("center")
+    if isinstance(raw_center, dict):
+        cx = int(raw_center.get("cx", 0))
+        cy = int(raw_center.get("cy", 0))
+    elif "cx" in item or "cy" in item:
+        cx = int(item.get("cx", 0))
+        cy = int(item.get("cy", 0))
+    elif bw > 0 and bh > 0:
+        cx = round(bx + (bw / 2.0))
+        cy = round(by + (bh / 2.0))
+    else:
+        cx = bx
+        cy = by
+
+    return {"x": bx, "y": by, "width": bw, "height": bh}, {"cx": cx, "cy": cy}
+
+
+def ui_snapshot(
+    app_name: str | None = None,
+    max_elements: int = 80,
+    interactive_only: bool = False,
+    *,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    user32: Any = None,
+    kernel32: Any = None,
+    window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+) -> dict[str, Any]:
+    """Capture a semantic UI Automation snapshot and assign compact ref IDs ('e1'..'eN')."""
+    if app_name is not None and not isinstance(app_name, str):
+        raise ValueError("app_name must be a string when provided.")
+    if isinstance(max_elements, bool) or not isinstance(max_elements, int):
+        raise ValueError("max_elements must be an integer.")
+    if not isinstance(interactive_only, bool):
+        raise ValueError("interactive_only must be a boolean.")
+    clamped_max = max(1, min(MAX_UI_INSPECT_ELEMENTS, max_elements))
+
+    cleaned_app = app_name.strip() if app_name is not None else None
+    if cleaned_app == "":
+        raise ValueError("app_name must not be empty when provided.")
+
+    hwnd = _resolve_target_hwnd_optional(
+        cleaned_app,
+        powershell_runner=powershell_runner,
+        user32=user32,
+        kernel32=kernel32,
+        window_enumerator=window_enumerator,
+        focus_if_app_name=True,
+    )
+
+    app_b64 = (
+        base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
+    )
+    interactive_flag = 1 if interactive_only else 0
+    ps_command = (
+        f"& {{ {_POWERSHELL_SNAPSHOT_UI_SCRIPT} }} "
+        f"-TargetHwnd {hwnd} -MaxElements {clamped_max} "
+        f"-InteractiveOnly {interactive_flag} -AppNameBase64 '{app_b64}'"
+    )
+    data = _run_powershell_uia_json(
+        ps_command,
+        operation="UI Automation snapshot",
+        powershell_runner=powershell_runner,
+    )
+
+    window_title = str(data.get("window_title") or "")
+    raw_hwnd = data.get("hwnd")
+    resolved_hwnd = hwnd or (
+        int(raw_hwnd) if isinstance(raw_hwnd, int) and not isinstance(raw_hwnd, bool) else 0
+    )
+
+    raw_elements = data.get("elements") or []
+    if isinstance(raw_elements, dict):
+        raw_elements = [raw_elements]
+
+    llm_elements: list[dict[str, Any]] = []
+    elements_by_ref: dict[str, dict[str, Any]] = {}
+
+    for item in raw_elements:
+        if not isinstance(item, dict):
+            continue
+        raw_ct = str(item.get("control_type") or item.get("role") or "")
+        role = _normalize_ui_role(raw_ct)
+        name = str(item.get("name") or "")
+        raw_val = item.get("value")
+        value = str(raw_val) if raw_val is not None else None
+        enabled = bool(item.get("enabled", True))
+        focused = bool(item.get("focused", False))
+        automation_id = str(item.get("automation_id") or "")
+
+        if role == "text":
+            if interactive_only:
+                continue
+            if not name.strip() and (value is None or not value.strip()):
+                continue
+        elif interactive_only and not enabled:
+            continue
+
+        bounds, center = _extract_element_geometry(item)
+        ref = f"e{len(llm_elements) + 1}"
+        control_type = (
+            str(item.get("control_type") or "") or _ROLE_TO_CONTROL_TYPE.get(role, "")
+        )
+
+        elements_by_ref[ref] = {
+            "ref": ref,
+            "role": role,
+            "name": name,
+            "value": value,
+            "enabled": enabled,
+            "focused": focused,
+            "bounds": bounds,
+            "center": center,
+            "automation_id": automation_id,
+            "control_type": control_type,
+        }
+        llm_elements.append(
+            {
+                "ref": ref,
+                "role": role,
+                "name": name,
+                "value": value,
+                "enabled": enabled,
+                "focused": focused,
+            }
+        )
+        if len(llm_elements) >= clamped_max:
+            break
+
+    snapshot_id = f"snap_{uuid.uuid4().hex[:12]}"
+    _UI_REF_STORE.update(
+        snapshot_id=snapshot_id,
+        window_title=window_title,
+        hwnd=resolved_hwnd,
+        elements_by_ref=elements_by_ref,
+    )
+
+    return {
+        "snapshot_id": snapshot_id,
+        "window_title": window_title,
+        "element_count": len(llm_elements),
+        "elements": llm_elements,
+    }
+
+
+def ui_act(
+    ref: str,
+    action: str = "click",
+    value: str | None = None,
+    interval_ms: int = 12,
+    *,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    user32: Any = None,
+    sleep_fn: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
+    """Execute a semantic action against an element ref from the latest ui_snapshot()."""
+    if not isinstance(action, str):
+        raise ValueError("action must be a string.")
+    normalized_action = action.strip().lower()
+    if normalized_action not in VALID_UI_ACT_ACTIONS:
+        raise ValueError(
+            f"Unsupported ui_act action {action!r}. Must be one of {sorted(VALID_UI_ACT_ACTIONS)}."
+        )
+    if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
+        raise ValueError("interval_ms must be an integer.")
+    clamped_interval = max(0, min(200, interval_ms))
+
+    if normalized_action == "set_value":
+        if value is None or not isinstance(value, str):
+            raise ValueError("value must be a string for 'set_value' action.")
+        if len(value) > MAX_GUI_TYPE_TEXT_LEN:
+            raise ValueError(
+                f"value length ({len(value)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
+            )
+    elif normalized_action == "type":
+        if not isinstance(value, str) or len(value) == 0:
+            raise ValueError("value must be a non-empty string for 'type' action.")
+        if len(value) > MAX_GUI_TYPE_TEXT_LEN:
+            raise ValueError(
+                f"value length ({len(value)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
+            )
+
+    snapshot_id, window_title, snapshot_hwnd, entry = _UI_REF_STORE.resolve(ref)
+    norm_ref = entry["ref"]
+    bounds = entry["bounds"]
+    center = entry["center"]
+    target_cx = int(center["cx"])
+    target_cy = int(center["cy"])
+
+    method = ""
+    if normalized_action in {"click", "set_value"} and (
+        powershell_runner is not None or shutil.which("powershell.exe") is not None
+    ):
+        title_b64 = (
+            base64.b64encode(window_title.encode("utf-8")).decode("ascii")
+            if window_title
+            else ""
+        )
+        aid_b64 = (
+            base64.b64encode(entry["automation_id"].encode("utf-8")).decode("ascii")
+            if entry["automation_id"]
+            else ""
+        )
+        name_b64 = (
+            base64.b64encode(entry["name"].encode("utf-8")).decode("ascii")
+            if entry["name"]
+            else ""
+        )
+        val_b64 = (
+            base64.b64encode(value.encode("utf-8")).decode("ascii")
+            if normalized_action == "set_value" and value
+            else ""
+        )
+        ct_arg = str(entry.get("control_type") or "")
+        if ct_arg and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", ct_arg):
+            ct_arg = ""
+        ps_command = (
+            f"& {{ {_POWERSHELL_UI_ACT_SCRIPT} }} "
+            f"-TargetHwnd {snapshot_hwnd} -WindowTitleBase64 '{title_b64}' "
+            f"-Action '{normalized_action}' -AutomationIdBase64 '{aid_b64}' "
+            f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
+            f"-ExpectedX {int(bounds['x'])} -ExpectedY {int(bounds['y'])} "
+            f"-ExpectedW {int(bounds['width'])} -ExpectedH {int(bounds['height'])} "
+            f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
+        )
+        data = _run_powershell_uia_json(
+            ps_command,
+            operation=f"UI Automation {normalized_action}",
+            powershell_runner=powershell_runner,
+        )
+        if data.get("found"):
+            if isinstance(data.get("cx"), int) and not isinstance(data.get("cx"), bool):
+                target_cx = int(data["cx"])
+            if isinstance(data.get("cy"), int) and not isinstance(data.get("cy"), bool):
+                target_cy = int(data["cy"])
+        if data.get("acted"):
+            method = str(
+                data.get("method")
+                or ("value_pattern" if normalized_action == "set_value" else "invoke")
+            )
+            result: dict[str, Any] = {
+                "ok": True,
+                "status": "completed",
+                "snapshot_id": snapshot_id,
+                "ref": norm_ref,
+                "action": normalized_action,
+                "role": entry["role"],
+                "name": entry["name"],
+                "method": method,
+                "x": target_cx,
+                "y": target_cy,
+            }
+            if normalized_action == "set_value" and value is not None:
+                result["char_count"] = len(value)
+            return result
+
+    u32 = _get_win32_user32(user32)
+    _ensure_window_foreground(snapshot_hwnd, u32)
+
+    if normalized_action == "click":
+        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+        method = "win32_click"
+    elif normalized_action == "double_click":
+        _perform_mouse_click(target_cx, target_cy, clicks=1, button="double", user32=u32)
+        method = "win32_double_click"
+    elif normalized_action == "right_click":
+        _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
+        method = "win32_right_click"
+    elif normalized_action == "set_value":
+        assert value is not None
+        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+        _send_key_chord(u32, ["ctrl", "a"])
+        _send_key_chord(u32, ["backspace"])
+        if value:
+            _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
+        method = "keyboard_fallback"
+    elif normalized_action == "type":
+        assert value is not None
+        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+        _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
+        method = "win32_type"
+    else:  # "clear"
+        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+        _send_key_chord(u32, ["ctrl", "a"])
+        _send_key_chord(u32, ["backspace"])
+        method = "win32_clear"
+
+    res: dict[str, Any] = {
+        "ok": True,
+        "status": "completed",
+        "snapshot_id": snapshot_id,
+        "ref": norm_ref,
+        "action": normalized_action,
+        "role": entry["role"],
+        "name": entry["name"],
+        "method": method,
+        "x": target_cx,
+        "y": target_cy,
+    }
+    if normalized_action in {"set_value", "type"} and value is not None:
+        res["char_count"] = len(value)
+        res["interval_ms"] = clamped_interval
+    return res
 
 
 def inspect_ui_elements(
@@ -2853,6 +3648,7 @@ def gui_action(
     button: str = "left",
     delta: int = 0,
     seconds: float = 1.0,
+    interval_ms: int = 12,
     *,
     user32: Any = None,
     sleep_fn: Callable[[float], None] | None = None,
@@ -2914,72 +3710,22 @@ def gui_action(
             raise ValueError(
                 f"text length ({len(text)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
             )
-        utf16_bytes = text.encode("utf-16-le")
-        events: list[_INPUT] = []
-        for idx in range(0, len(utf16_bytes), 2):
-            code_unit = int.from_bytes(utf16_bytes[idx : idx + 2], "little")
-            events.append(
-                _INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUT_UNION(
-                        ki=_KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)
-                    ),
-                )
-            )
-            events.append(
-                _INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUT_UNION(
-                        ki=_KEYBDINPUT(
-                            wVk=0,
-                            wScan=code_unit,
-                            dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                        )
-                    ),
-                )
-            )
-        _send_win32_inputs(u32, events)
+        clamped_interval = _send_unicode_text(
+            u32,
+            text,
+            interval_ms=interval_ms,
+            sleep_fn=sleep_fn,
+        )
         return {
             "ok": True,
             "status": "completed",
             "action": "type_text",
             "char_count": len(text),
+            "interval_ms": clamped_interval,
         }
 
     if normalized_action == "press_keys":
-        if not isinstance(keys, list) or len(keys) == 0:
-            raise ValueError("keys must be a non-empty list of key names for 'press_keys'.")
-        if len(keys) > 6:
-            raise ValueError("keys chord cannot exceed 6 keys.")
-        normalized_keys = [_normalize_key_name(k) for k in keys]
-        combo_set = frozenset(normalized_keys)
-        for blocked in _BLOCKED_KEY_COMBOS:
-            if blocked.issubset(combo_set):
-                raise ValueError(
-                    f"Blocked dangerous key combination: {'+'.join(normalized_keys)}"
-                )
-        events = []
-        for k_name in normalized_keys:
-            vk = _ALLOWED_VK_MAP[k_name]
-            ext = KEYEVENTF_EXTENDEDKEY if k_name in _EXTENDED_VK_KEYS else 0
-            events.append(
-                _INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=ext)),
-                )
-            )
-        for k_name in reversed(normalized_keys):
-            vk = _ALLOWED_VK_MAP[k_name]
-            ext = KEYEVENTF_EXTENDEDKEY if k_name in _EXTENDED_VK_KEYS else 0
-            events.append(
-                _INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUT_UNION(
-                        ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=ext | KEYEVENTF_KEYUP)
-                    ),
-                )
-            )
-        _send_win32_inputs(u32, events)
+        normalized_keys = _send_key_chord(u32, keys or [])
         return {
             "ok": True,
             "status": "completed",
