@@ -7,6 +7,7 @@ import {
   DEFAULT_QUICK_ASK_SHORTCUT,
   readDaemonConnection,
   readDesktopConfig,
+  resolveActiveRendererDir,
   resolveDaemonLauncher,
   resolveRendererAssetPath,
   shouldStartHidden,
@@ -126,5 +127,30 @@ describe("Electron main helpers", () => {
       args: ["-m", "clea", "daemon", "--background"],
       cwd: repoDir,
     });
+  });
+
+  it("selects the fresher renderer bundle between out/renderer and dist", () => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "clea-renderer-sync-"));
+    tmpDirs.push(baseDir);
+    const outRenderer = path.join(baseDir, "out", "renderer");
+    const distDir = path.join(baseDir, "dist");
+    fs.mkdirSync(outRenderer, { recursive: true });
+    fs.mkdirSync(distDir, { recursive: true });
+
+    const outIndex = path.join(outRenderer, "index.html");
+    const distIndex = path.join(distDir, "index.html");
+    fs.writeFileSync(outIndex, "<html>out</html>", "utf-8");
+    fs.writeFileSync(distIndex, "<html>dist</html>", "utf-8");
+
+    const now = new Date();
+    const older = new Date(now.getTime() - 10_000);
+    fs.utimesSync(outIndex, older, older);
+    fs.utimesSync(distIndex, now, now);
+
+    expect(resolveActiveRendererDir(outRenderer, distDir)).toBe(distDir);
+
+    const newer = new Date(now.getTime() + 10_000);
+    fs.utimesSync(outIndex, newer, newer);
+    expect(resolveActiveRendererDir(outRenderer, distDir)).toBe(outRenderer);
   });
 });

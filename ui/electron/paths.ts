@@ -109,6 +109,28 @@ export function resolveRendererAssetPath(rendererDir: string, requestUrl: string
   return candidate;
 }
 
+/**
+ * Pick whichever static renderer directory (`out/renderer` or `dist`) has the most
+ * recently built `index.html` so `pnpm build` and `pnpm desktop:build` stay unified.
+ */
+export function resolveActiveRendererDir(
+  outRendererDir: string,
+  distDir: string = path.resolve(outRendererDir, "../../dist"),
+): string {
+  try {
+    const outIndex = path.join(outRendererDir, "index.html");
+    const distIndex = path.join(distDir, "index.html");
+    const outStat = fs.existsSync(outIndex) ? fs.statSync(outIndex) : null;
+    const distStat = fs.existsSync(distIndex) ? fs.statSync(distIndex) : null;
+    if (distStat && (!outStat || distStat.mtimeMs > outStat.mtimeMs)) {
+      return path.resolve(distDir);
+    }
+  } catch {
+    // Fall back to outRendererDir
+  }
+  return path.resolve(outRendererDir);
+}
+
 export function shouldStartHidden(
   argv: readonly string[],
   loginSettings?: { wasOpenedAtLogin?: boolean },

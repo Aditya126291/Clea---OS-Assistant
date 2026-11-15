@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
+import { cn } from "@/lib/utils";
 import { useCleaStore } from "@/protocol/store";
 import { MarkdownContent } from "./MarkdownContent";
 import { ToolCallCard } from "./ToolCallCard";
@@ -40,6 +41,7 @@ export function ChatView() {
   const respondApproval = useCleaStore((s) => s.respondApproval);
   const exitReadOnlyConversation = useCleaStore((s) => s.exitReadOnlyConversation);
   const newSession = useCleaStore((s) => s.newSession);
+  const callOverlayOpen = useCleaStore((s) => s.callOverlayOpen);
 
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -259,7 +261,13 @@ export function ChatView() {
         </div>
       </div>
 
-      <div className="border-t border-[var(--border)] bg-[var(--bg)] px-6 py-4">
+      <div
+        data-testid="chat-composer-container"
+        className={cn(
+          "border-t border-[var(--border)] bg-[var(--bg)] px-6 py-4 transition-[padding]",
+          callOverlayOpen && "pr-68",
+        )}
+      >
         <form
           className="mx-auto flex max-w-2xl items-end gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 focus-within:border-[var(--border-strong)]"
           onSubmit={(e) => {

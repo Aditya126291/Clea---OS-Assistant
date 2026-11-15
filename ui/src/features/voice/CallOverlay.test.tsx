@@ -1,9 +1,10 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CleaAvatar, sanitizeSvg } from "@/components/ui/clea-avatar";
+import { CallOverlay as ComponentCallOverlay } from "@/components/voice/CallOverlay";
 import { useCleaStore } from "@/protocol/store";
 import type { VoiceState } from "@/protocol/types";
 import { CallOverlay } from "./CallOverlay";
-import { CallOverlay as ComponentCallOverlay } from "@/components/voice/CallOverlay";
 import { DevVoiceMockPanel } from "./DevVoiceMockPanel";
 
 describe("CallOverlay", () => {
@@ -194,5 +195,97 @@ describe("CallOverlay", () => {
     expect(useCleaStore.getState().callOverlayOpen).toBe(false);
     expect(useCleaStore.getState().voiceState).toBe("idle");
     expect(useCleaStore.getState().voiceError).toBeNull();
+  });
+
+  it("renders inline animated SVG avatar with preserved <style> keyframes and <filter> glitch effects and state-reactive outer ring", () => {
+    useCleaStore.setState({ callOverlayOpen: true, voiceState: "listening", tasks: [] });
+    const { container } = render(<CallOverlay />);
+
+    const avatar = screen.getByTestId("voice-call-avatar");
+    expect(avatar).toHaveClass("rounded-full", "overflow-hidden");
+    expect(avatar).toHaveAttribute("data-avatar-src", "/clea-avatar.svg");
+
+    const svg = avatar.querySelector("svg");
+    expect(svg).not.toBeNull();
+    expect(svg?.querySelector("style")?.textContent).toContain("@keyframes");
+    expect(svg?.querySelector("filter#fR")).not.toBeNull();
+    expect(svg?.querySelector("filter#fC")).not.toBeNull();
+
+    const ring = screen.getByTestId("voice-avatar-ring");
+    expect(ring.className).toContain("ring-cyan-400");
+
+    act(() => {
+      useCleaStore.setState({ voiceState: "thinking" });
+    });
+    expect(ring.className).toContain("ring-violet-400");
+
+    act(() => {
+      useCleaStore.setState({ voiceState: "speaking" });
+    });
+    expect(ring.className).toContain("ring-amber-400");
+
+    // Running tools while idle also activates the violet ring
+    act(() => {
+      useCleaStore.setState({
+        voiceState: "idle",
+        tasks: [
+          {
+            task_id: "tool-1",
+            title: "Run search",
+            status: "running",
+            started_at: "2026-11-15T10:00:00Z",
+            finished_at: null,
+            detail: null,
+          },
+        ],
+      });
+    });
+    expect(ring.className).toContain("ring-violet-400");
+    expect(container.querySelector("aside")?.className).toContain("bottom-24");
+  });
+
+  it("sanitizes <script> tags, on* attributes, and javascript: URIs while keeping SVG filters and animations", () => {
+    const untrustedSvg = [
+      '<svg viewBox="0 0 100 100" width="100" height="100" onload="alert(1)">',
+      "<style>@keyframes glitch { 0% { opacity: 1; } }</style>",
+      '<filter id="fR"><feColorMatrix type="matrix"/></filter>',
+      "<script>window.pwned = true;</script>",
+      '<circle cx="50" cy="50" r="40" onclick="evil()" onmouseover=\'evil2()\' />',
+      '<use href="javascript:alert(2)" xlink:href="#art" />',
+      "</svg>",
+    ].join("");
+
+    const cleaned = sanitizeSvg(untrustedSvg);
+    expect(cleaned).not.toContain("<script");
+    expect(cleaned).not.toContain("onload=");
+    expect(cleaned).not.toContain("onclick=");
+    expect(cleaned).not.toContain("onmouseover=");
+    expect(cleaned).not.toContain("javascript:");
+    expect(cleaned).toContain("@keyframes glitch");
+    expect(cleaned).toContain('<filter id="fR">');
+    expect(cleaned).toContain('width="100%" height="100%"');
+
+    const { container } = render(<CleaAvatar svgMarkup={untrustedSvg} />);
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("filter#fR")).not.toBeNull();
+  });
+
+  it("sanitizes dynamically fetched /clea-avatar.svg markup when fetch is mocked", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      text: async () =>
+        '<svg viewBox="0 0 24 24" onload="evil()"><script>evil()</script><circle id="fetched-node" cx="12" cy="12" r="10"/></svg>',
+    });
+
+    try {
+      const { container } = render(<CleaAvatar />);
+      await waitFor(() => {
+        expect(container.querySelector("#fetched-node")).not.toBeNull();
+      });
+      expect(container.querySelector("script")).toBeNull();
+      expect(container.querySelector("svg")?.getAttribute("onload")).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
