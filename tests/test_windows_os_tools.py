@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import ctypes
 import json
 import subprocess
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -61,6 +63,9 @@ from clea.tools.windows_os import (
     _POWERSHELL_INSPECT_UI_SCRIPT,
     _POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT,
     _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT,
+    _POWERSHELL_SNAPSHOT_UI_SCRIPT,
+    _POWERSHELL_UI_ACT_SCRIPT,
+    _UI_REF_STORE,
     CF_UNICODETEXT,
     INPUT_KEYBOARD,
     INPUT_MOUSE,
@@ -97,6 +102,8 @@ from clea.tools.windows_os import (
     read_clipboard,
     resolve_app_spec,
     select_clipboard_item,
+    ui_act,
+    ui_snapshot,
     write_clipboard,
 )
 
@@ -2286,3 +2293,560 @@ async def test_voice_runner_to_daemon_e2e_gui_multistep_tools(
         "os.click_ui_element",
         "os.gui_action",
     }
+
+
+# --------------------------------------------------------------------- 5. Semantic Snapshot & Refs
+
+
+def _sample_mixed_uia_payload() -> dict[str, Any]:
+    return {
+        "window_title": "Search Portal - Browser",
+        "hwnd": 777,
+        "count": 8,
+        "elements": [
+            {
+                "name": "Address and search bar",
+                "automation_id": "urlBar",
+                "control_type": "Edit",
+                "value": "https://example.com",
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 120, "y": 40, "width": 600, "height": 32},
+                "center": {"cx": 420, "cy": 56},
+            },
+            {
+                "name": "   ",
+                "automation_id": "emptySpacer",
+                "control_type": "Text",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 0, "y": 0, "width": 10, "height": 10},
+                "center": {"cx": 5, "cy": 5},
+            },
+            {
+                "name": "Status: Ready",
+                "automation_id": "statusLabel",
+                "control_type": "Text",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 20, "y": 100, "width": 200, "height": 20},
+                "center": {"cx": 120, "cy": 110},
+            },
+            {
+                "name": "Query",
+                "automation_id": "searchInput",
+                "control_type": "Edit",
+                "value": "",
+                "enabled": True,
+                "focused": True,
+                "bounds": {"x": 200, "y": 200, "width": 300, "height": 36},
+                "center": {"cx": 350, "cy": 218},
+            },
+            {
+                "name": "Submit",
+                "automation_id": "submitBtn",
+                "control_type": "Button",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 520, "y": 200, "width": 90, "height": 36},
+                "center": {"cx": 565, "cy": 218},
+            },
+            {
+                "name": "Disabled Action",
+                "automation_id": "disabledBtn",
+                "control_type": "Button",
+                "value": None,
+                "enabled": False,
+                "focused": False,
+                "bounds": {"x": 620, "y": 200, "width": 90, "height": 36},
+                "center": {"cx": 665, "cy": 218},
+            },
+            {
+                "name": "Docs",
+                "automation_id": "",
+                "control_type": "Hyperlink",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 40, "y": 260, "width": 60, "height": 20},
+                "center": {"cx": 70, "cy": 270},
+            },
+            {
+                "name": "Settings",
+                "automation_id": "settingsTab",
+                "control_type": "TabItem",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 120, "y": 260, "width": 80, "height": 24},
+                "center": {"cx": 160, "cy": 272},
+            },
+            {
+                "name": "Auto-sync",
+                "automation_id": "syncCheck",
+                "control_type": "CheckBox",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 220, "y": 260, "width": 100, "height": 24},
+                "center": {"cx": 270, "cy": 272},
+            },
+            {
+                "name": "Region",
+                "automation_id": "regionCombo",
+                "control_type": "ComboBox",
+                "value": "us-east",
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 340, "y": 260, "width": 120, "height": 24},
+                "center": {"cx": 400, "cy": 272},
+            },
+            {
+                "name": "Mode A",
+                "automation_id": "modeRadio",
+                "control_type": "RadioButton",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 480, "y": 260, "width": 80, "height": 24},
+                "center": {"cx": 520, "cy": 272},
+            },
+            {
+                "name": "File",
+                "automation_id": "fileMenu",
+                "control_type": "MenuItem",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 10, "y": 10, "width": 40, "height": 20},
+                "center": {"cx": 30, "cy": 20},
+            },
+            {
+                "name": "Item One",
+                "automation_id": "item1",
+                "control_type": "ListItem",
+                "value": None,
+                "enabled": True,
+                "focused": False,
+                "bounds": {"x": 10, "y": 300, "width": 100, "height": 20},
+                "center": {"cx": 60, "cy": 310},
+            },
+        ],
+    }
+
+
+def test_ui_snapshot_parses_mixed_controls_filters_and_populates_ref_store() -> None:
+    _UI_REF_STORE.clear()
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    u32 = _FakeInputUser32(hwnd=777)
+
+    def _mock_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(_sample_mixed_uia_payload()),
+            stderr="",
+        )
+
+    snap = ui_snapshot(
+        app_name="Browser",
+        max_elements=999,
+        interactive_only=False,
+        powershell_runner=_mock_runner,
+        user32=u32,
+        window_enumerator=lambda: [
+            EnumeratedWindow(
+                hwnd=777,
+                title="Search Portal - Browser",
+                process_name="msedge.exe",
+                is_visible=True,
+            )
+        ],
+    )
+
+    assert snap["snapshot_id"].startswith("snap_")
+    assert snap["window_title"] == "Search Portal - Browser"
+    # Empty-whitespace Text element is dropped; 12 remaining elements
+    assert snap["element_count"] == 12
+    assert len(snap["elements"]) == 12
+
+    # Verify PowerShell invocation safety & clamping
+    cmd, kwargs = calls[0]
+    assert kwargs["shell"] is False
+    assert kwargs["timeout"] == 5.0
+    assert cmd[1:4] == ["-NoProfile", "-NonInteractive", "-Command"]
+    assert "UIAutomationClient" in cmd[4]
+    assert "UIAutomationTypes" in cmd[4]
+    assert "RangeValuePattern" in _POWERSHELL_SNAPSHOT_UI_SCRIPT
+    assert "-MaxElements 150" in cmd[4]
+    assert "-InteractiveOnly 0" in cmd[4]
+    assert "-TargetHwnd 777" in cmd[4]
+
+    # Verify compact LLM schema (no raw coordinates or automation_id leaked)
+    for idx, el in enumerate(snap["elements"], start=1):
+        assert el["ref"] == f"e{idx}"
+        assert set(el.keys()) == {"ref", "role", "name", "value", "enabled", "focused"}
+
+    roles_by_ref = {el["ref"]: el["role"] for el in snap["elements"]}
+    assert roles_by_ref == {
+        "e1": "input",
+        "e2": "text",
+        "e3": "input",
+        "e4": "button",
+        "e5": "button",  # disabled button still included when interactive_only=False
+        "e6": "link",
+        "e7": "tab",
+        "e8": "checkbox",
+        "e9": "combo",
+        "e10": "radio",
+        "e11": "menu_item",
+        "e12": "list_item",
+    }
+    assert snap["elements"][2]["focused"] is True
+    assert snap["elements"][4]["enabled"] is False
+    assert snap["elements"][8]["value"] == "us-east"
+
+    # Verify internal _UiRefStore holds bounds, center, and automation_id
+    sid, wtitle, hwnd, entry = _UI_REF_STORE.resolve("e4")
+    assert sid == snap["snapshot_id"]
+    assert wtitle == "Search Portal - Browser"
+    assert hwnd == 777
+    assert entry["bounds"] == {"x": 520, "y": 200, "width": 90, "height": 36}
+    assert entry["center"] == {"cx": 565, "cy": 218}
+    assert entry["automation_id"] == "submitBtn"
+
+    # interactive_only=True drops Text readouts AND disabled controls
+    snap_interactive = ui_snapshot(
+        max_elements=0,
+        interactive_only=True,
+        powershell_runner=_mock_runner,
+    )
+    assert "-MaxElements 1" in calls[1][0][4]
+    assert "-InteractiveOnly 1" in calls[1][0][4]
+    assert snap_interactive["element_count"] == 1
+    assert snap_interactive["elements"][0]["role"] == "input"
+
+    snap_interactive_all = ui_snapshot(
+        max_elements=80,
+        interactive_only=True,
+        powershell_runner=_mock_runner,
+    )
+    assert snap_interactive_all["element_count"] == 10
+    assert all(el["role"] != "text" and el["enabled"] for el in snap_interactive_all["elements"])
+
+
+def test_ui_snapshot_validation_and_error_paths() -> None:
+    with pytest.raises(ValueError, match="app_name"):
+        ui_snapshot(app_name="   ")
+    with pytest.raises(ValueError, match="max_elements"):
+        ui_snapshot(max_elements=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="interactive_only"):
+        ui_snapshot(interactive_only="yes")  # type: ignore[arg-type]
+
+    def _timeout_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=5.0)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        ui_snapshot(powershell_runner=_timeout_runner)
+
+    def _fail_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Snapshot failure")
+
+    with pytest.raises(RuntimeError, match="Snapshot failure"):
+        ui_snapshot(powershell_runner=_fail_runner)
+
+    def _bad_json_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="{bad", stderr="")
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        ui_snapshot(powershell_runner=_bad_json_runner)
+
+
+def test_ui_act_click_patterns_and_coordinate_fallback() -> None:
+    _UI_REF_STORE.clear()
+    with pytest.raises(ValueError, match="no active snapshot"):
+        ui_act("e1")
+
+    def _snap_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(_sample_mixed_uia_payload()),
+            stderr="",
+        )
+
+    ui_snapshot(powershell_runner=_snap_runner)
+
+    # 1. Click via native UIA pattern (InvokePattern / SelectionItemPattern / TogglePattern / etc.)
+    act_cmds: list[str] = []
+    u32_uia = _FakeInputUser32(hwnd=777)
+
+    def _invoke_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert kwargs["shell"] is False
+        assert kwargs["timeout"] == 5.0
+        act_cmds.append(cmd[4])
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {"found": True, "acted": True, "method": "invoke", "cx": 565, "cy": 218}
+            ),
+            stderr="",
+        )
+
+    res_invoke = ui_act("@E4", action="click", powershell_runner=_invoke_runner, user32=u32_uia)
+    assert res_invoke["ok"] is True
+    assert res_invoke["ref"] == "e4"
+    assert res_invoke["method"] == "invoke"
+    assert u32_uia.cursor_moves == []
+    assert u32_uia.sent_inputs == []
+    expected_aid_b64 = base64.b64encode(b"submitBtn").decode("ascii")
+    expected_name_b64 = base64.b64encode(b"Submit").decode("ascii")
+    assert f"-AutomationIdBase64 '{expected_aid_b64}'" in act_cmds[0]
+    assert f"-NameBase64 '{expected_name_b64}'" in act_cmds[0]
+    assert "-ExpectedX 520 -ExpectedY 200 -ExpectedW 90 -ExpectedH 36" in act_cmds[0]
+
+    for pat in (
+        "InvokePattern",
+        "SelectionItemPattern",
+        "TogglePattern",
+        "ExpandCollapsePattern",
+        "ValuePattern",
+    ):
+        assert pat in _POWERSHELL_UI_ACT_SCRIPT
+
+    # 2. Click fallback to Win32 SetCursorPos(cx, cy) + left click when UIA patterns unsupported
+    u32_fallback = _FakeInputUser32(hwnd=777)
+
+    def _no_pattern_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"found": True, "acted": False, "method": "", "cx": 72, "cy": 271}),
+            stderr="",
+        )
+
+    res_fb = ui_act("e6", action="click", powershell_runner=_no_pattern_runner, user32=u32_fallback)
+    assert res_fb["method"] == "win32_click"
+    assert res_fb["x"] == 72
+    assert res_fb["y"] == 271
+    assert u32_fallback.cursor_moves == [(72, 271)]
+    assert [inp.union.mi.dwFlags for inp in u32_fallback.sent_inputs] == [
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+    ]
+
+    # 3. double_click and right_click use Win32 SendInput directly at stored center
+    u32_mouse = _FakeInputUser32(hwnd=777)
+    res_dbl = ui_act("e4", action="double_click", user32=u32_mouse)
+    assert res_dbl["method"] == "win32_double_click"
+    assert u32_mouse.cursor_moves == [(565, 218)]
+    assert [inp.union.mi.dwFlags for inp in u32_mouse.sent_inputs] == [
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+    ]
+
+    u32_mouse.cursor_moves.clear()
+    u32_mouse.sent_inputs.clear()
+    res_right = ui_act("@e4", action="right_click", user32=u32_mouse)
+    assert res_right["method"] == "win32_right_click"
+    assert u32_mouse.cursor_moves == [(565, 218)]
+    assert [inp.union.mi.dwFlags for inp in u32_mouse.sent_inputs] == [
+        MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP,
+    ]
+
+
+def test_ui_act_set_value_type_clear_pacing_and_ref_errors() -> None:
+    _UI_REF_STORE.clear()
+
+    def _snap_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(_sample_mixed_uia_payload()),
+            stderr="",
+        )
+
+    ui_snapshot(powershell_runner=_snap_runner)
+
+    # 1. set_value via UIA ValuePattern -> instant, no mouse/keyboard Win32 injection
+    u32_vp = _FakeInputUser32(hwnd=777)
+
+    def _vp_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        expected_val_b64 = base64.b64encode(b"hello world").decode("ascii")
+        assert f"-ValueBase64 '{expected_val_b64}'" in cmd[4]
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {"found": True, "acted": True, "method": "value_pattern", "cx": 350, "cy": 218}
+            ),
+            stderr="",
+        )
+
+    res_vp = ui_act(
+        "e3",
+        action="set_value",
+        value="hello world",
+        powershell_runner=_vp_runner,
+        user32=u32_vp,
+    )
+    assert res_vp["method"] == "value_pattern"
+    assert res_vp["char_count"] == 11
+    assert u32_vp.cursor_moves == []
+    assert u32_vp.sent_inputs == []
+
+    # 2. set_value fallback when ValuePattern unsupported -> click + Ctrl+A + Backspace + paced
+    u32_fb = _FakeInputUser32(hwnd=777)
+    sleeps_fb: list[float] = []
+
+    def _no_vp_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"found": False, "acted": False, "method": "", "cx": 350, "cy": 218}),
+            stderr="",
+        )
+
+    res_fb = ui_act(
+        "@e3",
+        action="set_value",
+        value="ab",
+        interval_ms=999,  # clamps to 200ms
+        powershell_runner=_no_vp_runner,
+        user32=u32_fb,
+        sleep_fn=sleeps_fb.append,
+    )
+    assert res_fb["method"] == "keyboard_fallback"
+    assert res_fb["interval_ms"] == 200
+    assert u32_fb.cursor_moves == [(350, 218)]
+    assert sleeps_fb == [0.2]
+    # Sequence: 2 mouse (click), 4 key (ctrl+a), 2 key (backspace), 4 key ('a','b' Unicode)
+    assert [inp.type for inp in u32_fb.sent_inputs] == [
+        INPUT_MOUSE,
+        INPUT_MOUSE,
+        *([INPUT_KEYBOARD] * 10),
+    ]
+    vk_and_scans = [
+        (inp.union.ki.wVk, inp.union.ki.wScan, inp.union.ki.dwFlags)
+        for inp in u32_fb.sent_inputs[2:]
+    ]
+    assert vk_and_scans == [
+        (0x11, 0, 0),
+        (0x41, 0, 0),
+        (0x41, 0, KEYEVENTF_KEYUP),
+        (0x11, 0, KEYEVENTF_KEYUP),
+        (0x08, 0, 0),
+        (0x08, 0, KEYEVENTF_KEYUP),
+        (0, ord("a"), KEYEVENTF_UNICODE),
+        (0, ord("a"), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+        (0, ord("b"), KEYEVENTF_UNICODE),
+        (0, ord("b"), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+    ]
+
+    # 3. type action -> focuses element and sends paced Unicode without Ctrl+A/Backspace
+    u32_type = _FakeInputUser32(hwnd=777)
+    sleeps_type: list[float] = []
+    res_type = ui_act(
+        "E3",
+        action="type",
+        value="xyz",
+        interval_ms=15,
+        user32=u32_type,
+        sleep_fn=sleeps_type.append,
+    )
+    assert res_type["method"] == "win32_type"
+    assert res_type["char_count"] == 3
+    assert sleeps_type == [0.015, 0.015]
+    assert u32_type.cursor_moves == [(350, 218)]
+    assert len(u32_type.sent_inputs) == 8  # 2 mouse + 6 unicode key events
+
+    # 4. clear action -> focuses element and sends Ctrl+A + Backspace
+    u32_clear = _FakeInputUser32(hwnd=777)
+    res_clear = ui_act("e3", action="clear", user32=u32_clear)
+    assert res_clear["method"] == "win32_clear"
+    assert u32_clear.cursor_moves == [(350, 218)]
+    assert len(u32_clear.sent_inputs) == 8  # 2 mouse + 4 ctrl+a + 2 backspace
+
+    # 5. Unknown/malformed ref and parameter errors
+    for bad_ref in ("e999", "@e999", "@@e3", "@", ""):
+        with pytest.raises(ValueError, match="ref"):
+            ui_act(bad_ref, action="click")
+
+    with pytest.raises(ValueError, match="Unsupported ui_act action"):
+        ui_act("e3", action="hover")
+    with pytest.raises(ValueError, match="set_value"):
+        ui_act("e3", action="set_value", value=None)
+    with pytest.raises(ValueError, match="type"):
+        ui_act("e3", action="type", value="")
+    with pytest.raises(ValueError, match="interval_ms"):
+        ui_act("e3", action="type", value="a", interval_ms=True)  # type: ignore[arg-type]
+
+
+def test_gui_action_type_text_pacing_and_ref_store_thread_safety() -> None:
+    u32 = _FakeInputUser32()
+    sleeps: list[float] = []
+    res = gui_action("type_text", text="abc", interval_ms=12, user32=u32, sleep_fn=sleeps.append)
+    assert res["char_count"] == 3
+    assert res["interval_ms"] == 12
+    assert sleeps == [0.012, 0.012]
+    assert len(u32.sent_inputs) == 6
+
+    # Zero pacing sends in one batch with no sleeps
+    sleeps.clear()
+    u32.sent_inputs.clear()
+    res_fast = gui_action(
+        "type_text",
+        text="abc",
+        interval_ms=-10,
+        user32=u32,
+        sleep_fn=sleeps.append,
+    )
+    assert res_fast["interval_ms"] == 0
+    assert sleeps == []
+    assert len(u32.sent_inputs) == 6
+
+    # Concurrent update & resolve smoke check on _UI_REF_STORE
+    errors: list[Exception] = []
+
+    def _writer(idx: int) -> None:
+        try:
+            _UI_REF_STORE.update(
+                snapshot_id=f"snap_{idx}",
+                window_title="App",
+                hwnd=idx,
+                elements_by_ref={
+                    "e1": {
+                        "ref": "e1",
+                        "role": "button",
+                        "name": f"Btn {idx}",
+                        "value": None,
+                        "enabled": True,
+                        "focused": False,
+                        "bounds": {"x": 10, "y": 10, "width": 50, "height": 20},
+                        "center": {"cx": 35, "cy": 20},
+                        "automation_id": f"btn_{idx}",
+                        "control_type": "Button",
+                    }
+                },
+            )
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(1, 15)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    sid, _, _, entry = _UI_REF_STORE.resolve("e1")
+    assert sid.startswith("snap_")
+    assert entry["ref"] == "e1"
+
