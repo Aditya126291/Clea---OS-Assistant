@@ -86,6 +86,9 @@ from clea.core.protocol import (
     OsOpenUrlRequest,
     OsReadClipboardRequest,
     OsSelectClipboardItemRequest,
+    OsUiActRequest,
+    OsUiBatchRequest,
+    OsUiSnapshotRequest,
     OsWriteClipboardRequest,
     RequestFrame,
     ResponseFrame,
@@ -103,10 +106,16 @@ from clea.core.protocol import (
     TranscriptRole,
     TranscriptsGetRequest,
     TranscriptsListRequest,
+    UiActAction,
+    UiBatchOp,
+    UiBatchStep,
+    UiDiff,
+    UiDiffChangedValue,
     UiElementItem,
     UiNavigateData,
     UiNavigateEvent,
     UiNavigateRequest,
+    UiSnapshotElement,
     UiView,
     UsageEvent,
     VoiceConversationListItem,
@@ -225,6 +234,15 @@ def build_json_schema() -> dict[str, Any]:
         os_inspect_ui_elements_request: OsInspectUiElementsRequest
         os_click_ui_element_request: OsClickUiElementRequest
         os_gui_action_request: OsGuiActionRequest
+        os_ui_snapshot_request: OsUiSnapshotRequest
+        os_ui_act_request: OsUiActRequest
+        os_ui_batch_request: OsUiBatchRequest
+        ui_snapshot_element: UiSnapshotElement
+        ui_diff: UiDiff
+        ui_diff_changed_value: UiDiffChangedValue
+        ui_batch_step: UiBatchStep
+        ui_act_action: UiActAction
+        ui_batch_op: UiBatchOp
         clipboard_item: ClipboardItem
         ui_element_item: UiElementItem
         workspace_git_inspect_request: WorkspaceGitInspectRequest

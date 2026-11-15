@@ -51,6 +51,12 @@ from clea.core.protocol import (
     OsSelectClipboardItemParams,
     OsSelectClipboardItemRequest,
     OsSelectClipboardItemResult,
+    OsUiActParams,
+    OsUiActRequest,
+    OsUiBatchParams,
+    OsUiBatchRequest,
+    OsUiSnapshotParams,
+    OsUiSnapshotRequest,
     OsWriteClipboardParams,
     OsWriteClipboardRequest,
     ResponseFrame,
@@ -61,6 +67,7 @@ from clea.core.protocol import (
     TranscriptEvent,
     TranscriptsGetRequest,
     TranscriptsListRequest,
+    UiBatchStep,
     UsageData,
     UsageEvent,
     VoiceDelegateTaskParams,
@@ -247,6 +254,12 @@ def test_every_method_has_a_result_model() -> None:
             ("os.inspect_ui_elements", {}),
             ("os.click_ui_element", {"name": "Equals"}),
             ("os.gui_action", {"action": "wait", "seconds": 0.5}),
+            ("os.ui_snapshot", {}),
+            ("os.ui_act", {"ref": "e0", "action": "click"}),
+            (
+                "os.ui_batch",
+                {"steps": [{"op": "act", "ref": "e0", "action": "click"}]},
+            ),
             ("workspace.git_inspect", {}),
         ]
     }
@@ -283,6 +296,22 @@ def test_windows_os_and_git_protocol_roundtrip() -> None:
         ),
         OsGuiActionRequest(
             params=OsGuiActionParams(action="press_keys", keys=["ctrl", "l"])
+        ),
+        OsUiSnapshotRequest(
+            params=OsUiSnapshotParams(app_name="Calculator", max_elements=30)
+        ),
+        OsUiActRequest(
+            params=OsUiActParams(ref="e2", action="set_value", value="42")
+        ),
+        OsUiBatchRequest(
+            params=OsUiBatchParams(
+                steps=[
+                    UiBatchStep(op="act", ref="e1", action="click"),
+                    UiBatchStep(op="wait", seconds=0.2),
+                ],
+                stop_on_error=True,
+                stop_on_window_change=True,
+            )
         ),
         WorkspaceGitInspectRequest(
             params=WorkspaceGitInspectParams(include_diff=True, diff_stat_only=False)

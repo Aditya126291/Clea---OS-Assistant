@@ -34,6 +34,9 @@ from clea.core.protocol import (
     OsSelectClipboardItemParams,
     OsSelectClipboardItemRequest,
     OsSelectClipboardItemResult,
+    OsUiActResult,
+    OsUiBatchResult,
+    OsUiSnapshotResult,
     OsWriteClipboardResult,
     ResponseFrame,
     WorkspaceGitInspectResult,
@@ -85,7 +88,9 @@ from clea.tools.windows_os import (
     VK_VOLUME_UP,
     WM_CLOSE,
     EnumeratedWindow,
+    clear_ui_ref_store,
     click_ui_element,
+    compute_ui_diff,
     control_media_volume,
     control_system,
     find_matching_start_app,
@@ -97,6 +102,10 @@ from clea.tools.windows_os import (
     read_clipboard,
     resolve_app_spec,
     select_clipboard_item,
+    set_ui_snapshot_state,
+    ui_act,
+    ui_batch,
+    ui_snapshot,
     write_clipboard,
 )
 
@@ -2285,4 +2294,641 @@ async def test_voice_runner_to_daemon_e2e_gui_multistep_tools(
         "os.inspect_ui_elements",
         "os.click_ui_element",
         "os.gui_action",
+        "os.ui_snapshot",
+        "os.ui_act",
+        "os.ui_batch",
     }
+
+
+# ---------------------------------------------------------------------------
+# UI Diff, Snapshot, Semantic Act & Batch Tests
+
+
+def test_compute_ui_diff_detects_changes() -> None:
+    clear_ui_ref_store()
+    before = {
+        "window_title": "App - Calculator",
+        "count": 4,
+        "elements": [
+            {
+                "ref": "e0",
+                "role": "edit",
+                "name": "Input",
+                "value": "initial_text",
+                "x": 100,
+                "y": 100,
+                "automation_id": "txtInput",
+            },
+            {
+                "ref": "e1",
+                "role": "text",
+                "name": "0",
+                "value": None,
+                "x": 200,
+                "y": 100,
+                "automation_id": "lblResult",
+            },
+            {
+                "ref": "e2",
+                "role": "button",
+                "name": "Submit",
+                "value": None,
+                "x": 300,
+                "y": 100,
+                "automation_id": "btnSubmit",
+            },
+            {
+                "ref": "e3",
+                "role": "button",
+                "name": "Old Button",
+                "value": None,
+                "x": 400,
+                "y": 100,
+                "automation_id": "btnOld",
+            },
+        ],
+    }
+
+    after = {
+        "window_title": "App - Calculator Results",
+        "count": 4,
+        "elements": [
+            {
+                "ref": "e0",
+                "role": "edit",
+                "name": "Input",
+                "value": "updated_text",
+                "x": 100,
+                "y": 100,
+                "automation_id": "txtInput",
+            },
+            {
+                "ref": "e1",
+                "role": "text",
+                "name": "42",
+                "value": None,
+                "x": 200,
+                "y": 100,
+                "automation_id": "lblResult",
+            },
+            {
+                "ref": "e2",
+                "role": "button",
+                "name": "Submit",
+                "value": None,
+                "x": 300,
+                "y": 100,
+                "automation_id": "btnSubmit",
+            },
+            {
+                "ref": "e4",
+                "role": "button",
+                "name": "New Button",
+                "value": None,
+                "x": 500,
+                "y": 100,
+                "automation_id": "btnNew",
+            },
+        ],
+    }
+
+    diff = compute_ui_diff(before, after)
+    assert diff["window_changed"] is True
+    assert diff["window_title"] == "App - Calculator Results"
+    assert diff["removed_count"] == 1
+
+    changed = diff["changed_values"]
+    assert len(changed) == 2
+
+    # Verify edit value change
+    edit_change = next(c for c in changed if c["role"] == "edit")
+    assert edit_change["name"] == "Input"
+    assert edit_change["old_value"] == "initial_text"
+    assert edit_change["new_value"] == "updated_text"
+
+    # Verify text readout name change
+    text_change = next(c for c in changed if c["role"] == "text")
+    assert text_change["old_value"] == "0"
+    assert text_change["new_value"] == "42"
+
+    # Verify added elements
+    assert len(diff["added_elements"]) == 1
+    assert diff["added_elements"][0]["name"] == "New Button"
+    assert diff["added_elements"][0]["ref"] == "e4"
+
+
+def test_compute_ui_diff_caps_added_elements_at_25() -> None:
+    before = {"window_title": "Feed", "count": 0, "elements": []}
+    after_elements = [
+        {
+            "ref": f"e{i}",
+            "role": "text",
+            "name": f"Post #{i}",
+            "value": None,
+            "x": 100,
+            "y": 50 * i,
+        }
+        for i in range(35)
+    ]
+    after = {"window_title": "Feed", "count": 35, "elements": after_elements}
+
+    diff = compute_ui_diff(before, after)
+    assert diff["window_changed"] is False
+    assert len(diff["added_elements"]) == 25
+    assert diff["removed_count"] == 0
+
+
+def test_compute_ui_diff_handles_empty_snapshots() -> None:
+    diff_empty = compute_ui_diff({}, {})
+    assert diff_empty["window_changed"] is False
+    assert diff_empty["window_title"] == ""
+    assert diff_empty["changed_values"] == []
+    assert diff_empty["added_elements"] == []
+    assert diff_empty["removed_count"] == 0
+
+    diff_removed = compute_ui_diff(
+        {"window_title": "W1", "elements": [{"ref": "e0", "name": "Item"}]},
+        {"window_title": "W1", "elements": []},
+    )
+    assert diff_removed["removed_count"] == 1
+    assert diff_removed["added_elements"] == []
+
+
+def test_ui_snapshot_indexes_elements_and_caches_store() -> None:
+    clear_ui_ref_store()
+
+    def _fake_runner(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        payload = {
+            "window_title": "Calculator",
+            "elements": [
+                {
+                    "name": "One",
+                    "control_type": "Button",
+                    "automation_id": "num1Button",
+                    "x": 100,
+                    "y": 200,
+                },
+                {
+                    "name": "Display",
+                    "control_type": "Text",
+                    "value": "0",
+                    "automation_id": "CalcDisplay",
+                    "x": 100,
+                    "y": 50,
+                },
+            ],
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    snap = ui_snapshot("Calculator", max_elements=20, powershell_runner=_fake_runner)
+    assert snap["ok"] is True
+    assert snap["window_title"] == "Calculator"
+    assert snap["count"] == 2
+    assert snap["elements"][0]["ref"] == "e0"
+    assert snap["elements"][0]["role"] == "button"
+    assert snap["elements"][1]["ref"] == "e1"
+    assert snap["elements"][1]["value"] == "0"
+
+
+def test_ui_act_actions_and_diff_verification() -> None:
+    clear_ui_ref_store()
+    initial_snap = {
+        "window_title": "Editor",
+        "elements": [
+            {
+                "ref": "e0",
+                "role": "edit",
+                "name": "Code",
+                "value": "def foo(): pass",
+                "x": 150,
+                "y": 250,
+            },
+            {
+                "ref": "e1",
+                "role": "button",
+                "name": "Run",
+                "value": None,
+                "x": 400,
+                "y": 50,
+            },
+        ],
+    }
+    set_ui_snapshot_state(initial_snap)
+
+    u32 = _FakeInputUser32()
+    updated_snap = {
+        "window_title": "Editor",
+        "elements": [
+            {
+                "ref": "e0",
+                "role": "edit",
+                "name": "Code",
+                "value": "def foo(): return 42",
+                "x": 150,
+                "y": 250,
+            },
+            {
+                "ref": "e1",
+                "role": "button",
+                "name": "Run",
+                "value": None,
+                "x": 400,
+                "y": 50,
+            },
+        ],
+    }
+
+    res = ui_act(
+        "e0",
+        "set_value",
+        "def foo(): return 42",
+        ui_snapshot_fn=lambda **_kw: updated_snap,
+        user32=u32,
+    )
+    assert res["ok"] is True
+    assert res["status"] == "completed"
+    assert res["action"] == "set_value"
+    assert res["ref"] == "e0"
+    assert res["diff"]["changed_values"][0]["new_value"] == "def foo(): return 42"
+    assert res["snapshot"]["elements"][0]["value"] == "def foo(): return 42"
+
+    # Test error when ref not present
+    with pytest.raises(ValueError, match="UI element ref 'e99' not found"):
+        ui_act("e99", "click", user32=u32)
+
+    # Test error when action is unsupported
+    with pytest.raises(ValueError, match="Unsupported UI act action 'hover'"):
+        ui_act("e0", "hover", user32=u32)
+
+    # Test error when type has no string value
+    with pytest.raises(ValueError, match="value string is required"):
+        ui_act("e0", "type", value=None, user32=u32)
+
+
+def test_ui_batch_multi_step_execution_and_diff() -> None:
+    clear_ui_ref_store()
+    init_snap = {
+        "window_title": "Test App",
+        "elements": [
+            {
+                "ref": "e0",
+                "role": "edit",
+                "name": "Username",
+                "value": "",
+                "x": 100,
+                "y": 100,
+            },
+            {
+                "ref": "e1",
+                "role": "button",
+                "name": "Login",
+                "value": None,
+                "x": 200,
+                "y": 100,
+            },
+        ],
+    }
+    set_ui_snapshot_state(init_snap)
+
+    u32 = _FakeInputUser32()
+    final_snap = {
+        "window_title": "Dashboard",
+        "elements": [
+            {
+                "ref": "e0",
+                "role": "text",
+                "name": "Welcome Alice",
+                "value": None,
+                "x": 150,
+                "y": 50,
+            }
+        ],
+    }
+
+    steps = [
+        {"op": "act", "ref": "e0", "action": "set_value", "value": "alice"},
+        {"op": "act", "ref": "e1", "action": "click"},
+        {"op": "press_keys", "keys": ["enter"]},
+        {"op": "scroll", "delta": -120, "x": 150, "y": 150},
+        {"op": "wait", "seconds": 0.1},
+        {"op": "click_at", "x": 300, "y": 300, "clicks": 1, "button": "left"},
+    ]
+
+    res = ui_batch(
+        steps,
+        stop_on_window_change=False,
+        ui_snapshot_fn=lambda **_kw: final_snap,
+        user32=u32,
+    )
+    assert res["ok"] is True
+    assert res["status"] == "completed"
+    assert res["steps_executed"] == 6
+    assert len(res["step_results"]) == 6
+    assert all(sr["status"] == "ok" for sr in res["step_results"])
+    assert res["diff"]["window_changed"] is True
+    assert res["diff"]["window_title"] == "Dashboard"
+
+
+def test_ui_batch_stop_on_window_change_halts_early() -> None:
+    clear_ui_ref_store()
+    set_ui_snapshot_state(
+        {
+            "window_title": "Page 1",
+            "elements": [{"ref": "e0", "role": "button", "name": "Next", "x": 50, "y": 50}],
+        }
+    )
+
+    # When the click triggers a page change, foreground title becomes Page 2
+    def _fake_title() -> str:
+        return "Page 2 - Confirmation"
+
+    steps = [
+        {"op": "act", "ref": "e0", "action": "click"},
+        {"op": "press_keys", "keys": ["enter"]},
+        {"op": "wait", "seconds": 0.5},
+    ]
+
+    res = ui_batch(
+        steps,
+        stop_on_window_change=True,
+        window_title_fn=_fake_title,
+        ui_snapshot_fn=lambda **_kw: {
+            "window_title": "Page 2 - Confirmation",
+            "elements": [{"ref": "e0", "role": "button", "name": "Confirm", "x": 60, "y": 60}],
+        },
+        user32=_FakeInputUser32(),
+    )
+    assert res["status"] == "stopped_on_window_change"
+    assert res["steps_executed"] == 1
+    assert len(res["step_results"]) == 1
+    assert res["step_results"][0]["op"] == "act"
+
+
+def test_ui_batch_stop_on_error_handling() -> None:
+    clear_ui_ref_store()
+    set_ui_snapshot_state(
+        {
+            "window_title": "App",
+            "elements": [{"ref": "e0", "role": "button", "name": "Btn", "x": 10, "y": 10}],
+        }
+    )
+
+    steps = [
+        {"op": "act", "ref": "e0", "action": "click"},
+        {"op": "act", "ref": "nonexistent_ref", "action": "click"},
+        {"op": "wait", "seconds": 0.2},
+    ]
+
+    # Stop on error = True
+    res_stopped = ui_batch(
+        steps,
+        stop_on_error=True,
+        ui_snapshot_fn=lambda **_kw: {"window_title": "App", "elements": []},
+        user32=_FakeInputUser32(),
+    )
+    assert res_stopped["status"] == "partial_error"
+    assert res_stopped["steps_executed"] == 2
+    assert res_stopped["step_results"][1]["status"] == "error"
+
+    # Stop on error = False
+    res_continued = ui_batch(
+        steps,
+        stop_on_error=False,
+        ui_snapshot_fn=lambda **_kw: {"window_title": "App", "elements": []},
+        user32=_FakeInputUser32(),
+    )
+    assert res_continued["status"] == "partial_error"
+    assert res_continued["steps_executed"] == 3
+    assert res_continued["step_results"][2]["status"] == "ok"
+
+
+def test_ui_batch_validates_step_constraints() -> None:
+    with pytest.raises(ValueError, match="between 1 and 20 step operations"):
+        ui_batch([])
+
+    with pytest.raises(ValueError, match="between 1 and 20 step operations"):
+        ui_batch([{"op": "wait"}] * 21)
+
+    with pytest.raises(ValueError, match="Unsupported batch op 'teleport'"):
+        ui_batch([{"op": "teleport"}])
+
+
+@pytest.mark.asyncio
+async def test_voice_runner_to_daemon_e2e_ui_snapshot_act_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify VoiceRunner -> CleaDaemon RPC dispatch for ui_snapshot, ui_act, and ui_batch."""
+    snapshot_calls: list[tuple[str | None, int]] = []
+    act_calls: list[tuple[str, str, str | None]] = []
+    batch_calls: list[tuple[int, bool, bool]] = []
+
+    def _fake_snapshot(
+        app_name: str | None = None,
+        max_elements: int = 60,
+        **_kw: Any,
+    ) -> dict[str, Any]:
+        snapshot_calls.append((app_name, max_elements))
+        return {
+            "ok": True,
+            "window_title": app_name or "WebBrowser",
+            "count": 2,
+            "elements": [
+                {
+                    "ref": "e0",
+                    "role": "edit",
+                    "name": "Search",
+                    "value": "clea",
+                    "x": 100,
+                    "y": 100,
+                    "automation_id": "searchBox",
+                    "control_type": "Edit",
+                },
+                {
+                    "ref": "e1",
+                    "role": "button",
+                    "name": "Submit",
+                    "value": None,
+                    "x": 200,
+                    "y": 100,
+                    "automation_id": "submitBtn",
+                    "control_type": "Button",
+                },
+            ],
+        }
+
+    def _fake_act(
+        ref: str,
+        action: str,
+        value: str | None = None,
+        **_kw: Any,
+    ) -> dict[str, Any]:
+        act_calls.append((ref, action, value))
+        return {
+            "ok": True,
+            "status": "completed",
+            "action": action,
+            "ref": ref,
+            "diff": {
+                "window_changed": False,
+                "window_title": "WebBrowser",
+                "changed_values": [
+                    {
+                        "ref": ref,
+                        "role": "edit",
+                        "name": "Search",
+                        "old_value": "clea",
+                        "new_value": value or "",
+                    }
+                ],
+                "added_elements": [],
+                "removed_count": 0,
+            },
+            "snapshot": {
+                "ok": True,
+                "window_title": "WebBrowser",
+                "count": 2,
+                "elements": [
+                    {
+                        "ref": "e0",
+                        "role": "edit",
+                        "name": "Search",
+                        "value": value or "",
+                        "x": 100,
+                        "y": 100,
+                        "automation_id": "searchBox",
+                        "control_type": "Edit",
+                    }
+                ],
+            },
+        }
+
+    def _fake_batch(
+        steps: list[dict[str, Any]],
+        stop_on_error: bool = True,
+        stop_on_window_change: bool = True,
+        **_kw: Any,
+    ) -> dict[str, Any]:
+        batch_calls.append((len(steps), stop_on_error, stop_on_window_change))
+        return {
+            "ok": True,
+            "status": "completed",
+            "steps_executed": len(steps),
+            "step_results": [
+                {"step": i, "op": s["op"], "status": "ok"} for i, s in enumerate(steps)
+            ],
+            "diff": {
+                "window_changed": True,
+                "window_title": "Search Results",
+                "changed_values": [],
+                "added_elements": [
+                    {
+                        "ref": "e2",
+                        "role": "link",
+                        "name": "Clea Home",
+                        "value": None,
+                        "x": 150,
+                        "y": 200,
+                        "automation_id": "res1",
+                        "control_type": "Hyperlink",
+                    }
+                ],
+                "removed_count": 0,
+            },
+            "snapshot": {
+                "ok": True,
+                "window_title": "Search Results",
+                "count": 1,
+                "elements": [
+                    {
+                        "ref": "e2",
+                        "role": "link",
+                        "name": "Clea Home",
+                        "value": None,
+                        "x": 150,
+                        "y": 200,
+                        "automation_id": "res1",
+                        "control_type": "Hyperlink",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(daemon_mod, "ui_snapshot", _fake_snapshot)
+    monkeypatch.setattr(daemon_mod, "ui_act", _fake_act)
+    monkeypatch.setattr(daemon_mod, "ui_batch", _fake_batch)
+
+    async with _running_voice_daemon_env(tmp_path) as (_daemon, _runner, backend):
+        # 1. Voice tool call: ui_snapshot
+        r_snap = await _invoke_voice_tool(
+            backend,
+            call_id="c-snap",
+            name="ui_snapshot",
+            arguments={"app_name": "WebBrowser", "max_elements": 50},
+        )
+        assert r_snap.is_error is False
+        parsed_snap = OsUiSnapshotResult(**r_snap.response)
+        assert parsed_snap.window_title == "WebBrowser"
+        assert parsed_snap.count == 2
+        assert parsed_snap.elements[0].ref == "e0"
+        assert snapshot_calls == [("WebBrowser", 50)]
+
+        # 2. Voice tool call: ui_act
+        r_act = await _invoke_voice_tool(
+            backend,
+            call_id="c-act",
+            name="ui_act",
+            arguments={"ref": "e0", "action": "set_value", "value": "gemini live"},
+        )
+        assert r_act.is_error is False
+        parsed_act = OsUiActResult(**r_act.response)
+        assert parsed_act.status == "completed"
+        assert parsed_act.action == "set_value"
+        assert parsed_act.ref == "e0"
+        assert parsed_act.diff is not None
+        assert parsed_act.diff.changed_values[0].new_value == "gemini live"
+        assert act_calls == [("e0", "set_value", "gemini live")]
+
+        # 3. Voice tool call: ui_batch
+        r_batch = await _invoke_voice_tool(
+            backend,
+            call_id="c-batch",
+            name="ui_batch",
+            arguments={
+                "steps": [
+                    {"op": "act", "ref": "e1", "action": "click"},
+                    {"op": "press_keys", "keys": ["enter"]},
+                    {"op": "wait", "seconds": 0.5},
+                ],
+                "stop_on_error": True,
+                "stop_on_window_change": True,
+            },
+        )
+        assert r_batch.is_error is False
+        parsed_batch = OsUiBatchResult(**r_batch.response)
+        assert parsed_batch.status == "completed"
+        assert parsed_batch.steps_executed == 3
+        assert parsed_batch.diff is not None
+        assert parsed_batch.diff.window_changed is True
+        assert parsed_batch.diff.window_title == "Search Results"
+        assert batch_calls == [(3, True, True)]
+
+        # 4. Error validation in voice handler: ui_act missing ref
+        r_err_act = await _invoke_voice_tool(
+            backend,
+            call_id="c-err-act",
+            name="ui_act",
+            arguments={"action": "click"},
+        )
+        assert r_err_act.is_error is True
+        assert "ref is required" in str(r_err_act.response.get("error", ""))
+
+        # 5. Error validation in voice handler: ui_batch empty steps
+        r_err_batch = await _invoke_voice_tool(
+            backend,
+            call_id="c-err-batch",
+            name="ui_batch",
+            arguments={"steps": []},
+        )
+        assert r_err_batch.is_error is True
+        assert "non-empty list" in str(r_err_batch.response.get("error", ""))

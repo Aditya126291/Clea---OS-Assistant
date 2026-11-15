@@ -3032,3 +3032,565 @@ def gui_action(
         "x": x,
         "y": y,
     }
+
+
+# ---------------------------------------------------------------------------
+# UI Snapshot, Semantic Act, State Diff & Speculative Batching
+
+_UI_REF_STORE: dict[str, dict[str, Any]] = {}
+_LAST_UI_SNAPSHOT: dict[str, Any] | None = None
+_LAST_UI_SNAPSHOT_TIME: float = 0.0
+_LAST_UI_WINDOW_TITLE: str = ""
+
+VALID_UI_ACT_ACTIONS: frozenset[str] = frozenset(
+    {"click", "set_value", "type", "clear", "double_click", "right_click"}
+)
+VALID_UI_BATCH_OPS: frozenset[str] = frozenset(
+    {"act", "press_keys", "scroll", "wait", "click_at"}
+)
+
+
+def clear_ui_ref_store() -> None:
+    """Clear cached UI element refs and snapshot state (used for test isolation)."""
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    _UI_REF_STORE.clear()
+    _LAST_UI_SNAPSHOT = None
+    _LAST_UI_SNAPSHOT_TIME = 0.0
+    _LAST_UI_WINDOW_TITLE = ""
+
+
+def set_ui_snapshot_state(snapshot: dict[str, Any]) -> None:
+    """Explicitly cache a snapshot dictionary and populate element refs."""
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    _UI_REF_STORE.clear()
+    raw_elements = snapshot.get("elements") or []
+    for idx, el in enumerate(raw_elements):
+        ref = str(el.get("ref") or f"e{idx}")
+        _UI_REF_STORE[ref] = {
+            "ref": ref,
+            "role": str(el.get("role") or el.get("control_type") or "").strip().lower(),
+            "name": str(el.get("name") or "").strip(),
+            "value": str(el["value"]) if el.get("value") is not None else None,
+            "x": int(el.get("x", 0)),
+            "y": int(el.get("y", 0)),
+            "automation_id": str(el.get("automation_id") or ""),
+            "control_type": str(el.get("control_type") or el.get("role") or ""),
+        }
+    _LAST_UI_SNAPSHOT = {
+        "ok": True,
+        "window_title": str(snapshot.get("window_title") or ""),
+        "count": len(_UI_REF_STORE),
+        "elements": list(_UI_REF_STORE.values()),
+    }
+    _LAST_UI_SNAPSHOT_TIME = time.time()
+    _LAST_UI_WINDOW_TITLE = str(snapshot.get("window_title") or "")
+
+
+def _get_foreground_window_title(user32: Any = None) -> str:
+    """Retrieve the title of the current foreground window via Win32."""
+    u32 = _get_win32_user32(user32)
+    if hasattr(u32, "foreground_title"):
+        return str(u32.foreground_title)
+    if not hasattr(u32, "GetForegroundWindow"):
+        return ""
+    hwnd = u32.GetForegroundWindow()
+    if not hwnd:
+        return ""
+    if (
+        hasattr(u32, "window_titles")
+        and isinstance(u32.window_titles, dict)
+        and hwnd in u32.window_titles
+    ):
+        return str(u32.window_titles[hwnd])
+    length = 0
+    if hasattr(u32, "GetWindowTextLengthW"):
+        length = int(u32.GetWindowTextLengthW(hwnd))
+    if length <= 0:
+        length = 256
+    buf = ctypes.create_unicode_buffer(length + 1)
+    if hasattr(u32, "GetWindowTextW"):
+        copied = int(u32.GetWindowTextW(hwnd, buf, length + 1))
+        if copied > 0:
+            return buf.value
+    return ""
+
+
+def ui_snapshot(
+    app_name: str | None = None,
+    max_elements: int = 60,
+    *,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    user32: Any = None,
+    kernel32: Any = None,
+    window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+) -> dict[str, Any]:
+    """Capture visible UI elements and return a snapshot with indexed ref tags ('e0', 'e1', ...)."""
+    raw = inspect_ui_elements(
+        app_name=app_name,
+        max_elements=max_elements,
+        powershell_runner=powershell_runner,
+        user32=user32,
+        kernel32=kernel32,
+        window_enumerator=window_enumerator,
+    )
+    raw_elements = raw.get("elements") or []
+    elements: list[dict[str, Any]] = []
+    _UI_REF_STORE.clear()
+    for idx, item in enumerate(raw_elements):
+        ref = f"e{idx}"
+        role = str(item.get("role") or item.get("control_type") or "").strip().lower()
+        name = str(item.get("name") or "").strip()
+        val = item.get("value")
+        el_dict = {
+            "ref": ref,
+            "role": role,
+            "name": name,
+            "value": str(val) if val is not None else None,
+            "x": int(item.get("x", 0)),
+            "y": int(item.get("y", 0)),
+            "automation_id": str(item.get("automation_id") or ""),
+            "control_type": str(item.get("control_type") or item.get("role") or ""),
+        }
+        elements.append(el_dict)
+        _UI_REF_STORE[ref] = el_dict
+
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    snapshot = {
+        "ok": True,
+        "window_title": str(raw.get("window_title") or ""),
+        "count": len(elements),
+        "elements": elements,
+    }
+    _LAST_UI_SNAPSHOT = snapshot
+    _LAST_UI_SNAPSHOT_TIME = time.time()
+    _LAST_UI_WINDOW_TITLE = snapshot["window_title"]
+    return snapshot
+
+
+def compute_ui_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Compute structural UI diff between two snapshots generically across apps and browsers."""
+    before_dict = before if isinstance(before, dict) else {}
+    after_dict = after if isinstance(after, dict) else {}
+
+    before_title = str(before_dict.get("window_title") or "")
+    after_title = str(after_dict.get("window_title") or "")
+    window_changed = before_title != after_title
+
+    def _normalize_el(item: Any) -> dict[str, Any]:
+        if hasattr(item, "model_dump"):
+            return item.model_dump()
+        return dict(item) if isinstance(item, dict) else {}
+
+    before_els = [_normalize_el(x) for x in (before_dict.get("elements") or [])]
+    after_els = [_normalize_el(x) for x in (after_dict.get("elements") or [])]
+
+    matched_before: set[int] = set()
+    matched_after: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    changed_values: list[dict[str, Any]] = []
+
+    # 1. Match by automation_id when non-empty in both
+    for j, a in enumerate(after_els):
+        aid_a = str(a.get("automation_id") or "").strip()
+        if not aid_a:
+            continue
+        role_a = str(a.get("role") or "").strip().lower()
+        for i, b in enumerate(before_els):
+            if i in matched_before:
+                continue
+            aid_b = str(b.get("automation_id") or "").strip()
+            role_b = str(b.get("role") or "").strip().lower()
+            if aid_a == aid_b and (not role_a or not role_b or role_a == role_b):
+                matched_before.add(i)
+                matched_after.add(j)
+                pairs.append((i, j))
+                break
+
+    # 2. Match by (role, name) when name is non-empty
+    for j, a in enumerate(after_els):
+        if j in matched_after:
+            continue
+        name_a = str(a.get("name") or "").strip().lower()
+        role_a = str(a.get("role") or "").strip().lower()
+        if not name_a:
+            continue
+        for i, b in enumerate(before_els):
+            if i in matched_before:
+                continue
+            name_b = str(b.get("name") or "").strip().lower()
+            role_b = str(b.get("role") or "").strip().lower()
+            if name_a == name_b and (not role_a or not role_b or role_a == role_b):
+                matched_before.add(i)
+                matched_after.add(j)
+                pairs.append((i, j))
+                break
+
+    # 3. Match by (role, position) within 15px (e.g. dynamic text readouts or edited fields)
+    for j, a in enumerate(after_els):
+        if j in matched_after:
+            continue
+        role_a = str(a.get("role") or "").strip().lower()
+        xa = int(a.get("x", 0))
+        ya = int(a.get("y", 0))
+        for i, b in enumerate(before_els):
+            if i in matched_before:
+                continue
+            role_b = str(b.get("role") or "").strip().lower()
+            xb = int(b.get("x", 0))
+            yb = int(b.get("y", 0))
+            if (
+                (not role_a or not role_b or role_a == role_b)
+                and abs(xa - xb) <= 15
+                and abs(ya - yb) <= 15
+            ):
+                matched_before.add(i)
+                matched_after.add(j)
+                pairs.append((i, j))
+                break
+
+    # Check for value / readout changes among matched pairs
+    for i, j in pairs:
+        b = before_els[i]
+        a = after_els[j]
+        b_val = b.get("value")
+        a_val = a.get("value")
+        b_name = str(b.get("name") or "")
+        a_name = str(a.get("name") or "")
+        role = str(a.get("role") or b.get("role") or "")
+        role_lower = role.lower()
+
+        if b_val != a_val:
+            changed_values.append(
+                {
+                    "ref": str(a.get("ref") or b.get("ref") or ""),
+                    "role": role,
+                    "name": a_name or b_name,
+                    "old_value": str(b_val) if b_val is not None else None,
+                    "new_value": str(a_val) if a_val is not None else None,
+                }
+            )
+        elif b_name != a_name and (
+            role_lower in {"text", "readout", "label", "status_bar", "title_bar"}
+            or (b_val is None and a_val is None)
+        ):
+            changed_values.append(
+                {
+                    "ref": str(a.get("ref") or b.get("ref") or ""),
+                    "role": role,
+                    "name": a_name or b_name,
+                    "old_value": b_name,
+                    "new_value": a_name,
+                }
+            )
+
+    added_elements: list[dict[str, Any]] = []
+    for j, a in enumerate(after_els):
+        if j not in matched_after:
+            added_elements.append(
+                {
+                    "ref": str(a.get("ref") or ""),
+                    "role": str(a.get("role") or a.get("control_type") or "").strip().lower(),
+                    "name": str(a.get("name") or ""),
+                    "value": str(a["value"]) if a.get("value") is not None else None,
+                    "x": int(a.get("x", 0)),
+                    "y": int(a.get("y", 0)),
+                    "automation_id": str(a.get("automation_id") or ""),
+                    "control_type": str(a.get("control_type") or a.get("role") or ""),
+                }
+            )
+    added_elements = added_elements[:25]
+    removed_count = len(before_els) - len(matched_before)
+
+    return {
+        "window_changed": window_changed,
+        "window_title": after_title,
+        "changed_values": changed_values,
+        "added_elements": added_elements,
+        "removed_count": removed_count,
+    }
+
+
+def ui_act(
+    ref: str,
+    action: str,
+    value: str | None = None,
+    *,
+    ui_snapshot_fn: Callable[..., dict[str, Any]] | None = None,
+    gui_action_fn: Callable[..., dict[str, Any]] | None = None,
+    user32: Any = None,
+    _capture_snapshot: bool = True,
+) -> dict[str, Any]:
+    """Execute a semantic action on an indexed UI element and return verification diff."""
+    if not isinstance(ref, str) or not ref.strip():
+        raise ValueError("ref must be a non-empty string.")
+    cleaned_ref = ref.strip()
+
+    if not isinstance(action, str) or not action.strip():
+        raise ValueError("action must be a non-empty string.")
+    norm_action = action.strip().lower()
+    if norm_action not in VALID_UI_ACT_ACTIONS:
+        raise ValueError(
+            f"Unsupported UI act action {action!r}. Must be one of {sorted(VALID_UI_ACT_ACTIONS)}."
+        )
+
+    snap_runner = ui_snapshot_fn or ui_snapshot
+    action_runner = gui_action_fn or gui_action
+
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME
+    if not _UI_REF_STORE:
+        snap_runner(user32=user32)
+
+    if cleaned_ref not in _UI_REF_STORE:
+        avail = ", ".join(sorted(_UI_REF_STORE.keys())[:25]) or "none"
+        raise ValueError(
+            f"UI element ref {cleaned_ref!r} not found in current snapshot. Available refs: {avail}"
+        )
+
+    before_snap = _LAST_UI_SNAPSHOT or {}
+    target = _UI_REF_STORE[cleaned_ref]
+    cx = int(target.get("x", 0))
+    cy = int(target.get("y", 0))
+
+    if norm_action == "click":
+        action_runner(action="click_at", x=cx, y=cy, clicks=1, button="left", user32=user32)
+    elif norm_action == "double_click":
+        action_runner(action="click_at", x=cx, y=cy, clicks=2, button="double", user32=user32)
+    elif norm_action == "right_click":
+        action_runner(action="click_at", x=cx, y=cy, clicks=1, button="right", user32=user32)
+    elif norm_action == "clear":
+        action_runner(action="click_at", x=cx, y=cy, clicks=1, button="left", user32=user32)
+        action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+        action_runner(action="press_keys", keys=["backspace"], user32=user32)
+    elif norm_action == "type":
+        if value is None or not isinstance(value, str):
+            raise ValueError("value string is required for 'type' action.")
+        action_runner(action="click_at", x=cx, y=cy, clicks=1, button="left", user32=user32)
+        action_runner(action="type_text", text=value, user32=user32)
+    elif norm_action == "set_value":
+        val_str = str(value) if value is not None else ""
+        action_runner(action="click_at", x=cx, y=cy, clicks=1, button="left", user32=user32)
+        action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+        action_runner(action="press_keys", keys=["backspace"], user32=user32)
+        if val_str:
+            action_runner(action="type_text", text=val_str, user32=user32)
+
+    if not _capture_snapshot:
+        return {
+            "ok": True,
+            "status": "completed",
+            "action": norm_action,
+            "ref": cleaned_ref,
+        }
+
+    after_snap = snap_runner(user32=user32)
+    diff = compute_ui_diff(before_snap, after_snap)
+    return {
+        "ok": True,
+        "status": "completed",
+        "action": norm_action,
+        "ref": cleaned_ref,
+        "diff": diff,
+        "snapshot": after_snap,
+    }
+
+
+def ui_batch(
+    steps: list[dict[str, Any]],
+    stop_on_error: bool = True,
+    stop_on_window_change: bool = True,
+    *,
+    ui_snapshot_fn: Callable[..., dict[str, Any]] | None = None,
+    gui_action_fn: Callable[..., dict[str, Any]] | None = None,
+    window_title_fn: Callable[[], str] | None = None,
+    user32: Any = None,
+) -> dict[str, Any]:
+    """Execute speculative multi-step GUI actions in a single round-trip with state diffing."""
+    if not isinstance(steps, list) or len(steps) < 1 or len(steps) > 20:
+        raise ValueError("steps must be a list containing between 1 and 20 step operations.")
+
+    # Validate step shapes
+    for idx, s in enumerate(steps):
+        if hasattr(s, "model_dump"):
+            s_dict = s.model_dump(exclude_unset=True)
+        elif isinstance(s, dict):
+            s_dict = s
+        else:
+            raise ValueError(f"Step {idx} must be a dictionary.")
+        op = str(s_dict.get("op") or "").strip().lower()
+        if op not in VALID_UI_BATCH_OPS:
+            valid_ops = sorted(VALID_UI_BATCH_OPS)
+            raise ValueError(
+                f"Unsupported batch op {op!r} in step {idx}. Must be one of {valid_ops}."
+            )
+        if op == "act":
+            if not s_dict.get("ref"):
+                raise ValueError(f"Step {idx} 'act' requires 'ref'.")
+            act = str(s_dict.get("action") or "").strip().lower()
+            if act not in VALID_UI_ACT_ACTIONS:
+                valid_acts = sorted(VALID_UI_ACT_ACTIONS)
+                raise ValueError(
+                    f"Unsupported action {act!r} in step {idx} 'act'. Must be one of {valid_acts}."
+                )
+        elif op == "press_keys":
+            keys = s_dict.get("keys")
+            if not isinstance(keys, list) or len(keys) == 0:
+                raise ValueError(f"Step {idx} 'press_keys' requires non-empty list 'keys'.")
+        elif op == "scroll":
+            delta = s_dict.get("delta")
+            if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
+                raise ValueError(f"Step {idx} 'scroll' requires non-zero integer 'delta'.")
+        elif op == "click_at":
+            x = s_dict.get("x")
+            y = s_dict.get("y")
+            if (
+                x is None
+                or y is None
+                or isinstance(x, bool)
+                or isinstance(y, bool)
+                or not isinstance(x, int)
+                or not isinstance(y, int)
+                or x < 0
+                or y < 0
+            ):
+                raise ValueError(
+                    f"Step {idx} 'click_at' requires non-negative integer 'x' and 'y'."
+                )
+
+    snap_runner = ui_snapshot_fn or ui_snapshot
+    action_runner = gui_action_fn or gui_action
+    title_getter = window_title_fn or (lambda: _get_foreground_window_title(user32))
+
+    is_stale = (time.time() - _LAST_UI_SNAPSHOT_TIME) > 60.0
+    if not _UI_REF_STORE or _LAST_UI_SNAPSHOT is None or is_stale:
+        before_snapshot = snap_runner(user32=user32)
+    else:
+        before_snapshot = _LAST_UI_SNAPSHOT
+
+    initial_title = str(before_snapshot.get("window_title") or "")
+    if not initial_title:
+        with contextlib.suppress(Exception):
+            initial_title = title_getter()
+
+    step_results: list[dict[str, Any]] = []
+    status = "completed"
+
+    for idx, s in enumerate(steps):
+        s_dict = s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else dict(s)
+        op = str(s_dict.get("op") or "").strip().lower()
+        trigger_nav = False
+
+        try:
+            if op == "act":
+                ref = str(s_dict.get("ref") or "").strip()
+                action = str(s_dict.get("action") or "").strip().lower()
+                val = s_dict.get("value")
+                ui_act(
+                    ref,
+                    action,
+                    val,
+                    ui_snapshot_fn=snap_runner,
+                    gui_action_fn=action_runner,
+                    user32=user32,
+                    _capture_snapshot=False,
+                )
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "act",
+                        "ref": ref,
+                        "action": action,
+                        "status": "ok",
+                    }
+                )
+                if action in {"click", "double_click"}:
+                    trigger_nav = True
+
+            elif op == "press_keys":
+                keys = [str(k) for k in s_dict["keys"]]
+                action_runner(action="press_keys", keys=keys, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "press_keys",
+                        "status": "ok",
+                    }
+                )
+                norm_keys = [k.strip().lower() for k in keys]
+                if any(k in {"enter", "return", "tab", "escape", "esc"} for k in norm_keys):
+                    trigger_nav = True
+
+            elif op == "scroll":
+                delta = int(s_dict["delta"])
+                x = s_dict.get("x")
+                y = s_dict.get("y")
+                action_runner(action="scroll", delta=delta, x=x, y=y, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "scroll",
+                        "status": "ok",
+                    }
+                )
+
+            elif op == "wait":
+                sec = float(s_dict.get("seconds", 0.5))
+                action_runner(action="wait", seconds=sec, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "wait",
+                        "status": "ok",
+                    }
+                )
+
+            elif op == "click_at":
+                x = int(s_dict["x"])
+                y = int(s_dict["y"])
+                clicks = int(s_dict.get("clicks", 1))
+                btn = str(s_dict.get("button", "left"))
+                action_runner(action="click_at", x=x, y=y, clicks=clicks, button=btn, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "click_at",
+                        "status": "ok",
+                    }
+                )
+                trigger_nav = True
+
+        except Exception as exc:
+            step_results.append(
+                {
+                    "step": idx,
+                    "op": op,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+            if stop_on_error:
+                status = "partial_error"
+                break
+            continue
+
+        if stop_on_window_change and trigger_nav:
+            current_title = ""
+            with contextlib.suppress(Exception):
+                current_title = title_getter()
+            if current_title and initial_title and current_title != initial_title:
+                status = "stopped_on_window_change"
+                break
+
+    if status == "completed" and any(r.get("status") == "error" for r in step_results):
+        status = "partial_error"
+
+    after_snapshot = snap_runner(user32=user32)
+    diff = compute_ui_diff(before_snapshot, after_snapshot)
+
+    return {
+        "ok": True,
+        "status": status,
+        "steps_executed": len(step_results),
+        "step_results": step_results,
+        "diff": diff,
+        "snapshot": after_snapshot,
+    }

@@ -91,6 +91,9 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "inspect_ui_elements",
         "click_ui_element",
         "gui_action",
+        "ui_snapshot",
+        "ui_act",
+        "ui_batch",
     }
     for tool in tools:
         assert tool.behavior == "non_blocking"
@@ -157,6 +160,17 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "scroll",
         "wait",
     ]
+    assert by_name["ui_snapshot"].parameters_schema.get("required", []) == []
+    assert by_name["ui_act"].parameters_schema["required"] == ["ref", "action"]
+    assert by_name["ui_act"].parameters_schema["properties"]["action"]["enum"] == [
+        "click",
+        "set_value",
+        "type",
+        "clear",
+        "double_click",
+        "right_click",
+    ]
+    assert by_name["ui_batch"].parameters_schema["required"] == ["steps"]
     assert by_name["inspect_git_workspace"].parameters_schema.get("required", []) == []
 
     assert by_name["select_clipboard_item"].parameters_schema["required"] == ["index"]

@@ -150,6 +150,16 @@ import type {
   OsClickUiElementResult,
   OsGuiActionParams,
   OsGuiActionResult,
+  OsUiSnapshotParams,
+  OsUiSnapshotResult,
+  OsUiActParams,
+  OsUiActResult,
+  OsUiBatchParams,
+  OsUiBatchResult,
+  UiSnapshotElement,
+  UiDiff,
+  UiDiffChangedValue,
+  UiBatchStep,
   GitWorktreeItem,
   GitCommitItem,
   WorkspaceGitInspectParams,
@@ -308,6 +318,16 @@ export type {
   OsClickUiElementResult,
   OsGuiActionParams,
   OsGuiActionResult,
+  OsUiSnapshotParams,
+  OsUiSnapshotResult,
+  OsUiActParams,
+  OsUiActResult,
+  OsUiBatchParams,
+  OsUiBatchResult,
+  UiSnapshotElement,
+  UiDiff,
+  UiDiffChangedValue,
+  UiBatchStep,
   GitWorktreeItem,
   GitCommitItem,
   WorkspaceGitInspectParams,
@@ -374,6 +394,9 @@ export interface MethodParamsMap {
   "os.inspect_ui_elements": OsInspectUiElementsParams;
   "os.click_ui_element": OsClickUiElementParams;
   "os.gui_action": OsGuiActionParams;
+  "os.ui_snapshot": OsUiSnapshotParams;
+  "os.ui_act": OsUiActParams;
+  "os.ui_batch": OsUiBatchParams;
   "workspace.git_inspect": WorkspaceGitInspectParams;
 }
 
@@ -435,6 +458,9 @@ export interface MethodResultMap {
   "os.inspect_ui_elements": OsInspectUiElementsResult;
   "os.click_ui_element": OsClickUiElementResult;
   "os.gui_action": OsGuiActionResult;
+  "os.ui_snapshot": OsUiSnapshotResult;
+  "os.ui_act": OsUiActResult;
+  "os.ui_batch": OsUiBatchResult;
   "workspace.git_inspect": WorkspaceGitInspectResult;
 }
 

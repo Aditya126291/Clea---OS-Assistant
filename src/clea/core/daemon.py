@@ -105,6 +105,9 @@ from clea.tools.windows_os import (
     open_url,
     read_clipboard,
     select_clipboard_item,
+    ui_act,
+    ui_batch,
+    ui_snapshot,
     write_clipboard,
 )
 
@@ -1835,6 +1838,12 @@ class CleaDaemon:
             await self._handle_os_click_ui_element(conn, req)
         elif method == "os.gui_action":
             await self._handle_os_gui_action(conn, req)
+        elif method == "os.ui_snapshot":
+            await self._handle_os_ui_snapshot(conn, req)
+        elif method == "os.ui_act":
+            await self._handle_os_ui_act(conn, req)
+        elif method == "os.ui_batch":
+            await self._handle_os_ui_batch(conn, req)
         elif method == "workspace.git_inspect":
             await self._handle_workspace_git_inspect(conn, req)
 
@@ -2760,6 +2769,72 @@ class CleaDaemon:
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
         await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_ui_snapshot(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                ui_snapshot,
+                req.params.app_name,
+                req.params.max_elements,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_ui_snapshot",
+            app_name=req.params.app_name,
+            count=res.get("count"),
+        )
+        model_cls = METHOD_RESULTS["os.ui_snapshot"]
+        await self._respond(ws, req, model_cls.model_validate(res))
+
+    async def _handle_os_ui_act(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        p = req.params
+        try:
+            res = await asyncio.to_thread(
+                ui_act,
+                p.ref,
+                p.action,
+                p.value,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_ui_act",
+            ref=p.ref,
+            ui_action=p.action,
+            status=res.get("status"),
+        )
+        model_cls = METHOD_RESULTS["os.ui_act"]
+        await self._respond(ws, req, model_cls.model_validate(res))
+
+    async def _handle_os_ui_batch(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        p = req.params
+        steps_raw = [
+            s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else s
+            for s in p.steps
+        ]
+        try:
+            res = await asyncio.to_thread(
+                ui_batch,
+                steps_raw,
+                p.stop_on_error,
+                p.stop_on_window_change,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_ui_batch",
+            steps_executed=res.get("steps_executed"),
+            status=res.get("status"),
+        )
+        model_cls = METHOD_RESULTS["os.ui_batch"]
+        await self._respond(ws, req, model_cls.model_validate(res))
 
     async def _handle_workspace_git_inspect(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
