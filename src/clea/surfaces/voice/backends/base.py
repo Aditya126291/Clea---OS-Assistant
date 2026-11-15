@@ -844,6 +844,173 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="ui_snapshot",
+            description=(
+                "Capture visible UI elements and accessibility tree for the active window or "
+                "specified application with stable element reference IDs (e.g. 'e0', 'e1') "
+                "for subsequent interaction."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": (
+                            "Optional target application or window title. Defaults to foreground "
+                            "window."
+                        ),
+                    },
+                    "max_elements": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum number of UI elements to capture (default 60, max 200)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="ui_act",
+            description=(
+                "Perform a semantic action on a UI element identified by its snapshot reference "
+                "ID ('ref', e.g. 'e3'). Automatically captures the resulting UI diff and updated "
+                "snapshot."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "ref": {
+                        "type": "string",
+                        "description": (
+                            "Element reference ID from a preceding ui_snapshot, e.g. 'e0', 'e3'."
+                        ),
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "click",
+                            "set_value",
+                            "type",
+                            "clear",
+                            "double_click",
+                            "right_click",
+                        ],
+                        "description": "Semantic action to execute on the element.",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": (
+                            "Text value to set or type for 'set_value' or 'type' actions."
+                        ),
+                    },
+                },
+                "required": ["ref", "action"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="ui_batch",
+            description=(
+                "Execute a multi-step sequence of speculative GUI actions and inputs in a single "
+                "tool call without intermediate snapshot round-trips. Captures one final snapshot "
+                "and UI diff at the end of the batch, and can halt early if the active window "
+                "changes or an error occurs."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["act", "press_keys", "scroll", "wait", "click_at"],
+                                    "description": "Operation type.",
+                                },
+                                "ref": {
+                                    "type": "string",
+                                    "description": (
+                                        "Element reference ID for 'act' op (e.g. 'e3')."
+                                    ),
+                                },
+                                "action": {
+                                    "type": "string",
+                                    "enum": [
+                                        "click",
+                                        "set_value",
+                                        "type",
+                                        "clear",
+                                        "double_click",
+                                        "right_click",
+                                    ],
+                                    "description": "Action for 'act' op.",
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "Value for 'set_value' or 'type' action.",
+                                },
+                                "keys": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "List of key names for 'press_keys' op.",
+                                },
+                                "delta": {
+                                    "type": "integer",
+                                    "description": "Scroll wheel delta for 'scroll' op.",
+                                },
+                                "seconds": {
+                                    "type": "number",
+                                    "description": "Duration for 'wait' op.",
+                                },
+                                "x": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Horizontal coordinate for 'click_at' or 'scroll'."
+                                    ),
+                                },
+                                "y": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Vertical coordinate for 'click_at' or 'scroll'."
+                                    ),
+                                },
+                                "clicks": {
+                                    "type": "integer",
+                                    "description": "Click count for 'click_at' op.",
+                                },
+                                "button": {
+                                    "type": "string",
+                                    "enum": ["left", "right", "double"],
+                                    "description": "Mouse button for 'click_at' op.",
+                                },
+                            },
+                            "required": ["op"],
+                        },
+                        "description": "1 to 20 action steps to execute sequentially.",
+                    },
+                    "stop_on_error": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to abort subsequent steps if any step fails (default true)."
+                        ),
+                    },
+                    "stop_on_window_change": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to stop speculative execution early if navigation/submission "
+                            "causes the foreground window to change (default true)."
+                        ),
+                    },
+                },
+                "required": ["steps"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="inspect_git_workspace",
             description=(
                 "Inspect a local Git repository or sibling worktree strictly read-only: current "

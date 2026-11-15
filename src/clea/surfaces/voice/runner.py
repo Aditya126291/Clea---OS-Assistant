@@ -64,6 +64,12 @@ from clea.core.protocol import (
     OsReadClipboardRequest,
     OsSelectClipboardItemParams,
     OsSelectClipboardItemRequest,
+    OsUiActParams,
+    OsUiActRequest,
+    OsUiBatchParams,
+    OsUiBatchRequest,
+    OsUiSnapshotParams,
+    OsUiSnapshotRequest,
     OsWriteClipboardParams,
     OsWriteClipboardRequest,
     ResponseFrame,
@@ -71,6 +77,7 @@ from clea.core.protocol import (
     TranscriptEvent,
     TranscriptsGetParams,
     TranscriptsGetRequest,
+    UiBatchStep,
     UiNavigateParams,
     UiNavigateRequest,
     UsageData,
@@ -2236,6 +2243,88 @@ class VoiceRunner:
                     )
                 ),
                 error_prefix="Failed to execute GUI action",
+            )
+            return
+
+        if event.name == "ui_snapshot":
+            raw_max = event.arguments.get("max_elements", 60)
+            max_elements = 60
+            if raw_max is not None and not isinstance(raw_max, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    max_elements = int(raw_max)
+            await _execute_rpc_tool(
+                OsUiSnapshotRequest(
+                    params=OsUiSnapshotParams(
+                        app_name=_req_str("app_name"),
+                        max_elements=max_elements,
+                    )
+                ),
+                error_prefix="Failed to capture UI snapshot",
+            )
+            return
+
+        if event.name == "ui_act":
+            ref = _req_str("ref")
+            if not ref:
+                await _send_error("ref is required for ui_act.")
+                return
+            action = _req_str("action")
+            if not action:
+                await _send_error("action is required for ui_act.")
+                return
+            action_norm = action.lower()
+            valid_actions = {
+                "click",
+                "set_value",
+                "type",
+                "clear",
+                "double_click",
+                "right_click",
+            }
+            if action_norm not in valid_actions:
+                await _send_error(f"Unsupported ui_act action: {action!r}")
+                return
+            raw_val = event.arguments.get("value")
+            val_str = str(raw_val) if raw_val is not None else None
+            await _execute_rpc_tool(
+                OsUiActRequest(
+                    params=OsUiActParams(
+                        ref=ref,
+                        action=action_norm,  # type: ignore[arg-type]
+                        value=val_str,
+                    )
+                ),
+                error_prefix="Failed to execute ui_act",
+            )
+            return
+
+        if event.name == "ui_batch":
+            raw_steps = event.arguments.get("steps")
+            if not isinstance(raw_steps, list) or len(raw_steps) == 0:
+                await _send_error("steps must be a non-empty list of step operations.")
+                return
+            if len(raw_steps) > 20:
+                await _send_error("steps cannot exceed 20 operations.")
+                return
+            stop_on_error = _parse_bool("stop_on_error", default=True)
+            stop_on_win_change = _parse_bool("stop_on_window_change", default=True)
+            try:
+                steps = [
+                    UiBatchStep.model_validate(s) if isinstance(s, dict) else s
+                    for s in raw_steps
+                ]
+            except Exception as exc:
+                await _send_error(f"Invalid batch step format: {exc}")
+                return
+            await _execute_rpc_tool(
+                OsUiBatchRequest(
+                    params=OsUiBatchParams(
+                        steps=steps,
+                        stop_on_error=stop_on_error,
+                        stop_on_window_change=stop_on_win_change,
+                    )
+                ),
+                error_prefix="Failed to execute ui_batch",
             )
             return
 

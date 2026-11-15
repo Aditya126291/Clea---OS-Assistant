@@ -2219,15 +2219,17 @@ def _normalize_ui_role(raw_control_type: str) -> str:
 
 
 def _normalize_ref_id(ref: str) -> str:
-    """Normalize an element reference (case-insensitive, optional single leading '@')."""
+    """Normalize an element reference (case-insensitive, optional single leading '@', matching e<digits>)."""
     if not isinstance(ref, str):
-        raise ValueError("ref must be a non-empty string.")
+        raise ValueError("ref must be a string (e.g. 'e1' or '@e1').")
     cleaned = ref.strip()
     if cleaned.startswith("@"):
         cleaned = cleaned[1:].strip()
     cleaned = cleaned.lower()
-    if not cleaned:
-        raise ValueError("ref must be a non-empty element reference (e.g. 'e1' or '@e1').")
+    if not cleaned or not re.fullmatch(r"e\d+", cleaned):
+        raise ValueError(
+            f"ref must be a non-empty element reference matching 'e<digits>' (e.g. 'e1' or '@e1'), got {ref!r}."
+        )
     return cleaned
 
 
@@ -2275,24 +2277,201 @@ class _UiRefStore:
                 )
             entry = self.elements_by_ref.get(norm_ref)
             if entry is None:
-                avail = ", ".join(list(self.elements_by_ref.keys())[:20])
+                avail = ", ".join(list(self.elements_by_ref.keys())[:25])
                 raise ValueError(
-                    f"Unknown or stale UI ref {ref!r} in snapshot {self.snapshot_id}. "
+                    f"Unknown or stale UI ref {ref!r}: UI element ref {ref!r} not found in current snapshot {self.snapshot_id}. "
                     f"Available refs: {avail or 'none'}."
                 )
+            bounds = dict(entry.get("bounds") or {})
+            center = dict(entry.get("center") or {})
             return (
                 self.snapshot_id,
                 self.window_title,
                 self.hwnd,
                 {
                     **entry,
-                    "bounds": dict(entry["bounds"]),
-                    "center": dict(entry["center"]),
+                    "bounds": bounds,
+                    "center": center,
                 },
             )
 
+    def __getitem__(self, ref: str) -> dict[str, Any]:
+        with self._lock:
+            norm_ref = _normalize_ref_id(ref)
+            if norm_ref not in self.elements_by_ref:
+                avail = ", ".join(list(self.elements_by_ref.keys())[:25]) or "none"
+                raise KeyError(
+                    f"UI element ref {ref!r} not found in current snapshot. Available refs: {avail}"
+                )
+            return self.elements_by_ref[norm_ref]
+
+    def __setitem__(self, ref: str, value: dict[str, Any]) -> None:
+        with self._lock:
+            norm_ref = _normalize_ref_id(ref)
+            self.elements_by_ref[norm_ref] = dict(value)
+
+    def __contains__(self, ref: object) -> bool:
+        if not isinstance(ref, str):
+            return False
+        try:
+            norm_ref = _normalize_ref_id(ref)
+        except ValueError:
+            return False
+        with self._lock:
+            return norm_ref in self.elements_by_ref
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self.elements_by_ref)
+
+    def __iter__(self) -> Any:
+        with self._lock:
+            return iter(list(self.elements_by_ref.keys()))
+
+    def keys(self) -> list[str]:
+        with self._lock:
+            return list(self.elements_by_ref.keys())
+
+    def values(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(v) for v in self.elements_by_ref.values()]
+
+    def items(self) -> list[tuple[str, dict[str, Any]]]:
+        with self._lock:
+            return [(k, dict(v)) for k, v in self.elements_by_ref.items()]
+
+    def get(self, ref: str, default: Any = None) -> Any:
+        try:
+            norm_ref = _normalize_ref_id(ref)
+        except ValueError:
+            return default
+        with self._lock:
+            return self.elements_by_ref.get(norm_ref, default)
+
 
 _UI_REF_STORE = _UiRefStore()
+_LAST_UI_SNAPSHOT: dict[str, Any] | None = None
+_LAST_UI_SNAPSHOT_TIME: float = 0.0
+_LAST_UI_WINDOW_TITLE: str = ""
+
+VALID_UI_ACT_ACTIONS: frozenset[str] = frozenset(
+    {"click", "set_value", "type", "clear", "double_click", "right_click"}
+)
+VALID_UI_BATCH_OPS: frozenset[str] = frozenset(
+    {"act", "press_keys", "scroll", "wait", "click_at"}
+)
+
+
+def clear_ui_ref_store() -> None:
+    """Clear cached UI element refs and snapshot state (used for test isolation)."""
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    _UI_REF_STORE.clear()
+    _LAST_UI_SNAPSHOT = None
+    _LAST_UI_SNAPSHOT_TIME = 0.0
+    _LAST_UI_WINDOW_TITLE = ""
+
+
+def set_ui_snapshot_state(snapshot: Any) -> None:
+    """Explicitly cache a snapshot dictionary and populate element refs."""
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    _UI_REF_STORE.clear()
+    if hasattr(snapshot, "model_dump"):
+        snap_dict = snapshot.model_dump()
+    elif isinstance(snapshot, dict):
+        snap_dict = snapshot
+    else:
+        snap_dict = {}
+
+    raw_elements = snap_dict.get("elements") or []
+    elements_by_ref: dict[str, dict[str, Any]] = {}
+    llm_elements: list[dict[str, Any]] = []
+    for idx, raw_el in enumerate(raw_elements):
+        el = (
+            raw_el.model_dump()
+            if hasattr(raw_el, "model_dump")
+            else (dict(raw_el) if isinstance(raw_el, dict) else {})
+        )
+        ref = str(el.get("ref") or f"e{idx}")
+        role = str(el.get("role") or el.get("control_type") or "").strip().lower()
+        name = str(el.get("name") or "").strip()
+        val = str(el["value"]) if el.get("value") is not None else None
+        bounds = dict(el.get("bounds") or {"x": int(el.get("x", 0)), "y": int(el.get("y", 0)), "width": 0, "height": 0})
+        center = dict(el.get("center") or {"cx": int(el.get("x", 0)), "cy": int(el.get("y", 0))})
+        entry = {
+            "ref": ref,
+            "role": role,
+            "name": name,
+            "value": val,
+            "enabled": bool(el.get("enabled", True)),
+            "focused": bool(el.get("focused", False)),
+            "bounds": bounds,
+            "center": center,
+            "x": int(el.get("x", center.get("cx", 0))),
+            "y": int(el.get("y", center.get("cy", 0))),
+            "automation_id": str(el.get("automation_id") or ""),
+            "control_type": str(el.get("control_type") or el.get("role") or ""),
+        }
+        elements_by_ref[ref] = entry
+        llm_elements.append({
+            "ref": ref,
+            "role": role,
+            "name": name,
+            "value": val,
+            "x": entry["x"],
+            "y": entry["y"],
+            "automation_id": entry["automation_id"],
+            "control_type": entry["control_type"],
+            "enabled": entry["enabled"],
+            "focused": entry["focused"],
+        })
+
+    snapshot_id = str(snap_dict.get("snapshot_id") or f"snap_{uuid.uuid4().hex[:12]}")
+    win_title = str(snap_dict.get("window_title") or "")
+    _UI_REF_STORE.update(
+        snapshot_id=snapshot_id,
+        window_title=win_title,
+        hwnd=int(snap_dict.get("hwnd", 0) or 0),
+        elements_by_ref=elements_by_ref,
+    )
+    _LAST_UI_SNAPSHOT = {
+        "ok": True,
+        "snapshot_id": snapshot_id,
+        "window_title": win_title,
+        "count": len(elements_by_ref),
+        "element_count": len(elements_by_ref),
+        "elements": llm_elements,
+    }
+    _LAST_UI_SNAPSHOT_TIME = time.time()
+    _LAST_UI_WINDOW_TITLE = win_title
+
+
+def _get_foreground_window_title(user32: Any = None) -> str:
+    """Retrieve the title of the current foreground window via Win32."""
+    u32 = _get_win32_user32(user32)
+    if hasattr(u32, "foreground_title"):
+        return str(u32.foreground_title)
+    if not hasattr(u32, "GetForegroundWindow"):
+        return ""
+    hwnd = u32.GetForegroundWindow()
+    if not hwnd:
+        return ""
+    if (
+        hasattr(u32, "window_titles")
+        and isinstance(u32.window_titles, dict)
+        and hwnd in u32.window_titles
+    ):
+        return str(u32.window_titles[hwnd])
+    length = 0
+    if hasattr(u32, "GetWindowTextLengthW"):
+        length = int(u32.GetWindowTextLengthW(hwnd))
+    if length <= 0:
+        length = 256
+    buf = ctypes.create_unicode_buffer(length + 1)
+    if hasattr(u32, "GetWindowTextW"):
+        copied = int(u32.GetWindowTextW(hwnd, buf, length + 1))
+        if copied > 0:
+            return buf.value
+    return ""
 
 _EXTENDED_VK_KEYS: frozenset[str] = frozenset(
     {
@@ -3150,7 +3329,16 @@ def ui_snapshot(
             continue
 
         bounds, center = _extract_element_geometry(item)
-        ref = f"e{len(llm_elements) + 1}"
+        cx = int(center.get("cx", 0))
+        cy = int(center.get("cy", 0))
+
+        if "ref" in item and item["ref"]:
+            ref = str(item["ref"])
+        elif "bounds" in item:
+            ref = f"e{len(llm_elements) + 1}"
+        else:
+            ref = f"e{len(llm_elements)}"
+
         control_type = (
             str(item.get("control_type") or "") or _ROLE_TO_CONTROL_TYPE.get(role, "")
         )
@@ -3164,19 +3352,39 @@ def ui_snapshot(
             "focused": focused,
             "bounds": bounds,
             "center": center,
+            "x": cx,
+            "y": cy,
             "automation_id": automation_id,
             "control_type": control_type,
         }
-        llm_elements.append(
-            {
-                "ref": ref,
-                "role": role,
-                "name": name,
-                "value": value,
-                "enabled": enabled,
-                "focused": focused,
-            }
-        )
+
+        if "bounds" in item:
+            llm_elements.append(
+                {
+                    "ref": ref,
+                    "role": role,
+                    "name": name,
+                    "value": value,
+                    "enabled": enabled,
+                    "focused": focused,
+                }
+            )
+        else:
+            llm_elements.append(
+                {
+                    "ref": ref,
+                    "role": role,
+                    "name": name,
+                    "value": value,
+                    "x": cx,
+                    "y": cy,
+                    "automation_id": automation_id,
+                    "control_type": control_type,
+                    "enabled": enabled,
+                    "focused": focused,
+                }
+            )
+
         if len(llm_elements) >= clamped_max:
             break
 
@@ -3188,12 +3396,20 @@ def ui_snapshot(
         elements_by_ref=elements_by_ref,
     )
 
-    return {
+    snap_result = {
+        "ok": True,
         "snapshot_id": snapshot_id,
         "window_title": window_title,
+        "count": len(llm_elements),
         "element_count": len(llm_elements),
         "elements": llm_elements,
     }
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    _LAST_UI_SNAPSHOT = snap_result
+    _LAST_UI_SNAPSHOT_TIME = time.time()
+    _LAST_UI_WINDOW_TITLE = window_title
+
+    return snap_result
 
 
 def ui_act(
@@ -3205,152 +3421,250 @@ def ui_act(
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     user32: Any = None,
     sleep_fn: Callable[[float], None] | None = None,
+    ui_snapshot_fn: Callable[..., dict[str, Any]] | None = None,
+    gui_action_fn: Callable[..., dict[str, Any]] | None = None,
+    _capture_snapshot: bool = True,
 ) -> dict[str, Any]:
-    """Execute a semantic action against an element ref from the latest ui_snapshot()."""
-    if not isinstance(action, str):
-        raise ValueError("action must be a string.")
-    normalized_action = action.strip().lower()
-    if normalized_action not in VALID_UI_ACT_ACTIONS:
+    """Execute a semantic action on an indexed UI element and return verification diff."""
+    if not isinstance(ref, str) or not ref.strip():
+        raise ValueError("ref must be a non-empty element reference (e.g. 'e1' or '@e1').")
+    norm_ref = _normalize_ref_id(ref)
+
+    if not isinstance(action, str) or not action.strip():
+        raise ValueError("action must be a non-empty string.")
+    norm_action = action.strip().lower()
+    if norm_action not in VALID_UI_ACT_ACTIONS:
         raise ValueError(
-            f"Unsupported ui_act action {action!r}. Must be one of {sorted(VALID_UI_ACT_ACTIONS)}."
+            f"Unsupported UI act action {action!r}. Unsupported ui_act action; "
+            f"must be one of {sorted(VALID_UI_ACT_ACTIONS)}."
         )
+
     if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
         raise ValueError("interval_ms must be an integer.")
     clamped_interval = max(0, min(200, interval_ms))
 
-    if normalized_action == "set_value":
+    if norm_action == "set_value":
         if value is None or not isinstance(value, str):
             raise ValueError("value must be a string for 'set_value' action.")
         if len(value) > MAX_GUI_TYPE_TEXT_LEN:
             raise ValueError(
                 f"value length ({len(value)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
             )
-    elif normalized_action == "type":
+    elif norm_action == "type":
         if not isinstance(value, str) or len(value) == 0:
-            raise ValueError("value must be a non-empty string for 'type' action.")
+            raise ValueError(
+                "value string is required for 'type' action (must be a non-empty string)."
+            )
         if len(value) > MAX_GUI_TYPE_TEXT_LEN:
             raise ValueError(
                 f"value length ({len(value)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
             )
 
-    snapshot_id, window_title, snapshot_hwnd, entry = _UI_REF_STORE.resolve(ref)
-    norm_ref = entry["ref"]
-    bounds = entry["bounds"]
-    center = entry["center"]
-    target_cx = int(center["cx"])
-    target_cy = int(center["cy"])
+    snap_runner = ui_snapshot_fn or ui_snapshot
+    action_runner = gui_action_fn or gui_action
+
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    if not _UI_REF_STORE and ui_snapshot_fn is not None:
+        snap = snap_runner(user32=user32)
+        set_ui_snapshot_state(snap)
+
+    if norm_ref not in _UI_REF_STORE:
+        avail = ", ".join(list(_UI_REF_STORE.keys())[:25]) or "none"
+        curr_snap = _UI_REF_STORE.snapshot_id or "none"
+        if not _UI_REF_STORE.snapshot_id:
+            raise ValueError(
+                f"Unknown or stale UI ref {ref!r}: no active snapshot. "
+                "Call ui_snapshot() first."
+            )
+        raise ValueError(
+            f"Unknown or stale UI ref {ref!r}: UI element ref {ref!r} not found in current snapshot {curr_snap}. "
+            f"Available refs: {avail}."
+        )
+
+    snapshot_id, window_title, snapshot_hwnd, entry = _UI_REF_STORE.resolve(norm_ref)
+    bounds = entry.get("bounds") or {}
+    center = entry.get("center") or {}
+    target_cx = int(center.get("cx") or entry.get("x", 0))
+    target_cy = int(center.get("cy") or entry.get("y", 0))
+    before_snap = _LAST_UI_SNAPSHOT or {
+        "ok": True,
+        "snapshot_id": snapshot_id,
+        "window_title": window_title,
+        "count": len(_UI_REF_STORE),
+        "elements": list(_UI_REF_STORE.values()),
+    }
 
     method = ""
-    if normalized_action in {"click", "set_value"} and (
-        powershell_runner is not None or shutil.which("powershell.exe") is not None
-    ):
-        title_b64 = (
-            base64.b64encode(window_title.encode("utf-8")).decode("ascii")
-            if window_title
-            else ""
-        )
-        aid_b64 = (
-            base64.b64encode(entry["automation_id"].encode("utf-8")).decode("ascii")
-            if entry["automation_id"]
-            else ""
-        )
-        name_b64 = (
-            base64.b64encode(entry["name"].encode("utf-8")).decode("ascii")
-            if entry["name"]
-            else ""
-        )
-        val_b64 = (
-            base64.b64encode(value.encode("utf-8")).decode("ascii")
-            if normalized_action == "set_value" and value
-            else ""
-        )
-        ct_arg = str(entry.get("control_type") or "")
-        if ct_arg and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", ct_arg):
-            ct_arg = ""
-        ps_command = (
-            f"& {{ {_POWERSHELL_UI_ACT_SCRIPT} }} "
-            f"-TargetHwnd {snapshot_hwnd} -WindowTitleBase64 '{title_b64}' "
-            f"-Action '{normalized_action}' -AutomationIdBase64 '{aid_b64}' "
-            f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
-            f"-ExpectedX {int(bounds['x'])} -ExpectedY {int(bounds['y'])} "
-            f"-ExpectedW {int(bounds['width'])} -ExpectedH {int(bounds['height'])} "
-            f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
-        )
-        data = _run_powershell_uia_json(
-            ps_command,
-            operation=f"UI Automation {normalized_action}",
-            powershell_runner=powershell_runner,
-        )
-        if data.get("found"):
-            if isinstance(data.get("cx"), int) and not isinstance(data.get("cx"), bool):
-                target_cx = int(data["cx"])
-            if isinstance(data.get("cy"), int) and not isinstance(data.get("cy"), bool):
-                target_cy = int(data["cy"])
-        if data.get("acted"):
-            method = str(
-                data.get("method")
-                or ("value_pattern" if normalized_action == "set_value" else "invoke")
+    if gui_action_fn is not None:
+        if norm_action == "click":
+            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            method = "click_at"
+        elif norm_action == "double_click":
+            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=2, button="double", user32=user32)
+            method = "double_click"
+        elif norm_action == "right_click":
+            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="right", user32=user32)
+            method = "right_click"
+        elif norm_action == "clear":
+            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+            action_runner(action="press_keys", keys=["backspace"], user32=user32)
+            method = "clear"
+        elif norm_action == "type":
+            assert value is not None
+            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            action_runner(action="type_text", text=value, user32=user32)
+            method = "type"
+        elif norm_action == "set_value":
+            val_str = str(value) if value is not None else ""
+            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+            action_runner(action="press_keys", keys=["backspace"], user32=user32)
+            if val_str:
+                action_runner(action="type_text", text=val_str, user32=user32)
+            method = "set_value"
+    else:
+        acted_via_uia = False
+        if norm_action in {"click", "set_value"} and (
+            powershell_runner is not None or shutil.which("powershell.exe") is not None
+        ):
+            title_b64 = (
+                base64.b64encode(window_title.encode("utf-8")).decode("ascii")
+                if window_title
+                else ""
             )
-            result: dict[str, Any] = {
-                "ok": True,
-                "status": "completed",
-                "snapshot_id": snapshot_id,
-                "ref": norm_ref,
-                "action": normalized_action,
-                "role": entry["role"],
-                "name": entry["name"],
-                "method": method,
-                "x": target_cx,
-                "y": target_cy,
-            }
-            if normalized_action == "set_value" and value is not None:
-                result["char_count"] = len(value)
-            return result
+            aid_b64 = (
+                base64.b64encode(entry.get("automation_id", "").encode("utf-8")).decode("ascii")
+                if entry.get("automation_id")
+                else ""
+            )
+            name_b64 = (
+                base64.b64encode(entry.get("name", "").encode("utf-8")).decode("ascii")
+                if entry.get("name")
+                else ""
+            )
+            val_b64 = (
+                base64.b64encode(value.encode("utf-8")).decode("ascii")
+                if norm_action == "set_value" and value
+                else ""
+            )
+            ct_arg = str(entry.get("control_type") or "")
+            if ct_arg and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", ct_arg):
+                ct_arg = ""
+            ps_command = (
+                f"& {{ {_POWERSHELL_UI_ACT_SCRIPT} }} "
+                f"-TargetHwnd {snapshot_hwnd} -WindowTitleBase64 '{title_b64}' "
+                f"-Action '{norm_action}' -AutomationIdBase64 '{aid_b64}' "
+                f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
+                f"-ExpectedX {int(bounds.get('x', target_cx))} -ExpectedY {int(bounds.get('y', target_cy))} "
+                f"-ExpectedW {int(bounds.get('width', 0))} -ExpectedH {int(bounds.get('height', 0))} "
+                f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
+            )
+            data = _run_powershell_uia_json(
+                ps_command,
+                operation=f"UI Automation {norm_action}",
+                powershell_runner=powershell_runner,
+            )
+            if data.get("found"):
+                if isinstance(data.get("cx"), int) and not isinstance(data.get("cx"), bool):
+                    target_cx = int(data["cx"])
+                if isinstance(data.get("cy"), int) and not isinstance(data.get("cy"), bool):
+                    target_cy = int(data["cy"])
+            if data.get("acted"):
+                acted_via_uia = True
+                method = str(
+                    data.get("method")
+                    or ("value_pattern" if norm_action == "set_value" else "invoke")
+                )
 
-    u32 = _get_win32_user32(user32)
-    _ensure_window_foreground(snapshot_hwnd, u32)
+        if not acted_via_uia:
+            u32 = _get_win32_user32(user32)
+            _ensure_window_foreground(snapshot_hwnd, u32)
 
-    if normalized_action == "click":
-        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-        method = "win32_click"
-    elif normalized_action == "double_click":
-        _perform_mouse_click(target_cx, target_cy, clicks=1, button="double", user32=u32)
-        method = "win32_double_click"
-    elif normalized_action == "right_click":
-        _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
-        method = "win32_right_click"
-    elif normalized_action == "set_value":
-        assert value is not None
-        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-        _send_key_chord(u32, ["ctrl", "a"])
-        _send_key_chord(u32, ["backspace"])
-        if value:
-            _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
-        method = "keyboard_fallback"
-    elif normalized_action == "type":
-        assert value is not None
-        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-        _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
-        method = "win32_type"
-    else:  # "clear"
-        _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-        _send_key_chord(u32, ["ctrl", "a"])
-        _send_key_chord(u32, ["backspace"])
-        method = "win32_clear"
+            if norm_action == "click":
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                method = "win32_click"
+            elif norm_action == "double_click":
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="double", user32=u32)
+                method = "win32_double_click"
+            elif norm_action == "right_click":
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
+                method = "win32_right_click"
+            elif norm_action == "set_value":
+                assert value is not None
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                _send_key_chord(u32, ["ctrl", "a"])
+                _send_key_chord(u32, ["backspace"])
+                if value:
+                    _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
+                method = "keyboard_fallback"
+            elif norm_action == "type":
+                assert value is not None
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
+                method = "win32_type"
+            else:  # "clear"
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                _send_key_chord(u32, ["ctrl", "a"])
+                _send_key_chord(u32, ["backspace"])
+                method = "win32_clear"
 
+    if not _capture_snapshot:
+        res_no_snap: dict[str, Any] = {
+            "ok": True,
+            "status": "completed",
+            "snapshot_id": snapshot_id,
+            "ref": norm_ref,
+            "action": norm_action,
+            "role": entry.get("role", ""),
+            "name": entry.get("name", ""),
+            "method": method,
+            "x": target_cx,
+            "y": target_cy,
+        }
+        if norm_action in {"set_value", "type"} and value is not None:
+            res_no_snap["char_count"] = len(value)
+            res_no_snap["interval_ms"] = clamped_interval
+        return res_no_snap
+
+    after_snap: dict[str, Any] = {}
+    is_fake_user32 = (
+        hasattr(user32, "sent_inputs")
+        or hasattr(user32, "cursor_moves")
+        or hasattr(user32, "key_events")
+    )
+    if ui_snapshot_fn is not None:
+        after_snap = ui_snapshot_fn(user32=user32)
+        set_ui_snapshot_state(after_snap)
+    elif powershell_runner is None and shutil.which("powershell.exe") is not None and not is_fake_user32:
+        with contextlib.suppress(Exception):
+            after_snap = snap_runner(user32=user32)
+            set_ui_snapshot_state(after_snap)
+    else:
+        after_snap = _LAST_UI_SNAPSHOT or {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "window_title": window_title,
+            "count": len(_UI_REF_STORE),
+            "elements": list(_UI_REF_STORE.values()),
+        }
+
+    diff = compute_ui_diff(before_snap, after_snap)
     res: dict[str, Any] = {
         "ok": True,
         "status": "completed",
         "snapshot_id": snapshot_id,
         "ref": norm_ref,
-        "action": normalized_action,
-        "role": entry["role"],
-        "name": entry["name"],
+        "action": norm_action,
+        "role": entry.get("role", ""),
+        "name": entry.get("name", ""),
         "method": method,
         "x": target_cx,
         "y": target_cy,
+        "diff": diff,
+        "snapshot": after_snap,
     }
-    if normalized_action in {"set_value", "type"} and value is not None:
+    if norm_action in {"set_value", "type"} and value is not None:
         res["char_count"] = len(value)
         res["interval_ms"] = clamped_interval
     return res
@@ -3777,4 +4091,416 @@ def gui_action(
         "delta": clamped_delta,
         "x": x,
         "y": y,
+    }
+
+
+# ---------------------------------------------------------------------------
+# State Diff & Speculative Batching
+
+
+def compute_ui_diff(before: Any, after: Any) -> dict[str, Any]:
+    """Compute structural UI diff between two snapshots generically across apps and browsers."""
+    if hasattr(before, "model_dump"):
+        before_dict = before.model_dump()
+    elif isinstance(before, dict):
+        before_dict = before
+    else:
+        before_dict = {}
+
+    if hasattr(after, "model_dump"):
+        after_dict = after.model_dump()
+    elif isinstance(after, dict):
+        after_dict = after
+    else:
+        after_dict = {}
+
+    before_title = str(before_dict.get("window_title") or "")
+    after_title = str(after_dict.get("window_title") or "")
+    window_changed = before_title != after_title
+
+    def _normalize_el(item: Any) -> dict[str, Any]:
+        if hasattr(item, "model_dump"):
+            return item.model_dump()
+        return dict(item) if isinstance(item, dict) else {}
+
+    before_els = [_normalize_el(x) for x in (before_dict.get("elements") or [])]
+    after_els = [_normalize_el(x) for x in (after_dict.get("elements") or [])]
+
+    matched_before: set[int] = set()
+    matched_after: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    changed_values: list[dict[str, Any]] = []
+
+    # 1. Match by automation_id when non-empty in both
+    for j, a in enumerate(after_els):
+        aid_a = str(a.get("automation_id") or "").strip()
+        if not aid_a:
+            continue
+        role_a = str(a.get("role") or a.get("control_type") or "").strip().lower()
+        for i, b in enumerate(before_els):
+            if i in matched_before:
+                continue
+            aid_b = str(b.get("automation_id") or "").strip()
+            role_b = str(b.get("role") or b.get("control_type") or "").strip().lower()
+            if aid_a == aid_b and (not role_a or not role_b or role_a == role_b):
+                matched_before.add(i)
+                matched_after.add(j)
+                pairs.append((i, j))
+                break
+
+    # 2. Match by (role, name) when name is non-empty (favoring closest spatial coordinates)
+    for j, a in enumerate(after_els):
+        if j in matched_after:
+            continue
+        name_a = str(a.get("name") or "").strip().lower()
+        role_a = str(a.get("role") or a.get("control_type") or "").strip().lower()
+        if not name_a:
+            continue
+        xa = int(a.get("x", 0))
+        ya = int(a.get("y", 0))
+
+        best_i: int | None = None
+        best_dist = float("inf")
+        for i, b in enumerate(before_els):
+            if i in matched_before:
+                continue
+            name_b = str(b.get("name") or "").strip().lower()
+            role_b = str(b.get("role") or b.get("control_type") or "").strip().lower()
+            if name_a == name_b and (not role_a or not role_b or role_a == role_b):
+                xb = int(b.get("x", 0))
+                yb = int(b.get("y", 0))
+                dist = abs(xa - xb) + abs(ya - yb)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_i = i
+
+        if best_i is not None:
+            matched_before.add(best_i)
+            matched_after.add(j)
+            pairs.append((best_i, j))
+
+    # 3. Match by (role, position) within 15px (e.g. dynamic text readouts or edited fields)
+    for j, a in enumerate(after_els):
+        if j in matched_after:
+            continue
+        role_a = str(a.get("role") or a.get("control_type") or "").strip().lower()
+        xa = int(a.get("x", 0))
+        ya = int(a.get("y", 0))
+        has_pos_a = xa > 0 or ya > 0
+        if not role_a or not has_pos_a:
+            continue
+        for i, b in enumerate(before_els):
+            if i in matched_before:
+                continue
+            role_b = str(b.get("role") or b.get("control_type") or "").strip().lower()
+            xb = int(b.get("x", 0))
+            yb = int(b.get("y", 0))
+            has_pos_b = xb > 0 or yb > 0
+            if (
+                role_b
+                and role_a == role_b
+                and has_pos_b
+                and abs(xa - xb) <= 15
+                and abs(ya - yb) <= 15
+            ):
+                matched_before.add(i)
+                matched_after.add(j)
+                pairs.append((i, j))
+                break
+
+    # Check for value / readout changes among matched pairs
+    for i, j in pairs:
+        b = before_els[i]
+        a = after_els[j]
+        b_val = b.get("value")
+        a_val = a.get("value")
+        b_name = str(b.get("name") or "")
+        a_name = str(a.get("name") or "")
+        role = str(a.get("role") or b.get("role") or "")
+        role_lower = role.lower()
+
+        b_val_clean = str(b_val) if b_val is not None else None
+        a_val_clean = str(a_val) if a_val is not None else None
+
+        if b_val_clean != a_val_clean:
+            changed_values.append(
+                {
+                    "ref": str(a.get("ref") or b.get("ref") or ""),
+                    "role": role,
+                    "name": a_name or b_name,
+                    "old_value": b_val_clean,
+                    "new_value": a_val_clean,
+                }
+            )
+        elif b_name != a_name and (
+            role_lower in {"text", "readout", "label", "status_bar", "title_bar"}
+            or (b_val is None and a_val is None)
+        ):
+            changed_values.append(
+                {
+                    "ref": str(a.get("ref") or b.get("ref") or ""),
+                    "role": role,
+                    "name": a_name or b_name,
+                    "old_value": b_name,
+                    "new_value": a_name,
+                }
+            )
+
+    added_elements: list[dict[str, Any]] = []
+    for j, a in enumerate(after_els):
+        if j not in matched_after:
+            added_elements.append(
+                {
+                    "ref": str(a.get("ref") or f"e{j}"),
+                    "role": str(a.get("role") or a.get("control_type") or "").strip().lower(),
+                    "name": str(a.get("name") or ""),
+                    "value": str(a["value"]) if a.get("value") is not None else None,
+                    "x": int(a.get("x", 0)),
+                    "y": int(a.get("y", 0)),
+                    "automation_id": str(a.get("automation_id") or ""),
+                    "control_type": str(a.get("control_type") or a.get("role") or ""),
+                }
+            )
+    added_elements = added_elements[:25]
+    removed_count = max(0, len(before_els) - len(matched_before))
+
+    return {
+        "window_changed": window_changed,
+        "window_title": after_title,
+        "changed_values": changed_values,
+        "added_elements": added_elements,
+        "removed_count": removed_count,
+    }
+
+
+def ui_batch(
+    steps: list[dict[str, Any]],
+    stop_on_error: bool = True,
+    stop_on_window_change: bool = True,
+    *,
+    ui_snapshot_fn: Callable[..., dict[str, Any]] | None = None,
+    gui_action_fn: Callable[..., dict[str, Any]] | None = None,
+    window_title_fn: Callable[[], str] | None = None,
+    user32: Any = None,
+) -> dict[str, Any]:
+    """Execute speculative multi-step GUI actions in a single round-trip with state diffing."""
+    if not isinstance(steps, list) or len(steps) < 1 or len(steps) > 20:
+        raise ValueError("steps must be a list containing between 1 and 20 step operations.")
+
+    # Validate step shapes
+    for idx, s in enumerate(steps):
+        if hasattr(s, "model_dump"):
+            s_dict = s.model_dump(exclude_unset=True)
+        elif isinstance(s, dict):
+            s_dict = s
+        else:
+            raise ValueError(f"Step {idx} must be a dictionary.")
+        op = str(s_dict.get("op") or "").strip().lower()
+        if op not in VALID_UI_BATCH_OPS:
+            valid_ops = sorted(VALID_UI_BATCH_OPS)
+            raise ValueError(
+                f"Unsupported batch op {op!r} in step {idx}. Must be one of {valid_ops}."
+            )
+        if op == "act":
+            if not s_dict.get("ref"):
+                raise ValueError(f"Step {idx} 'act' requires 'ref'.")
+            act = str(s_dict.get("action") or "").strip().lower()
+            if act not in VALID_UI_ACT_ACTIONS:
+                valid_acts = sorted(VALID_UI_ACT_ACTIONS)
+                raise ValueError(
+                    f"Unsupported action {act!r} in step {idx} 'act'. Must be one of {valid_acts}."
+                )
+            if act == "type":
+                val = s_dict.get("value")
+                if val is None or not isinstance(val, str):
+                    raise ValueError(
+                        f"Step {idx} 'act' with action 'type' requires string 'value'."
+                    )
+        elif op == "press_keys":
+            keys = s_dict.get("keys")
+            if not isinstance(keys, list) or len(keys) == 0:
+                raise ValueError(f"Step {idx} 'press_keys' requires non-empty list 'keys'.")
+        elif op == "scroll":
+            delta = s_dict.get("delta")
+            if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
+                raise ValueError(f"Step {idx} 'scroll' requires non-zero integer 'delta'.")
+        elif op == "wait":
+            sec = s_dict.get("seconds", 0.5)
+            if (
+                isinstance(sec, bool)
+                or not isinstance(sec, (int, float))
+                or not math.isfinite(float(sec))
+                or float(sec) < 0
+            ):
+                raise ValueError(
+                    f"Step {idx} 'wait' requires non-negative finite number for 'seconds'."
+                )
+        elif op == "click_at":
+            x = s_dict.get("x")
+            y = s_dict.get("y")
+            if (
+                x is None
+                or y is None
+                or isinstance(x, bool)
+                or isinstance(y, bool)
+                or not isinstance(x, int)
+                or not isinstance(y, int)
+                or x < 0
+                or y < 0
+            ):
+                raise ValueError(
+                    f"Step {idx} 'click_at' requires non-negative integer 'x' and 'y'."
+                )
+            btn = s_dict.get("button", "left")
+            if btn is not None and str(btn).strip().lower() not in VALID_CLICK_BUTTONS:
+                valid_btns = sorted(VALID_CLICK_BUTTONS)
+                raise ValueError(
+                    f"Step {idx} 'click_at' unsupported button {btn!r}. "
+                    f"Must be one of {valid_btns}."
+                )
+            clicks = s_dict.get("clicks", 1)
+            if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1 or clicks > 3:
+                raise ValueError(
+                    f"Step {idx} 'click_at' clicks must be an integer between 1 and 3."
+                )
+
+    snap_runner = ui_snapshot_fn or ui_snapshot
+    action_runner = gui_action_fn or gui_action
+    title_getter = window_title_fn or (lambda: _get_foreground_window_title(user32))
+
+    is_stale = (time.time() - _LAST_UI_SNAPSHOT_TIME) > 60.0
+    if not _UI_REF_STORE or _LAST_UI_SNAPSHOT is None or is_stale:
+        before_snapshot = snap_runner(user32=user32)
+        set_ui_snapshot_state(before_snapshot)
+    else:
+        before_snapshot = _LAST_UI_SNAPSHOT
+
+    initial_title = str(before_snapshot.get("window_title") or "")
+    if not initial_title:
+        with contextlib.suppress(Exception):
+            initial_title = title_getter()
+
+    step_results: list[dict[str, Any]] = []
+    status = "completed"
+
+    for idx, s in enumerate(steps):
+        s_dict = s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else dict(s)
+        op = str(s_dict.get("op") or "").strip().lower()
+        trigger_nav = False
+
+        try:
+            if op == "act":
+                ref = str(s_dict.get("ref") or "").strip()
+                action = str(s_dict.get("action") or "").strip().lower()
+                val = s_dict.get("value")
+                ui_act(
+                    ref,
+                    action,
+                    val,
+                    ui_snapshot_fn=snap_runner,
+                    gui_action_fn=action_runner,
+                    user32=user32,
+                    _capture_snapshot=False,
+                )
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "act",
+                        "ref": ref,
+                        "action": action,
+                        "status": "ok",
+                    }
+                )
+                if action in {"click", "double_click"}:
+                    trigger_nav = True
+
+            elif op == "press_keys":
+                keys = [str(k) for k in s_dict["keys"]]
+                action_runner(action="press_keys", keys=keys, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "press_keys",
+                        "status": "ok",
+                    }
+                )
+                norm_keys = [k.strip().lower() for k in keys]
+                if any(k in {"enter", "return", "tab", "escape", "esc"} for k in norm_keys):
+                    trigger_nav = True
+
+            elif op == "scroll":
+                delta = int(s_dict["delta"])
+                x = s_dict.get("x")
+                y = s_dict.get("y")
+                action_runner(action="scroll", delta=delta, x=x, y=y, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "scroll",
+                        "status": "ok",
+                    }
+                )
+
+            elif op == "wait":
+                sec = float(s_dict.get("seconds", 0.5))
+                action_runner(action="wait", seconds=sec, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "wait",
+                        "status": "ok",
+                    }
+                )
+
+            elif op == "click_at":
+                x = int(s_dict["x"])
+                y = int(s_dict["y"])
+                clicks = int(s_dict.get("clicks", 1))
+                btn = str(s_dict.get("button", "left"))
+                action_runner(action="click_at", x=x, y=y, clicks=clicks, button=btn, user32=user32)
+                step_results.append(
+                    {
+                        "step": idx,
+                        "op": "click_at",
+                        "status": "ok",
+                    }
+                )
+                trigger_nav = True
+
+        except Exception as exc:
+            step_results.append(
+                {
+                    "step": idx,
+                    "op": op,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+            if stop_on_error:
+                status = "partial_error"
+                break
+            continue
+
+        if stop_on_window_change and trigger_nav:
+            current_title = ""
+            with contextlib.suppress(Exception):
+                current_title = title_getter()
+            if current_title and current_title != initial_title:
+                status = "stopped_on_window_change"
+                break
+
+    if status == "completed" and any(r.get("status") == "error" for r in step_results):
+        status = "partial_error"
+
+    after_snapshot = snap_runner(user32=user32)
+    set_ui_snapshot_state(after_snapshot)
+    diff = compute_ui_diff(before_snapshot, after_snapshot)
+
+    return {
+        "ok": True,
+        "status": status,
+        "steps_executed": len(step_results),
+        "step_results": step_results,
+        "diff": diff,
+        "snapshot": after_snapshot,
     }

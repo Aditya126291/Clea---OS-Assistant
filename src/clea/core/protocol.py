@@ -280,6 +280,41 @@ class OsGuiActionParams(_Model):
     seconds: float = 1.0
 
 
+UiActAction = Literal["click", "set_value", "type", "clear", "double_click", "right_click"]
+UiBatchOp = Literal["act", "press_keys", "scroll", "wait", "click_at"]
+
+
+class OsUiSnapshotParams(_Model):
+    app_name: str | None = None
+    max_elements: int = 60
+
+
+class OsUiActParams(_Model):
+    ref: str
+    action: UiActAction
+    value: str | None = None
+
+
+class UiBatchStep(_Model):
+    op: UiBatchOp
+    ref: str | None = None
+    action: UiActAction | None = None
+    value: str | None = None
+    keys: list[str] | None = None
+    delta: int | None = None
+    seconds: float | None = None
+    x: int | None = None
+    y: int | None = None
+    clicks: int | None = None
+    button: GuiClickButton | None = None
+
+
+class OsUiBatchParams(_Model):
+    steps: list[UiBatchStep] = Field(default_factory=list)
+    stop_on_error: bool = True
+    stop_on_window_change: bool = True
+
+
 class WorkspaceGitInspectParams(_Model):
     repo_path: str | None = None
     include_diff: bool = False
@@ -612,6 +647,21 @@ class OsGuiActionRequest(_Request):
     params: OsGuiActionParams
 
 
+class OsUiSnapshotRequest(_Request):
+    method: Literal["os.ui_snapshot"] = "os.ui_snapshot"
+    params: OsUiSnapshotParams = Field(default_factory=OsUiSnapshotParams)
+
+
+class OsUiActRequest(_Request):
+    method: Literal["os.ui_act"] = "os.ui_act"
+    params: OsUiActParams
+
+
+class OsUiBatchRequest(_Request):
+    method: Literal["os.ui_batch"] = "os.ui_batch"
+    params: OsUiBatchParams
+
+
 class WorkspaceGitInspectRequest(_Request):
     method: Literal["workspace.git_inspect"] = "workspace.git_inspect"
     params: WorkspaceGitInspectParams = Field(default_factory=WorkspaceGitInspectParams)
@@ -675,6 +725,9 @@ RequestFrame = Annotated[
     | OsInspectUiElementsRequest
     | OsClickUiElementRequest
     | OsGuiActionRequest
+    | OsUiSnapshotRequest
+    | OsUiActRequest
+    | OsUiBatchRequest
     | WorkspaceGitInspectRequest,
     Field(discriminator="method"),
 ]
@@ -1281,6 +1334,58 @@ class OsGuiActionResult(_Model):
     seconds: float | None = None
 
 
+class UiSnapshotElement(_Model):
+    ref: str
+    role: str = ""
+    name: str = ""
+    value: str | None = None
+    x: int = 0
+    y: int = 0
+    automation_id: str = ""
+    control_type: str = ""
+
+
+class OsUiSnapshotResult(_Model):
+    ok: bool = True
+    window_title: str = ""
+    count: int = 0
+    elements: list[UiSnapshotElement] = Field(default_factory=list)
+
+
+class UiDiffChangedValue(_Model):
+    ref: str = ""
+    role: str = ""
+    name: str = ""
+    old_value: str | None = None
+    new_value: str | None = None
+
+
+class UiDiff(_Model):
+    window_changed: bool = False
+    window_title: str = ""
+    changed_values: list[UiDiffChangedValue] = Field(default_factory=list)
+    added_elements: list[UiSnapshotElement] = Field(default_factory=list)
+    removed_count: int = 0
+
+
+class OsUiActResult(_Model):
+    ok: bool = True
+    status: str = "completed"
+    action: str = ""
+    ref: str = ""
+    diff: UiDiff | None = None
+    snapshot: OsUiSnapshotResult | None = None
+
+
+class OsUiBatchResult(_Model):
+    ok: bool = True
+    status: Literal["completed", "stopped_on_window_change", "partial_error"] = "completed"
+    steps_executed: int = 0
+    step_results: list[dict[str, Any]] = Field(default_factory=list)
+    diff: UiDiff | None = None
+    snapshot: OsUiSnapshotResult | None = None
+
+
 class GitWorktreeItem(_Model):
     path: str
     head: str = ""
@@ -1366,6 +1471,9 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "os.inspect_ui_elements": OsInspectUiElementsResult,
     "os.click_ui_element": OsClickUiElementResult,
     "os.gui_action": OsGuiActionResult,
+    "os.ui_snapshot": OsUiSnapshotResult,
+    "os.ui_act": OsUiActResult,
+    "os.ui_batch": OsUiBatchResult,
     "workspace.git_inspect": WorkspaceGitInspectResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""
