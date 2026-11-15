@@ -2219,7 +2219,7 @@ def _normalize_ui_role(raw_control_type: str) -> str:
 
 
 def _normalize_ref_id(ref: str) -> str:
-    """Normalize an element reference (case-insensitive, optional single leading '@', matching e<digits>)."""
+    """Normalize an element reference (case-insensitive, optional leading '@', e<digits>)."""
     if not isinstance(ref, str):
         raise ValueError("ref must be a string (e.g. 'e1' or '@e1').")
     cleaned = ref.strip()
@@ -2228,7 +2228,8 @@ def _normalize_ref_id(ref: str) -> str:
     cleaned = cleaned.lower()
     if not cleaned or not re.fullmatch(r"e\d+", cleaned):
         raise ValueError(
-            f"ref must be a non-empty element reference matching 'e<digits>' (e.g. 'e1' or '@e1'), got {ref!r}."
+            f"ref must be a non-empty element reference matching 'e<digits>' "
+            f"(e.g. 'e1' or '@e1'), got {ref!r}."
         )
     return cleaned
 
@@ -2279,8 +2280,8 @@ class _UiRefStore:
             if entry is None:
                 avail = ", ".join(list(self.elements_by_ref.keys())[:25])
                 raise ValueError(
-                    f"Unknown or stale UI ref {ref!r}: UI element ref {ref!r} not found in current snapshot {self.snapshot_id}. "
-                    f"Available refs: {avail or 'none'}."
+                    f"Unknown or stale UI ref {ref!r}: UI element ref {ref!r} not found in "
+                    f"current snapshot {self.snapshot_id}. Available refs: {avail or 'none'}."
                 )
             bounds = dict(entry.get("bounds") or {})
             center = dict(entry.get("center") or {})
@@ -2395,7 +2396,10 @@ def set_ui_snapshot_state(snapshot: Any) -> None:
         role = str(el.get("role") or el.get("control_type") or "").strip().lower()
         name = str(el.get("name") or "").strip()
         val = str(el["value"]) if el.get("value") is not None else None
-        bounds = dict(el.get("bounds") or {"x": int(el.get("x", 0)), "y": int(el.get("y", 0)), "width": 0, "height": 0})
+        bounds = dict(
+            el.get("bounds")
+            or {"x": int(el.get("x", 0)), "y": int(el.get("y", 0)), "width": 0, "height": 0}
+        )
         center = dict(el.get("center") or {"cx": int(el.get("x", 0)), "cy": int(el.get("y", 0))})
         entry = {
             "ref": ref,
@@ -3477,8 +3481,8 @@ def ui_act(
                 "Call ui_snapshot() first."
             )
         raise ValueError(
-            f"Unknown or stale UI ref {ref!r}: UI element ref {ref!r} not found in current snapshot {curr_snap}. "
-            f"Available refs: {avail}."
+            f"Unknown or stale UI ref {ref!r}: UI element ref {ref!r} not found in "
+            f"current snapshot {curr_snap}. Available refs: {avail}."
         )
 
     snapshot_id, window_title, snapshot_hwnd, entry = _UI_REF_STORE.resolve(norm_ref)
@@ -3497,27 +3501,69 @@ def ui_act(
     method = ""
     if gui_action_fn is not None:
         if norm_action == "click":
-            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            action_runner(
+                action="click_at",
+                x=target_cx,
+                y=target_cy,
+                clicks=1,
+                button="left",
+                user32=user32,
+            )
             method = "click_at"
         elif norm_action == "double_click":
-            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=2, button="double", user32=user32)
+            action_runner(
+                action="click_at",
+                x=target_cx,
+                y=target_cy,
+                clicks=2,
+                button="double",
+                user32=user32,
+            )
             method = "double_click"
         elif norm_action == "right_click":
-            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="right", user32=user32)
+            action_runner(
+                action="click_at",
+                x=target_cx,
+                y=target_cy,
+                clicks=1,
+                button="right",
+                user32=user32,
+            )
             method = "right_click"
         elif norm_action == "clear":
-            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            action_runner(
+                action="click_at",
+                x=target_cx,
+                y=target_cy,
+                clicks=1,
+                button="left",
+                user32=user32,
+            )
             action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
             action_runner(action="press_keys", keys=["backspace"], user32=user32)
             method = "clear"
         elif norm_action == "type":
             assert value is not None
-            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            action_runner(
+                action="click_at",
+                x=target_cx,
+                y=target_cy,
+                clicks=1,
+                button="left",
+                user32=user32,
+            )
             action_runner(action="type_text", text=value, user32=user32)
             method = "type"
         elif norm_action == "set_value":
             val_str = str(value) if value is not None else ""
-            action_runner(action="click_at", x=target_cx, y=target_cy, clicks=1, button="left", user32=user32)
+            action_runner(
+                action="click_at",
+                x=target_cx,
+                y=target_cy,
+                clicks=1,
+                button="left",
+                user32=user32,
+            )
             action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
             action_runner(action="press_keys", keys=["backspace"], user32=user32)
             if val_str:
@@ -3556,8 +3602,10 @@ def ui_act(
                 f"-TargetHwnd {snapshot_hwnd} -WindowTitleBase64 '{title_b64}' "
                 f"-Action '{norm_action}' -AutomationIdBase64 '{aid_b64}' "
                 f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
-                f"-ExpectedX {int(bounds.get('x', target_cx))} -ExpectedY {int(bounds.get('y', target_cy))} "
-                f"-ExpectedW {int(bounds.get('width', 0))} -ExpectedH {int(bounds.get('height', 0))} "
+                f"-ExpectedX {int(bounds.get('x', target_cx))} "
+                f"-ExpectedY {int(bounds.get('y', target_cy))} "
+                f"-ExpectedW {int(bounds.get('width', 0))} "
+                f"-ExpectedH {int(bounds.get('height', 0))} "
                 f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
             )
             data = _run_powershell_uia_json(
@@ -3636,7 +3684,11 @@ def ui_act(
     if ui_snapshot_fn is not None:
         after_snap = ui_snapshot_fn(user32=user32)
         set_ui_snapshot_state(after_snap)
-    elif powershell_runner is None and shutil.which("powershell.exe") is not None and not is_fake_user32:
+    elif (
+        powershell_runner is None
+        and shutil.which("powershell.exe") is not None
+        and not is_fake_user32
+    ):
         with contextlib.suppress(Exception):
             after_snap = snap_runner(user32=user32)
             set_ui_snapshot_state(after_snap)
