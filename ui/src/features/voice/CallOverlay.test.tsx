@@ -251,22 +251,25 @@ describe("CallOverlay", () => {
 
   it("sanitizes <script> tags, on* attributes, and javascript: URIs while keeping SVG filters and animations", () => {
     const untrustedSvg = [
-      '<svg/onload="alert(1)" viewBox="0 0 100 100" width="100" height="100">',
-      "<style>@keyframes glitch { 0% { opacity: 1; } }</style>",
+      '<svg/onload="alert(1)" aria-label="a > b" viewBox="0 0 100 100" width="100" height="100">',
+      '<style>@import "https://evil.example/x.css"; @keyframes glitch { 0% { opacity: 1; } } .bad { background: url(java/**/script:alert(7)); } .bad2 { background: url("\\6a avascript:alert(8)"); }</style>',
       '<filter id="fR"><feColorMatrix type="matrix"/></filter>',
       "<script>window.pwned = true;</script >",
+      '<script data-x=">">window.attrGt = true;</script>',
       "<scr<script></script>ipt>window.nested = true;</script>",
       '<circle id="c"onclick="evil()" onmouseover=\'evil2()\' cx="50" cy="50" r="40" />',
       '<use href="javascript:alert(2)" xlink:href="#art" />',
       '<use href="&#106;avascript:alert(3)" xlink:href="java&#x09;script:alert(4)" />',
-      '<set attributeName="onload" to="alert(5)" />',
-      '<animate attributeName="xlink:href" to="javascript:alert(6)" />',
+      '<set attributeName="onload" to="alert(5)">smil-body</set>',
+      '<animate data-x=">" attributeName="href" to="javascript:alert(6)" />',
+      '<animate attributeName="opacity" values="0;1;0" dur="3s" repeatCount="indefinite" />',
       "</svg>",
     ].join("");
 
     const cleaned = sanitizeSvg(untrustedSvg);
     expect(cleaned).not.toContain("<script");
     expect(cleaned).not.toContain("window.pwned");
+    expect(cleaned).not.toContain("window.attrGt");
     expect(cleaned).not.toContain("window.nested");
     expect(cleaned).not.toContain("onload=");
     expect(cleaned).not.toContain("onclick=");
@@ -274,14 +277,20 @@ describe("CallOverlay", () => {
     expect(cleaned).not.toContain("javascript:");
     expect(cleaned).not.toContain("&#106;avascript:");
     expect(cleaned).not.toContain("alert(");
+    expect(cleaned).not.toContain("@import");
+    expect(cleaned).not.toContain("smil-body");
+    expect(cleaned).not.toContain("</set>");
     expect(cleaned).toContain("@keyframes glitch");
+    expect(cleaned).toContain('<animate attributeName="opacity"');
     expect(cleaned).toContain('<filter id="fR">');
     expect(cleaned).toContain('width="100%" height="100%"');
+    expect(cleaned).toContain('aria-label="a > b"');
 
     const { container } = render(<CleaAvatar svgMarkup={untrustedSvg} />);
     expect(container.querySelector("script")).toBeNull();
     expect(container.querySelector("set")).toBeNull();
-    expect(container.querySelector("animate")).toBeNull();
+    expect(container.querySelectorAll("animate")).toHaveLength(1);
+    expect(container.querySelector("animate")?.getAttribute("attributeName")).toBe("opacity");
     expect(container.querySelector("svg")?.getAttribute("onload")).toBeNull();
     expect(container.querySelector("circle")?.getAttribute("onclick")).toBeNull();
     expect(container.querySelector("filter#fR")).not.toBeNull();
