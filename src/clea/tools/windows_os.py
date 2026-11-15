@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import difflib
+import json
 import logging
 import os
 import re
@@ -17,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +28,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Window show/focus constants
+SW_MAXIMIZE: int = 3
+SW_MINIMIZE: int = 6
 SW_RESTORE: int = 9
+WM_CLOSE: int = 0x0010
 
 # Virtual key codes for media & step volume controls
 VK_VOLUME_MUTE: int = 0xAD
@@ -45,6 +51,94 @@ DEFAULT_CLIPBOARD_MAX_CHARS: int = 8000
 MAX_CLIPBOARD_CHARS: int = 100_000
 
 PROCESS_QUERY_LIMITED_INFORMATION: int = 0x1000
+
+# Allowlisted ms-settings URIs
+_ALLOWED_MS_SETTINGS: frozenset[str] = frozenset(
+    {
+        "ms-settings:",
+        "ms-settings:display",
+        "ms-settings:sound",
+        "ms-settings:notifications",
+        "ms-settings:quiethours",
+        "ms-settings:powersleep",
+        "ms-settings:batterysaver",
+        "ms-settings:storagesense",
+        "ms-settings:multitasking",
+        "ms-settings:project",
+        "ms-settings:about",
+        "ms-settings:bluetooth",
+        "ms-settings:connecteddevices",
+        "ms-settings:printers",
+        "ms-settings:mousetouchpad",
+        "ms-settings:network",
+        "ms-settings:network-wifi",
+        "ms-settings:network-ethernet",
+        "ms-settings:personalization",
+        "ms-settings:personalization-background",
+        "ms-settings:personalization-colors",
+        "ms-settings:themes",
+        "ms-settings:lockscreen",
+        "ms-settings:appsfeatures",
+        "ms-settings:defaultapps",
+        "ms-settings:optionalfeatures",
+        "ms-settings:dateandtime",
+        "ms-settings:regionlanguage",
+        "ms-settings:gaming-gamebar",
+        "ms-settings:easeofaccess",
+        "ms-settings:privacy",
+        "ms-settings:windowsupdate",
+    }
+)
+
+_ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+_DANGEROUS_SCHEME_PREFIXES: tuple[str, ...] = (
+    "file:",
+    "javascript:",
+    "data:",
+    "vbscript:",
+    "cmd:",
+    "powershell:",
+    "ms-settings:",
+    "shell:",
+    "ws:",
+    "wss:",
+    "about:",
+    "chrome:",
+    "edge:",
+)
+
+_SITE_SHORTCUTS: dict[str, str] = {
+    "google": "https://www.google.com",
+    "github": "https://github.com",
+    "youtube": "https://www.youtube.com",
+    "reddit": "https://www.reddit.com",
+    "twitter": "https://x.com",
+    "x": "https://x.com",
+    "gmail": "https://mail.google.com",
+    "chatgpt": "https://chatgpt.com",
+    "wikipedia": "https://www.wikipedia.org",
+}
+
+VALID_SYSTEM_ACTIONS: tuple[str, ...] = (
+    "get_brightness",
+    "set_brightness",
+    "step_brightness",
+    "brightness_up",
+    "brightness_down",
+    "minimize_window",
+    "maximize_window",
+    "restore_window",
+    "close_window",
+    "minimize",
+    "maximize",
+    "restore",
+    "close",
+    "lock_screen",
+    "lock",
+    "open_settings",
+    "settings",
+)
 
 VALID_MEDIA_VOLUME_ACTIONS: tuple[str, ...] = (
     "mute",
@@ -308,6 +402,23 @@ def _get_win32_user32(user32: Any = None) -> Any:
 
     u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
     u32.SetClipboardData.restype = ctypes.c_void_p
+
+    if hasattr(u32, "GetForegroundWindow"):
+        u32.GetForegroundWindow.argtypes = []
+        u32.GetForegroundWindow.restype = wintypes.HWND
+
+    if hasattr(u32, "PostMessageW"):
+        u32.PostMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        u32.PostMessageW.restype = wintypes.BOOL
+
+    if hasattr(u32, "LockWorkStation"):
+        u32.LockWorkStation.argtypes = []
+        u32.LockWorkStation.restype = wintypes.BOOL
 
     return u32
 
@@ -579,6 +690,113 @@ def _validate_target_path(
     return resolved
 
 
+_INSTALLED_APPS_CACHE: list[dict[str, str]] | None = None
+_INSTALLED_APPS_CACHE_TIME: float = 0.0
+_APP_CACHE_TTL: float = 300.0  # 5 minutes
+
+
+def get_installed_apps(
+    *,
+    force_refresh: bool = False,
+    app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
+) -> list[dict[str, str]]:
+    """Retrieve catalog of installed Start Menu / UWP apps via Get-StartApps with caching."""
+    global _INSTALLED_APPS_CACHE, _INSTALLED_APPS_CACHE_TIME
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _INSTALLED_APPS_CACHE is not None
+        and (now - _INSTALLED_APPS_CACHE_TIME) < _APP_CACHE_TTL
+    ):
+        return _INSTALLED_APPS_CACHE
+
+    if app_catalog_fetcher is not None:
+        raw_apps = app_catalog_fetcher()
+    else:
+        ps_exe = shutil.which("powershell.exe")
+        if not ps_exe:
+            return []
+        try:
+            proc = subprocess.run(
+                [
+                    ps_exe,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress",
+                ],
+                shell=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10.0,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                return []
+            parsed = json.loads(proc.stdout.strip())
+            raw_apps = parsed if isinstance(parsed, list) else [parsed]
+        except Exception as exc:
+            logger.debug("Failed to retrieve StartApps: %s", exc)
+            return []
+
+    cleaned: list[dict[str, str]] = []
+    for item in raw_apps:
+        if isinstance(item, dict) and "Name" in item and "AppID" in item:
+            name = str(item["Name"]).strip()
+            appid = str(item["AppID"]).strip()
+            if name and appid:
+                low_name = name.lower()
+                low_appid = appid.lower()
+                if any(dis in low_name or dis in low_appid for dis in _DISALLOWED_SHELL_BINARIES):
+                    continue
+                cleaned.append({"Name": name, "AppID": appid})
+
+    _INSTALLED_APPS_CACHE = cleaned
+    _INSTALLED_APPS_CACHE_TIME = now
+    return cleaned
+
+
+def find_matching_start_app(
+    query: str,
+    catalog: list[dict[str, str]],
+) -> dict[str, str] | None:
+    """Fuzzy match an application name against the StartApps catalog."""
+    q = query.strip().lower()
+    if not q:
+        return None
+
+    for entry in catalog:
+        if entry["Name"].strip().lower() == q:
+            return entry
+
+    for entry in catalog:
+        if entry["AppID"].strip().lower() == q:
+            return entry
+
+    for entry in catalog:
+        name_lower = entry["Name"].strip().lower()
+        words = re.split(r"[\s._-]+", name_lower)
+        if q in words or name_lower.startswith(q):
+            return entry
+
+    for entry in catalog:
+        if q in entry["Name"].strip().lower():
+            return entry
+
+    best_match: dict[str, str] | None = None
+    best_ratio = 0.0
+    for entry in catalog:
+        name_lower = entry["Name"].strip().lower()
+        ratio = difflib.SequenceMatcher(None, q, name_lower).ratio()
+        if ratio > best_ratio and ratio >= 0.6:
+            best_ratio = ratio
+            best_match = entry
+
+    return best_match
+
+
 def open_or_focus_app(
     app_name: str,
     target_path: str | None = None,
@@ -589,23 +807,29 @@ def open_or_focus_app(
     which_fn: Callable[[str], str | None] = shutil.which,
     popen_fn: Callable[..., Any] = subprocess.Popen,
     env: dict[str, str] | None = None,
+    app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
 ) -> dict[str, Any]:
     """Focus a running application window or launch an allowed desktop application.
 
     If a matching visible window is already open and no ``target_path`` is supplied,
     restores the window if minimized and brings it to the foreground. Otherwise
-    launches the validated executable with ``shell=False``.
+    launches the validated executable or Start Menu / UWP app with ``shell=False``.
     """
     resolved_target = _validate_target_path(target_path, env=env)
-    spec, _ = _resolve_spec_and_command(
-        app_name,
-        which_fn=which_fn,
-        env=env,
-        require_executable=False,
-    )
+    spec: _AppSpec | None = None
+    resolve_err: Exception | None = None
+    try:
+        spec, _ = _resolve_spec_and_command(
+            app_name,
+            which_fn=which_fn,
+            env=env,
+            require_executable=False,
+        )
+    except ValueError as exc:
+        resolve_err = exc
 
     u32 = _get_win32_user32(user32)
-    if resolved_target is None:
+    if resolved_target is None and spec is not None:
         if window_enumerator is not None:
             windows = list(window_enumerator())
         else:
@@ -627,31 +851,105 @@ def open_or_focus_app(
                     "target_path": None,
                 }
 
-    launched_spec, cmd = _resolve_spec_and_command(
-        app_name,
-        which_fn=which_fn,
-        env=env,
-        require_executable=True,
-    )
-    assert cmd is not None
-    if resolved_target is not None:
-        cmd = [*cmd, str(resolved_target)]
+    if spec is not None:
+        try:
+            launched_spec, cmd = _resolve_spec_and_command(
+                app_name,
+                which_fn=which_fn,
+                env=env,
+                require_executable=True,
+            )
+            assert cmd is not None
+            if resolved_target is not None:
+                cmd = [*cmd, str(resolved_target)]
 
-    popen_fn(
-        cmd,
-        shell=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return {
-        "ok": True,
-        "status": "launched",
-        "app": launched_spec.canonical_name,
-        "window_title": None,
-        "hwnd": None,
-        "executable": cmd[0],
-        "target_path": str(resolved_target) if resolved_target is not None else None,
-    }
+            popen_fn(
+                cmd,
+                shell=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return {
+                "ok": True,
+                "status": "launched",
+                "app": launched_spec.canonical_name,
+                "window_title": None,
+                "hwnd": None,
+                "executable": cmd[0],
+                "target_path": str(resolved_target) if resolved_target is not None else None,
+            }
+        except ValueError as exc:
+            resolve_err = exc
+
+    # Check input safety before dynamic StartApps lookup
+    if not isinstance(app_name, str):
+        raise ValueError("app_name must be a non-empty string.")
+    stripped = app_name.strip()
+    if not stripped:
+        raise ValueError("app_name must not be empty.")
+    if ".." in stripped or _SHELL_METACHAR_RE.search(stripped):
+        raise ValueError(f"Invalid characters in application name: {app_name!r}")
+    normalized = " ".join(stripped.lower().split())
+    if (
+        normalized in _DISALLOWED_SHELL_BINARIES
+        or f"{normalized}.exe" in _DISALLOWED_SHELL_BINARIES
+    ):
+        raise ValueError(f"Application '{app_name}' is disallowed for security reasons.")
+
+    catalog = get_installed_apps(app_catalog_fetcher=app_catalog_fetcher)
+    matched_app = find_matching_start_app(stripped, catalog)
+    if matched_app is not None:
+        matched_name = matched_app["Name"]
+        matched_appid = matched_app["AppID"]
+
+        if resolved_target is None:
+            if window_enumerator is not None:
+                windows = list(window_enumerator())
+            else:
+                k32 = _get_win32_kernel32(kernel32)
+                windows = _enumerate_windows_ctypes(u32, k32)
+
+            for win in windows:
+                if not win.is_visible:
+                    continue
+                w_title = (win.title or "").lower()
+                w_proc = (win.process_name or "").lower()
+                if matched_name.lower() in w_title or matched_name.lower() in w_proc:
+                    if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
+                        u32.ShowWindow(win.hwnd, SW_RESTORE)
+                    u32.SetForegroundWindow(win.hwnd)
+                    return {
+                        "ok": True,
+                        "status": "focused",
+                        "app": matched_name,
+                        "window_title": win.title,
+                        "hwnd": int(win.hwnd),
+                        "executable": None,
+                        "target_path": None,
+                    }
+
+        launch_cmd = ["explorer.exe", f"shell:AppsFolder\\{matched_appid}"]
+        if resolved_target is not None:
+            launch_cmd.append(str(resolved_target))
+        popen_fn(
+            launch_cmd,
+            shell=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {
+            "ok": True,
+            "status": "launched",
+            "app": matched_name,
+            "window_title": None,
+            "hwnd": None,
+            "executable": launch_cmd[0],
+            "target_path": str(resolved_target) if resolved_target is not None else None,
+        }
+
+    if resolve_err is not None:
+        raise resolve_err
+    raise ValueError(f"Application '{app_name}' could not be resolved to an allowed executable.")
 
 
 # --------------------------------------------------------------------------- System Volume & Media
@@ -828,21 +1126,200 @@ def _open_clipboard(user32: Any, *, retries: int = 5, retry_delay: float = 0.02)
             user32.CloseClipboard()
 
 
-def read_clipboard(
-    max_chars: int = DEFAULT_CLIPBOARD_MAX_CHARS,
+_POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT = r"""
+param(
+    [int]$MaxItems = 10,
+    [int]$MaxChars = 8000,
+    [switch]$IncludeImageBytes
+)
+
+$ErrorActionPreference = 'Stop'
+
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+Add-Type -AssemblyName System.Drawing
+
+function Await-AsyncOp($asyncOp) {
+    $asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethodDefinition
+    } | Select-Object -First 1
+    if (-not $asTaskGeneric) {
+        throw "Could not find AsTask generic method"
+    }
+    $targetType = $asyncOp.GetType().GetGenericArguments()[0]
+    $asTask = $asTaskGeneric.MakeGenericMethod($targetType)
+    $task = $asTask.Invoke($null, @($asyncOp))
+    $task.Wait(5000)
+    return $task.Result
+}
+
+$historyEnabled = $false
+try {
+    $clip = [Windows.ApplicationModel.DataTransfer.Clipboard,
+        Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]
+    $historyEnabled = $clip::IsHistoryEnabled()
+} catch {
+    $historyEnabled = $false
+}
+
+$historyOp = [Windows.ApplicationModel.DataTransfer.Clipboard,
+    Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]::GetHistoryItemsAsync()
+$historyResult = Await-AsyncOp $historyOp
+
+$rawItems = $historyResult.Items
+$totalItems = 0
+if ($rawItems) {
+    $totalItems = $rawItems.Count
+}
+
+$limit = [Math]::Min($totalItems, $MaxItems)
+$outItems = @()
+
+for ($i = 0; $i -lt $limit; $i++) {
+    $item = $rawItems[$i]
+    $id = ""
+    try { $id = [string]$item.Id } catch {}
+    $ts = ""
+    try { $ts = $item.Timestamp.ToString("o") } catch {}
+    $content = $item.Content
+
+    $itemDict = [ordered]@{
+        index = $i
+        id = $id
+        timestamp = $ts
+        kind = "unknown"
+        text = $null
+        truncated = $false
+        image = $null
+    }
+
+    $handled = $false
+    try {
+        $txtFmt = [Windows.ApplicationModel.DataTransfer.StandardDataFormats]::Text
+        if ($content.Contains($txtFmt)) {
+            $textOp = $content.GetTextAsync()
+            $text = Await-AsyncOp $textOp
+            $truncated = $false
+            if ($text -and $text.Length -gt $MaxChars) {
+                $text = $text.Substring(0, $MaxChars)
+                $truncated = $true
+            }
+            $itemDict.kind = "text"
+            $itemDict.text = $text
+            $itemDict.truncated = $truncated
+            $handled = $true
+        }
+    } catch {
+        # format check or fetch failed
+    }
+
+    if (-not $handled) {
+        try {
+            $bmpFmt = [Windows.ApplicationModel.DataTransfer.StandardDataFormats]::Bitmap
+            if ($content.Contains($bmpFmt)) {
+                $bitmapOp = $content.GetBitmapAsync()
+                $streamRef = Await-AsyncOp $bitmapOp
+                if ($streamRef) {
+                    $streamOp = $streamRef.OpenReadAsync()
+                    $raStream = Await-AsyncOp $streamOp
+                    $streamExt = [System.IO.WindowsRuntimeStreamExtensions]
+                    $netStream = $streamExt::AsStreamForRead($raStream)
+                    $img = [System.Drawing.Image]::FromStream($netStream)
+                    $w = $img.Width
+                    $h = $img.Height
+                    $imgData = [ordered]@{
+                        width = $w
+                        height = $h
+                        format = "png"
+                        bytes = $null
+                    }
+                    if ($IncludeImageBytes) {
+                        $ms = New-Object System.IO.MemoryStream
+                        $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+                        $imgData.bytes = [Convert]::ToBase64String($ms.ToArray())
+                        $ms.Dispose()
+                    }
+                    $img.Dispose()
+                    $netStream.Dispose()
+                    $raStream.Dispose()
+
+                    $itemDict.kind = "image"
+                    $itemDict.image = $imgData
+                    $handled = $true
+                }
+            }
+        } catch {
+            # bitmap check or fetch failed
+        }
+    }
+
+    $outItems += $itemDict
+}
+
+$output = [ordered]@{
+    history_enabled = [bool]$historyEnabled
+    total_items = $totalItems
+    items = $outItems
+}
+
+$output | ConvertTo-Json -Depth 5 -Compress
+"""
+
+_POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT = r"""
+param(
+    [int]$ItemIndex
+)
+
+$ErrorActionPreference = 'Stop'
+
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+function Await-AsyncOp($asyncOp) {
+    $asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethodDefinition
+    } | Select-Object -First 1
+    if (-not $asTaskGeneric) {
+        throw "Could not find AsTask generic method"
+    }
+    $targetType = $asyncOp.GetType().GetGenericArguments()[0]
+    $asTask = $asTaskGeneric.MakeGenericMethod($targetType)
+    $task = $asTask.Invoke($null, @($asyncOp))
+    $task.Wait(5000)
+    return $task.Result
+}
+
+$historyOp = [Windows.ApplicationModel.DataTransfer.Clipboard,
+    Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]::GetHistoryItemsAsync()
+$historyResult = Await-AsyncOp $historyOp
+
+if (-not $historyResult.Items -or $ItemIndex -lt 0 -or $ItemIndex -ge $historyResult.Items.Count) {
+    $cnt = 0
+    if ($historyResult.Items) { $cnt = $historyResult.Items.Count }
+    throw "Index $ItemIndex is out of range (history items count: $cnt)"
+}
+
+$targetItem = $historyResult.Items[$ItemIndex]
+$status = [Windows.ApplicationModel.DataTransfer.Clipboard,
+    Windows.ApplicationModel.DataTransfer,
+    ContentType = WindowsRuntime]::SetHistoryItemAsContent($targetItem)
+
+$successEnum = [Windows.ApplicationModel.DataTransfer.SetHistoryItemAsContentStatus]::Success
+$out = [ordered]@{
+    success = ($status -eq $successEnum)
+    status = $status.ToString()
+    index = $ItemIndex
+    id = [string]$targetItem.Id
+}
+
+$out | ConvertTo-Json -Compress
+"""
+
+
+def _read_clipboard_win32(
+    cap: int,
     *,
     user32: Any = None,
     kernel32: Any = None,
 ) -> dict[str, Any]:
-    """Read UTF-16LE Unicode text from the Windows clipboard with a character cap."""
-    if isinstance(max_chars, bool):
-        raise ValueError("max_chars must be an integer.")
-    try:
-        cap = int(max_chars)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("max_chars must be an integer.") from exc
-    cap = max(1, min(cap, MAX_CLIPBOARD_CHARS))
-
     u32 = _get_win32_user32(user32)
     k32 = _get_win32_kernel32(kernel32)
 
@@ -893,6 +1370,158 @@ def read_clipboard(
     }
 
 
+def read_clipboard(
+    max_chars: int = DEFAULT_CLIPBOARD_MAX_CHARS,
+    *,
+    include_history: bool = False,
+    max_items: int = 10,
+    include_image_bytes: bool = False,
+    user32: Any = None,
+    kernel32: Any = None,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> dict[str, Any]:
+    """Read UTF-16LE Unicode text or history items from the Windows clipboard.
+
+    When ``include_history=False`` (default), reads active clipboard text via classic
+    Win32 APIs. When ``include_history=True``, queries WinRT Clipboard History via
+    PowerShell 5.1, wrapping format checks in try/catch and falling back to Win32 on error.
+    """
+    if isinstance(max_chars, bool):
+        raise ValueError("max_chars must be an integer.")
+    try:
+        cap = int(max_chars)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_chars must be an integer.") from exc
+    cap = max(1, min(cap, MAX_CLIPBOARD_CHARS))
+
+    if not include_history:
+        return _read_clipboard_win32(cap, user32=user32, kernel32=kernel32)
+
+    history_enabled = False
+    total_items = 0
+    items: list[dict[str, Any]] = []
+    winrt_success = False
+
+    ps_exe = shutil.which("powershell.exe")
+    if ps_exe:
+        runner = powershell_runner or subprocess.run
+        try:
+            inc_bytes_flag = " -IncludeImageBytes" if include_image_bytes else ""
+            cmd = [
+                ps_exe,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    f"& {{ {_POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT} }} "
+                    f"-MaxItems {int(max_items)} -MaxChars {int(cap)}{inc_bytes_flag}"
+                ),
+            ]
+            proc = runner(
+                cmd,
+                shell=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10.0,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                data = json.loads(proc.stdout.strip())
+                history_enabled = bool(data.get("history_enabled", False))
+                total_items = int(data.get("total_items", 0))
+                raw_items = data.get("items", [])
+                if isinstance(raw_items, list):
+                    items = raw_items
+                winrt_success = True
+        except Exception as exc:
+            logger.debug("WinRT clipboard history failed (%s); falling back to Win32.", exc)
+
+    if winrt_success and items:
+        top_item = items[0]
+        if top_item.get("kind") == "text" and top_item.get("text") is not None:
+            text = top_item["text"]
+            truncated = bool(top_item.get("truncated", False))
+            total_chars = len(text)
+            top_image = None
+        else:
+            text = ""
+            truncated = False
+            total_chars = 0
+            top_image = top_item.get("image")
+    else:
+        win32_res = _read_clipboard_win32(cap, user32=user32, kernel32=kernel32)
+        text = win32_res["text"]
+        truncated = win32_res["truncated"]
+        total_chars = win32_res["total_chars"]
+        top_image = None
+
+    res: dict[str, Any] = {
+        "ok": True,
+        "text": text,
+        "truncated": truncated,
+        "char_count": len(text),
+        "total_chars": total_chars,
+        "history_enabled": history_enabled,
+        "total_items": total_items,
+        "items": items,
+    }
+    if top_image is not None:
+        res["image"] = top_image
+    return res
+
+
+def select_clipboard_item(
+    index: int,
+    *,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> dict[str, Any]:
+    """Restore a clipboard history item by index via WinRT SetHistoryItemAsContent."""
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise ValueError("index must be an integer.")
+    if index < 0:
+        raise ValueError("index must be non-negative.")
+
+    ps_exe = shutil.which("powershell.exe")
+    if not ps_exe:
+        raise RuntimeError("powershell.exe is required for clipboard history operations.")
+
+    runner = powershell_runner or subprocess.run
+    proc = runner(
+        [
+            ps_exe,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"& {{ {_POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT} }} -ItemIndex {index}",
+        ],
+        shell=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10.0,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"Failed to select clipboard item {index}: {err}")
+
+    try:
+        data = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Unexpected output selecting clipboard item: {proc.stdout}") from exc
+
+    return {
+        "ok": bool(data.get("success", False)),
+        "success": bool(data.get("success", False)),
+        "index": index,
+        "item_id": data.get("id"),
+        "status": data.get("status", "Unknown"),
+    }
+
+
 def write_clipboard(
     text: str,
     *,
@@ -937,3 +1566,417 @@ def write_clipboard(
         "ok": True,
         "char_count": len(text),
     }
+
+
+# --------------------------------------------------------------------------- URL & System Controls
+
+
+def open_url(
+    url: str,
+    browser: str | None = None,
+    *,
+    startfile_fn: Callable[[str], Any] | None = None,
+    popen_fn: Callable[..., Any] = subprocess.Popen,
+    which_fn: Callable[[str], str | None] = shutil.which,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate and open an http/https URL in the default or specified browser."""
+    if not isinstance(url, str):
+        raise ValueError("url must be a string.")
+    stripped = url.strip()
+    if not stripped:
+        raise ValueError("url must not be empty.")
+
+    if any(ord(ch) < 32 for ch in stripped):
+        raise ValueError("URL contains invalid control characters.")
+
+    lower_stripped = stripped.lower()
+    if any(lower_stripped.startswith(prefix) for prefix in _DANGEROUS_SCHEME_PREFIXES):
+        raise ValueError(f"Disallowed URL scheme in {url!r}. Only http and https URLs are allowed.")
+
+    if lower_stripped in _SITE_SHORTCUTS:
+        target_url = _SITE_SHORTCUTS[lower_stripped]
+    elif "://" not in stripped and not stripped.startswith(("//", "\\\\")):
+        target_url = f"https://{stripped}"
+    else:
+        target_url = stripped
+
+    parsed = urllib.parse.urlsplit(target_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in _ALLOWED_URL_SCHEMES:
+        raise ValueError(
+            f"Invalid URL scheme '{parsed.scheme}'. Only http and https URLs are allowed."
+        )
+
+    if not parsed.netloc:
+        raise ValueError(f"Invalid URL: host/domain is required in {url!r}")
+
+    if browser is None:
+        starter = startfile_fn or getattr(os, "startfile", None)
+        if starter is not None:
+            starter(target_url)
+        else:
+            popen_fn(
+                ["explorer.exe", target_url],
+                shell=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return {
+            "ok": True,
+            "success": True,
+            "url": target_url,
+            "browser": "default",
+            "status": "opened",
+        }
+
+    b_clean = browser.strip().lower()
+    if b_clean in _DISALLOWED_SHELL_BINARIES or _SHELL_METACHAR_RE.search(b_clean):
+        raise ValueError(f"Disallowed browser name: {browser!r}")
+
+    browser_exe: str | None = None
+    env_map = dict(os.environ) if env is None else env
+    if b_clean in _KNOWN_APPS:
+        spec = _KNOWN_APPS[b_clean]
+        for cand in spec.candidate_exes:
+            found = which_fn(cand)
+            if found:
+                browser_exe = found
+                break
+        if not browser_exe:
+            for p in spec.install_paths:
+                exp = _expand_env_vars(p, env_map)
+                if Path(exp).is_file():
+                    browser_exe = exp
+                    break
+    else:
+        browser_exe = which_fn(b_clean) or which_fn(f"{b_clean}.exe")
+
+    if not browser_exe:
+        raise ValueError(f"Browser '{browser}' could not be resolved to an executable.")
+
+    popen_fn(
+        [browser_exe, target_url],
+        shell=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return {
+        "ok": True,
+        "success": True,
+        "url": target_url,
+        "browser": b_clean,
+        "status": "opened",
+    }
+
+
+def _get_wmi_brightness(
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> int:
+    """Read current display brightness percentage (0..100) via WmiMonitorBrightness."""
+    runner = powershell_runner or subprocess.run
+    ps_exe = shutil.which("powershell.exe") or "powershell.exe"
+    proc = runner(
+        [
+            ps_exe,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                "(Get-CimInstance -Namespace root\\wmi "
+                "-ClassName WmiMonitorBrightness).CurrentBrightness"
+            ),
+        ],
+        shell=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=8.0,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"Failed to query display brightness: {err}")
+    val = proc.stdout.strip()
+    if not val:
+        raise RuntimeError("No brightness value returned (display may not support WMI brightness).")
+    return int(val.split()[0])
+
+
+def _set_wmi_brightness(
+    level: int,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    """Set display brightness percentage (0..100) via WmiMonitorBrightnessMethods."""
+    clamped = max(0, min(100, int(level)))
+    runner = powershell_runner or subprocess.run
+    ps_exe = shutil.which("powershell.exe") or "powershell.exe"
+    script = (
+        "$b = Get-CimInstance -Namespace root\\wmi -ClassName WmiMonitorBrightnessMethods; "
+        "if ($b) { "
+        f"Invoke-CimMethod -InputObject $b -MethodName WmiSetBrightness "
+        f"-Arguments @{{Timeout = 1; Brightness = [uint32]{clamped}}} "
+        "} else { throw 'WmiMonitorBrightnessMethods not available' }"
+    )
+    proc = runner(
+        [
+            ps_exe,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        shell=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=8.0,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"Failed to set display brightness: {err}")
+
+
+def _resolve_window_hwnd(
+    hwnd: int | None = None,
+    app_name: str | None = None,
+    title: str | None = None,
+    *,
+    user32: Any = None,
+    kernel32: Any = None,
+    window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+) -> int:
+    """Resolve a window HWND from explicit handle, title/app query, or foreground window."""
+    if hwnd is not None:
+        if isinstance(hwnd, bool) or not isinstance(hwnd, int):
+            raise ValueError("hwnd must be an integer.")
+        return int(hwnd)
+
+    u32 = _get_win32_user32(user32)
+
+    if app_name or title:
+        if window_enumerator is not None:
+            windows = list(window_enumerator())
+        else:
+            k32 = _get_win32_kernel32(kernel32)
+            windows = _enumerate_windows_ctypes(u32, k32)
+
+        target_title = (title or "").lower().strip()
+        target_app = (app_name or "").lower().strip()
+
+        for win in windows:
+            if not win.is_visible:
+                continue
+            w_title = (win.title or "").lower()
+            w_proc = (win.process_name or "").lower()
+            if target_title and target_title in w_title:
+                return int(win.hwnd)
+            if target_app and (target_app in w_proc or target_app in w_title):
+                return int(win.hwnd)
+
+        raise ValueError(
+            f"No visible window found matching app_name={app_name!r}, title={title!r}."
+        )
+
+    if hasattr(u32, "GetForegroundWindow"):
+        fg = u32.GetForegroundWindow()
+        if fg:
+            return int(fg)
+
+    raise RuntimeError("No active foreground window found.")
+
+
+def control_system(
+    action: str,
+    *,
+    level: int | None = None,
+    step: int | None = None,
+    page: str | None = None,
+    uri: str | None = None,
+    hwnd: int | None = None,
+    app_name: str | None = None,
+    title: str | None = None,
+    user32: Any = None,
+    kernel32: Any = None,
+    window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    wmi_brightness_getter: Callable[[], int] | None = None,
+    wmi_brightness_setter: Callable[[int], None] | None = None,
+    startfile_fn: Callable[[str], Any] | None = None,
+    popen_fn: Callable[..., Any] = subprocess.Popen,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> dict[str, Any]:
+    """Control Windows display brightness, window state, screen lock, or settings navigation."""
+    if not isinstance(action, str):
+        raise ValueError("action must be a string.")
+    normalized = action.strip().lower()
+    if normalized not in VALID_SYSTEM_ACTIONS:
+        actions_str = ", ".join(VALID_SYSTEM_ACTIONS)
+        raise ValueError(
+            f"Unsupported system action {action!r}. Valid actions: {actions_str}."
+        )
+
+    # 1. Brightness controls
+    if normalized == "get_brightness":
+        getter = wmi_brightness_getter or (
+            lambda: _get_wmi_brightness(powershell_runner=powershell_runner)
+        )
+        curr = getter()
+        return {
+            "ok": True,
+            "success": True,
+            "action": "get_brightness",
+            "level": curr,
+        }
+
+    if normalized == "set_brightness":
+        if level is None:
+            raise ValueError("level (0..100) is required when action is 'set_brightness'.")
+        if isinstance(level, bool):
+            raise ValueError("level must be an integer between 0 and 100.")
+        try:
+            parsed_level = int(level)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("level must be an integer between 0 and 100.") from exc
+        clamped = max(0, min(100, parsed_level))
+        setter = wmi_brightness_setter or (
+            lambda lvl: _set_wmi_brightness(lvl, powershell_runner=powershell_runner)
+        )
+        setter(clamped)
+        return {
+            "ok": True,
+            "success": True,
+            "action": "set_brightness",
+            "level": clamped,
+        }
+
+    if normalized in ("step_brightness", "brightness_up", "brightness_down"):
+        if step is not None:
+            if isinstance(step, bool):
+                raise ValueError("step must be an integer.")
+            try:
+                st = int(step)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("step must be an integer.") from exc
+        else:
+            st = -10 if normalized == "brightness_down" else 10
+
+        getter = wmi_brightness_getter or (
+            lambda: _get_wmi_brightness(powershell_runner=powershell_runner)
+        )
+        curr = getter()
+        new_l = max(0, min(100, curr + st))
+        setter = wmi_brightness_setter or (
+            lambda lvl: _set_wmi_brightness(lvl, powershell_runner=powershell_runner)
+        )
+        setter(new_l)
+        return {
+            "ok": True,
+            "success": True,
+            "action": "step_brightness",
+            "level": new_l,
+            "previous_level": curr,
+            "step": st,
+        }
+
+    # 2. Window actions
+    if normalized in (
+        "minimize_window",
+        "minimize",
+        "maximize_window",
+        "maximize",
+        "restore_window",
+        "restore",
+        "close_window",
+        "close",
+    ):
+        target_hwnd = _resolve_window_hwnd(
+            hwnd=hwnd,
+            app_name=app_name,
+            title=title,
+            user32=user32,
+            kernel32=kernel32,
+            window_enumerator=window_enumerator,
+        )
+        u32 = _get_win32_user32(user32)
+
+        if normalized in ("minimize_window", "minimize"):
+            u32.ShowWindow(target_hwnd, SW_MINIMIZE)
+            return {
+                "ok": True,
+                "success": True,
+                "action": "minimize_window",
+                "hwnd": target_hwnd,
+            }
+        if normalized in ("maximize_window", "maximize"):
+            u32.ShowWindow(target_hwnd, SW_MAXIMIZE)
+            return {
+                "ok": True,
+                "success": True,
+                "action": "maximize_window",
+                "hwnd": target_hwnd,
+            }
+        if normalized in ("restore_window", "restore"):
+            u32.ShowWindow(target_hwnd, SW_RESTORE)
+            return {
+                "ok": True,
+                "success": True,
+                "action": "restore_window",
+                "hwnd": target_hwnd,
+            }
+        if normalized in ("close_window", "close"):
+            u32.PostMessageW(target_hwnd, WM_CLOSE, 0, 0)
+            return {
+                "ok": True,
+                "success": True,
+                "action": "close_window",
+                "hwnd": target_hwnd,
+            }
+
+    # 3. Screen locking
+    if normalized in ("lock_screen", "lock"):
+        u32 = _get_win32_user32(user32)
+        if hasattr(u32, "LockWorkStation"):
+            u32.LockWorkStation()
+        return {
+            "ok": True,
+            "success": True,
+            "action": "lock_screen",
+        }
+
+    # 4. Settings navigation
+    if normalized in ("open_settings", "settings"):
+        target_input = (uri or page or "").strip()
+        if not target_input:
+            target_uri = "ms-settings:"
+        elif target_input.startswith("ms-settings:"):
+            target_uri = target_input
+        else:
+            target_uri = f"ms-settings:{target_input}"
+
+        if target_uri not in _ALLOWED_MS_SETTINGS:
+            raise ValueError(
+                f"ms-settings URI '{target_uri}' is not in the allowlist. "
+                f"Allowed settings: {', '.join(sorted(_ALLOWED_MS_SETTINGS))}."
+            )
+
+        starter = startfile_fn or getattr(os, "startfile", None)
+        if starter is not None:
+            starter(target_uri)
+        else:
+            popen_fn(
+                ["explorer.exe", target_uri],
+                shell=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return {
+            "ok": True,
+            "success": True,
+            "action": "open_settings",
+            "uri": target_uri,
+        }
+
+    raise ValueError(f"Unhandled system action: {action!r}")

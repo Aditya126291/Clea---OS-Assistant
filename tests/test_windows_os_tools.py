@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes
+import json
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -43,19 +44,28 @@ from clea.tools.windows_os import (
     CF_UNICODETEXT,
     KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP,
+    SW_MAXIMIZE,
+    SW_MINIMIZE,
     SW_RESTORE,
     VALID_MEDIA_VOLUME_ACTIONS,
+    VALID_SYSTEM_ACTIONS,
     VK_MEDIA_NEXT_TRACK,
     VK_MEDIA_PLAY_PAUSE,
     VK_MEDIA_PREV_TRACK,
     VK_VOLUME_DOWN,
     VK_VOLUME_MUTE,
     VK_VOLUME_UP,
+    WM_CLOSE,
     EnumeratedWindow,
     control_media_volume,
+    control_system,
+    find_matching_start_app,
+    get_installed_apps,
     open_or_focus_app,
+    open_url,
     read_clipboard,
     resolve_app_spec,
+    select_clipboard_item,
     write_clipboard,
 )
 
@@ -126,13 +136,16 @@ class _FakeClipboardWin32:
 
 
 class _FakeWindowUser32:
-    """Minimal user32 double tracking window focus and keybd_event calls."""
+    """Minimal user32 double tracking window focus, state, and keybd_event calls."""
 
     def __init__(self, *, iconic_hwnds: set[int] | None = None) -> None:
         self.iconic_hwnds = iconic_hwnds or set()
         self.show_calls: list[tuple[int, int]] = []
         self.foreground_calls: list[int] = []
         self.key_events: list[tuple[int, int, int, int]] = []
+        self.post_messages: list[tuple[int, int, int, int]] = []
+        self.lock_workstation_calls: int = 0
+        self.foreground_window: int = 42
 
     def IsIconic(self, hwnd: int) -> int:
         return 1 if hwnd in self.iconic_hwnds else 0
@@ -147,6 +160,17 @@ class _FakeWindowUser32:
 
     def keybd_event(self, vk: int, scan: int, flags: int, extra: int) -> None:
         self.key_events.append((vk, scan, flags, extra))
+
+    def PostMessageW(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        self.post_messages.append((hwnd, msg, wparam, lparam))
+        return 1
+
+    def LockWorkStation(self) -> int:
+        self.lock_workstation_calls += 1
+        return 1
+
+    def GetForegroundWindow(self) -> int:
+        return self.foreground_window
 
 
 class _FakeLiveBackend(VoiceBackend):
@@ -722,9 +746,13 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
             "diff_truncated": False,
         }
 
+    import clea.tools.windows_os as windows_os_mod
+
+    daemon_mod.windows_os = windows_os_mod
     monkeypatch.setattr(daemon_mod, "open_or_focus_app", _fake_open)
     monkeypatch.setattr(daemon_mod, "control_media_volume", _fake_volume)
     monkeypatch.setattr(daemon_mod, "read_clipboard", _fake_read_clip)
+    monkeypatch.setattr(windows_os_mod, "read_clipboard", _fake_read_clip)
     monkeypatch.setattr(daemon_mod, "write_clipboard", _fake_write_clip)
     monkeypatch.setattr(daemon_mod, "inspect_git_workspace", _fake_git)
 
@@ -801,3 +829,453 @@ async def test_voice_runner_to_daemon_e2e_for_all_os_and_git_tools(
         "os.write_clipboard",
         "workspace.git_inspect",
     }
+
+
+# ----------------------------------------------------------- 6. WinRT Clipboard History
+
+
+def test_read_clipboard_winrt_text_and_image_items() -> None:
+    history_json = json.dumps(
+        {
+            "history_enabled": True,
+            "total_items": 2,
+            "items": [
+                {
+                    "index": 0,
+                    "id": "{guid-0}",
+                    "timestamp": "2026-11-15T04:30:00Z",
+                    "kind": "text",
+                    "text": "WinRT text content",
+                    "truncated": False,
+                    "image": None,
+                },
+                {
+                    "index": 1,
+                    "id": "{guid-1}",
+                    "timestamp": "2026-11-15T04:29:00Z",
+                    "kind": "image",
+                    "text": None,
+                    "truncated": False,
+                    "image": {
+                        "width": 800,
+                        "height": 600,
+                        "format": "png",
+                        "bytes": "iVBORw0KGgoAAAANSUhEUg==",
+                    },
+                },
+            ],
+        }
+    )
+
+    runner_calls: list[list[str]] = []
+
+    def _mock_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        runner_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=history_json, stderr="")
+
+    res = read_clipboard(
+        include_history=True,
+        max_items=5,
+        include_image_bytes=True,
+        powershell_runner=_mock_runner,
+    )
+
+    assert res["ok"] is True
+    assert res["text"] == "WinRT text content"
+    assert res["truncated"] is False
+    assert res["history_enabled"] is True
+    assert res["total_items"] == 2
+    assert len(res["items"]) == 2
+    assert res["items"][0]["kind"] == "text"
+    assert res["items"][1]["kind"] == "image"
+    assert res["items"][1]["image"]["width"] == 800
+    assert res["items"][1]["image"]["bytes"] == "iVBORw0KGgoAAAANSUhEUg=="
+
+    assert len(runner_calls) == 1
+    cmd_str = " ".join(runner_calls[0])
+    assert "powershell.exe" in runner_calls[0][0]
+    assert "-MaxItems 5" in cmd_str
+    assert "-IncludeImageBytes" in cmd_str
+
+
+def test_read_clipboard_winrt_fallback_to_win32_on_error() -> None:
+    clip = _FakeClipboardWin32("fallback text from win32")
+
+    def _failing_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="WinRT access denied")
+
+    res = read_clipboard(
+        include_history=True,
+        user32=clip,
+        kernel32=clip,
+        powershell_runner=_failing_runner,
+    )
+
+    assert res["ok"] is True
+    assert res["text"] == "fallback text from win32"
+    assert res["history_enabled"] is False
+    assert res["total_items"] == 0
+    assert res["items"] == []
+
+
+def test_read_clipboard_no_history_does_not_invoke_powershell() -> None:
+    clip = _FakeClipboardWin32("classic text")
+    called = False
+
+    def _runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal called
+        called = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    res = read_clipboard(
+        include_history=False,
+        user32=clip,
+        kernel32=clip,
+        powershell_runner=_runner,
+    )
+    assert res["ok"] is True
+    assert res["text"] == "classic text"
+    assert "history_enabled" not in res
+    assert called is False
+
+
+def test_select_clipboard_item_success_and_errors() -> None:
+    def _mock_runner(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "-ItemIndex 2" in " ".join(cmd):
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {"success": True, "status": "Success", "index": 2, "id": "guid-2"}
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Index out of range")
+
+    res = select_clipboard_item(2, powershell_runner=_mock_runner)
+    assert res["ok"] is True
+    assert res["success"] is True
+    assert res["index"] == 2
+    assert res["item_id"] == "guid-2"
+    assert res["status"] == "Success"
+
+    with pytest.raises(RuntimeError, match="Failed to select clipboard item"):
+        select_clipboard_item(99, powershell_runner=_mock_runner)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        select_clipboard_item(-1, powershell_runner=_mock_runner)
+
+    with pytest.raises(ValueError, match="integer"):
+        select_clipboard_item("invalid", powershell_runner=_mock_runner)  # type: ignore[arg-type]
+
+
+# ----------------------------------------------------------- 7. Dynamic App Discovery
+
+
+def test_get_installed_apps_caching_and_sanitization() -> None:
+    raw_catalog = [
+        {"Name": "Spotify", "AppID": "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"},
+        {"Name": "Calculator", "AppID": "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"},
+        {"Name": "Command Prompt", "AppID": "cmd.exe"},
+        {"Name": "PowerShell 7", "AppID": "pwsh.exe"},
+    ]
+    fetch_count = 0
+
+    def _fetcher() -> list[dict[str, str]]:
+        nonlocal fetch_count
+        fetch_count += 1
+        return raw_catalog
+
+    apps = get_installed_apps(force_refresh=True, app_catalog_fetcher=_fetcher)
+    assert len(apps) == 2
+    assert {a["Name"] for a in apps} == {"Spotify", "Calculator"}
+    assert fetch_count == 1
+
+    # Second call returns cached list without invoking fetcher
+    apps_cached = get_installed_apps(force_refresh=False, app_catalog_fetcher=_fetcher)
+    assert apps_cached == apps
+    assert fetch_count == 1
+
+    # Force refresh calls fetcher again
+    get_installed_apps(force_refresh=True, app_catalog_fetcher=_fetcher)
+    assert fetch_count == 2
+
+
+def test_find_matching_start_app() -> None:
+    catalog = [
+        {"Name": "Visual Studio Code", "AppID": "Microsoft.VisualStudioCode"},
+        {"Name": "Spotify Music", "AppID": "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!App"},
+        {"Name": "Blender 5.3", "AppID": "BlenderFoundation.Blender"},
+        {"Name": "Calculator", "AppID": "Microsoft.WindowsCalculator"},
+    ]
+
+    m1 = find_matching_start_app("Spotify Music", catalog)
+    assert m1 is not None and m1["Name"] == "Spotify Music"
+
+    m2 = find_matching_start_app("Microsoft.WindowsCalculator", catalog)
+    assert m2 is not None and m2["Name"] == "Calculator"
+
+    m3 = find_matching_start_app("blender", catalog)
+    assert m3 is not None and m3["Name"] == "Blender 5.3"
+
+    m4 = find_matching_start_app("spotfy", catalog)
+    assert m4 is not None and m4["Name"] == "Spotify Music"
+
+    assert find_matching_start_app("nonexistent_unknown_xyz", catalog) is None
+    assert find_matching_start_app("", catalog) is None
+
+
+def test_open_or_focus_app_dynamic_start_apps_flow(tmp_path: Path) -> None:
+    user32 = _FakeWindowUser32(iconic_hwnds={77})
+    catalog = [
+        {"Name": "Spotify", "AppID": "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"},
+    ]
+    popen_calls: list[list[str]] = []
+
+    # 1. When app is already running, focuses window
+    windows = [
+        EnumeratedWindow(
+            hwnd=77, title="Spotify Free", process_name="Spotify.exe", is_visible=True
+        ),
+    ]
+    res_focus = open_or_focus_app(
+        "spotify",
+        user32=user32,
+        window_enumerator=lambda: windows,
+        app_catalog_fetcher=lambda: catalog,
+        popen_fn=lambda cmd, **kw: popen_calls.append(cmd),
+    )
+    assert res_focus["ok"] is True
+    assert res_focus["status"] == "focused"
+    assert res_focus["app"].lower() == "spotify"
+    assert res_focus["hwnd"] == 77
+    assert user32.show_calls == [(77, SW_RESTORE)]
+    assert user32.foreground_calls == [77]
+    assert popen_calls == []
+
+    # 2. When app is not running, launches via explorer.exe shell:AppsFolder\...
+    res_launch = open_or_focus_app(
+        "spotify",
+        user32=user32,
+        window_enumerator=list,
+        which_fn=lambda _n: None,
+        app_catalog_fetcher=lambda: catalog,
+        popen_fn=lambda cmd, **kw: popen_calls.append(cmd),
+    )
+    assert res_launch["ok"] is True
+    assert res_launch["status"] == "launched"
+    assert res_launch["app"] == "Spotify"
+    assert res_launch["executable"] == "explorer.exe"
+    expected_app_id = "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"
+    assert popen_calls == [["explorer.exe", f"shell:AppsFolder\\{expected_app_id}"]]
+
+
+# --------------------------------------------------------------------------- 8. URL Launcher
+
+
+def test_open_url_success_and_shortcuts() -> None:
+    startfile_urls: list[str] = []
+    popen_calls: list[list[str]] = []
+
+    # Default browser via startfile
+    res1 = open_url(
+        "https://example.com/test",
+        startfile_fn=startfile_urls.append,
+    )
+    assert res1["ok"] is True
+    assert res1["success"] is True
+    assert res1["url"] == "https://example.com/test"
+    assert res1["browser"] == "default"
+    assert startfile_urls == ["https://example.com/test"]
+
+    # Site shortcut resolution: 'github' -> 'https://github.com'
+    res2 = open_url("github", startfile_fn=startfile_urls.append)
+    assert res2["url"] == "https://github.com"
+    assert startfile_urls[-1] == "https://github.com"
+
+    # Domain shorthand: 'docs.python.org' -> 'https://docs.python.org'
+    res3 = open_url("docs.python.org", startfile_fn=startfile_urls.append)
+    assert res3["url"] == "https://docs.python.org"
+    assert startfile_urls[-1] == "https://docs.python.org"
+
+    # Specified browser launch
+    res4 = open_url(
+        "https://clea.ai",
+        browser="chrome",
+        which_fn=lambda n: r"C:\Chrome\chrome.exe" if "chrome" in n else None,
+        popen_fn=lambda cmd, **kw: popen_calls.append(cmd),
+    )
+    assert res4["ok"] is True
+    assert res4["browser"] == "chrome"
+    assert popen_calls == [[r"C:\Chrome\chrome.exe", "https://clea.ai"]]
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "",
+        "   ",
+        "file:///C:/Windows/System32/cmd.exe",
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "cmd://something",
+        "powershell://test",
+        "http://",
+        "https://",
+        "https://example.com\nwith-newline",
+    ],
+)
+def test_open_url_rejects_dangerous_or_malformed_urls(bad_url: str) -> None:
+    with pytest.raises(ValueError):
+        open_url(bad_url, startfile_fn=lambda _u: None)
+
+
+def test_open_url_disallowed_or_missing_browser() -> None:
+    with pytest.raises(ValueError, match="Disallowed browser"):
+        open_url("https://example.com", browser="cmd.exe")
+
+    with pytest.raises(ValueError, match="could not be resolved"):
+        open_url(
+            "https://example.com",
+            browser="nonexistent-browser-xyz",
+            which_fn=lambda _n: None,
+        )
+
+
+# --------------------------------------------------------------------------- 9. System Controls
+
+
+def test_control_system_brightness_controls() -> None:
+    current = 65
+    set_levels: list[int] = []
+
+    def _getter() -> int:
+        return current
+
+    def _setter(lvl: int) -> None:
+        nonlocal current
+        current = lvl
+        set_levels.append(lvl)
+
+    # get_brightness
+    res_get = control_system("get_brightness", wmi_brightness_getter=_getter)
+    assert res_get == {"ok": True, "success": True, "action": "get_brightness", "level": 65}
+
+    # set_brightness
+    res_set = control_system(
+        "set_brightness",
+        level=80,
+        wmi_brightness_getter=_getter,
+        wmi_brightness_setter=_setter,
+    )
+    assert res_set == {"ok": True, "success": True, "action": "set_brightness", "level": 80}
+    assert current == 80
+
+    # step_brightness (+10 default for brightness_up)
+    res_up = control_system(
+        "brightness_up",
+        wmi_brightness_getter=_getter,
+        wmi_brightness_setter=_setter,
+    )
+    assert res_up["level"] == 90
+    assert current == 90
+
+    # step_brightness (-10 default for brightness_down)
+    res_down = control_system(
+        "brightness_down",
+        wmi_brightness_getter=_getter,
+        wmi_brightness_setter=_setter,
+    )
+    assert res_down["level"] == 80
+    assert current == 80
+
+    # step_brightness custom step with clamp
+    res_step = control_system(
+        "step_brightness",
+        step=50,
+        wmi_brightness_getter=_getter,
+        wmi_brightness_setter=_setter,
+    )
+    assert res_step["level"] == 100
+    assert current == 100
+
+
+def test_control_system_window_actions() -> None:
+    user32 = _FakeWindowUser32()
+    user32.foreground_window = 101
+
+    # minimize explicit hwnd
+    res_min = control_system("minimize_window", hwnd=55, user32=user32)
+    assert res_min == {"ok": True, "success": True, "action": "minimize_window", "hwnd": 55}
+    assert (55, SW_MINIMIZE) in user32.show_calls
+
+    # maximize foreground fallback
+    res_max = control_system("maximize_window", user32=user32)
+    assert res_max == {"ok": True, "success": True, "action": "maximize_window", "hwnd": 101}
+    assert (101, SW_MAXIMIZE) in user32.show_calls
+
+    # restore matching window by title
+    windows = [
+        EnumeratedWindow(hwnd=202, title="Document - WordPad", process_name="wordpad.exe"),
+    ]
+    res_restore = control_system(
+        "restore_window",
+        title="WordPad",
+        user32=user32,
+        window_enumerator=lambda: windows,
+    )
+    assert res_restore == {"ok": True, "success": True, "action": "restore_window", "hwnd": 202}
+    assert (202, SW_RESTORE) in user32.show_calls
+
+    # close window
+    res_close = control_system("close_window", hwnd=202, user32=user32)
+    assert res_close == {"ok": True, "success": True, "action": "close_window", "hwnd": 202}
+    assert user32.post_messages == [(202, WM_CLOSE, 0, 0)]
+
+
+def test_control_system_lock_and_settings() -> None:
+    user32 = _FakeWindowUser32()
+    opened_uris: list[str] = []
+
+    # lock screen
+    res_lock = control_system("lock_screen", user32=user32)
+    assert res_lock == {"ok": True, "success": True, "action": "lock_screen"}
+    assert user32.lock_workstation_calls == 1
+
+    # open allowlisted settings
+    res_set1 = control_system(
+        "open_settings",
+        page="display",
+        startfile_fn=opened_uris.append,
+    )
+    assert res_set1 == {
+        "ok": True,
+        "success": True,
+        "action": "open_settings",
+        "uri": "ms-settings:display",
+    }
+    assert opened_uris == ["ms-settings:display"]
+
+    res_set2 = control_system(
+        "open_settings",
+        uri="ms-settings:sound",
+        startfile_fn=opened_uris.append,
+    )
+    assert res_set2 == {
+        "ok": True,
+        "success": True,
+        "action": "open_settings",
+        "uri": "ms-settings:sound",
+    }
+
+    # reject non-allowlisted settings
+    with pytest.raises(ValueError, match="not in the allowlist"):
+        control_system("open_settings", page="malicious_page", startfile_fn=opened_uris.append)
+
+    # reject unsupported action
+    with pytest.raises(ValueError, match="Unsupported system action"):
+        control_system("destroy_universe")
+
+    assert "get_brightness" in VALID_SYSTEM_ACTIONS
+    assert "lock_screen" in VALID_SYSTEM_ACTIONS
+    assert "open_settings" in VALID_SYSTEM_ACTIONS
