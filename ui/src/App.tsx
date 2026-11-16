@@ -32,7 +32,7 @@ function CleaShell() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "l") {
         const target = e.target as HTMLElement | null;
         if (target) {
           const tag = target.tagName ? target.tagName.toLowerCase() : "";

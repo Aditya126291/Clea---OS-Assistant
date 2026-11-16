@@ -84,11 +84,14 @@ def test_meaningful_turn_filter() -> None:
     assert not is_meaningful_turn("wait")
     assert not is_meaningful_turn("hold on")
     assert not is_meaningful_turn("try again")
-    assert not is_meaningful_turn("hello")
     assert not is_meaningful_turn("ok")
     assert not is_meaningful_turn("um, wait...")
     assert not is_meaningful_turn("uh okay yeah")
+    assert not is_meaningful_turn("never mind")
+    assert not is_meaningful_turn("mic check")
+    assert not is_meaningful_turn("can you hear me")
 
+    assert is_meaningful_turn("Hi Clea")
     assert is_meaningful_turn("User prefers Python and Rust for new backend services.")
     assert is_meaningful_turn("My project is located at C:/Users/Projects/Clea.")
     assert is_meaningful_turn("Please remember that I prefer dark theme.")
@@ -532,3 +535,128 @@ async def test_transient_api_errors_handled_gracefully(tmp_path: Path) -> None:
     session_state = state["sessions"].get(VOICE_COMPANION_SESSION_ID)
     assert session_state is not None
     assert session_state["status"] == "failed"
+
+
+def test_prune_diagnostic_logs_adjusts_consolidation_checkpoint(tmp_path: Path) -> None:
+    """Verify pruning messages shifts consolidation checkpoint so turns are not re-processed."""
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    # 1. Populate voice_companion.jsonl with 600 turns
+    now = datetime(2026, 11, 25, 12, 0, 0, tzinfo=UTC)
+    entries: list[tuple[str, str, datetime]] = []
+    for i in range(600):
+        entries.append(("user", f"Turn {i}", now - timedelta(minutes=600 - i)))
+    mem.append_voice_companion_call(call_id="call-600", entries=entries)
+
+    # 2. Simulate consolidation_state.json where 550 turns were already consolidated
+    state_file = mem.memory_dir / "consolidation_state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "sessions": {
+                    VOICE_COMPANION_SESSION_ID: {
+                        "status": "completed",
+                        "last_consolidated_message_idx": 550,
+                        "last_consolidated_turn": 550,
+                        "last_consolidated_turn_count": 550,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 3. Prune with max_entries=500 -> 100 turns removed from front
+    res = prune_diagnostic_logs(max_entries=500, max_age_days=30, data_dir=tmp_path, now=now)
+    assert res["pruned_companion_turns"] == 100
+
+    # 4. Checkpoint MUST be decremented by 100 (550 - 100 = 450)
+    updated_state = json.loads(state_file.read_text(encoding="utf-8"))
+    vc_info = updated_state["sessions"][VOICE_COMPANION_SESSION_ID]
+    assert vc_info["last_consolidated_message_idx"] == 450
+    assert vc_info["last_consolidated_turn"] == 450
+
+
+@pytest.mark.asyncio
+async def test_delete_fallback_to_text(tmp_path: Path) -> None:
+    """Verify that if LLM provides a hallucinated entry_id for delete, it falls back to text."""
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    mem.add_or_update_entry(
+        text="User lives in Seattle.",
+        section="Profile",
+        entry_id="prof-loc01",
+    )
+
+    mem.append_voice_companion_call(
+        call_id="call-del-1",
+        entries=[
+            ("user", "I don't live in Seattle anymore.", datetime.now().astimezone()),
+            ("assistant", "Understood.", datetime.now().astimezone()),
+            ("user", "Please remove Seattle from memory.", datetime.now().astimezone()),
+        ],
+    )
+
+    mock_provider = _MockConsolidationProvider(
+        response_payload={
+            "summary": "User requested deletion of Seattle location.",
+            "operations": [
+                {
+                    "op": "delete",
+                    "entry_id": "nonexistent-id-999",
+                    "target_section": "Profile",
+                    "text": "User lives in Seattle.",
+                    "reason": "User moved",
+                }
+            ],
+        }
+    )
+
+    manager = ConsolidationManager(memory=mem, provider=mock_provider)
+    success = await manager.consolidate_session(VOICE_COMPANION_SESSION_ID, force=True)
+    assert success is True
+
+    # Even though entry_id was nonexistent, fallback to text removed the fact!
+    sections = mem.parse_sections()
+    assert not any("Seattle" in e.text for e in sections["Profile"])
+
+
+def test_concurrent_pruning_thread_safety(tmp_path: Path) -> None:
+    """Verify concurrent pruning and appending execute safely without file lock crashes."""
+    import concurrent.futures
+
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    now = datetime.now(UTC)
+    # Seed 100 entries
+    entries: list[tuple[str, str, datetime]] = [
+        ("user", f"Seed {i}", now - timedelta(days=8 if i < 30 else 1)) for i in range(100)
+    ]
+    mem.append_voice_companion_call(call_id="call-init", entries=entries)
+
+    def _do_prune():
+        return prune_diagnostic_logs(
+            max_age_days=7, max_entries=50, data_dir=tmp_path, now=now
+        )
+
+    def _do_append(idx: int):
+        return mem.append_voice_companion_call(
+            call_id=f"call-thread-{idx}",
+            entries=[("user", f"Concurrent turn {idx}", datetime.now().astimezone())],
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futs = []
+        for i in range(5):
+            futs.append(executor.submit(_do_prune))
+            futs.append(executor.submit(_do_append, i))
+        results = [f.result() for f in futs]
+
+    assert len(results) == 10
+    # No orphaned temporary files left behind
+    logs_dir = tmp_path / "logs"
+    assert len(list(logs_dir.glob("*.tmp.*"))) == 0
+    assert len(list((logs_dir / "transcripts").glob("*.tmp.*"))) == 0

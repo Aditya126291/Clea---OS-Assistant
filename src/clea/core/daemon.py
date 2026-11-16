@@ -276,6 +276,18 @@ class CleaDaemon:
         self._consolidation_task_terminal: dict[str, bool] = {}
         self._ended_voice_call_ids: set[str] = set()
         self._startup_task: asyncio.Task[None] | None = None
+        self._prune_task: asyncio.Task[Any] | None = None
+
+    def _schedule_diagnostic_log_pruning(self) -> asyncio.Task[Any] | None:
+        """Schedule diagnostic log pruning in the background if not already running."""
+        if self._prune_task is not None and not self._prune_task.done():
+            return self._prune_task
+        task = self._spawn_background_task(
+            asyncio.to_thread(self.agent.memory.prune_diagnostic_logs),
+            name="prune-diagnostic-logs",
+        )
+        self._prune_task = task
+        return task
 
     def _spawn_background_task(
         self,
@@ -1550,10 +1562,7 @@ class CleaDaemon:
                 tr = self.agent.memory.get_transcript(req_call_id)
                 if tr and tr.get("messages"):
                     self._schedule_consolidation_now(req_call_id)
-                self._spawn_background_task(
-                    asyncio.to_thread(self.agent.memory.prune_diagnostic_logs),
-                    name="prune-diagnostic-logs",
-                )
+                self._schedule_diagnostic_log_pruning()
                 self._ended_voice_call_ids.discard(req_call_id)
                 await self._respond(
                     ws,
@@ -1606,10 +1615,7 @@ class CleaDaemon:
             if persisted and req.params.reason != "transcript_sync":
                 self._schedule_consolidation_now(ended_id)
 
-            self._spawn_background_task(
-                asyncio.to_thread(self.agent.memory.prune_diagnostic_logs),
-                name="prune-diagnostic-logs",
-            )
+            self._schedule_diagnostic_log_pruning()
 
             await self._broadcast(
                 CallEndedEvent(

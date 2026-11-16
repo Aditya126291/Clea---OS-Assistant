@@ -197,12 +197,14 @@ _FILLER_TURNS = {
     "huh",
     "wait",
     "wait a sec",
+    "wait a second",
+    "wait a minute",
     "hold on",
+    "hold on a sec",
+    "hold on a second",
+    "just a sec",
+    "just a second",
     "try again",
-    "hello",
-    "hi",
-    "hey",
-    "yo",
     "ok",
     "okay",
     "yeah",
@@ -210,13 +212,55 @@ _FILLER_TURNS = {
     "no",
     "nope",
     "sure",
-    "bye",
-    "goodbye",
-    "thanks",
-    "thank you",
+    "never mind",
+    "nevermind",
     "test",
     "testing",
+    "just testing",
     "one two three",
+    "one two",
+    "mic check",
+    "check check",
+    "can you hear me",
+}
+
+_FILLER_WORDS = {
+    "um",
+    "uh",
+    "er",
+    "ah",
+    "hmm",
+    "hm",
+    "huh",
+    "wait",
+    "hold",
+    "on",
+    "sec",
+    "second",
+    "minute",
+    "try",
+    "again",
+    "ok",
+    "okay",
+    "yeah",
+    "yes",
+    "no",
+    "nope",
+    "sure",
+    "never",
+    "mind",
+    "nevermind",
+    "test",
+    "testing",
+    "just",
+    "one",
+    "two",
+    "three",
+    "mic",
+    "check",
+    "can",
+    "hear",
+    "me",
 }
 
 
@@ -228,9 +272,7 @@ def is_meaningful_turn(text: str) -> bool:
     if cleaned in _FILLER_TURNS:
         return False
     words = cleaned.split()
-    if all(w in _FILLER_TURNS for w in words):
-        return False
-    if len(words) <= 2 and all(w in _FILLER_TURNS for w in words):
+    if all(w in _FILLER_WORDS for w in words):
         return False
     return True
 
@@ -892,7 +934,10 @@ class ConsolidationManager:
 
                 try:
                     if op.op in ("remove", "delete"):
-                        self.memory.remove_entries(op.entry_id or op.text)
+                        target_id = op.entry_id.strip("[]") if op.entry_id else None
+                        removed = self.memory.remove_entries(target_id) if target_id else []
+                        if not removed and op.text:
+                            self.memory.remove_entries(op.text)
                     else:
                         self.memory.add_or_update_entry(
                             text=op.text,

@@ -316,6 +316,13 @@ describe("UI screens & navigation", () => {
     fireEvent.keyDown(window, { key: "l", metaKey: true });
     expect(useCleaStore.getState().activeView).toBe("chat");
 
+    // When Shift or Alt is combined (e.g. Ctrl+Shift+L or Ctrl+Alt+L), ignore
+    fireEvent.keyDown(window, { key: "l", ctrlKey: true, shiftKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
+    fireEvent.keyDown(window, { key: "l", ctrlKey: true, altKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
     // When focus is inside an input, Ctrl+L should be ignored
     const input = document.createElement("input");
     container.appendChild(input);

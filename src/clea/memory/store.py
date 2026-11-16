@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -111,6 +112,44 @@ def _format_time_local(dt: datetime) -> str:
     return dt.strftime("%H:%M")
 
 
+_DIR_PRUNE_LOCKS: dict[str, threading.Lock] = {}
+_DIR_LOCKS_GUARD = threading.Lock()
+
+
+def _get_dir_prune_lock(base_dir: Path) -> threading.Lock:
+    """Return a process-wide thread lock keyed by data directory path."""
+    resolved = str(base_dir.resolve())
+    with _DIR_LOCKS_GUARD:
+        lock = _DIR_PRUNE_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.Lock()
+            _DIR_PRUNE_LOCKS[resolved] = lock
+        return lock
+
+
+def _atomic_replace_file(
+    tmp_path: Path,
+    target_path: Path,
+    retries: int = 5,
+    delay: float = 0.05,
+) -> None:
+    """Safely replace target_path with tmp_path on Windows with retries and temp cleanup."""
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            tmp_path.replace(target_path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(delay * (2**attempt))
+        except Exception as exc:
+            last_exc = exc
+            break
+    tmp_path.unlink(missing_ok=True)
+    if last_exc:
+        raise last_exc
+
+
 class MemoryStore:
     """Manages MEMORY.md, episode summaries, and structured transcripts."""
 
@@ -135,6 +174,9 @@ class MemoryStore:
         self.embedding_store = EmbeddingStore(self.embeddings_path)
         self.embedding_provider = embedding_provider or EmbeddingProvider(embed_fn=embed_fn)
         self.token_cap = token_cap
+    @property
+    def _prune_lock(self) -> threading.Lock:
+        return _get_dir_prune_lock(self.base_dir)
 
     @property
     def embed_fn(self) -> EmbedFn | None:
@@ -285,7 +327,7 @@ class MemoryStore:
 
         tmp_path = self.long_term_path.with_name(f"{self.long_term_path.name}.tmp.{uuid4().hex}")
         tmp_path.write_text(content, encoding="utf-8")
-        tmp_path.replace(self.long_term_path)
+        _atomic_replace_file(tmp_path, self.long_term_path)
         return self.long_term_path
 
     # --- Section Parsing & Formatting ---
@@ -1106,7 +1148,7 @@ class MemoryStore:
         with tmp.open("w", encoding="utf-8") as handle:
             handle.write(json.dumps(header, ensure_ascii=False) + "\n")
             handle.write(rest)
-        tmp.replace(path)
+        _atomic_replace_file(tmp, path)
         return header
 
     def delete_transcript(self, session_id: str, *, delete_episodes: bool = False) -> Path:
@@ -1234,161 +1276,206 @@ class MemoryStore:
         - NEVER modifies curated Memory entries (MEMORY.md, episodes, daily memory).
         - NEVER touches saved HISTORY conversation threads
           (<session_id>.jsonl where session_id != voice_companion).
-        - Idempotent and safe against concurrent execution.
+        - Idempotent and safe against concurrent execution and Windows file contention.
         """
-        ref_now = now or datetime.now().astimezone()
-        if ref_now.tzinfo is None:
-            ref_now = ref_now.astimezone()
-        cutoff = ref_now - timedelta(days=max_age_days)
-        cutoff_epoch = cutoff.timestamp()
+        with self._prune_lock:
+            ref_now = now or datetime.now().astimezone()
+            if ref_now.tzinfo is None:
+                ref_now = ref_now.astimezone()
+            cutoff = ref_now - timedelta(days=max_age_days)
+            cutoff_epoch = cutoff.timestamp()
 
-        pruned_companion = 0
-        pruned_metrics = 0
-        pruned_audit = 0
-        pruned_logs = 0
-        pruned_trash = 0
+            pruned_companion = 0
+            pruned_metrics = 0
+            pruned_audit = 0
+            pruned_logs = 0
+            pruned_trash = 0
 
-        # 1. Prune voice_companion.jsonl stream
-        vc_path = self.transcript_path(VOICE_COMPANION_SESSION_ID)
-        if vc_path.exists():
-            try:
-                with vc_path.open("r", encoding="utf-8") as handle:
-                    lines = [line.strip() for line in handle if line.strip()]
-                if lines:
-                    header_line = lines[0]
-                    msg_lines = lines[1:]
-                    kept_msg_lines: list[str] = []
-                    for line in msg_lines:
+            # 1. Prune voice_companion.jsonl stream
+            vc_path = self.transcript_path(VOICE_COMPANION_SESSION_ID)
+            if vc_path.exists():
+                try:
+                    with vc_path.open("r", encoding="utf-8") as handle:
+                        lines = [line.strip() for line in handle if line.strip()]
+                    if lines:
+                        header_line = lines[0]
+                        msg_lines = lines[1:]
+                        kept_msg_lines: list[str] = []
+                        for line in msg_lines:
+                            try:
+                                msg_obj = json.loads(line)
+                                ts_str = msg_obj.get("timestamp")
+                                if ts_str:
+                                    dt = datetime.fromisoformat(ts_str)
+                                    if dt.tzinfo is None:
+                                        dt = dt.astimezone()
+                                    if dt < cutoff:
+                                        pruned_companion += 1
+                                        continue
+                                kept_msg_lines.append(line)
+                            except Exception:
+                                kept_msg_lines.append(line)
+
+                        if len(kept_msg_lines) > max_entries:
+                            excess = len(kept_msg_lines) - max_entries
+                            pruned_companion += excess
+                            kept_msg_lines = kept_msg_lines[-max_entries:]
+
+                        if pruned_companion > 0 or len(kept_msg_lines) + 1 < len(lines):
+                            tmp_path = vc_path.with_name(
+                                f"{VOICE_COMPANION_SESSION_ID}.tmp.{uuid4().hex}"
+                            )
+                            with tmp_path.open("w", encoding="utf-8") as handle:
+                                handle.write(header_line + "\n")
+                                for line in kept_msg_lines:
+                                    handle.write(line + "\n")
+                            _atomic_replace_file(tmp_path, vc_path)
+                except Exception as exc:
+                    logger.warning("Error pruning companion logs in %s: %s", vc_path, exc)
+
+            # 1b. If companion messages were pruned from front of voice_companion.jsonl,
+            # adjust last_consolidated_message_idx in consolidation_state.json so that
+            # checkpoint indexes remain valid and previously consolidated messages are
+            # never erroneously re-consolidated.
+            if pruned_companion > 0:
+                state_path = self.memory_dir / "consolidation_state.json"
+                if state_path.exists():
+                    try:
+                        c_state = json.loads(state_path.read_text(encoding="utf-8"))
+                        sessions_map = c_state.get("sessions")
+                        if isinstance(sessions_map, dict):
+                            vc_info = sessions_map.get(VOICE_COMPANION_SESSION_ID)
+                            if isinstance(vc_info, dict):
+                                for key in (
+                                    "last_consolidated_message_idx",
+                                    "last_consolidated_turn",
+                                    "last_consolidated_turn_count",
+                                ):
+                                    if key in vc_info and isinstance(vc_info[key], (int, float)):
+                                        vc_info[key] = max(0, int(vc_info[key]) - pruned_companion)
+                                tmp_state = state_path.with_name(
+                                    f"consolidation_state.tmp.{uuid4().hex}"
+                                )
+                                tmp_state.write_text(
+                                    json.dumps(c_state, indent=2, ensure_ascii=False),
+                                    encoding="utf-8",
+                                )
+                                _atomic_replace_file(tmp_state, state_path)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed adjusting consolidation_state after pruning: %s", exc
+                        )
+
+            # 2. Prune logs/voice_metrics.jsonl
+            logs_dir = self.base_dir / "logs"
+            metrics_path = logs_dir / "voice_metrics.jsonl"
+            if metrics_path.exists():
+                try:
+                    with metrics_path.open("r", encoding="utf-8") as handle:
+                        lines = [line.strip() for line in handle if line.strip()]
+                    kept_metrics: list[str] = []
+                    for line in lines:
                         try:
-                            msg_obj = json.loads(line)
-                            ts_str = msg_obj.get("timestamp")
+                            record = json.loads(line)
+                            ts_str = record.get("timestamp") or record.get("created_at")
                             if ts_str:
                                 dt = datetime.fromisoformat(ts_str)
                                 if dt.tzinfo is None:
                                     dt = dt.astimezone()
                                 if dt < cutoff:
-                                    pruned_companion += 1
+                                    pruned_metrics += 1
                                     continue
-                            kept_msg_lines.append(line)
+                            kept_metrics.append(line)
                         except Exception:
-                            kept_msg_lines.append(line)
+                            kept_metrics.append(line)
 
-                    if len(kept_msg_lines) > max_entries:
-                        excess = len(kept_msg_lines) - max_entries
-                        pruned_companion += excess
-                        kept_msg_lines = kept_msg_lines[-max_entries:]
+                    if len(kept_metrics) > max_entries:
+                        excess = len(kept_metrics) - max_entries
+                        pruned_metrics += excess
+                        kept_metrics = kept_metrics[-max_entries:]
 
-                    if pruned_companion > 0 or len(kept_msg_lines) + 1 < len(lines):
-                        tmp_path = vc_path.with_name(
-                            f"{VOICE_COMPANION_SESSION_ID}.tmp.{uuid4().hex}"
-                        )
-                        with tmp_path.open("w", encoding="utf-8") as handle:
-                            handle.write(header_line + "\n")
-                            for line in kept_msg_lines:
+                    if pruned_metrics > 0 or len(kept_metrics) < len(lines):
+                        tmp_metrics = metrics_path.with_name(f"voice_metrics.tmp.{uuid4().hex}")
+                        with tmp_metrics.open("w", encoding="utf-8") as handle:
+                            for line in kept_metrics:
                                 handle.write(line + "\n")
-                        tmp_path.replace(vc_path)
-            except Exception as exc:
-                logger.warning("Error pruning companion logs in %s: %s", vc_path, exc)
+                        _atomic_replace_file(tmp_metrics, metrics_path)
+                except Exception as exc:
+                    logger.warning("Error pruning voice metrics in %s: %s", metrics_path, exc)
 
-        # 2. Prune logs/voice_metrics.jsonl
-        logs_dir = self.base_dir / "logs"
-        metrics_path = logs_dir / "voice_metrics.jsonl"
-        if metrics_path.exists():
-            try:
-                with metrics_path.open("r", encoding="utf-8") as handle:
-                    lines = [line.strip() for line in handle if line.strip()]
-                kept_metrics: list[str] = []
-                for line in lines:
+            # 3. Prune logs/audit.jsonl
+            audit_path = logs_dir / "audit.jsonl"
+            if audit_path.exists():
+                try:
+                    with audit_path.open("r", encoding="utf-8") as handle:
+                        lines = [line.strip() for line in handle if line.strip()]
+                    kept_audit: list[str] = []
+                    for line in lines:
+                        try:
+                            record = json.loads(line)
+                            ts_str = record.get("timestamp") or record.get("created_at")
+                            if ts_str:
+                                dt = datetime.fromisoformat(ts_str)
+                                if dt.tzinfo is None:
+                                    dt = dt.astimezone()
+                                if dt < cutoff:
+                                    pruned_audit += 1
+                                    continue
+                            kept_audit.append(line)
+                        except Exception:
+                            kept_audit.append(line)
+
+                    if len(kept_audit) > max_entries:
+                        excess = len(kept_audit) - max_entries
+                        pruned_audit += excess
+                        kept_audit = kept_audit[-max_entries:]
+
+                    if pruned_audit > 0 or len(kept_audit) < len(lines):
+                        tmp_audit = audit_path.with_name(f"audit.tmp.{uuid4().hex}")
+                        with tmp_audit.open("w", encoding="utf-8") as handle:
+                            for line in kept_audit:
+                                handle.write(line + "\n")
+                        _atomic_replace_file(tmp_audit, audit_path)
+                except Exception as exc:
+                    logger.warning("Error pruning audit logs in %s: %s", audit_path, exc)
+
+            # 4. Prune rotated diagnostic files: logs/daemon.log.*, logs/voice.log.*
+            if logs_dir.is_dir():
+                for pat in ("daemon.log.*", "voice.log.*", "daemon_*.log", "voice_*.log"):
+                    for p in logs_dir.glob(pat):
+                        try:
+                            if p.stat().st_mtime < cutoff_epoch:
+                                p.unlink(missing_ok=True)
+                                pruned_logs += 1
+                        except Exception:
+                            pass
+
+                # Clean up stale temporary files older than 1 hour left from interrupted runs
+                tmp_cutoff = ref_now.timestamp() - 3600.0
+                for tmp_file in list(logs_dir.glob("*.tmp.*")) + list(
+                    self.transcripts_dir.glob("*.tmp.*")
+                ):
                     try:
-                        record = json.loads(line)
-                        ts_str = record.get("timestamp") or record.get("created_at")
-                        if ts_str:
-                            dt = datetime.fromisoformat(ts_str)
-                            if dt.tzinfo is None:
-                                dt = dt.astimezone()
-                            if dt < cutoff:
-                                pruned_metrics += 1
-                                continue
-                        kept_metrics.append(line)
-                    except Exception:
-                        kept_metrics.append(line)
-
-                if len(kept_metrics) > max_entries:
-                    excess = len(kept_metrics) - max_entries
-                    pruned_metrics += excess
-                    kept_metrics = kept_metrics[-max_entries:]
-
-                if pruned_metrics > 0 or len(kept_metrics) < len(lines):
-                    tmp_metrics = metrics_path.with_name(f"voice_metrics.tmp.{uuid4().hex}")
-                    with tmp_metrics.open("w", encoding="utf-8") as handle:
-                        for line in kept_metrics:
-                            handle.write(line + "\n")
-                    tmp_metrics.replace(metrics_path)
-            except Exception as exc:
-                logger.warning("Error pruning voice metrics in %s: %s", metrics_path, exc)
-
-        # 3. Prune logs/audit.jsonl
-        audit_path = logs_dir / "audit.jsonl"
-        if audit_path.exists():
-            try:
-                with audit_path.open("r", encoding="utf-8") as handle:
-                    lines = [line.strip() for line in handle if line.strip()]
-                kept_audit: list[str] = []
-                for line in lines:
-                    try:
-                        record = json.loads(line)
-                        ts_str = record.get("timestamp") or record.get("created_at")
-                        if ts_str:
-                            dt = datetime.fromisoformat(ts_str)
-                            if dt.tzinfo is None:
-                                dt = dt.astimezone()
-                            if dt < cutoff:
-                                pruned_audit += 1
-                                continue
-                        kept_audit.append(line)
-                    except Exception:
-                        kept_audit.append(line)
-
-                if len(kept_audit) > max_entries:
-                    excess = len(kept_audit) - max_entries
-                    pruned_audit += excess
-                    kept_audit = kept_audit[-max_entries:]
-
-                if pruned_audit > 0 or len(kept_audit) < len(lines):
-                    tmp_audit = audit_path.with_name(f"audit.tmp.{uuid4().hex}")
-                    with tmp_audit.open("w", encoding="utf-8") as handle:
-                        for line in kept_audit:
-                            handle.write(line + "\n")
-                    tmp_audit.replace(audit_path)
-            except Exception as exc:
-                logger.warning("Error pruning audit logs in %s: %s", audit_path, exc)
-
-        # 4. Prune rotated diagnostic files: logs/daemon.log.*, logs/voice.log.*
-        if logs_dir.is_dir():
-            for pat in ("daemon.log.*", "voice.log.*", "daemon_*.log", "voice_*.log"):
-                for p in logs_dir.glob(pat):
-                    try:
-                        if p.stat().st_mtime < cutoff_epoch:
-                            p.unlink(missing_ok=True)
-                            pruned_logs += 1
+                        if tmp_file.stat().st_mtime < tmp_cutoff:
+                            tmp_file.unlink(missing_ok=True)
                     except Exception:
                         pass
 
-        # 5. Prune trash directory if files older than max_age_days
-        try:
-            pruned_trash = self.purge_trash(min_age_seconds=max_age_days * 86400.0)
-        except Exception:
-            pass
+            # 5. Prune trash directory if files older than max_age_days
+            try:
+                pruned_trash = self.purge_trash(min_age_seconds=max_age_days * 86400.0)
+            except Exception:
+                pass
 
-        result = {
-            "pruned_companion_turns": pruned_companion,
-            "pruned_voice_metrics": pruned_metrics,
-            "pruned_audit_records": pruned_audit,
-            "pruned_log_files": pruned_logs,
-            "pruned_trash_files": pruned_trash,
-        }
-        result["total_pruned"] = sum(result.values())
-        return result
+            result = {
+                "pruned_companion_turns": pruned_companion,
+                "pruned_voice_metrics": pruned_metrics,
+                "pruned_audit_records": pruned_audit,
+                "pruned_log_files": pruned_logs,
+                "pruned_trash_files": pruned_trash,
+            }
+            result["total_pruned"] = sum(result.values())
+            return result
 
     def delete_episode(self, session_id: str, *, backup_in_trash: bool = False) -> bool:
         """Remove session episode entry from memory/episodes/*.md."""
@@ -2441,7 +2528,7 @@ class MemoryStore:
             json.dumps({"tasks": bounded}, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        tmp.replace(self.background_tasks_path)
+        _atomic_replace_file(tmp, self.background_tasks_path)
 
     def record_background_task(
         self,
