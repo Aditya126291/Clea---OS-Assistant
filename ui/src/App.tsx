@@ -32,6 +32,7 @@ function CleaShell() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "l") {
         const target = e.target as HTMLElement | null;
         if (target) {

@@ -435,6 +435,14 @@ class MemoryStore:
             else f"{target_section[:4].lower()}-{uuid4().hex[:4]}"
         )
 
+        # Clean leading bullet symbols, duplicated bracketed IDs, and section tags from LLM text
+        clean_text = text.strip()
+        clean_text = re.sub(r"^[-*•]\s+", "", clean_text).strip()
+        clean_text = re.sub(r"^\[[\w\-]+\]\s*", "", clean_text).strip()
+        clean_text = re.sub(r"^\([\w\s\-]+\)\s*", "", clean_text).strip()
+        if not clean_text:
+            clean_text = text.strip()
+
         # If entry_id was specified and exists in another section, remove it from that section
         if entry_id:
             for s_name, s_entries in sections.items():
@@ -442,7 +450,7 @@ class MemoryStore:
                     sections[s_name] = [e for e in s_entries if e.id != resolved_id]
 
         existing_idx: int | None = None
-        norm_new_text = " ".join(text.lower().split())
+        norm_new_text = " ".join(clean_text.lower().split())
 
         for idx, existing in enumerate(target_list):
             if existing.id == resolved_id:
@@ -461,7 +469,7 @@ class MemoryStore:
             id=resolved_id,
             date=today_str,
             source=source,
-            text=text.strip(),
+            text=clean_text,
             section=target_section,
         )
 
@@ -497,7 +505,12 @@ class MemoryStore:
         matches: list[MemoryEntry] = []
         for entries in sections.values():
             for e in entries:
-                if norm_q in e.text.lower() or norm_q == e.id.lower() or norm_id == e.id.lower():
+                if (
+                    norm_id == e.id.lower()
+                    or norm_q == e.id.lower()
+                    or (len(norm_q) >= 3 and norm_q in e.text.lower())
+                    or norm_q == e.text.lower().strip()
+                ):
                     matches.append(e)
         return matches
 
@@ -514,7 +527,12 @@ class MemoryStore:
         for sec_name, entries in sections.items():
             kept: list[MemoryEntry] = []
             for e in entries:
-                if norm_q in e.text.lower() or norm_q == e.id.lower() or norm_id == e.id.lower():
+                if (
+                    norm_id == e.id.lower()
+                    or norm_q == e.id.lower()
+                    or (len(norm_q) >= 3 and norm_q in e.text.lower())
+                    or norm_q == e.text.lower().strip()
+                ):
                     removed.append(e)
                 else:
                     kept.append(e)
@@ -1282,8 +1300,10 @@ class MemoryStore:
             ref_now = now or datetime.now().astimezone()
             if ref_now.tzinfo is None:
                 ref_now = ref_now.astimezone()
-            cutoff = ref_now - timedelta(days=max_age_days)
+            effective_max_age_days = max(0, max_age_days)
+            cutoff = ref_now - timedelta(days=effective_max_age_days)
             cutoff_epoch = cutoff.timestamp()
+            effective_max_entries = max(0, max_entries)
 
             pruned_companion = 0
             pruned_metrics = 0
@@ -1316,10 +1336,14 @@ class MemoryStore:
                             except Exception:
                                 kept_msg_lines.append(line)
 
-                        if len(kept_msg_lines) > max_entries:
-                            excess = len(kept_msg_lines) - max_entries
+                        if len(kept_msg_lines) > effective_max_entries:
+                            excess = len(kept_msg_lines) - effective_max_entries
                             pruned_companion += excess
-                            kept_msg_lines = kept_msg_lines[-max_entries:]
+                            kept_msg_lines = (
+                                kept_msg_lines[-effective_max_entries:]
+                                if effective_max_entries > 0
+                                else []
+                            )
 
                         if pruned_companion > 0 or len(kept_msg_lines) + 1 < len(lines):
                             tmp_path = vc_path.with_name(
@@ -1389,10 +1413,14 @@ class MemoryStore:
                         except Exception:
                             kept_metrics.append(line)
 
-                    if len(kept_metrics) > max_entries:
-                        excess = len(kept_metrics) - max_entries
+                    if len(kept_metrics) > effective_max_entries:
+                        excess = len(kept_metrics) - effective_max_entries
                         pruned_metrics += excess
-                        kept_metrics = kept_metrics[-max_entries:]
+                        kept_metrics = (
+                            kept_metrics[-effective_max_entries:]
+                            if effective_max_entries > 0
+                            else []
+                        )
 
                     if pruned_metrics > 0 or len(kept_metrics) < len(lines):
                         tmp_metrics = metrics_path.with_name(f"voice_metrics.tmp.{uuid4().hex}")
@@ -1425,10 +1453,14 @@ class MemoryStore:
                         except Exception:
                             kept_audit.append(line)
 
-                    if len(kept_audit) > max_entries:
-                        excess = len(kept_audit) - max_entries
+                    if len(kept_audit) > effective_max_entries:
+                        excess = len(kept_audit) - effective_max_entries
                         pruned_audit += excess
-                        kept_audit = kept_audit[-max_entries:]
+                        kept_audit = (
+                            kept_audit[-effective_max_entries:]
+                            if effective_max_entries > 0
+                            else []
+                        )
 
                     if pruned_audit > 0 or len(kept_audit) < len(lines):
                         tmp_audit = audit_path.with_name(f"audit.tmp.{uuid4().hex}")

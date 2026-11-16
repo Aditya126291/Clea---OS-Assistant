@@ -660,3 +660,127 @@ def test_concurrent_pruning_thread_safety(tmp_path: Path) -> None:
     logs_dir = tmp_path / "logs"
     assert len(list(logs_dir.glob("*.tmp.*"))) == 0
     assert len(list((logs_dir / "transcripts").glob("*.tmp.*"))) == 0
+
+
+def test_prune_diagnostic_logs_zero_and_negative_caps(tmp_path: Path) -> None:
+    """Verify max_entries=0 or negative values prune all messages cleanly without slicing errors."""
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    now = datetime(2026, 11, 20, 12, 0, 0, tzinfo=UTC)
+    entries: list[tuple[str, str, datetime]] = [
+        ("user", f"Turn {i}", now - timedelta(hours=i)) for i in range(10)
+    ]
+    mem.append_voice_companion_call(call_id="call-zero-cap", entries=entries)
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "voice_metrics.jsonl").write_text(
+        json.dumps({"call_id": "m1", "timestamp": now.isoformat()}) + "\n",
+        encoding="utf-8",
+    )
+    (logs_dir / "audit.jsonl").write_text(
+        json.dumps({"tool": "t1", "timestamp": now.isoformat()}) + "\n",
+        encoding="utf-8",
+    )
+
+    res = prune_diagnostic_logs(max_entries=0, max_age_days=30, data_dir=tmp_path, now=now)
+    assert res["pruned_companion_turns"] == 10
+    assert res["pruned_voice_metrics"] == 1
+    assert res["pruned_audit_records"] == 1
+
+    # voice_companion.jsonl has only header line remaining
+    with mem.transcript_path(VOICE_COMPANION_SESSION_ID).open("r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    assert len(lines) == 1
+
+    # metrics and audit are empty
+    assert (logs_dir / "voice_metrics.jsonl").read_text(encoding="utf-8").strip() == ""
+    assert (logs_dir / "audit.jsonl").read_text(encoding="utf-8").strip() == ""
+
+
+def test_meaningful_turn_filter_none_and_empty_payloads() -> None:
+    """Verify None, empty string, and null payload fields return False in is_meaningful_turn."""
+    assert is_meaningful_turn(None) is False
+    assert is_meaningful_turn("") is False
+    assert is_meaningful_turn("   ") is False
+    assert is_meaningful_turn("None") is False
+
+    # Simulate transcript messages with None text
+    dummy_transcript = {
+        "messages": [
+            {"role": "user", "text": None},
+            {"role": "assistant", "text": "Can I help you?"},
+            {"role": "user", "text": "   "},
+        ]
+    }
+    mem = MemoryStore()
+    mgr = ConsolidationManager(memory=mem, provider=_MockConsolidationProvider())
+    is_triv, meaningful = mgr.is_trivial_session(dummy_transcript)
+    assert is_triv is True
+    assert meaningful == 0
+
+
+def test_add_or_update_entry_strips_llm_bracket_and_bullet_pollution(tmp_path: Path) -> None:
+    """Verify add_or_update_entry cleans markdown bullets, duplicate IDs, and section tags."""
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    # 1. LLM echoes - [pref-01] (Preferences) in text
+    entry1 = mem.add_or_update_entry(
+        text="- [pref-theme] (Preferences) User prefers high-contrast dark mode.",
+        section="Preferences",
+        entry_id="pref-theme",
+    )
+    assert entry1.id == "pref-theme"
+    assert entry1.text == "User prefers high-contrast dark mode."
+    assert "- [pref-theme]" not in entry1.text
+    assert "(Preferences)" not in entry1.text
+
+    # 2. Update same entry with different text
+    entry2 = mem.add_or_update_entry(
+        text="* User prefers solarized dark mode.",
+        section="Preferences",
+        entry_id="[pref-theme]",
+    )
+    assert entry2.id == "pref-theme"
+    assert entry2.text == "User prefers solarized dark mode."
+    assert "* " not in entry2.text
+
+    # Verify MEMORY.md file content is cleanly formatted
+    md_content = mem.read_long_term()
+    assert "- [pref-theme] (" in md_content
+    assert "User prefers solarized dark mode." in md_content
+    assert "[pref-theme] (" not in entry2.text
+
+
+def test_remove_entries_short_query_safety(tmp_path: Path) -> None:
+    """Verify short queries (< 3 chars) do not accidentally remove entries by substring."""
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+
+    mem.add_or_update_entry(
+        text="User lives in India.",
+        section="Profile",
+        entry_id="prof-in01",
+    )
+    mem.add_or_update_entry(
+        text="User writes Python and Go.",
+        section="Preferences",
+        entry_id="pref-lang",
+    )
+
+    # Short 2-char query "in" would match "User lives in India" as a substring,
+    # but should NOT delete unless exact match or ID match.
+    removed = mem.remove_entries("in")
+    assert len(removed) == 0
+
+    # Entry is still present
+    sections = mem.parse_sections()
+    assert any(e.id == "prof-in01" for e in sections["Profile"])
+
+    # Deleting by exact ID works regardless of query length
+    removed_by_id = mem.remove_entries("prof-in01")
+    assert len(removed_by_id) == 1
+    assert removed_by_id[0].id == "prof-in01"
+

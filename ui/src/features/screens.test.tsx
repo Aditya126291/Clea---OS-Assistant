@@ -344,6 +344,16 @@ describe("UI screens & navigation", () => {
     fireEvent.keyDown(select, { key: "l", ctrlKey: true });
     expect(useCleaStore.getState().activeView).toBe("chat");
 
+    // When event is defaultPrevented, Ctrl+L should be ignored
+    const preventedEvent = new KeyboardEvent("keydown", {
+      key: "l",
+      ctrlKey: true,
+      cancelable: true,
+    });
+    preventedEvent.preventDefault();
+    window.dispatchEvent(preventedEvent);
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
     // When focus is inside a contenteditable element, Ctrl+L should be ignored
     const editable = document.createElement("div");
     editable.setAttribute("contenteditable", "true");

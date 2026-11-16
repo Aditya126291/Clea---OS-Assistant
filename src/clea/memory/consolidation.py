@@ -24,6 +24,7 @@ from clea.memory.store import (
     VOICE_COMPANION_SESSION_ID,
     MemoryStore,
     SourceTag,
+    _atomic_replace_file,
     is_secret_or_sensitive,
 )
 from clea.providers.base import LLMProvider, Message
@@ -211,6 +212,8 @@ _FILLER_TURNS = {
     "yes",
     "no",
     "nope",
+    "none",
+    "null",
     "sure",
     "never mind",
     "nevermind",
@@ -246,6 +249,8 @@ _FILLER_WORDS = {
     "yes",
     "no",
     "nope",
+    "none",
+    "null",
     "sure",
     "never",
     "mind",
@@ -264,9 +269,11 @@ _FILLER_WORDS = {
 }
 
 
-def is_meaningful_turn(text: str) -> bool:
+def is_meaningful_turn(text: str | None) -> bool:
     """Return True if text contains substantive information beyond conversational filler."""
-    cleaned = re.sub(r"[^\w\s]", "", text.strip().lower())
+    if not text:
+        return False
+    cleaned = re.sub(r"[^\w\s]", "", str(text).strip().lower())
     if not cleaned:
         return False
     if cleaned in _FILLER_TURNS:
@@ -453,7 +460,7 @@ class ConsolidationManager:
         self.memory.memory_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.pending_file.with_name(f"pending_sessions.tmp.{uuid4().hex}")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(self.pending_file)
+        _atomic_replace_file(tmp, self.pending_file)
 
     def load_state(self) -> dict[str, Any]:
         """Load state tracking consolidated sessions."""
@@ -469,7 +476,7 @@ class ConsolidationManager:
         self.memory.memory_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_name(f"consolidation_state.tmp.{uuid4().hex}")
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(self.state_file)
+        _atomic_replace_file(tmp, self.state_file)
 
     def _is_voice_call_covered_by_companion(
         self,
@@ -660,7 +667,7 @@ class ConsolidationManager:
         meaningful_user_turns = sum(
             1
             for m in messages
-            if m.get("role") == "user" and is_meaningful_turn(str(m.get("text", "")))
+            if m.get("role") == "user" and is_meaningful_turn(str(m.get("text") or ""))
         )
         has_tool_use = any(bool(m.get("tool_calls")) or m.get("role") == "tool" for m in messages)
         if meaningful_user_turns < self.min_user_turns and not has_tool_use:
@@ -777,16 +784,25 @@ class ConsolidationManager:
                     summary=summary,
                     trivial=True,
                 )
-                state = self.load_state()
-                now_iso = datetime.now().astimezone().isoformat()
                 resolved_sid = self.memory.resolve_session_id(session_id)
-                sess_data = self._build_completed_session_data(turn_count, now_iso, trivial=True)
-                state.setdefault("sessions", {})[session_id] = sess_data
-                if resolved_sid and resolved_sid != session_id:
-                    state["sessions"][resolved_sid] = sess_data
-                self._sync_voice_companion_state(state, transcript, now_iso)
-                state["last_consolidated_at"] = now_iso
-                self.save_state(state)
+                with self.memory._prune_lock:
+                    state = self.load_state()
+                    now_iso = datetime.now().astimezone().isoformat()
+                    if is_vc:
+                        current_vc = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+                        current_len = len(current_vc.get("messages", [])) if current_vc else 0
+                        effective_turn_count = min(turn_count, current_len)
+                    else:
+                        effective_turn_count = turn_count
+                    sess_data = self._build_completed_session_data(
+                        effective_turn_count, now_iso, trivial=True
+                    )
+                    state.setdefault("sessions", {})[session_id] = sess_data
+                    if resolved_sid and resolved_sid != session_id:
+                        state["sessions"][resolved_sid] = sess_data
+                    self._sync_voice_companion_state(state, transcript, now_iso)
+                    state["last_consolidated_at"] = now_iso
+                    self.save_state(state)
                 if effective_status_cb is not None:
                     await effective_status_cb("succeeded", None)
                 terminal_emitted = True
@@ -954,19 +970,27 @@ class ConsolidationManager:
             except Exception as emb_err:
                 logger.debug("Embedding backfill skipped after consolidation: %s", emb_err)
 
-            # 3. Mark completed
+            # 3. Mark completed under prune lock to prevent concurrent checkpoint drift
             resolved_sid = self.memory.resolve_session_id(session_id)
-            sess_data = self._build_completed_session_data(
-                turn_count,
-                now_iso,
-                retry_count=sess_info.get("retry_count", 0),
-            )
-            state.setdefault("sessions", {})[session_id] = sess_data
-            if resolved_sid and resolved_sid != session_id:
-                state["sessions"][resolved_sid] = sess_data
-            self._sync_voice_companion_state(state, transcript, now_iso)
-            state["last_consolidated_at"] = now_iso
-            self.save_state(state)
+            with self.memory._prune_lock:
+                state = self.load_state()
+                if is_vc:
+                    current_vc = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+                    current_len = len(current_vc.get("messages", [])) if current_vc else 0
+                    effective_turn_count = min(turn_count, current_len)
+                else:
+                    effective_turn_count = turn_count
+                sess_data = self._build_completed_session_data(
+                    effective_turn_count,
+                    now_iso,
+                    retry_count=sess_info.get("retry_count", 0),
+                )
+                state.setdefault("sessions", {})[session_id] = sess_data
+                if resolved_sid and resolved_sid != session_id:
+                    state["sessions"][resolved_sid] = sess_data
+                self._sync_voice_companion_state(state, transcript, now_iso)
+                state["last_consolidated_at"] = now_iso
+                self.save_state(state)
 
             logger.info("Successfully consolidated session %s", session_id)
             if effective_status_cb is not None:
