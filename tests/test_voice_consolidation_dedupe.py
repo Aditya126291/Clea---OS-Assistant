@@ -372,8 +372,7 @@ async def test_activity_title_differentiates_voice_companion_from_chat_sessions(
         timestamp=datetime(2026, 11, 14, 15, 42, 0).astimezone(),
     )
     assert (
-        daemon._format_session_consolidation_title("chat-title-test")
-        == "Summarising session 15:42"
+        daemon._format_session_consolidation_title("chat-title-test") == "Summarising session 15:42"
     )
 
 
@@ -540,4 +539,3 @@ async def test_daemon_stop_shields_already_running_idle_consolidation(tmp_path: 
     state = daemon.consolidation.load_state()["sessions"][VOICE_COMPANION_SESSION_ID]
     assert state["status"] == "completed"
     assert state["last_consolidated_message_idx"] == 6
-

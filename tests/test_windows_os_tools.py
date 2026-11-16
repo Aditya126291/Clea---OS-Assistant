@@ -654,10 +654,7 @@ def test_inspect_git_workspace_parses_outputs_and_enforces_read_only(tmp_path: P
                 "detached\n"
             )
         elif sub == "log":
-            out = (
-                "abc1234 Add Tier-1 Windows OS tools\n"
-                "def5678 Previous master commit\n"
-            )
+            out = "abc1234 Add Tier-1 Windows OS tools\ndef5678 Previous master commit\n"
         elif sub == "diff":
             if "--stat" in cmd:
                 out = " src/clea/core/daemon.py | 12 +++++++-----\n"
@@ -1076,9 +1073,7 @@ async def test_daemon_direct_rpc_e2e_for_new_windows_os_methods(
             subprotocols=auth.client_subprotocols(token),
         ) as ws:
             # 1. os.select_clipboard_item
-            req_sel = OsSelectClipboardItemRequest(
-                params=OsSelectClipboardItemParams(index=3)
-            )
+            req_sel = OsSelectClipboardItemRequest(params=OsSelectClipboardItemParams(index=3))
             await ws.send(req_sel.model_dump_json())
             raw_sel = await asyncio.wait_for(ws.recv(), timeout=5.0)
             frame_sel = parse_frame(raw_sel)

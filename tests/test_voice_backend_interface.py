@@ -178,10 +178,7 @@ def test_default_voice_tools_cover_required_tools() -> None:
         by_name["select_clipboard_item"].parameters_schema["properties"]["index"]["type"]
         == "integer"
     )
-    assert (
-        by_name["select_clipboard_item"].parameters_schema["properties"]["index"]["minimum"]
-        == 0
-    )
+    assert by_name["select_clipboard_item"].parameters_schema["properties"]["index"]["minimum"] == 0
 
     assert by_name["open_url"].parameters_schema["required"] == ["url"]
     assert by_name["open_url"].parameters_schema["properties"]["url"]["type"] == "string"
@@ -203,12 +200,8 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "open_settings",
     ):
         assert expected_action in cs_actions
-    assert (
-        by_name["control_system"].parameters_schema["properties"]["level"]["minimum"] == 0
-    )
-    assert (
-        by_name["control_system"].parameters_schema["properties"]["level"]["maximum"] == 100
-    )
+    assert by_name["control_system"].parameters_schema["properties"]["level"]["minimum"] == 0
+    assert by_name["control_system"].parameters_schema["properties"]["level"]["maximum"] == 100
 
 
 def test_new_windows_os_voice_tools_registration_and_schemas() -> None:

@@ -1947,9 +1947,7 @@ def control_system(
 
     if normalized not in VALID_SYSTEM_ACTIONS:
         actions_str = ", ".join(VALID_SYSTEM_ACTIONS)
-        raise ValueError(
-            f"Unsupported system action {action!r}. Valid actions: {actions_str}."
-        )
+        raise ValueError(f"Unsupported system action {action!r}. Valid actions: {actions_str}.")
 
     # 1. Brightness controls
     if normalized == "get_brightness":
@@ -2358,9 +2356,7 @@ _LAST_UI_WINDOW_TITLE: str = ""
 VALID_UI_ACT_ACTIONS: frozenset[str] = frozenset(
     {"click", "set_value", "type", "clear", "double_click", "right_click"}
 )
-VALID_UI_BATCH_OPS: frozenset[str] = frozenset(
-    {"act", "press_keys", "scroll", "wait", "click_at"}
-)
+VALID_UI_BATCH_OPS: frozenset[str] = frozenset({"act", "press_keys", "scroll", "wait", "click_at"})
 
 
 def clear_ui_ref_store() -> None:
@@ -2416,18 +2412,20 @@ def set_ui_snapshot_state(snapshot: Any) -> None:
             "control_type": str(el.get("control_type") or el.get("role") or ""),
         }
         elements_by_ref[ref] = entry
-        llm_elements.append({
-            "ref": ref,
-            "role": role,
-            "name": name,
-            "value": val,
-            "x": entry["x"],
-            "y": entry["y"],
-            "automation_id": entry["automation_id"],
-            "control_type": entry["control_type"],
-            "enabled": entry["enabled"],
-            "focused": entry["focused"],
-        })
+        llm_elements.append(
+            {
+                "ref": ref,
+                "role": role,
+                "name": name,
+                "value": val,
+                "x": entry["x"],
+                "y": entry["y"],
+                "automation_id": entry["automation_id"],
+                "control_type": entry["control_type"],
+                "enabled": entry["enabled"],
+                "focused": entry["focused"],
+            }
+        )
 
     snapshot_id = str(snap_dict.get("snapshot_id") or f"snap_{uuid.uuid4().hex[:12]}")
     win_title = str(snap_dict.get("window_title") or "")
@@ -2476,6 +2474,7 @@ def _get_foreground_window_title(user32: Any = None) -> str:
         if copied > 0:
             return buf.value
     return ""
+
 
 _EXTENDED_VK_KEYS: frozenset[str] = frozenset(
     {
@@ -3138,9 +3137,7 @@ def _send_key_chord(u32: Any, keys: list[str]) -> list[str]:
     combo_set = frozenset(normalized_keys)
     for blocked in _BLOCKED_KEY_COMBOS:
         if blocked.issubset(combo_set):
-            raise ValueError(
-                f"Blocked dangerous key combination: {'+'.join(normalized_keys)}"
-            )
+            raise ValueError(f"Blocked dangerous key combination: {'+'.join(normalized_keys)}")
     events: list[_INPUT] = []
     for k_name in normalized_keys:
         vk = _ALLOWED_VK_MAP[k_name]
@@ -3157,9 +3154,7 @@ def _send_key_chord(u32: Any, keys: list[str]) -> list[str]:
         events.append(
             _INPUT(
                 type=INPUT_KEYBOARD,
-                union=_INPUT_UNION(
-                    ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=ext | KEYEVENTF_KEYUP)
-                ),
+                union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=ext | KEYEVENTF_KEYUP)),
             )
         )
     _send_win32_inputs(u32, events)
@@ -3284,9 +3279,7 @@ def ui_snapshot(
         focus_if_app_name=True,
     )
 
-    app_b64 = (
-        base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
-    )
+    app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
     interactive_flag = 1 if interactive_only else 0
     ps_command = (
         f"& {{ {_POWERSHELL_SNAPSHOT_UI_SCRIPT} }} "
@@ -3343,9 +3336,7 @@ def ui_snapshot(
         else:
             ref = f"e{len(llm_elements)}"
 
-        control_type = (
-            str(item.get("control_type") or "") or _ROLE_TO_CONTROL_TYPE.get(role, "")
-        )
+        control_type = str(item.get("control_type") or "") or _ROLE_TO_CONTROL_TYPE.get(role, "")
 
         elements_by_ref[ref] = {
             "ref": ref,
@@ -3477,8 +3468,7 @@ def ui_act(
         curr_snap = _UI_REF_STORE.snapshot_id or "none"
         if not _UI_REF_STORE.snapshot_id:
             raise ValueError(
-                f"Unknown or stale UI ref {ref!r}: no active snapshot. "
-                "Call ui_snapshot() first."
+                f"Unknown or stale UI ref {ref!r}: no active snapshot. Call ui_snapshot() first."
             )
         raise ValueError(
             f"Unknown or stale UI ref {ref!r}: UI element ref {ref!r} not found in "
@@ -3769,9 +3759,7 @@ def inspect_ui_elements(
 
     ps_exe = _resolve_powershell_exe(powershell_runner)
     runner = powershell_runner or subprocess.run
-    app_b64 = (
-        base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
-    )
+    app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
     cmd = [
         ps_exe,
         "-NoProfile",
@@ -3916,9 +3904,7 @@ def click_ui_element(
     ps_exe = _resolve_powershell_exe(powershell_runner)
     runner = powershell_runner or subprocess.run
     name_b64 = base64.b64encode(target_name.encode("utf-8")).decode("ascii")
-    app_b64 = (
-        base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
-    )
+    app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
     ct_arg = cleaned_ct or ""
     cmd = [
         ps_exe,

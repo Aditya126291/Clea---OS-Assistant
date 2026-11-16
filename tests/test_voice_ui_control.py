@@ -237,6 +237,7 @@ async def _running_voice_ui_env(
             connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as rpc_ws,
             connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ui_ws,
         ):
+
             async def _read_ui_events() -> None:
                 while True:
                     raw = await ui_ws.recv()
@@ -500,9 +501,7 @@ async def test_send_chat_message_streams_live_in_new_and_existing_chat(tmp_path:
         assert res2.is_error is False
         assert res2.response["session_id"] == sid
 
-        await _wait_until(
-            lambda: len((mem.get_transcript(sid) or {}).get("messages", [])) >= 4
-        )
+        await _wait_until(lambda: len((mem.get_transcript(sid) or {}).get("messages", [])) >= 4)
         transcript2 = mem.get_transcript(sid)
         assert transcript2 is not None
         assert transcript2["messages"][2]["text"] == "Give a short example"

@@ -74,9 +74,7 @@ class _FakeVoiceBackend(VoiceBackend):
     async def send_audio(self, pcm_bytes: bytes) -> None:
         pass
 
-    async def send_video_frame(
-        self, image_bytes: bytes, *, mime_type: str = "image/jpeg"
-    ) -> None:
+    async def send_video_frame(self, image_bytes: bytes, *, mime_type: str = "image/jpeg") -> None:
         pass
 
     async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
@@ -114,8 +112,7 @@ def _keyword_axis_embedder(text: str) -> list[float]:
     vec = [0.0, 0.0, 0.0, 0.0]
     # Axis 0: container orchestration / deployment
     if any(
-        w in low
-        for w in ("kubernetes", "docker", "container", "cluster", "orchestration", "pods")
+        w in low for w in ("kubernetes", "docker", "container", "cluster", "orchestration", "pods")
     ):
         vec[0] += 1.0
     # Axis 1: cooking / food
@@ -123,14 +120,11 @@ def _keyword_axis_embedder(text: str) -> list[float]:
         vec[1] += 1.0
     # Axis 2: time-series databases / telemetry
     if any(
-        w in low
-        for w in ("timescaledb", "telemetry", "time-series", "database", "time series")
+        w in low for w in ("timescaledb", "telemetry", "time-series", "database", "time series")
     ):
         vec[2] += 1.0
     # Axis 3: audio / hardware troubleshooting
-    if any(
-        w in low for w in ("audio", "playback", "sound", "microphone", "bluetooth", "stutter")
-    ):
+    if any(w in low for w in ("audio", "playback", "sound", "microphone", "bluetooth", "stutter")):
         vec[3] += 1.0
     norm = math.sqrt(sum(x * x for x in vec))
     if norm == 0.0:
@@ -146,11 +140,7 @@ def test_layer1_full_history_search_beyond_top_10_and_list_conversations(tmp_pat
     past_base = now_dt - timedelta(hours=20)
     # Seed 16 conversations; chat-00..chat-02 are older than chat-03..chat-15.
     for idx in range(16):
-        dt = (
-            past_base + timedelta(hours=idx)
-            if idx <= 2
-            else now_dt + timedelta(minutes=idx * 5)
-        )
+        dt = past_base + timedelta(hours=idx) if idx <= 2 else now_dt + timedelta(minutes=idx * 5)
         sid = f"chat-{idx:02d}"
         if idx == 0:
             title = "Legacy Database Engine"

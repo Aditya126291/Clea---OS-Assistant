@@ -331,6 +331,10 @@ class CleaDaemon:
         self.agent.memory.ensure_initialized()
         self.agent.memory.migrate_legacy_daily_logs()
         self.agent.memory.purge_trash()
+        try:
+            self.agent.memory.prune_diagnostic_logs()
+        except Exception as exc:
+            logger.warning("Failed pruning diagnostic logs on daemon startup: %s", exc)
         self._reconcile_orphaned_tasks()
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
@@ -403,9 +407,7 @@ class CleaDaemon:
                 reason="Interrupted by daemon shutdown"
             )
         with contextlib.suppress(Exception):
-            self.consolidation.reconcile_orphaned_running(
-                reason="Interrupted by daemon shutdown"
-            )
+            self.consolidation.reconcile_orphaned_running(reason="Interrupted by daemon shutdown")
         auth.remove_token(self.token_file, self.token)
         self._instance_lock.release()
 
@@ -586,10 +588,9 @@ class CleaDaemon:
                 on_task_status=_on_status,
             )
         except asyncio.CancelledError:
-            if (
-                (local_started and not local_terminal)
-                or self._consolidation_task_terminal.get(task_id) is False
-            ):
+            if (local_started and not local_terminal) or self._consolidation_task_terminal.get(
+                task_id
+            ) is False:
                 local_terminal = True
                 was_cancelled = task_id in self._cancelled_task_ids
                 with contextlib.suppress(Exception):
@@ -600,18 +601,16 @@ class CleaDaemon:
                     )
         except Exception as exc:
             logger.exception("Error consolidating session %s %s", canonical_sid, log_context)
-            if (
-                (local_started and not local_terminal)
-                or self._consolidation_task_terminal.get(task_id) is False
-            ):
+            if (local_started and not local_terminal) or self._consolidation_task_terminal.get(
+                task_id
+            ) is False:
                 local_terminal = True
                 with contextlib.suppress(Exception):
                     await self._emit_consolidation_task_status(canonical_sid, "failed", str(exc))
         finally:
-            if (
-                (local_started and not local_terminal)
-                or self._consolidation_task_terminal.get(task_id) is False
-            ):
+            if (local_started and not local_terminal) or self._consolidation_task_terminal.get(
+                task_id
+            ) is False:
                 with contextlib.suppress(Exception):
                     await self._emit_consolidation_task_status(
                         canonical_sid, "failed", "Consolidation did not complete cleanly"
@@ -1121,9 +1120,7 @@ class CleaDaemon:
             current_status = state_info.get("status", "completed" if ok else "failed")
             err = state_info.get("last_error") or state_info.get("error") if not ok else None
             if ok:
-                await self._broadcast(
-                    MemoryUpdatedEvent(data=MemoryUpdatedData(action="updated"))
-                )
+                await self._broadcast(MemoryUpdatedEvent(data=MemoryUpdatedData(action="updated")))
             await self._respond(
                 ws,
                 req,
@@ -1325,9 +1322,7 @@ class CleaDaemon:
         elif method == "conversation.rename":
             session_id = req.params.session_id
             if session_id == VOICE_COMPANION_SESSION_ID:
-                await self._respond(
-                    ws, req, error="Cannot rename the Voice Companion stream."
-                )
+                await self._respond(ws, req, error="Cannot rename the Voice Companion stream.")
                 return
             new_title = req.params.title
             try:
@@ -1351,9 +1346,7 @@ class CleaDaemon:
         elif method == "conversation.pin":
             session_id = req.params.session_id
             if session_id == VOICE_COMPANION_SESSION_ID:
-                await self._respond(
-                    ws, req, error="Cannot pin the Voice Companion stream."
-                )
+                await self._respond(ws, req, error="Cannot pin the Voice Companion stream.")
                 return
             pinned = req.params.pinned
             try:
@@ -1396,9 +1389,7 @@ class CleaDaemon:
         elif method == "conversation.delete":
             session_id = req.params.session_id
             if session_id == VOICE_COMPANION_SESSION_ID:
-                await self._respond(
-                    ws, req, error="Cannot delete the Voice Companion stream."
-                )
+                await self._respond(ws, req, error="Cannot delete the Voice Companion stream.")
                 return
             if session_id in self._busy_sessions:
                 await self._respond(
@@ -1407,9 +1398,7 @@ class CleaDaemon:
                 return
             delete_episodes = req.params.delete_episodes
             try:
-                await self._perform_conversation_delete(
-                    session_id, delete_episodes=delete_episodes
-                )
+                await self._perform_conversation_delete(session_id, delete_episodes=delete_episodes)
             except (ValueError, FileNotFoundError) as exc:
                 await self._respond(ws, req, error=str(exc))
                 return
@@ -1561,6 +1550,10 @@ class CleaDaemon:
                 tr = self.agent.memory.get_transcript(req_call_id)
                 if tr and tr.get("messages"):
                     self._schedule_consolidation_now(req_call_id)
+                self._spawn_background_task(
+                    asyncio.to_thread(self.agent.memory.prune_diagnostic_logs),
+                    name="prune-diagnostic-logs",
+                )
                 self._ended_voice_call_ids.discard(req_call_id)
                 await self._respond(
                     ws,
@@ -1612,6 +1605,11 @@ class CleaDaemon:
             )
             if persisted and req.params.reason != "transcript_sync":
                 self._schedule_consolidation_now(ended_id)
+
+            self._spawn_background_task(
+                asyncio.to_thread(self.agent.memory.prune_diagnostic_logs),
+                name="prune-diagnostic-logs",
+            )
 
             await self._broadcast(
                 CallEndedEvent(
@@ -2226,9 +2224,7 @@ class CleaDaemon:
             return
 
         try:
-            await self._perform_conversation_delete(
-                sid, delete_episodes=req.params.delete_episodes
-            )
+            await self._perform_conversation_delete(sid, delete_episodes=req.params.delete_episodes)
         except (ValueError, FileNotFoundError) as exc:
             await self._respond(ws, req, error=str(exc))
             return
@@ -2654,9 +2650,7 @@ class CleaDaemon:
                 # If control_system did not accept window_title or window_action,
                 # retry with title only
                 fallback_kwargs = {
-                    k: v
-                    for k, v in kwargs.items()
-                    if k not in ("window_title", "window_action")
+                    k: v for k, v in kwargs.items() if k not in ("window_title", "window_action")
                 }
                 if target_title is not None and "title" not in fallback_kwargs:
                     fallback_kwargs["title"] = target_title
@@ -2836,8 +2830,7 @@ class CleaDaemon:
         ws = conn.ws
         p = req.params
         steps_raw = [
-            s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else s
-            for s in p.steps
+            s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else s for s in p.steps
         ]
         try:
             res = await asyncio.to_thread(

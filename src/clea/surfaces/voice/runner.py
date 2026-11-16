@@ -1368,9 +1368,9 @@ class VoiceRunner:
                                 or candidate.monitor_index is None
                                 or candidate.monitor_index == res.monitor_index
                             )
-                            same_window = (
-                                (candidate.process_name, candidate.window_title)
-                                == (res.process_name, res.window_title)
+                            same_window = (candidate.process_name, candidate.window_title) == (
+                                res.process_name,
+                                res.window_title,
                             )
                             if (
                                 not candidate_blocked
@@ -1549,9 +1549,7 @@ class VoiceRunner:
                     limit = max(1, min(int(raw_limit), 50))
             try:
                 res = await self._rpc(
-                    VoiceListConversationsRequest(
-                        params=VoiceListConversationsParams(limit=limit)
-                    ),
+                    VoiceListConversationsRequest(params=VoiceListConversationsParams(limit=limit)),
                     timeout=10.0,
                 )
                 tool_resp = VoiceToolResponse(
@@ -1892,9 +1890,7 @@ class VoiceRunner:
                 await _send_error("query_or_id must not be empty.")
                 return
             await _execute_rpc_tool(
-                MemoryDeleteFactRequest(
-                    params=MemoryDeleteFactParams(query_or_id=query_or_id)
-                ),
+                MemoryDeleteFactRequest(params=MemoryDeleteFactParams(query_or_id=query_or_id)),
                 error_prefix="Failed to delete memory fact",
             )
             return
@@ -2041,9 +2037,7 @@ class VoiceRunner:
                 await _send_error("index must be non-negative.")
                 return
             await _execute_rpc_tool(
-                OsSelectClipboardItemRequest(
-                    params=OsSelectClipboardItemParams(index=index)
-                ),
+                OsSelectClipboardItemRequest(params=OsSelectClipboardItemParams(index=index)),
                 error_prefix="Failed to select clipboard item",
             )
             return
@@ -2318,8 +2312,7 @@ class VoiceRunner:
             stop_on_win_change = _parse_bool("stop_on_window_change", default=True)
             try:
                 steps = [
-                    UiBatchStep.model_validate(s) if isinstance(s, dict) else s
-                    for s in raw_steps
+                    UiBatchStep.model_validate(s) if isinstance(s, dict) else s for s in raw_steps
                 ]
             except Exception as exc:
                 await _send_error(f"Invalid batch step format: {exc}")

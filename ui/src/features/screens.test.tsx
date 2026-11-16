@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "@/App";
 import { ActivityView } from "@/features/activity/ActivityView";
@@ -104,8 +104,11 @@ describe("UI screens & navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: /Settings/i }));
     expect(useCleaStore.getState().activeView).toBe("settings");
 
-    fireEvent.click(screen.getByRole("button", { name: /Open Voice Companion Transcript/i }));
-    expect(useCleaStore.getState().activeView).toBe("voice");
+    const footer = screen.getByTestId("sidebar-footer");
+    expect(within(footer).getByRole("button", { name: /^Voice$/i })).toBeInTheDocument();
+    expect(within(footer).getByRole("button", { name: /Theme:/i })).toBeInTheDocument();
+    expect(within(footer).queryByRole("button", { name: /^Log$/i })).toBeNull();
+    expect(within(footer).queryByRole("button", { name: /Open Voice Companion Transcript/i })).toBeNull();
   });
 
   it("renders running and finished tasks in ActivityView", () => {
@@ -267,5 +270,79 @@ describe("UI screens & navigation", () => {
     expect(composerContainer.className).toContain("pl-6");
     expect(composerContainer.className).toContain("pr-68");
     expect(composerContainer.className).not.toContain("px-6");
+  });
+
+  it("toggles Companion Log from ActivityView header button", () => {
+    useCleaStore.setState({ activeView: "activity" });
+    render(<ActivityView />);
+
+    const companionBtn = screen.getByRole("button", { name: /Companion Log/i });
+    expect(companionBtn).toBeInTheDocument();
+
+    fireEvent.click(companionBtn);
+    expect(useCleaStore.getState().activeView).toBe("voice");
+
+    act(() => {
+      useCleaStore.getState().toggleCompanionLog();
+    });
+    expect(useCleaStore.getState().activeView).toBe("activity");
+  });
+
+  it("toggles Companion Log via Ctrl+L and Cmd+L shortcuts and ignores typing in input/textarea", () => {
+    const connectSpy = vi.fn();
+    const disconnectSpy = vi.fn();
+    useCleaStore.setState({
+      connect: connectSpy,
+      disconnect: disconnectSpy,
+      connectionState: "connected",
+      activeView: "chat",
+      previousView: "chat",
+    });
+
+    const { container } = render(<App />);
+
+    // Ctrl+L opens voice Companion Log
+    fireEvent.keyDown(window, { key: "l", ctrlKey: true });
+    expect(useCleaStore.getState().activeView).toBe("voice");
+
+    // Ctrl+L closes voice Companion Log back to chat
+    fireEvent.keyDown(window, { key: "l", ctrlKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
+    // Meta+L (Cmd+L) works as well
+    fireEvent.keyDown(window, { key: "l", metaKey: true });
+    expect(useCleaStore.getState().activeView).toBe("voice");
+
+    fireEvent.keyDown(window, { key: "l", metaKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
+    // When focus is inside an input, Ctrl+L should be ignored
+    const input = document.createElement("input");
+    container.appendChild(input);
+    input.focus();
+    fireEvent.keyDown(input, { key: "l", ctrlKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
+    // When focus is inside a textarea, Ctrl+L should be ignored
+    const textarea = document.createElement("textarea");
+    container.appendChild(textarea);
+    textarea.focus();
+    fireEvent.keyDown(textarea, { key: "l", ctrlKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
+    // When focus is inside a select, Ctrl+L should be ignored
+    const select = document.createElement("select");
+    container.appendChild(select);
+    select.focus();
+    fireEvent.keyDown(select, { key: "l", ctrlKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
+
+    // When focus is inside a contenteditable element, Ctrl+L should be ignored
+    const editable = document.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    container.appendChild(editable);
+    editable.focus();
+    fireEvent.keyDown(editable, { key: "l", ctrlKey: true });
+    expect(useCleaStore.getState().activeView).toBe("chat");
   });
 });

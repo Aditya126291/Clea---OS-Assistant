@@ -314,4 +314,14 @@ describe("CallOverlay", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("opens the Companion Log via View Companion Log button", () => {
+    useCleaStore.setState({ activeView: "chat", callOverlayOpen: true });
+    render(<CallOverlay />);
+
+    const btn = screen.getByRole("button", { name: /View Companion Log/i });
+    expect(btn).toBeInTheDocument();
+    fireEvent.click(btn);
+    expect(useCleaStore.getState().activeView).toBe("voice");
+  });
 });

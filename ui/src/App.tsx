@@ -28,6 +28,32 @@ function CleaShell() {
   const connect = useCleaStore((s) => s.connect);
   const disconnect = useCleaStore((s) => s.disconnect);
   const retryNow = useCleaStore((s) => s.retryNow);
+  const toggleCompanionLog = useCleaStore((s) => s.toggleCompanionLog);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") {
+        const target = e.target as HTMLElement | null;
+        if (target) {
+          const tag = target.tagName ? target.tagName.toLowerCase() : "";
+          if (
+            tag === "input" ||
+            tag === "textarea" ||
+            tag === "select" ||
+            target.isContentEditable ||
+            target.getAttribute?.("contenteditable") === "true" ||
+            Boolean(target.closest?.("input, textarea, select, [contenteditable='true']"))
+          ) {
+            return;
+          }
+        }
+        e.preventDefault();
+        toggleCompanionLog();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [toggleCompanionLog]);
 
   const quickAsk = isQuickAskMode();
 

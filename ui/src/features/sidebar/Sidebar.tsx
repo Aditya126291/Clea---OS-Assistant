@@ -426,35 +426,22 @@ export function Sidebar() {
         data-testid="sidebar-footer"
         className="flex shrink-0 items-center justify-between gap-1.5 px-3 py-2.5"
       >
-        <div className="flex min-w-0 items-center gap-1">
-          <Button
-            size="sm"
-            variant={callOverlayOpen ? "default" : "ghost"}
-            onClick={() => {
-              if (!callOverlayOpen) {
-                void startVoiceCall();
-              } else {
-                void endVoiceCall();
-              }
-            }}
-            aria-pressed={callOverlayOpen}
-            className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
-          >
-            <AudioLines className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            <span>Voice</span>
-          </Button>
-
-          <Button
-            size="sm"
-            variant={activeView === "voice" ? "secondary" : "ghost"}
-            onClick={() => setActiveView("voice")}
-            title="Open Voice Companion Transcript"
-            aria-label="Open Voice Companion Transcript"
-            className="h-7 shrink-0 px-2 text-xs"
-          >
-            Log
-          </Button>
-        </div>
+        <Button
+          size="sm"
+          variant={callOverlayOpen ? "default" : "ghost"}
+          onClick={() => {
+            if (!callOverlayOpen) {
+              void startVoiceCall();
+            } else {
+              void endVoiceCall();
+            }
+          }}
+          aria-pressed={callOverlayOpen}
+          className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
+        >
+          <AudioLines className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span>Voice</span>
+        </Button>
 
         <Button
           size="sm"

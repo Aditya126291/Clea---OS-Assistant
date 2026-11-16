@@ -283,12 +283,16 @@ def score_conversation_lexical(
         [title, episode_summary, *fact_texts_for_cov, *turn_texts_for_cov],
     )
     if total_cov <= 0.0:
-        return 0.0, 0.0, {
-            "title": 0.0,
-            "episode": 0.0,
-            "fact": 0.0,
-            "turn": 0.0,
-        }
+        return (
+            0.0,
+            0.0,
+            {
+                "title": 0.0,
+                "episode": 0.0,
+                "fact": 0.0,
+                "turn": 0.0,
+            },
+        )
 
     title_pts = WEIGHT_TITLE * cov_title
     episode_pts = WEIGHT_EPISODE * cov_episode
@@ -299,12 +303,16 @@ def score_conversation_lexical(
     # Normalize against 9.5 so Title (+5.0) > Episode (+3.5) > Fact (+3.0) > Turn (+1.0)
     # remains strictly ordered inside [0.0, 1.0].
     normalized = min(1.0, raw_lexical / 9.5)
-    return normalized, total_cov, {
-        "title": title_pts,
-        "episode": episode_pts,
-        "fact": fact_pts,
-        "turn": turn_pts,
-    }
+    return (
+        normalized,
+        total_cov,
+        {
+            "title": title_pts,
+            "episode": episode_pts,
+            "fact": fact_pts,
+            "turn": turn_pts,
+        },
+    )
 
 
 def score_memory_lexical(
@@ -470,9 +478,7 @@ class EmbeddingProvider:
     def _embed_via_ollama(self, text: str) -> list[float] | None:
         mocked = _is_mock_obj(urllib.request.urlopen)
         configured_url = (
-            self.ollama_url
-            or os.environ.get("CLEA_OLLAMA_URL")
-            or os.environ.get("OLLAMA_HOST")
+            self.ollama_url or os.environ.get("CLEA_OLLAMA_URL") or os.environ.get("OLLAMA_HOST")
         )
         configured_model = self.ollama_model or os.environ.get("CLEA_OLLAMA_EMBED_MODEL")
 
@@ -607,11 +613,7 @@ class EmbeddingStore:
         self._ensure_loaded()
         digest = text_hash(text)
         existing = self._items.get(key)
-        if (
-            existing
-            and existing.get("text_hash") == digest
-            and existing.get("vector") == compact
-        ):
+        if existing and existing.get("text_hash") == digest and existing.get("vector") == compact:
             return False
         self._items[key] = {
             "text_hash": digest,

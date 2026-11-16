@@ -294,15 +294,9 @@ def test_windows_os_and_git_protocol_roundtrip() -> None:
                 name="Equals", control_type="Button", app_name="Calculator"
             )
         ),
-        OsGuiActionRequest(
-            params=OsGuiActionParams(action="press_keys", keys=["ctrl", "l"])
-        ),
-        OsUiSnapshotRequest(
-            params=OsUiSnapshotParams(app_name="Calculator", max_elements=30)
-        ),
-        OsUiActRequest(
-            params=OsUiActParams(ref="e2", action="set_value", value="42")
-        ),
+        OsGuiActionRequest(params=OsGuiActionParams(action="press_keys", keys=["ctrl", "l"])),
+        OsUiSnapshotRequest(params=OsUiSnapshotParams(app_name="Calculator", max_elements=30)),
+        OsUiActRequest(params=OsUiActParams(ref="e2", action="set_value", value="42")),
         OsUiBatchRequest(
             params=OsUiBatchParams(
                 steps=[
@@ -1164,4 +1158,3 @@ async def test_daemon_windows_os_control_system_window_actions(tmp_path: Path) -
         assert payload["id"] == req.id
         assert payload["ok"] is True
         assert payload["result"]["window_title"] == "Notepad"
-

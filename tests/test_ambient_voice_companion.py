@@ -904,4 +904,3 @@ async def test_concurrent_call_start_trigger_collision_safety(tmp_path: Path) ->
         await runner.stop()
         runner_task.cancel()
         await daemon.stop()
-

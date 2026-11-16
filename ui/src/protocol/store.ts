@@ -43,6 +43,7 @@ export interface CleaStoreState {
   reconnectAttempt: number;
   lastError: string | null;
   activeView: AppView;
+  previousView: AppView;
   commandPaletteOpen: boolean;
 
   sessionId: string | null;
@@ -95,6 +96,7 @@ export interface CleaStoreState {
   disconnect: () => void;
   retryNow: () => void;
   setActiveView: (view: AppView) => void;
+  toggleCompanionLog: () => void;
   setMemorySubView: (view: "overview" | "transcripts") => void;
   setCommandPaletteOpen: (open: boolean) => void;
   setCallOverlayOpen: (open: boolean) => void;
@@ -213,6 +215,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   reconnectAttempt: 0,
   lastError: null,
   activeView: "chat",
+  previousView: "chat",
   commandPaletteOpen: false,
 
   sessionId: null,
@@ -362,12 +365,27 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   },
 
   setActiveView: (view) => {
+    const current = get().activeView;
+    if (current !== "voice") {
+      set({ previousView: current });
+    }
     set({ activeView: view });
     if (view !== "chat") {
       notifyChatFocus(null);
     } else {
       const sid = get().resumedSessionId || get().sessionId || null;
       notifyChatFocus(sid);
+    }
+  },
+  toggleCompanionLog: () => {
+    const current = get().activeView;
+    if (current === "voice") {
+      const prev = get().previousView;
+      const target = prev && prev !== "voice" ? prev : "activity";
+      get().setActiveView(target);
+    } else {
+      set({ previousView: current });
+      get().setActiveView("voice");
     }
   },
   setMemorySubView: (view) => set({ memorySubView: view }),

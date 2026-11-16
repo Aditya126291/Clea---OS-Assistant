@@ -342,9 +342,9 @@ async def test_gemini_backend_send_tool_responses_attaches_media_parts() -> None
     assert mock_session.send_realtime_input.call_count == 0
     assert mock_session.send_tool_response.called
 
-    sent_list: list[types.FunctionResponse] = (
-        mock_session.send_tool_response.call_args.kwargs["function_responses"]
-    )
+    sent_list: list[types.FunctionResponse] = mock_session.send_tool_response.call_args.kwargs[
+        "function_responses"
+    ]
     assert len(sent_list) == 2
 
     ok_resp = sent_list[0]

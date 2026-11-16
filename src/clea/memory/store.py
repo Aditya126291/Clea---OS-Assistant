@@ -15,7 +15,7 @@ import logging
 import re
 import shutil
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -387,7 +387,17 @@ class MemoryStore:
         target_list = sections[target_section]
 
         today_str = (now or datetime.now().astimezone()).date().isoformat()
-        resolved_id = entry_id or f"{target_section[:4].lower()}-{uuid4().hex[:4]}"
+        resolved_id = (
+            entry_id.strip("[]")
+            if entry_id and entry_id.strip("[]")
+            else f"{target_section[:4].lower()}-{uuid4().hex[:4]}"
+        )
+
+        # If entry_id was specified and exists in another section, remove it from that section
+        if entry_id:
+            for s_name, s_entries in sections.items():
+                if s_name != target_section:
+                    sections[s_name] = [e for e in s_entries if e.id != resolved_id]
 
         existing_idx: int | None = None
         norm_new_text = " ".join(text.lower().split())
@@ -788,11 +798,7 @@ class MemoryStore:
                 active_tr = self.get_transcript(active_conversation_id)
             except Exception:
                 active_tr = None
-            if (
-                active_tr
-                and not active_tr.get("is_voice_call")
-                and active_tr.get("messages")
-            ):
+            if active_tr and not active_tr.get("is_voice_call") and active_tr.get("messages"):
                 active_title = str(active_tr.get("title") or "Conversation").strip()
                 recent_chat_msgs = list(active_tr.get("messages", []))[-max(1, active_chat_turns) :]
                 active_sid = active_tr.get("session_id", active_conversation_id)
@@ -937,9 +943,7 @@ class MemoryStore:
         path = self.transcript_path(VOICE_COMPANION_SESSION_ID)
 
         existing_vc = (
-            self._read_transcript_file(path, VOICE_COMPANION_SESSION_ID)
-            if path.exists()
-            else None
+            self._read_transcript_file(path, VOICE_COMPANION_SESSION_ID) if path.exists() else None
         )
         existing_for_call = (
             [m for m in existing_vc.get("messages", []) if m.get("call_id") == call_id]
@@ -1217,6 +1221,174 @@ class MemoryStore:
                 except Exception as exc:
                     logger.warning("Could not purge trash file %s: %s", p, exc)
         return count
+
+    def prune_diagnostic_logs(
+        self,
+        max_age_days: int = 7,
+        max_entries: int = 500,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Prune raw voice companion turns and diagnostic logs by TTL and max entry cap.
+
+        Strict Guarantees:
+        - NEVER modifies curated Memory entries (MEMORY.md, episodes, daily memory).
+        - NEVER touches saved HISTORY conversation threads
+          (<session_id>.jsonl where session_id != voice_companion).
+        - Idempotent and safe against concurrent execution.
+        """
+        ref_now = now or datetime.now().astimezone()
+        if ref_now.tzinfo is None:
+            ref_now = ref_now.astimezone()
+        cutoff = ref_now - timedelta(days=max_age_days)
+        cutoff_epoch = cutoff.timestamp()
+
+        pruned_companion = 0
+        pruned_metrics = 0
+        pruned_audit = 0
+        pruned_logs = 0
+        pruned_trash = 0
+
+        # 1. Prune voice_companion.jsonl stream
+        vc_path = self.transcript_path(VOICE_COMPANION_SESSION_ID)
+        if vc_path.exists():
+            try:
+                with vc_path.open("r", encoding="utf-8") as handle:
+                    lines = [line.strip() for line in handle if line.strip()]
+                if lines:
+                    header_line = lines[0]
+                    msg_lines = lines[1:]
+                    kept_msg_lines: list[str] = []
+                    for line in msg_lines:
+                        try:
+                            msg_obj = json.loads(line)
+                            ts_str = msg_obj.get("timestamp")
+                            if ts_str:
+                                dt = datetime.fromisoformat(ts_str)
+                                if dt.tzinfo is None:
+                                    dt = dt.astimezone()
+                                if dt < cutoff:
+                                    pruned_companion += 1
+                                    continue
+                            kept_msg_lines.append(line)
+                        except Exception:
+                            kept_msg_lines.append(line)
+
+                    if len(kept_msg_lines) > max_entries:
+                        excess = len(kept_msg_lines) - max_entries
+                        pruned_companion += excess
+                        kept_msg_lines = kept_msg_lines[-max_entries:]
+
+                    if pruned_companion > 0 or len(kept_msg_lines) + 1 < len(lines):
+                        tmp_path = vc_path.with_name(
+                            f"{VOICE_COMPANION_SESSION_ID}.tmp.{uuid4().hex}"
+                        )
+                        with tmp_path.open("w", encoding="utf-8") as handle:
+                            handle.write(header_line + "\n")
+                            for line in kept_msg_lines:
+                                handle.write(line + "\n")
+                        tmp_path.replace(vc_path)
+            except Exception as exc:
+                logger.warning("Error pruning companion logs in %s: %s", vc_path, exc)
+
+        # 2. Prune logs/voice_metrics.jsonl
+        logs_dir = self.base_dir / "logs"
+        metrics_path = logs_dir / "voice_metrics.jsonl"
+        if metrics_path.exists():
+            try:
+                with metrics_path.open("r", encoding="utf-8") as handle:
+                    lines = [line.strip() for line in handle if line.strip()]
+                kept_metrics: list[str] = []
+                for line in lines:
+                    try:
+                        record = json.loads(line)
+                        ts_str = record.get("timestamp") or record.get("created_at")
+                        if ts_str:
+                            dt = datetime.fromisoformat(ts_str)
+                            if dt.tzinfo is None:
+                                dt = dt.astimezone()
+                            if dt < cutoff:
+                                pruned_metrics += 1
+                                continue
+                        kept_metrics.append(line)
+                    except Exception:
+                        kept_metrics.append(line)
+
+                if len(kept_metrics) > max_entries:
+                    excess = len(kept_metrics) - max_entries
+                    pruned_metrics += excess
+                    kept_metrics = kept_metrics[-max_entries:]
+
+                if pruned_metrics > 0 or len(kept_metrics) < len(lines):
+                    tmp_metrics = metrics_path.with_name(f"voice_metrics.tmp.{uuid4().hex}")
+                    with tmp_metrics.open("w", encoding="utf-8") as handle:
+                        for line in kept_metrics:
+                            handle.write(line + "\n")
+                    tmp_metrics.replace(metrics_path)
+            except Exception as exc:
+                logger.warning("Error pruning voice metrics in %s: %s", metrics_path, exc)
+
+        # 3. Prune logs/audit.jsonl
+        audit_path = logs_dir / "audit.jsonl"
+        if audit_path.exists():
+            try:
+                with audit_path.open("r", encoding="utf-8") as handle:
+                    lines = [line.strip() for line in handle if line.strip()]
+                kept_audit: list[str] = []
+                for line in lines:
+                    try:
+                        record = json.loads(line)
+                        ts_str = record.get("timestamp") or record.get("created_at")
+                        if ts_str:
+                            dt = datetime.fromisoformat(ts_str)
+                            if dt.tzinfo is None:
+                                dt = dt.astimezone()
+                            if dt < cutoff:
+                                pruned_audit += 1
+                                continue
+                        kept_audit.append(line)
+                    except Exception:
+                        kept_audit.append(line)
+
+                if len(kept_audit) > max_entries:
+                    excess = len(kept_audit) - max_entries
+                    pruned_audit += excess
+                    kept_audit = kept_audit[-max_entries:]
+
+                if pruned_audit > 0 or len(kept_audit) < len(lines):
+                    tmp_audit = audit_path.with_name(f"audit.tmp.{uuid4().hex}")
+                    with tmp_audit.open("w", encoding="utf-8") as handle:
+                        for line in kept_audit:
+                            handle.write(line + "\n")
+                    tmp_audit.replace(audit_path)
+            except Exception as exc:
+                logger.warning("Error pruning audit logs in %s: %s", audit_path, exc)
+
+        # 4. Prune rotated diagnostic files: logs/daemon.log.*, logs/voice.log.*
+        if logs_dir.is_dir():
+            for pat in ("daemon.log.*", "voice.log.*", "daemon_*.log", "voice_*.log"):
+                for p in logs_dir.glob(pat):
+                    try:
+                        if p.stat().st_mtime < cutoff_epoch:
+                            p.unlink(missing_ok=True)
+                            pruned_logs += 1
+                    except Exception:
+                        pass
+
+        # 5. Prune trash directory if files older than max_age_days
+        try:
+            pruned_trash = self.purge_trash(min_age_seconds=max_age_days * 86400.0)
+        except Exception:
+            pass
+
+        result = {
+            "pruned_companion_turns": pruned_companion,
+            "pruned_voice_metrics": pruned_metrics,
+            "pruned_audit_records": pruned_audit,
+            "pruned_log_files": pruned_logs,
+            "pruned_trash_files": pruned_trash,
+        }
+        result["total_pruned"] = sum(result.values())
+        return result
 
     def delete_episode(self, session_id: str, *, backup_in_trash: bool = False) -> bool:
         """Remove session episode entry from memory/episodes/*.md."""
@@ -1637,9 +1809,7 @@ class MemoryStore:
                 ts = str(msg.get("timestamp") or effective_updated_at)
                 snip = build_search_snippet(searchable_text, q_lower, q_tokens)
                 call_id = str(msg["call_id"]) if msg.get("call_id") else None
-                turn_candidates.append(
-                    (turn_cov, _iso_sort_value(ts), ts, role, snip, call_id)
-                )
+                turn_candidates.append((turn_cov, _iso_sort_value(ts), ts, role, snip, call_id))
 
             q_set = set(q_tokens)
             conv_tokens = set(tokenize_query("\n".join([title, episode_summary, *turn_texts])))
@@ -1824,10 +1994,7 @@ class MemoryStore:
                     "role": str(msg.get("role") or "assistant"),
                     "content": content,
                     "timestamp": str(
-                        msg.get("timestamp")
-                        or tr.get("updated_at")
-                        or tr.get("started_at")
-                        or ""
+                        msg.get("timestamp") or tr.get("updated_at") or tr.get("started_at") or ""
                     ),
                 }
             )
@@ -1843,9 +2010,7 @@ class MemoryStore:
         header_updated = str(tr.get("updated_at") or tr.get("started_at") or "")
         last_msg_ts = str(messages[-1].get("timestamp") or "") if messages else ""
         effective_updated_at = (
-            _latest_iso_timestamp(header_updated, last_msg_ts)
-            if last_msg_ts
-            else header_updated
+            _latest_iso_timestamp(header_updated, last_msg_ts) if last_msg_ts else header_updated
         )
 
         return {
@@ -2002,11 +2167,7 @@ class MemoryStore:
 
         tr = self.get_transcript(session_id)
         msgs = tr.get("messages", []) if tr else []
-        title = (
-            str(tr.get("title") or "Conversation")
-            if tr
-            else _truncate(clean_label or body)
-        )
+        title = str(tr.get("title") or "Conversation") if tr else _truncate(clean_label or body)
         updated_at = str(tr.get("updated_at") or dt.isoformat()) if tr else dt.isoformat()
         return {
             "session_id": session_id,
@@ -2424,3 +2585,17 @@ def _parse_turns(markdown: str) -> list[tuple[str, str, str, str]]:
             user, assistant = body, ""
         turns.append((match.group("sid"), match.group("time"), user, assistant))
     return turns
+
+
+def prune_diagnostic_logs(
+    max_age_days: int = 7,
+    max_entries: int = 500,
+    data_dir: Path | None = None,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Convenience wrapper for MemoryStore.prune_diagnostic_logs."""
+    return MemoryStore(base_dir=data_dir).prune_diagnostic_logs(
+        max_age_days=max_age_days,
+        max_entries=max_entries,
+        now=now,
+    )

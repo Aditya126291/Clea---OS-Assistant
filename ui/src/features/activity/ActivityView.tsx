@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  AudioLines,
   Calendar,
   CheckCircle2,
   Clock,
@@ -107,6 +108,8 @@ function TaskCard({ task }: { task: TaskStatusData }) {
 export function ActivityView() {
   const tasks = useCleaStore((s) => s.tasks);
   const emitDevSampleTask = useCleaStore((s) => s.emitDevSampleTask);
+  const activeView = useCleaStore((s) => s.activeView);
+  const toggleCompanionLog = useCleaStore((s) => s.toggleCompanionLog);
 
   // Filter out chat turns: Activity shows only background_task, scheduled, and agent_run
   const activityTasks = tasks.filter((t) => t.kind !== "chat_turn");
@@ -130,12 +133,25 @@ export function ActivityView() {
             Background tasks, scheduled jobs, and agent runs.
           </p>
         </div>
-        {import.meta.env.DEV && (
-          <Button size="sm" variant="outline" onClick={() => void emitDevSampleTask()}>
-            <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-            Emit sample tasks (dev)
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant={activeView === "voice" ? "secondary" : "outline"}
+            onClick={toggleCompanionLog}
+            title="Companion Log (Ctrl+L)"
+            aria-label="Companion Log"
+            className="h-7 gap-1.5 px-2.5 text-xs text-[var(--text-muted)] hover:text-[var(--text)]"
+          >
+            <AudioLines className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Companion Log</span>
           </Button>
-        )}
+          {import.meta.env.DEV && (
+            <Button size="sm" variant="outline" onClick={() => void emitDevSampleTask()}>
+              <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+              Emit sample tasks (dev)
+            </Button>
+          )}
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto px-6 py-6">
