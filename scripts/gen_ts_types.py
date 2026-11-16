@@ -90,6 +90,8 @@ from clea.core.protocol import (
     OsUiBatchRequest,
     OsUiSnapshotRequest,
     OsWriteClipboardRequest,
+    ReminderFiredData,
+    ReminderFiredEvent,
     RequestFrame,
     ResponseFrame,
     RiskTier,
@@ -100,6 +102,8 @@ from clea.core.protocol import (
     TaskKind,
     TaskState,
     TaskStatusEvent,
+    TimerFiredData,
+    TimerFiredEvent,
     ToolCallFinishedEvent,
     ToolCallStartedEvent,
     TranscriptEvent,
@@ -270,6 +274,10 @@ def build_json_schema() -> dict[str, Any]:
         ui_navigate_event: UiNavigateEvent
         conversation_created_event: ConversationCreatedEvent
         memory_updated_event: MemoryUpdatedEvent
+        timer_fired_event: TimerFiredEvent
+        timer_fired_data: TimerFiredData
+        reminder_fired_event: ReminderFiredEvent
+        reminder_fired_data: ReminderFiredData
         conversation_updated_data: ConversationUpdatedData
         conversation_deleted_data: ConversationDeletedData
         ui_navigate_data: UiNavigateData
