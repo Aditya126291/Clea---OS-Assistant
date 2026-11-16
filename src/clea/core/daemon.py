@@ -94,6 +94,7 @@ from clea.tools import (
     register_builtin_tools,
     register_file_tools,
     register_memory_tools,
+    register_system_control_tools,
     register_timer_tools,
     requires_approval,
     set_default_timer_manager,
@@ -3535,6 +3536,10 @@ def build_daemon(
         resolved_registry.get("set_timer")
     except KeyError:
         register_timer_tools(resolved_registry, resolved_timer_manager)
+    try:
+        resolved_registry.get("manage_window")
+    except KeyError:
+        register_system_control_tools(resolved_registry)
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,

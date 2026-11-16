@@ -17,6 +17,12 @@ from clea.tools.registry import (
     ToolRegistry,
     requires_approval,
 )
+from clea.tools.system_controls import (
+    manage_window,
+    register_system_control_tools,
+    system_control,
+    system_diagnostics,
+)
 from clea.tools.system_info import register_builtin_tools
 from clea.tools.timers import (
     TimerListResult,
@@ -47,12 +53,14 @@ __all__ = [
     "get_default_timer_manager",
     "list_timers_and_reminders",
     "manage_file",
+    "manage_window",
     "parse_duration",
     "parse_when",
     "read_document",
     "register_builtin_tools",
     "register_file_tools",
     "register_memory_tools",
+    "register_system_control_tools",
     "register_timer_tools",
     "requires_approval",
     "search_files",
@@ -60,4 +68,6 @@ __all__ = [
     "set_default_timer_manager",
     "set_reminder",
     "set_timer",
+    "system_control",
+    "system_diagnostics",
 ]
