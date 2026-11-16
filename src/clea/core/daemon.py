@@ -90,6 +90,7 @@ from clea.tools import (
     RiskLevel,
     ToolRegistry,
     register_builtin_tools,
+    register_file_tools,
     register_memory_tools,
     requires_approval,
 )
@@ -3487,6 +3488,10 @@ def build_daemon(
         resolved_registry.get("remember")
     except KeyError:
         register_memory_tools(resolved_registry, resolved_memory)
+    try:
+        resolved_registry.get("search_files")
+    except KeyError:
+        register_file_tools(resolved_registry)
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,
