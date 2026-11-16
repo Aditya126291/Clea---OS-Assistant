@@ -88,10 +88,14 @@ from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
     RiskLevel,
+    TimerManager,
     ToolRegistry,
+    get_default_timer_manager,
     register_builtin_tools,
     register_memory_tools,
+    register_timer_tools,
     requires_approval,
+    set_default_timer_manager,
 )
 from clea.tools.git_workspace import inspect_git_workspace
 from clea.tools.registry import ToolDefinition
@@ -222,6 +226,7 @@ class CleaDaemon:
         lock_file: Path | None = None,
         allowed_origins: Iterable[str] | None = None,
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+        timer_manager: TimerManager | None = None,
     ) -> None:
         self.host = _validate_localhost(host)
         self.port = port
@@ -276,6 +281,25 @@ class CleaDaemon:
         self._consolidation_task_terminal: dict[str, bool] = {}
         self._ended_voice_call_ids: set[str] = set()
         self._startup_task: asyncio.Task[None] | None = None
+        if timer_manager is not None:
+            self.timer_manager = timer_manager
+        else:
+            timer_dir = (
+                agent.memory.base_dir.parent
+                if agent.memory.base_dir.name == "memory"
+                else agent.memory.base_dir
+            )
+            self.timer_manager = TimerManager(
+                storage_path=timer_dir / "timers.json",
+                on_event=self._broadcast,
+            )
+        if self.timer_manager.on_event is None:
+            self.timer_manager.on_event = self._broadcast
+        set_default_timer_manager(self.timer_manager)
+        try:
+            self.agent.registry.get("set_timer")
+        except KeyError:
+            register_timer_tools(self.agent.registry, self.timer_manager)
 
     def _spawn_background_task(
         self,
@@ -347,6 +371,7 @@ class CleaDaemon:
                 self._run_startup_consolidation(),
                 name="startup-consolidation",
             )
+            await self.timer_manager.start()
         except Exception:
             if self._server is not None:
                 self._server.close()
@@ -358,6 +383,10 @@ class CleaDaemon:
 
     async def stop(self) -> None:
         """Gracefully close the WebSocket server and remove the token and lock files."""
+        with contextlib.suppress(Exception):
+            await self.timer_manager.stop()
+        if get_default_timer_manager() is self.timer_manager:
+            set_default_timer_manager(None)
         for t in list(self._idle_tasks.values()):
             if not t.done():
                 t.cancel()
@@ -3478,16 +3507,30 @@ def build_daemon(
     lock_file: Path | None = None,
     allowed_origins: Iterable[str] | None = None,
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    timer_manager: TimerManager | None = None,
 ) -> CleaDaemon:
     """Assemble a CleaDaemon wired with default memory, tools, and Gemini provider."""
     resolved_memory = memory or MemoryStore()
     resolved_registry = registry or ToolRegistry()
+    if timer_manager is not None:
+        resolved_timer_manager = timer_manager
+    else:
+        timer_dir = (
+            resolved_memory.base_dir.parent
+            if resolved_memory.base_dir.name == "memory"
+            else resolved_memory.base_dir
+        )
+        resolved_timer_manager = TimerManager(storage_path=timer_dir / "timers.json")
     if not resolved_registry.list_definitions():
         register_builtin_tools(resolved_registry)
     try:
         resolved_registry.get("remember")
     except KeyError:
         register_memory_tools(resolved_registry, resolved_memory)
+    try:
+        resolved_registry.get("set_timer")
+    except KeyError:
+        register_timer_tools(resolved_registry, resolved_timer_manager)
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,
@@ -3503,6 +3546,7 @@ def build_daemon(
         lock_file=lock_file,
         allowed_origins=allowed_origins,
         approval_timeout=approval_timeout,
+        timer_manager=resolved_timer_manager,
     )
 
 

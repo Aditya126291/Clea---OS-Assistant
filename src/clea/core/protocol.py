@@ -1725,6 +1725,31 @@ class MemoryUpdatedEvent(_Event):
     data: MemoryUpdatedData
 
 
+class TimerFiredData(_Model):
+    timer_id: str
+    label: str = "Timer"
+    duration_seconds: float = 0.0
+    fires_at: str
+    fired_at: str
+
+
+class TimerFiredEvent(_Event):
+    event: Literal["timer.fired"] = "timer.fired"
+    data: TimerFiredData
+
+
+class ReminderFiredData(_Model):
+    reminder_id: str
+    message: str
+    due_at: str
+    fired_at: str
+
+
+class ReminderFiredEvent(_Event):
+    event: Literal["reminder.fired"] = "reminder.fired"
+    data: ReminderFiredData
+
+
 EventFrame = Annotated[
     AssistantTokenEvent
     | ToolCallStartedEvent
@@ -1743,7 +1768,9 @@ EventFrame = Annotated[
     | ConversationDeletedEvent
     | UiNavigateEvent
     | ConversationCreatedEvent
-    | MemoryUpdatedEvent,
+    | MemoryUpdatedEvent
+    | TimerFiredEvent
+    | ReminderFiredEvent,
     Field(discriminator="event"),
 ]
 """Any daemon-to-client event (discriminated by ``event``)."""
