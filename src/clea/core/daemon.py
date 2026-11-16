@@ -91,6 +91,7 @@ from clea.tools import (
     ToolRegistry,
     register_builtin_tools,
     register_memory_tools,
+    register_system_control_tools,
     requires_approval,
 )
 from clea.tools.git_workspace import inspect_git_workspace
@@ -3488,6 +3489,10 @@ def build_daemon(
         resolved_registry.get("remember")
     except KeyError:
         register_memory_tools(resolved_registry, resolved_memory)
+    try:
+        resolved_registry.get("manage_window")
+    except KeyError:
+        register_system_control_tools(resolved_registry)
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,

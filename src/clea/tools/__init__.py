@@ -11,6 +11,12 @@ from clea.tools.registry import (
     ToolRegistry,
     requires_approval,
 )
+from clea.tools.system_controls import (
+    manage_window,
+    register_system_control_tools,
+    system_control,
+    system_diagnostics,
+)
 from clea.tools.system_info import register_builtin_tools
 
 __all__ = [
@@ -21,7 +27,11 @@ __all__ = [
     "ToolDefinition",
     "ToolNotFoundError",
     "ToolRegistry",
+    "manage_window",
     "register_builtin_tools",
     "register_memory_tools",
+    "register_system_control_tools",
     "requires_approval",
+    "system_control",
+    "system_diagnostics",
 ]
