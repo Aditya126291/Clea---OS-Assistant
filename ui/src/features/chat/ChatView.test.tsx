@@ -89,4 +89,88 @@ describe("ChatView", () => {
     fireEvent.keyDown(input, { key: "Enter", shiftKey: false });
     expect(sendSpy).toHaveBeenCalledWith("Line 1");
   });
+
+  it("handles pasting an image, displays dismissible badge, and submits with image note", async () => {
+    class MockImage {
+      onload: (() => void) | null = null;
+      naturalWidth = 1200;
+      naturalHeight = 800;
+      set src(_val: string) {
+        setTimeout(() => this.onload?.(), 0);
+      }
+    }
+    vi.stubGlobal("Image", MockImage);
+    window.URL.createObjectURL = vi.fn(() => "blob:mock-image");
+    window.URL.revokeObjectURL = vi.fn();
+
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useCleaStore.setState({ sendMessage: sendSpy });
+
+    render(<ChatView />);
+    const input = screen.getByLabelText("Message Clea");
+
+    const file = new File(["fake-png-data"], "test_shot.png", { type: "image/png" });
+    const clipboardData = {
+      items: [
+        {
+          type: "image/png",
+          getAsFile: () => file,
+        },
+      ],
+    };
+
+    fireEvent.paste(input, { clipboardData });
+
+    // Wait for the mock Image onload to trigger state update
+    const badge = await screen.findByTestId("pasted-image-badge");
+    expect(badge).toBeInTheDocument();
+    expect(screen.getByText(/test_shot\.png · 1200×800/)).toBeInTheDocument();
+
+    // Submit with text
+    fireEvent.change(input, { target: { value: "Analyze this" } });
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: false });
+
+    expect(sendSpy).toHaveBeenCalledWith(
+      "Analyze this\n[Attached image: test_shot.png · 1200×800]"
+    );
+    expect(screen.queryByTestId("pasted-image-badge")).not.toBeInTheDocument();
+  });
+
+  it("allows dismissing pasted image badge via close button", async () => {
+    class MockImage {
+      onload: (() => void) | null = null;
+      naturalWidth = 640;
+      naturalHeight = 480;
+      set src(_val: string) {
+        setTimeout(() => this.onload?.(), 0);
+      }
+    }
+    vi.stubGlobal("Image", MockImage);
+    window.URL.createObjectURL = vi.fn(() => "blob:mock-image-2");
+    window.URL.revokeObjectURL = vi.fn();
+
+    render(<ChatView />);
+    const input = screen.getByLabelText("Message Clea");
+
+    const file = new File(["data"], "image.png", { type: "image/png" });
+    const clipboardData = {
+      items: [
+        {
+          type: "image/png",
+          getAsFile: () => file,
+        },
+      ],
+    };
+
+    fireEvent.paste(input, { clipboardData });
+
+    const badge = await screen.findByTestId("pasted-image-badge");
+    expect(badge).toBeInTheDocument();
+    expect(screen.getByText(/clipboard_image\.png · 640×480/)).toBeInTheDocument();
+
+    const removeBtn = screen.getByLabelText("Remove attached image");
+    fireEvent.click(removeBtn);
+
+    expect(screen.queryByTestId("pasted-image-badge")).not.toBeInTheDocument();
+  });
 });

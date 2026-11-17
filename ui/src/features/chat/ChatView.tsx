@@ -1,5 +1,5 @@
-import { ArrowLeft, ArrowUp, MessageSquarePlus, RefreshCw, Sparkles } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { ArrowLeft, ArrowUp, ImageIcon, MessageSquarePlus, RefreshCw, Sparkles, X } from "lucide-react";
+import { useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
@@ -7,6 +7,12 @@ import { cn } from "@/lib/utils";
 import { useCleaStore } from "@/protocol/store";
 import { MarkdownContent } from "./MarkdownContent";
 import { ToolCallCard } from "./ToolCallCard";
+
+interface PastedImageInfo {
+  name: string;
+  width: number;
+  height: number;
+}
 
 function StreamingIndicator() {
   const [stillWorking, setStillWorking] = useState(false);
@@ -44,6 +50,7 @@ export function ChatView() {
   const callOverlayOpen = useCleaStore((s) => s.callOverlayOpen);
 
   const [draft, setDraft] = useState("");
+  const [pastedImage, setPastedImage] = useState<PastedImageInfo | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -66,11 +73,51 @@ export function ChatView() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [draft]);
 
+  const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          const url = URL.createObjectURL(file);
+          const img = new window.Image();
+          img.onload = () => {
+            setPastedImage({
+              name: file.name && file.name !== "image.png" ? file.name : "clipboard_image.png",
+              width: img.naturalWidth || 800,
+              height: img.naturalHeight || 600,
+            });
+            URL.revokeObjectURL(url);
+          };
+          img.onerror = () => {
+            setPastedImage({
+              name: file.name && file.name !== "image.png" ? file.name : "clipboard_image.png",
+              width: 800,
+              height: 600,
+            });
+            URL.revokeObjectURL(url);
+          };
+          img.src = url;
+          break;
+        }
+      }
+    }
+  };
+
   const handleSubmit = () => {
     const trimmed = draft.trim();
-    if (!trimmed || sending) return;
+    if ((!trimmed && !pastedImage) || sending) return;
+    let textToSend = trimmed;
+    if (pastedImage) {
+      const imageTag = `[Attached image: ${pastedImage.name} · ${pastedImage.width}×${pastedImage.height}]`;
+      textToSend = trimmed ? `${trimmed}\n${imageTag}` : `Please inspect this image.\n${imageTag}`;
+      setPastedImage(null);
+    }
     setDraft("");
-    void sendMessage(trimmed);
+    void sendMessage(textToSend);
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -268,6 +315,27 @@ export function ChatView() {
           callOverlayOpen ? "pl-6 pr-68" : "px-6",
         )}
       >
+        {pastedImage && (
+          <div
+            data-testid="pasted-image-badge"
+            className="mx-auto mb-2 flex max-w-2xl items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs text-[var(--text)] shadow-xs"
+          >
+            <div className="flex items-center gap-2 truncate">
+              <ImageIcon className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" aria-hidden="true" />
+              <span className="truncate font-medium">
+                {pastedImage.name} · {pastedImage.width}×{pastedImage.height}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPastedImage(null)}
+              aria-label="Remove attached image"
+              className="ml-2 rounded p-0.5 text-[var(--text-subtle)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text)]"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        )}
         <form
           className="mx-auto flex max-w-2xl items-end gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 focus-within:border-[var(--border-strong)]"
           onSubmit={(e) => {
@@ -281,6 +349,7 @@ export function ChatView() {
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             placeholder="Message Clea…"
             aria-label="Message Clea"
             className="max-h-40 min-h-[38px] min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-[var(--text)] placeholder:text-[var(--text-subtle)] focus:outline-none"
@@ -288,7 +357,7 @@ export function ChatView() {
           <Button
             type="submit"
             size="icon"
-            disabled={!draft.trim() || sending}
+            disabled={(!draft.trim() && !pastedImage) || sending}
             aria-label="Send message"
             className="shrink-0 rounded-lg"
           >

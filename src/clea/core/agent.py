@@ -249,13 +249,25 @@ class AgentLoop:
                     if on_tool_start is not None:
                         await on_tool_start(call)
                     is_error = False
+                    tool_image_bytes = None
+                    tool_image_mime = None
                     try:
                         raw_result = await self.registry.execute(
                             call.name,
                             call.arguments,
                             confirm=effective_confirm,
                         )
-                        output = _serialize_tool_output(raw_result)
+                        if isinstance(raw_result, dict) and "attachment" in raw_result:
+                            tool_att = raw_result["attachment"]
+                            if isinstance(tool_att, dict):
+                                tool_image_bytes = tool_att.get("data") or tool_att.get("bytes")
+                                tool_image_mime = tool_att.get("mime_type", "image/png")
+                            clean_result = {
+                                k: v for k, v in raw_result.items() if k != "attachment"
+                            }
+                            output = _serialize_tool_output(clean_result)
+                        else:
+                            output = _serialize_tool_output(raw_result)
                     except Exception as exc:
                         is_error = True
                         output = f"Tool error: {exc}"
@@ -270,6 +282,8 @@ class AgentLoop:
                             tool_call_id=call.id,
                             tool_name=call.name,
                             is_error=is_error,
+                            image_bytes=tool_image_bytes,
+                            image_mime_type=tool_image_mime,
                         )
                     )
 
@@ -287,6 +301,9 @@ class AgentLoop:
             session.messages = pre_turn_messages
             raise
         finally:
+            for m in session.messages:
+                if getattr(m, "image_bytes", None) is not None:
+                    m.image_bytes = None
             total_ms = (time.perf_counter() - turn_start) * 1000.0
             input_tokens_sum = (
                 sum(u.input_tokens for u in call_usages if u.input_tokens is not None)

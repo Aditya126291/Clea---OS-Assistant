@@ -87,11 +87,14 @@ from clea.memory.store import FIXED_SECTIONS, VOICE_COMPANION_SESSION_ID, Memory
 from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
+    ArtifactStore,
     ClipboardService,
     RiskLevel,
+    ScreenVisionService,
     TimerManager,
     ToolRegistry,
     get_default_clipboard_service,
+    get_default_screen_vision_service,
     get_default_timer_manager,
     register_builtin_tools,
     register_clipboard_tools,
@@ -99,8 +102,10 @@ from clea.tools import (
     register_memory_tools,
     register_system_control_tools,
     register_timer_tools,
+    register_vision_tools,
     requires_approval,
     set_default_clipboard_service,
+    set_default_screen_vision_service,
     set_default_timer_manager,
 )
 from clea.tools.git_workspace import inspect_git_workspace
@@ -234,6 +239,7 @@ class CleaDaemon:
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
         timer_manager: TimerManager | None = None,
         clipboard_service: ClipboardService | None = None,
+        screen_vision_service: ScreenVisionService | None = None,
     ) -> None:
         self.host = _validate_localhost(host)
         self.port = port
@@ -316,10 +322,34 @@ class CleaDaemon:
             self.agent.registry.get("read_clipboard")
         except KeyError:
             register_clipboard_tools(self.agent.registry, self.clipboard_service)
+        data_base_dir = (
+            agent.memory.base_dir.parent
+            if agent.memory.base_dir.name == "memory"
+            else agent.memory.base_dir
+        )
+        if screen_vision_service is not None:
+            self.screen_vision_service = screen_vision_service
+            self.artifact_store = (
+                getattr(screen_vision_service, "artifact_store", None)
+                or ArtifactStore(data_dir=data_base_dir)
+            )
+        else:
+            self.artifact_store = ArtifactStore(data_dir=data_base_dir)
+            self.screen_vision_service = ScreenVisionService(
+                clipboard_service=self.clipboard_service,
+                artifact_store=self.artifact_store,
+            )
+        set_default_screen_vision_service(self.screen_vision_service)
+        try:
+            self.agent.registry.get("inspect_screen")
+        except KeyError:
+            register_vision_tools(self.agent.registry, self.screen_vision_service)
 
     def _on_housekeeping_tick(self) -> None:
         """Periodic housekeeping tick called by background monitor loop."""
         self.clipboard_service.poll_sequence()
+        with contextlib.suppress(Exception):
+            self.artifact_store.prune_expired()
 
     def housekeeping_tick(self) -> None:
         """Explicit entry point for the periodic housekeeping tick."""
@@ -397,6 +427,8 @@ class CleaDaemon:
         self._reconcile_orphaned_tasks()
         with contextlib.suppress(Exception):
             self.clipboard_service.poll_sequence()
+        with contextlib.suppress(Exception):
+            self.artifact_store.prune_expired()
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
             self._server = await serve(
@@ -430,6 +462,8 @@ class CleaDaemon:
             set_default_timer_manager(None)
         if get_default_clipboard_service() is self.clipboard_service:
             set_default_clipboard_service(None)
+        if get_default_screen_vision_service() is self.screen_vision_service:
+            set_default_screen_vision_service(None)
         for t in list(self._idle_tasks.values()):
             if not t.done():
                 t.cancel()
