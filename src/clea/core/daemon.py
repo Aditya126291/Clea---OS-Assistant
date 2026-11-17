@@ -87,16 +87,20 @@ from clea.memory.store import FIXED_SECTIONS, VOICE_COMPANION_SESSION_ID, Memory
 from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
+    ClipboardService,
     RiskLevel,
     TimerManager,
     ToolRegistry,
+    get_default_clipboard_service,
     get_default_timer_manager,
     register_builtin_tools,
+    register_clipboard_tools,
     register_file_tools,
     register_memory_tools,
     register_system_control_tools,
     register_timer_tools,
     requires_approval,
+    set_default_clipboard_service,
     set_default_timer_manager,
 )
 from clea.tools.git_workspace import inspect_git_workspace
@@ -229,6 +233,7 @@ class CleaDaemon:
         allowed_origins: Iterable[str] | None = None,
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
         timer_manager: TimerManager | None = None,
+        clipboard_service: ClipboardService | None = None,
     ) -> None:
         self.host = _validate_localhost(host)
         self.port = port
@@ -303,6 +308,22 @@ class CleaDaemon:
             self.agent.registry.get("set_timer")
         except KeyError:
             register_timer_tools(self.agent.registry, self.timer_manager)
+        self.clipboard_service = clipboard_service or ClipboardService()
+        if hasattr(self.timer_manager, "on_tick") and self.timer_manager.on_tick is None:
+            self.timer_manager.on_tick = self._on_housekeeping_tick
+        set_default_clipboard_service(self.clipboard_service)
+        try:
+            self.agent.registry.get("read_clipboard")
+        except KeyError:
+            register_clipboard_tools(self.agent.registry, self.clipboard_service)
+
+    def _on_housekeeping_tick(self) -> None:
+        """Periodic housekeeping tick called by background monitor loop."""
+        self.clipboard_service.poll_sequence()
+
+    def housekeeping_tick(self) -> None:
+        """Explicit entry point for the periodic housekeeping tick."""
+        self._on_housekeeping_tick()
 
     def _schedule_diagnostic_log_pruning(self) -> asyncio.Task[Any] | None:
         """Schedule diagnostic log pruning in the background if not already running."""
@@ -374,6 +395,8 @@ class CleaDaemon:
         except Exception as exc:
             logger.warning("Failed pruning diagnostic logs on daemon startup: %s", exc)
         self._reconcile_orphaned_tasks()
+        with contextlib.suppress(Exception):
+            self.clipboard_service.poll_sequence()
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
             self._server = await serve(
@@ -405,6 +428,8 @@ class CleaDaemon:
             await self.timer_manager.stop()
         if get_default_timer_manager() is self.timer_manager:
             set_default_timer_manager(None)
+        if get_default_clipboard_service() is self.clipboard_service:
+            set_default_clipboard_service(None)
         for t in list(self._idle_tasks.values()):
             if not t.done():
                 t.cancel()
@@ -3509,6 +3534,7 @@ def build_daemon(
     allowed_origins: Iterable[str] | None = None,
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     timer_manager: TimerManager | None = None,
+    clipboard_service: ClipboardService | None = None,
 ) -> CleaDaemon:
     """Assemble a CleaDaemon wired with default memory, tools, and Gemini provider."""
     resolved_memory = memory or MemoryStore()
@@ -3540,6 +3566,11 @@ def build_daemon(
         resolved_registry.get("manage_window")
     except KeyError:
         register_system_control_tools(resolved_registry)
+    resolved_clipboard_service = clipboard_service or ClipboardService()
+    try:
+        resolved_registry.get("read_clipboard")
+    except KeyError:
+        register_clipboard_tools(resolved_registry, resolved_clipboard_service)
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,
@@ -3556,6 +3587,7 @@ def build_daemon(
         allowed_origins=allowed_origins,
         approval_timeout=approval_timeout,
         timer_manager=resolved_timer_manager,
+        clipboard_service=resolved_clipboard_service,
     )
 
 
