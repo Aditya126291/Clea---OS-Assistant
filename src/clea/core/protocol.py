@@ -1278,10 +1278,14 @@ class ClipboardItem(_Model):
 
 class OsReadClipboardResult(_Model):
     ok: bool = True
+    kind: str = "text"
     text: str = ""
     truncated: bool = False
     char_count: int = 0
     total_chars: int = 0
+    image: dict[str, Any] | None = None
+    file_paths: list[str] = Field(default_factory=list)
+    has_image_files: bool = False
     history_enabled: bool = False
     total_items: int = 0
     items: list[ClipboardItem] = Field(default_factory=list)

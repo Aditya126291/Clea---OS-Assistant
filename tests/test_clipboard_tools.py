@@ -24,6 +24,7 @@ from clea.tools import (
     ToolDefinition,
     ToolRegistry,
     Win32ClipboardBackend,
+    open_path_or_url,
     read_clipboard,
     register_clipboard_tools,
     save_clipboard_to_file,
@@ -737,6 +738,7 @@ def test_daemon_clipboard_service_and_housekeeping_tick(tmp_path: Path) -> None:
     assert "read_clipboard" in defs
     assert "transform_clipboard" in defs
     assert "save_clipboard_to_file" in defs
+    assert "open_path_or_url" in defs
 
     # Poll sequence and advance
     assert daemon.clipboard_service.poll_sequence() == 1
@@ -745,3 +747,197 @@ def test_daemon_clipboard_service_and_housekeeping_tick(tmp_path: Path) -> None:
     # Call housekeeping tick
     daemon.housekeeping_tick()
     assert daemon.clipboard_service.poll_sequence() == 2
+
+
+# --------------------------------------------- Step 1 Live Bug Regression Tests
+
+
+def test_win32_cf_bitmap_triggers_imagegrab_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import Image
+
+    from clea.tools.clipboard import CF_BITMAP
+
+    class _DummyFn:
+        argtypes: list[object] = []
+        restype: object = None
+
+    class _FakeUser32:
+        GetClipboardSequenceNumber = _DummyFn()
+        OpenClipboard = _DummyFn()
+        CloseClipboard = _DummyFn()
+        EmptyClipboard = _DummyFn()
+        GetClipboardData = _DummyFn()
+        SetClipboardData = _DummyFn()
+        IsClipboardFormatAvailable = _DummyFn()
+        RegisterClipboardFormatW = _DummyFn()
+
+        def __init__(self) -> None:
+            self.OpenClipboard = lambda hwnd: 1
+            self.CloseClipboard = lambda: 1
+            self.EmptyClipboard = lambda: 1
+            self.GetClipboardSequenceNumber = lambda: 42
+            self.RegisterClipboardFormatW = lambda name: 49152
+            self.IsClipboardFormatAvailable = lambda fmt: int(fmt == CF_BITMAP)
+            self.GetClipboardData = lambda fmt: None
+
+    class _FakeKernel32:
+        GlobalAlloc = _DummyFn()
+        GlobalLock = _DummyFn()
+        GlobalUnlock = _DummyFn()
+        GlobalSize = _DummyFn()
+
+    sample_img = Image.new("RGBA", (12, 8), (255, 0, 0, 255))
+    monkeypatch.setattr("PIL.ImageGrab.grabclipboard", lambda: sample_img)
+
+    backend = Win32ClipboardBackend(user32=_FakeUser32(), kernel32=_FakeKernel32())
+    snapshot = backend.read_snapshot()
+
+    assert snapshot.kind == "image"
+    assert snapshot.image_dimensions == (12, 8)
+    assert snapshot.image_bytes is not None
+
+
+def test_windows_os_read_clipboard_active_image_and_history_reflection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from clea.tools import windows_os
+
+    script = windows_os._POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT
+    assert "AsStreamForRead" in script
+    assert "GetMethods()" in script
+
+    class _FakeLiveUser32:
+        def OpenClipboard(self, hwnd: object) -> int:
+            return 1
+
+        def CloseClipboard(self) -> int:
+            return 1
+
+        def IsClipboardFormatAvailable(self, fmt: int) -> int:
+            return 0
+
+    monkeypatch.setattr(windows_os, "_get_win32_user32", lambda u32=None: _FakeLiveUser32())
+    monkeypatch.setattr(windows_os, "_get_win32_kernel32", lambda k32=None: object())
+    monkeypatch.setattr(
+        Win32ClipboardBackend,
+        "read_snapshot",
+        lambda self: ClipboardSnapshot(
+            kind="image",
+            image_bytes=b"\x89PNG\r\n\x1a\nfake",
+            image_dimensions=(1916, 1025),
+        ),
+    )
+
+    result = windows_os.read_clipboard(include_history=False)
+
+    assert result["ok"] is True
+    assert result["kind"] == "image"
+    assert result["image"] is not None
+    assert result["image"]["width"] == 1916
+    assert result["image"]["height"] == 1025
+
+
+def test_open_path_or_url_opens_saved_desktop_file_and_clipboard_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import webbrowser
+
+    desktop_dir = tmp_path / "Desktop"
+    desktop_dir.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    print_file = desktop_dir / "print.txt"
+    print_file.write_text("hello desktop", encoding="utf-8")
+
+    opened: list[str] = []
+    backend = FakeClipboardBackend()
+    service = ClipboardService(backend=backend, default_save_dir=desktop_dir)
+
+    # 1. Desktop relative filename
+    res_rel = open_path_or_url("print.txt", clipboard_service=service, opener_fn=opened.append)
+    assert res_rel["status"] == "opened"
+    assert Path(opened[-1]).resolve() == print_file.resolve()
+
+    # 2. Full path
+    res_abs = open_path_or_url(str(print_file), clipboard_service=service, opener_fn=opened.append)
+    assert res_abs["status"] == "opened"
+    assert Path(opened[-1]).resolve() == print_file.resolve()
+
+    # 3. Default to last_saved_path when target omitted (even if clipboard holds plain text)
+    backend.write_text("saved content")
+    save_res = service.save_to_file(filename="recent.txt")
+    assert save_res["status"] == "saved"
+    res_last = open_path_or_url(clipboard_service=service, opener_fn=opened.append)
+    assert res_last["status"] == "opened"
+    assert Path(opened[-1]).name == "recent.txt"
+
+    # 4. Clipboard URL via use_clipboard=True
+    backend.write_text("https://example.com/watch?v=123")
+    res_url = open_path_or_url(
+        use_clipboard=True, clipboard_service=service, opener_fn=opened.append
+    )
+    assert res_url["status"] == "opened"
+    assert opened[-1] == "https://example.com/watch?v=123"
+
+    # 5. Missing file returns error
+    res_missing = open_path_or_url(
+        "missing_file.txt", clipboard_service=service, opener_fn=opened.append
+    )
+    assert res_missing["status"] == "error"
+
+    # 6. Disallowed shell binary rejection
+    res_bad = open_path_or_url("cmd.exe", clipboard_service=service, opener_fn=opened.append)
+    assert res_bad["status"] == "error"
+
+    # 7. ToolRegistry invocation (with os.startfile and webbrowser stubbed)
+    import asyncio
+    import os
+
+    from clea.tools import AuditLogger
+
+    browser_opened: list[str] = []
+    monkeypatch.setattr(
+        os, "startfile", lambda url: browser_opened.append(url), raising=False
+    )
+    monkeypatch.setattr(webbrowser, "open", lambda url: browser_opened.append(url) or True)
+    registry = ToolRegistry(audit_logger=AuditLogger(log_path=tmp_path / "audit.jsonl"))
+    register_clipboard_tools(registry, service)
+    reg_res = asyncio.run(
+        registry.execute("open_path_or_url", {"target": "https://example.com/docs"})
+    )
+    assert reg_res["status"] == "opened"
+    assert browser_opened == ["https://example.com/docs"]
+
+
+def test_open_or_focus_app_resolves_desktop_relative_target_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clea.tools import windows_os
+
+    desktop_dir = tmp_path / "Desktop"
+    desktop_dir.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    print_file = desktop_dir / "print.txt"
+    print_file.write_text("print('ok')", encoding="utf-8")
+
+    popen_calls: list[list[str]] = []
+
+    class _FakeUser32:
+        def EnumWindows(self, cb: object, lparam: int) -> int:
+            return 1
+
+        def IsWindowVisible(self, hwnd: int) -> int:
+            return 0
+
+    res = windows_os.open_or_focus_app(
+        "notepad",
+        target_path="print.txt",
+        user32=_FakeUser32(),
+        which_fn=lambda name: r"C:\Windows\System32\notepad.exe" if "notepad" in name else None,
+        popen_fn=lambda cmd, **kw: popen_calls.append(list(cmd)) or object(),
+    )
+
+    assert res["ok"] is True
+    assert popen_calls
+    assert str(print_file.resolve()) in popen_calls[0]

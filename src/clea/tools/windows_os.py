@@ -708,7 +708,14 @@ def _validate_target_path(
 
     env_map = dict(os.environ) if env is None else env
     expanded = _expand_env_vars(stripped, env_map)
-    resolved = Path(expanded).expanduser().resolve()
+    cand_path = Path(expanded).expanduser()
+    resolved = cand_path.resolve()
+    if not resolved.exists() and not cand_path.is_absolute():
+        home = Path.home()
+        for base in (home / "Desktop", home / "Documents", home):
+            alt = (base / cand_path).resolve()
+            if alt.exists():
+                return alt
     if not resolved.exists():
         raise ValueError(f"target_path does not exist: {target_path!r}")
     return resolved
@@ -865,6 +872,41 @@ def open_or_focus_app(
     launches the validated executable or Start Menu / UWP app with ``shell=False``.
     """
     resolved_target = _validate_target_path(target_path, env=env)
+    if resolved_target is None and isinstance(app_name, str):
+        app_stripped = app_name.strip()
+        app_norm = " ".join(app_stripped.lower().split())
+        text_exts = {".txt", ".md", ".json", ".py", ".log"}
+        media_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"}
+        suffix = Path(app_stripped).suffix.lower()
+        if app_norm not in _APP_ALIASES and suffix in (text_exts | media_exts):
+            try:
+                file_target = _validate_target_path(app_stripped, env=env)
+            except ValueError:
+                file_target = None
+            if file_target is not None and file_target.is_file():
+                if suffix in text_exts:
+                    app_name = "notepad"
+                    resolved_target = file_target
+                else:
+                    if hasattr(os, "startfile"):
+                        os.startfile(str(file_target))
+                    else:
+                        popen_fn(
+                            ["explorer.exe", str(file_target)],
+                            shell=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    return {
+                        "ok": True,
+                        "status": "launched",
+                        "app": file_target.name,
+                        "window_title": None,
+                        "hwnd": None,
+                        "executable": "explorer.exe",
+                        "target_path": str(file_target),
+                    }
+
     spec: _AppSpec | None = None
     resolve_err: Exception | None = None
     try:
@@ -1291,7 +1333,10 @@ for ($i = 0; $i -lt $limit; $i++) {
                     $streamType = __WINRT_STREAM_TYPE__
                     $raStream = Await-AsyncOp $streamOp $streamType
                     $streamExt = [System.IO.WindowsRuntimeStreamExtensions]
-                    $netStream = $streamExt::AsStreamForRead($raStream)
+                    $asStreamMethod = $streamExt.GetMethods() | Where-Object {
+                        $_.Name -eq 'AsStreamForRead' -and $_.GetParameters().Count -eq 1
+                    } | Select-Object -First 1
+                    $netStream = $asStreamMethod.Invoke($null, @($raStream))
                     $img = [System.Drawing.Image]::FromStream($netStream)
                     $w = $img.Width
                     $h = $img.Height
@@ -1404,60 +1449,133 @@ _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT = (
 )
 
 
+def _fallback_snapshot_to_win32_dict(cap: int) -> dict[str, Any]:
+    """Read non-text clipboard formats (PNG, DIB, CF_BITMAP, CF_HDROP)."""
+    try:
+        from clea.tools.clipboard import Win32ClipboardBackend
+
+        snap = Win32ClipboardBackend().read_snapshot()
+    except Exception as exc:
+        logger.warning("Win32ClipboardBackend snapshot fallback failed: %s", exc)
+        return {
+            "ok": True,
+            "kind": "empty",
+            "text": "",
+            "truncated": False,
+            "char_count": 0,
+            "total_chars": 0,
+        }
+
+    if snap.kind == "image":
+        w, h = snap.image_dimensions or (0, 0)
+        return {
+            "ok": True,
+            "kind": "image",
+            "text": "",
+            "truncated": False,
+            "char_count": 0,
+            "total_chars": 0,
+            "image": {
+                "width": w,
+                "height": h,
+                "format": (snap.image_format or "png").lower(),
+                "size_bytes": len(snap.image_bytes) if snap.image_bytes else 0,
+            },
+        }
+    if snap.kind == "files":
+        file_text = "\n".join(snap.file_paths)
+        truncated = len(file_text) > cap
+        shown = file_text[:cap] if truncated else file_text
+        return {
+            "ok": True,
+            "kind": "files",
+            "text": shown,
+            "truncated": truncated,
+            "char_count": len(shown),
+            "total_chars": len(file_text),
+            "file_paths": list(snap.file_paths),
+            "has_image_files": snap.has_image_files,
+        }
+    if snap.kind == "text" and snap.text is not None:
+        total_chars = len(snap.text)
+        truncated = total_chars > cap
+        shown = snap.text[:cap] if truncated else snap.text
+        return {
+            "ok": True,
+            "kind": "text" if total_chars > 0 else "empty",
+            "text": shown,
+            "truncated": truncated,
+            "char_count": len(shown),
+            "total_chars": total_chars,
+        }
+    return {
+        "ok": True,
+        "kind": "empty",
+        "text": "",
+        "truncated": False,
+        "char_count": 0,
+        "total_chars": 0,
+    }
+
+
 def _read_clipboard_win32(
     cap: int,
     *,
     user32: Any = None,
     kernel32: Any = None,
 ) -> dict[str, Any]:
+    is_live = user32 is None and kernel32 is None
     u32 = _get_win32_user32(user32)
     k32 = _get_win32_kernel32(kernel32)
 
+    missing_unicode_text = False
     with _open_clipboard(u32):
         if hasattr(u32, "IsClipboardFormatAvailable") and not u32.IsClipboardFormatAvailable(
             CF_UNICODETEXT
         ):
-            return {
-                "ok": True,
-                "text": "",
-                "truncated": False,
-                "char_count": 0,
-                "total_chars": 0,
-            }
-
-        handle = u32.GetClipboardData(CF_UNICODETEXT)
-        if not handle:
-            return {
-                "ok": True,
-                "text": "",
-                "truncated": False,
-                "char_count": 0,
-                "total_chars": 0,
-            }
-
-        ptr = k32.GlobalLock(handle)
-        if not ptr:
-            raise RuntimeError("Failed to lock clipboard data handle.")
-        try:
-            if isinstance(ptr, str):
-                raw_text = ptr
-            elif isinstance(ptr, (bytes, bytearray)):
-                raw_text = bytes(ptr).decode("utf-16-le").rstrip("\x00")
+            missing_unicode_text = True
+        else:
+            handle = u32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                missing_unicode_text = True
             else:
-                raw_text = ctypes.wstring_at(ptr)
-        finally:
-            k32.GlobalUnlock(handle)
+                ptr = k32.GlobalLock(handle)
+                if not ptr:
+                    raise RuntimeError("Failed to lock clipboard data handle.")
+                try:
+                    if isinstance(ptr, str):
+                        raw_text = ptr
+                    elif isinstance(ptr, (bytes, bytearray)):
+                        raw_text = bytes(ptr).decode("utf-16-le").rstrip("\x00")
+                    else:
+                        raw_text = ctypes.wstring_at(ptr)
+                finally:
+                    k32.GlobalUnlock(handle)
+
+    if missing_unicode_text:
+        if is_live:
+            return _fallback_snapshot_to_win32_dict(cap)
+        return {
+            "ok": True,
+            "text": "",
+            "truncated": False,
+            "char_count": 0,
+            "total_chars": 0,
+        }
 
     total_chars = len(raw_text)
     truncated = total_chars > cap
     text = raw_text[:cap] if truncated else raw_text
-    return {
+    res: dict[str, Any] = {
         "ok": True,
         "text": text,
         "truncated": truncated,
         "char_count": len(text),
         "total_chars": total_chars,
     }
+    if is_live:
+        res["kind"] = "text" if total_chars > 0 else "empty"
+    return res
 
 
 def read_clipboard(
@@ -1528,8 +1646,11 @@ def read_clipboard(
         except Exception as exc:
             logger.debug("WinRT clipboard history failed (%s); falling back to Win32.", exc)
 
+    top_kind: str | None = None
+    extra_fields: dict[str, Any] = {}
     if winrt_success and items:
         top_item = items[0]
+        top_kind = str(top_item.get("kind") or "unknown")
         if top_item.get("kind") == "text" and top_item.get("text") is not None:
             text = top_item["text"]
             truncated = bool(top_item.get("truncated", False))
@@ -1545,7 +1666,11 @@ def read_clipboard(
         text = win32_res["text"]
         truncated = win32_res["truncated"]
         total_chars = win32_res["total_chars"]
-        top_image = None
+        top_image = win32_res.get("image")
+        top_kind = win32_res.get("kind")
+        if "file_paths" in win32_res:
+            extra_fields["file_paths"] = win32_res["file_paths"]
+            extra_fields["has_image_files"] = bool(win32_res.get("has_image_files", False))
 
     res: dict[str, Any] = {
         "ok": True,
@@ -1557,8 +1682,11 @@ def read_clipboard(
         "total_items": total_items,
         "items": items,
     }
+    if top_kind is not None:
+        res["kind"] = top_kind
     if top_image is not None:
         res["image"] = top_image
+    res.update(extra_fields)
     return res
 
 

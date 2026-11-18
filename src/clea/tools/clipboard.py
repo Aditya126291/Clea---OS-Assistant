@@ -8,12 +8,14 @@ import ctypes.wintypes as wintypes
 import io
 import json
 import logging
+import os
 import re
 import struct
 import sys
 import time
 import urllib.parse
-from collections.abc import Iterator
+import webbrowser
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +53,31 @@ TRACKING_PARAMS = {
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"]+")
 ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+_DISALLOWED_OPEN_BINARIES: frozenset[str] = frozenset(
+    {
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "bash",
+        "bash.exe",
+        "sh",
+        "sh.exe",
+        "wscript",
+        "wscript.exe",
+        "cscript",
+        "cscript.exe",
+        "mshta",
+        "mshta.exe",
+        "rundll32",
+        "rundll32.exe",
+        "regsvr32",
+        "regsvr32.exe",
+    }
+)
 
 
 # ----------------------------------------------------------- Error Classes & Snapshots
@@ -340,6 +367,10 @@ class Win32ClipboardBackend:
                     else:
                         logger.warning("GetClipboardData returned NULL for %s.", dib_label)
 
+            # Check CF_BITMAP (2) so ImageGrab fallback triggers when only DDB is advertised
+            if has_fmt and self._user32.IsClipboardFormatAvailable(CF_BITMAP):
+                image_available = True
+
             # 3. CF_HDROP (15) - Copied files
             if has_fmt and self._user32.IsClipboardFormatAvailable(CF_HDROP):
                 h_data = self._user32.GetClipboardData(CF_HDROP)
@@ -372,7 +403,7 @@ class Win32ClipboardBackend:
                     else:
                         logger.warning("GlobalLock failed for CF_UNICODETEXT.")
 
-        # Fallback outside OpenClipboard lock: PIL.ImageGrab if image formats failed
+        # Fallback outside OpenClipboard lock: PIL.ImageGrab if image formats failed or CF_BITMAP
         if image_available:
             try:
                 from PIL import Image, ImageGrab
@@ -387,6 +418,11 @@ class Win32ClipboardBackend:
                         image_bytes=png_bytes,
                         image_format="PNG",
                         image_dimensions=grabbed.size,
+                    )
+                if isinstance(grabbed, list) and grabbed:
+                    return ClipboardSnapshot(
+                        kind="files",
+                        file_paths=[str(p) for p in grabbed],
                     )
             except Exception as exc:
                 logger.warning("PIL.ImageGrab fallback failed to decode clipboard image: %s", exc)
@@ -521,6 +557,7 @@ class ClipboardService:
     ) -> None:
         self._backend = backend or Win32ClipboardBackend()
         self.default_save_dir = default_save_dir
+        self.last_saved_path: Path | None = None
         self._last_sequence: int | None = None
         self._last_changed_monotonic: float = time.monotonic()
 
@@ -749,6 +786,7 @@ class ClipboardService:
                 raise RuntimeError(
                     f"Clipboard image write completed but file was not found at {saved_path}."
                 )
+            self.last_saved_path = saved_path
             return {
                 "status": "saved",
                 "saved_path": str(saved_path),
@@ -778,6 +816,7 @@ class ClipboardService:
             raise RuntimeError(
                 f"Clipboard text write completed but file was not found at {saved_path}."
             )
+        self.last_saved_path = saved_path
         return {
             "status": "saved",
             "saved_path": str(saved_path),
@@ -785,6 +824,128 @@ class ClipboardService:
             "filename": saved_path.name,
             "size_bytes": len(content.encode("utf-8")),
             "kind": "text",
+        }
+
+    def open_path_or_url(
+        self,
+        target: str | None = None,
+        *,
+        use_clipboard: bool = False,
+        opener_fn: Callable[[str], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Open a local file (Desktop/Documents/last saved) or http/https URL on Windows."""
+        candidate = target.strip() if isinstance(target, str) else ""
+        if use_clipboard:
+            snapshot = self._backend.read_snapshot()
+            if snapshot.kind == "text" and snapshot.text and snapshot.text.strip():
+                url_match = URL_REGEX.search(snapshot.text)
+                if url_match:
+                    candidate = url_match.group(0).rstrip(".,);:!?'\"")
+                else:
+                    candidate = snapshot.text.strip()
+        elif not candidate:
+            if self.last_saved_path is not None and self.last_saved_path.is_file():
+                candidate = str(self.last_saved_path)
+            else:
+                snapshot = self._backend.read_snapshot()
+                if snapshot.kind == "text" and snapshot.text and snapshot.text.strip():
+                    url_match = URL_REGEX.search(snapshot.text)
+                    if url_match:
+                        candidate = url_match.group(0).rstrip(".,);:!?'\"")
+                    else:
+                        candidate = snapshot.text.strip()
+
+        if not candidate:
+            return {
+                "status": "error",
+                "error": (
+                    "No target path or URL provided, and clipboard does not contain a "
+                    "URL or file path."
+                ),
+            }
+
+        if any(ord(ch) < 32 for ch in candidate):
+            return {"status": "error", "error": "Target contains invalid control characters."}
+
+        # Open http/https URL
+        lower = candidate.lower()
+        if lower.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlsplit(candidate)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+                return {"status": "error", "error": f"Invalid HTTP/HTTPS URL: {candidate}"}
+            try:
+                if opener_fn is not None:
+                    opener_fn(candidate)
+                elif hasattr(os, "startfile"):
+                    os.startfile(candidate)
+                else:
+                    webbrowser.open(candidate)
+            except Exception as exc:
+                logger.warning("Failed opening URL %s: %s", candidate, exc)
+                return {"status": "error", "error": f"Failed to open URL: {exc}"}
+            return {
+                "status": "opened",
+                "kind": "url",
+                "target": candidate,
+            }
+
+        # Reject shell binaries
+        first_tok = re.split(r"[\s/\\]", lower)[0]
+        if first_tok in _DISALLOWED_OPEN_BINARIES:
+            return {"status": "error", "error": f"Opening executable '{first_tok}' is disallowed."}
+
+        # Resolve local file path
+        raw_path = Path(candidate).expanduser()
+        resolved_file: Path | None = None
+        if raw_path.is_absolute() and raw_path.is_file():
+            resolved_file = raw_path.resolve()
+        else:
+            candidates: list[Path] = []
+            if self.default_save_dir is not None:
+                candidates.append(self.default_save_dir / raw_path.name)
+                candidates.append(self.default_save_dir / candidate)
+            home = Path.home()
+            candidates.extend(
+                [
+                    home / "Desktop" / candidate,
+                    home / "Desktop" / raw_path.name,
+                    home / "Documents" / candidate,
+                    home / "Documents" / raw_path.name,
+                    home / candidate,
+                ]
+            )
+            if (
+                self.last_saved_path is not None
+                and self.last_saved_path.name.lower() == raw_path.name.lower()
+            ):
+                candidates.append(self.last_saved_path)
+
+            for cand in candidates:
+                with contextlib.suppress(OSError):
+                    if cand.is_file():
+                        resolved_file = cand.resolve()
+                        break
+
+        if resolved_file is None or not resolved_file.is_file():
+            return {"status": "error", "error": f"File not found on disk: {candidate}"}
+
+        try:
+            target_str = str(resolved_file)
+            if opener_fn is not None:
+                opener_fn(target_str)
+            elif hasattr(os, "startfile"):
+                os.startfile(target_str)
+            else:
+                webbrowser.open(resolved_file.as_uri())
+        except Exception as exc:
+            logger.warning("Failed opening file %s: %s", resolved_file, exc)
+            return {"status": "error", "error": f"Failed to open file: {exc}"}
+
+        return {
+            "status": "opened",
+            "kind": "file",
+            "target": str(resolved_file),
+            "filename": resolved_file.name,
         }
 
 
@@ -894,6 +1055,20 @@ def save_clipboard_to_file(
     return service.save_to_file(filename=filename, directory=directory)
 
 
+def open_path_or_url(
+    target: str | None = None,
+    use_clipboard: bool = False,
+    *,
+    clipboard_service: ClipboardService | None = None,
+    opener_fn: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """Open a saved local file (e.g. Desktop/Documents) or http/https URL on Windows."""
+    service = clipboard_service or get_default_clipboard_service()
+    return service.open_path_or_url(
+        target=target, use_clipboard=use_clipboard, opener_fn=opener_fn
+    )
+
+
 def register_clipboard_tools(
     registry: ToolRegistry,
     clipboard_service: ClipboardService | None = None,
@@ -901,8 +1076,9 @@ def register_clipboard_tools(
     read_risk: RiskLevel = RiskLevel.READ_ONLY,
     transform_risk: RiskLevel = RiskLevel.READ_ONLY,
     save_risk: RiskLevel = RiskLevel.READ_ONLY,
+    open_risk: RiskLevel = RiskLevel.READ_ONLY,
 ) -> None:
-    """Register read_clipboard, transform_clipboard, and save_clipboard_to_file in ToolRegistry."""
+    """Register clipboard inspection, transform, save, and open tools in ToolRegistry."""
     service = clipboard_service or get_default_clipboard_service()
 
     registry.register(
@@ -992,5 +1168,38 @@ def register_clipboard_tools(
         risk_level=save_risk,
         handler=lambda filename=None, directory="desktop": save_clipboard_to_file(
             filename=filename, directory=directory, clipboard_service=service
+        ),
+    )
+
+    registry.register(
+        name="open_path_or_url",
+        description=(
+            "Open a saved local file (e.g., on Desktop or Documents, or the most recently saved "
+            "clipboard file) or an http/https URL (explicitly provided or extracted from the "
+            "clipboard) using Windows default application / browser."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Optional file path, filename (e.g. 'print.txt'), or http/https URL. "
+                        "If omitted, uses the clipboard URL/path or most recently saved file."
+                    ),
+                },
+                "use_clipboard": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "When true, reads the URL or path directly from the active clipboard."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+        risk_level=open_risk,
+        handler=lambda target=None, use_clipboard=False: open_path_or_url(
+            target=target, use_clipboard=use_clipboard, clipboard_service=service
         ),
     )

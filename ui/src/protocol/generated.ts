@@ -962,16 +962,22 @@ export type Action7 =
   | "previous_track";
 export type Level2 = number | null;
 export type Ok14 = boolean;
+export type Kind2 = string;
 export type Text13 = string;
 export type Truncated1 = boolean;
 export type CharCount = number;
 export type TotalChars = number;
+export type Image = {
+  [k: string]: unknown | undefined;
+} | null;
+export type FilePaths = string[];
+export type HasImageFiles = boolean;
 export type HistoryEnabled = boolean;
 export type TotalItems = number;
 export type Index1 = number;
 export type Id67 = string;
 export type Timestamp7 = string;
-export type Kind2 = string;
+export type Kind3 = string;
 export type Text14 = string | null;
 export type Truncated2 = boolean;
 export type CharCount1 = number;
@@ -981,7 +987,7 @@ export type Height = number | null;
 export type Format = string | null;
 export type ImageBytesBase64 = string | null;
 export type SizeBytes = number | null;
-export type Image = {
+export type Image1 = {
   [k: string]: unknown | undefined;
 } | null;
 export type Items = ClipboardItem[];
@@ -1022,7 +1028,7 @@ export type SavedPath = string;
 export type Path = string;
 export type Filename2 = string;
 export type SizeBytes1 = number;
-export type Kind3 = string;
+export type Kind4 = string;
 export type Error5 = string | null;
 export type Ok21 = boolean;
 export type WindowTitle3 = string;
@@ -2683,10 +2689,14 @@ export interface OsControlMediaVolumeResult {
 }
 export interface OsReadClipboardResult {
   ok?: Ok14;
+  kind?: Kind2;
   text?: Text13;
   truncated?: Truncated1;
   char_count?: CharCount;
   total_chars?: TotalChars;
+  image?: Image;
+  file_paths?: FilePaths;
+  has_image_files?: HasImageFiles;
   history_enabled?: HistoryEnabled;
   total_items?: TotalItems;
   items?: Items;
@@ -2695,7 +2705,7 @@ export interface ClipboardItem {
   index?: Index1;
   id?: Id67;
   timestamp?: Timestamp7;
-  kind?: Kind2;
+  kind?: Kind3;
   text?: Text14;
   truncated?: Truncated2;
   char_count?: CharCount1;
@@ -2705,7 +2715,7 @@ export interface ClipboardItem {
   format?: Format;
   image_bytes_base64?: ImageBytesBase64;
   size_bytes?: SizeBytes;
-  image?: Image;
+  image?: Image1;
 }
 export interface OsSelectClipboardItemResult {
   ok?: Ok15;
@@ -2755,7 +2765,7 @@ export interface OsSaveClipboardToFileResult {
   path?: Path;
   filename?: Filename2;
   size_bytes?: SizeBytes1;
-  kind?: Kind3;
+  kind?: Kind4;
   error?: Error5;
 }
 export interface OsInspectUiElementsResult {

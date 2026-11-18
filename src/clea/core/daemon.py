@@ -2598,6 +2598,7 @@ class CleaDaemon:
             return
         self._audit_log(
             "os_read_clipboard",
+            kind=res.get("kind"),
             char_count=res.get("char_count"),
             truncated=res.get("truncated"),
             history_enabled=res.get("history_enabled"),
@@ -2606,6 +2607,12 @@ class CleaDaemon:
         model_cls = METHOD_RESULTS["os.read_clipboard"]
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
+        top_img = filtered.get("image")
+        if isinstance(top_img, dict):
+            norm_top_img = dict(top_img)
+            if "bytes" in norm_top_img and "image_bytes_base64" not in norm_top_img:
+                norm_top_img["image_bytes_base64"] = norm_top_img.pop("bytes")
+            filtered["image"] = norm_top_img
         raw_items = res.get("items")
         if isinstance(raw_items, list):
             normalized_items: list[dict[str, Any]] = []
