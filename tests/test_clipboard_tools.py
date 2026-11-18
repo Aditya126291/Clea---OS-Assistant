@@ -1167,15 +1167,61 @@ def test_cf_bitmap_getdibits_promotes_zero_alpha_bgrx_and_handles_real_gdi_bitma
     with Image.open(io.BytesIO(png_bytes)) as decoded:
         assert decoded.getpixel((0, 0)) == (50, 100, 200, 255)
 
+    # Pure-black GDI BGRX bitmap (all bytes zero) must also promote alpha to 255, not 0
+    black_bgrx = b"\x00" * (w * h * 4)
+
+    class _BlackBgrxGdi32(_ZeroAlphaGdi32):
+        def GetDIBits(
+            self,
+            hdc: Any,
+            hbm: Any,
+            start: int,
+            lines: int,
+            buf_ptr: Any,
+            bmi_ptr: Any,
+            usage: int,
+        ) -> int:
+            ctypes.memmove(buf_ptr, black_bgrx, len(black_bgrx))
+            return h
+
+    black_png, black_dims = _decode_hbitmap_to_png(1234, _BlackBgrxGdi32())
+    assert black_dims == (4, 3)
+    assert black_png is not None
+    with Image.open(io.BytesIO(black_png)) as black_decoded:
+        assert black_decoded.getpixel((0, 0)) == (0, 0, 0, 255)
+
     # Real Win32 in-memory HBITMAP test (never touches user clipboard)
     if sys.platform == "win32":
+        import ctypes.wintypes as wintypes
+
         backend = Win32ClipboardBackend()
         user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.ReleaseDC.restype = wintypes.BOOL
+
         gdi32 = backend._gdi32
-        hdc_screen = ctypes.c_void_p(user32.GetDC(None))
-        hdc_mem = ctypes.c_void_p(gdi32.CreateCompatibleDC(hdc_screen))
-        hbmp = ctypes.c_void_p(gdi32.CreateCompatibleBitmap(hdc_screen, 6, 4))
-        old = ctypes.c_void_p(gdi32.SelectObject(hdc_mem, hbmp))
+        gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+        gdi32.PatBlt.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.DWORD,
+        ]
+        gdi32.PatBlt.restype = wintypes.BOOL
+        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+
+        hdc_screen = user32.GetDC(None)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, 6, 4)
+        old = gdi32.SelectObject(hdc_mem, hbmp)
         gdi32.PatBlt(hdc_mem, 0, 0, 6, 4, 0x00FF0062)  # WHITENESS
         gdi32.SelectObject(hdc_mem, old)
         try:
@@ -1184,7 +1230,17 @@ def test_cf_bitmap_getdibits_promotes_zero_alpha_bgrx_and_handles_real_gdi_bitma
             assert real_png is not None
             with Image.open(io.BytesIO(real_png)) as real_img:
                 assert real_img.size == (6, 4)
-                assert real_img.getpixel((0, 0))[:3] == (255, 255, 255)
+                assert real_img.getpixel((0, 0)) == (255, 255, 255, 255)
+
+            old2 = gdi32.SelectObject(hdc_mem, hbmp)
+            gdi32.PatBlt(hdc_mem, 0, 0, 6, 4, 0x00000042)  # BLACKNESS
+            gdi32.SelectObject(hdc_mem, old2)
+            real_black_png, real_black_dims = _decode_hbitmap_to_png(hbmp, gdi32)
+            assert real_black_dims == (6, 4)
+            assert real_black_png is not None
+            with Image.open(io.BytesIO(real_black_png)) as real_black_img:
+                assert real_black_img.size == (6, 4)
+                assert real_black_img.getpixel((0, 0)) == (0, 0, 0, 255)
         finally:
             gdi32.DeleteObject(hbmp)
             gdi32.DeleteDC(hdc_mem)
@@ -1250,8 +1306,16 @@ def test_windows_os_read_clipboard_unifies_live_reads_and_avoids_unknown(
         ),
     )
 
+    from clea.core.protocol import OsReadClipboardResult
+
     hist_res = windows_os.read_clipboard(include_history=True)
     assert hist_res["ok"] is True
     assert hist_res["kind"] == "image"
     assert hist_res["image"]["width"] == 1280
     assert hist_res["image"]["height"] == 720
+    assert hist_res["items"][0]["kind"] == "image"
+    assert hist_res["items"][0]["image"]["width"] == 1280
+    assert hist_res["items"][0]["image"]["height"] == 720
+    parsed_model = OsReadClipboardResult(**hist_res)
+    assert parsed_model.kind == "image"
+    assert parsed_model.items[0].kind == "image"

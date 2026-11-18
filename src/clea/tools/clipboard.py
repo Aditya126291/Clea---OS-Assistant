@@ -339,7 +339,7 @@ def _decode_hbitmap_to_png(
 
             raw_bytes = bytes(buf)
             # 24-bit/BGRX GDI bitmaps leave every alpha byte at 0x00; promote to opaque RGBA.
-            if raw_bytes[3::4] == b"\x00" * (w * h) and any(raw_bytes):
+            if raw_bytes[3::4] == b"\x00" * (w * h):
                 img = Image.frombuffer("RGB", (w, h), raw_bytes, "raw", "BGRX", 0, 1).convert(
                     "RGBA"
                 )

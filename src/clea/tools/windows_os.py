@@ -1687,6 +1687,15 @@ def read_clipboard(
             if "file_paths" in win32_res:
                 extra_fields["file_paths"] = win32_res["file_paths"]
                 extra_fields["has_image_files"] = bool(win32_res.get("has_image_files", False))
+            if top_kind in ("image", "files", "text"):
+                patched_item = dict(top_item)
+                patched_item["kind"] = top_kind
+                if top_kind == "image" and top_image is not None:
+                    patched_item["image"] = top_image
+                elif top_kind in ("text", "files"):
+                    patched_item["text"] = text
+                    patched_item["truncated"] = truncated
+                items = [patched_item, *items[1:]]
         else:
             top_kind = raw_top_kind
             text = ""
