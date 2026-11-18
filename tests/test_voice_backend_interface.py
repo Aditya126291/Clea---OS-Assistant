@@ -84,6 +84,8 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "control_media_volume",
         "read_clipboard",
         "write_clipboard",
+        "transform_clipboard",
+        "save_clipboard_to_file",
         "inspect_git_workspace",
         "select_clipboard_item",
         "open_url",

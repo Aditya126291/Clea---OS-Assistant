@@ -253,6 +253,22 @@ class OsWriteClipboardParams(_Model):
     text: str
 
 
+class OsTransformClipboardParams(_Model):
+    action: Literal[
+        "format_json",
+        "minify_json",
+        "clean_text",
+        "unwrap_text",
+        "strip_tracking_urls",
+    ]
+    update_clipboard: bool = True
+
+
+class OsSaveClipboardToFileParams(_Model):
+    filename: str | None = None
+    directory: Literal["desktop", "documents"] = "desktop"
+
+
 GuiActionType = Literal["click_at", "type_text", "press_keys", "scroll", "wait"]
 GuiClickButton = Literal["left", "right", "double"]
 
@@ -635,6 +651,16 @@ class OsWriteClipboardRequest(_Request):
     params: OsWriteClipboardParams
 
 
+class OsTransformClipboardRequest(_Request):
+    method: Literal["os.transform_clipboard"] = "os.transform_clipboard"
+    params: OsTransformClipboardParams
+
+
+class OsSaveClipboardToFileRequest(_Request):
+    method: Literal["os.save_clipboard_to_file"] = "os.save_clipboard_to_file"
+    params: OsSaveClipboardToFileParams = Field(default_factory=OsSaveClipboardToFileParams)
+
+
 class OsInspectUiElementsRequest(_Request):
     method: Literal["os.inspect_ui_elements"] = "os.inspect_ui_elements"
     params: OsInspectUiElementsParams = Field(default_factory=OsInspectUiElementsParams)
@@ -725,6 +751,8 @@ RequestFrame = Annotated[
     | OsOpenUrlRequest
     | OsControlSystemRequest
     | OsWriteClipboardRequest
+    | OsTransformClipboardRequest
+    | OsSaveClipboardToFileRequest
     | OsInspectUiElementsRequest
     | OsClickUiElementRequest
     | OsGuiActionRequest
@@ -1296,6 +1324,26 @@ class OsWriteClipboardResult(_Model):
     char_count: int = 0
 
 
+class OsTransformClipboardResult(_Model):
+    ok: bool = True
+    status: str = "ok"
+    action: str = ""
+    updated_clipboard: bool = False
+    preview: str = ""
+    error: str | None = None
+
+
+class OsSaveClipboardToFileResult(_Model):
+    ok: bool = True
+    status: str = "saved"
+    saved_path: str = ""
+    path: str = ""
+    filename: str = ""
+    size_bytes: int = 0
+    kind: str = "text"
+    error: str | None = None
+
+
 class UiElementItem(_Model):
     index: int
     name: str = ""
@@ -1483,6 +1531,8 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "os.open_url": OsOpenUrlResult,
     "os.control_system": OsControlSystemResult,
     "os.write_clipboard": OsWriteClipboardResult,
+    "os.transform_clipboard": OsTransformClipboardResult,
+    "os.save_clipboard_to_file": OsSaveClipboardToFileResult,
     "os.inspect_ui_elements": OsInspectUiElementsResult,
     "os.click_ui_element": OsClickUiElementResult,
     "os.gui_action": OsGuiActionResult,

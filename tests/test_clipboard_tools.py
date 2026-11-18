@@ -374,10 +374,10 @@ def test_save_to_file_json_auto_extension(tmp_path: Path) -> None:
     service = ClipboardService(backend=backend, default_save_dir=tmp_path)
 
     res = service.save_to_file(directory="desktop")
-    assert res["status"] == "ok"
+    assert res["status"] == "saved"
     assert res["kind"] == "text"
-    saved_path = Path(res["path"])
-    assert saved_path.exists()
+    saved_path = Path(res["saved_path"])
+    assert saved_path.is_file()
     assert saved_path.suffix == ".json"
     assert "Clea" in saved_path.read_text(encoding="utf-8")
 
@@ -389,9 +389,9 @@ def test_save_to_file_python_auto_extension(tmp_path: Path) -> None:
     service = ClipboardService(backend=backend, default_save_dir=tmp_path)
 
     res = service.save_to_file(directory="desktop")
-    assert res["status"] == "ok"
-    saved_path = Path(res["path"])
-    assert saved_path.exists()
+    assert res["status"] == "saved"
+    saved_path = Path(res["saved_path"])
+    assert saved_path.is_file()
     assert saved_path.suffix == ".py"
 
 
@@ -402,9 +402,9 @@ def test_save_to_file_markdown_auto_extension(tmp_path: Path) -> None:
     service = ClipboardService(backend=backend, default_save_dir=tmp_path)
 
     res = service.save_to_file(directory="desktop")
-    assert res["status"] == "ok"
-    saved_path = Path(res["path"])
-    assert saved_path.exists()
+    assert res["status"] == "saved"
+    saved_path = Path(res["saved_path"])
+    assert saved_path.is_file()
     assert saved_path.suffix == ".md"
 
 
@@ -414,9 +414,9 @@ def test_save_to_file_plain_text_auto_extension(tmp_path: Path) -> None:
     service = ClipboardService(backend=backend, default_save_dir=tmp_path)
 
     res = service.save_to_file(directory="desktop")
-    assert res["status"] == "ok"
-    saved_path = Path(res["path"])
-    assert saved_path.exists()
+    assert res["status"] == "saved"
+    saved_path = Path(res["saved_path"])
+    assert saved_path.is_file()
     assert saved_path.suffix == ".txt"
 
 
@@ -427,10 +427,10 @@ def test_save_to_file_image_bytes(tmp_path: Path) -> None:
     service = ClipboardService(backend=backend, default_save_dir=tmp_path)
 
     res = service.save_to_file(filename="screenshot", directory="desktop")
-    assert res["status"] == "ok"
+    assert res["status"] == "saved"
     assert res["kind"] == "image"
-    saved_path = Path(res["path"])
-    assert saved_path.exists()
+    saved_path = Path(res["saved_path"])
+    assert saved_path.is_file()
     assert saved_path.suffix == ".png"
     assert saved_path.read_bytes() == fake_png
 
@@ -444,14 +444,14 @@ def test_save_to_file_collision_safe_naming(tmp_path: Path) -> None:
     res2 = service.save_to_file(filename="notes.txt", directory="desktop")
     res3 = service.save_to_file(filename="notes.txt", directory="desktop")
 
-    path1 = Path(res1["path"])
-    path2 = Path(res2["path"])
-    path3 = Path(res3["path"])
+    path1 = Path(res1["saved_path"])
+    path2 = Path(res2["saved_path"])
+    path3 = Path(res3["saved_path"])
 
     assert path1.name == "notes.txt"
     assert path2.name == "notes-1.txt"
     assert path3.name == "notes-2.txt"
-    assert path1.exists() and path2.exists() and path3.exists()
+    assert path1.is_file() and path2.is_file() and path3.is_file()
 
 
 def test_save_to_file_sanitizes_path_traversal(tmp_path: Path) -> None:
@@ -460,8 +460,8 @@ def test_save_to_file_sanitizes_path_traversal(tmp_path: Path) -> None:
     service = ClipboardService(backend=backend, default_save_dir=tmp_path)
 
     res = service.save_to_file(filename="../../escape/secrets.txt", directory="desktop")
-    assert res["status"] == "ok"
-    saved_path = Path(res["path"])
+    assert res["status"] == "saved"
+    saved_path = Path(res["saved_path"])
     # File must be stored directly within target_dir
     assert saved_path.parent.resolve() == tmp_path.resolve()
     assert saved_path.name == "secrets.txt"
@@ -522,8 +522,8 @@ async def test_tool_registry_registration_and_execution(tmp_path: Path) -> None:
         {"filename": "registry_test.json"},
         confirm=lambda _d, _a: True,
     )
-    assert save_res["status"] == "ok"
-    assert Path(save_res["path"]).exists()
+    assert save_res["status"] == "saved"
+    assert Path(save_res["saved_path"]).is_file()
 
 
 def test_read_clipboard_capped_truncation() -> None:
@@ -569,8 +569,146 @@ def test_transform_clipboard_and_save_direct_calls(tmp_path: Path) -> None:
     s_res = save_clipboard_to_file(
         filename="error_log", directory="desktop", clipboard_service=service
     )
-    assert s_res["status"] == "ok"
-    assert Path(s_res["path"]).exists()
+    assert s_res["status"] == "saved"
+    assert Path(s_res["saved_path"]).is_file()
+
+
+# --------------------------------------------- 64-Bit Win32 & DIB/DIBV5 Tests
+
+
+def test_win32_ctypes_64bit_void_p_signatures() -> None:
+    """Verify Win32ClipboardBackend configures c_void_p pointer signatures on Windows."""
+    import ctypes
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("Win32 DLL signatures apply on Windows only")
+
+    backend = Win32ClipboardBackend()
+    assert backend._user32.GetClipboardData.restype is ctypes.c_void_p
+    assert backend._user32.SetClipboardData.restype is ctypes.c_void_p
+    assert backend._user32.SetClipboardData.argtypes[1] is ctypes.c_void_p
+    assert backend._user32.OpenClipboard.argtypes == [ctypes.c_void_p]
+    assert backend._kernel32.GlobalAlloc.restype is ctypes.c_void_p
+    assert backend._kernel32.GlobalLock.argtypes == [ctypes.c_void_p]
+    assert backend._kernel32.GlobalLock.restype is ctypes.c_void_p
+    assert backend._kernel32.GlobalUnlock.argtypes == [ctypes.c_void_p]
+    assert backend._kernel32.GlobalSize.argtypes == [ctypes.c_void_p]
+    assert backend._kernel32.GlobalSize.restype is ctypes.c_size_t
+
+
+def test_dib_and_dibv5_reconstruction_into_png() -> None:
+    """Verify CF_DIB (biSize=40) and CF_DIBV5 (biSize=124, BI_BITFIELDS) decode to PNG."""
+    import ctypes
+    import io
+    import struct
+
+    from PIL import Image
+
+    from clea.tools.clipboard import CF_DIB, CF_DIBV5, _convert_dib_to_png
+
+    # 1. Construct a 24-bit RGB CF_DIB buffer (16x12)
+    src_img = Image.new("RGB", (16, 12), (42, 128, 210))
+    bmp_buf = io.BytesIO()
+    src_img.save(bmp_buf, format="BMP")
+    dib_bytes = bmp_buf.getvalue()[14:]
+
+    png_bytes, dims = _convert_dib_to_png(dib_bytes)
+    assert png_bytes is not None
+    assert dims == (16, 12)
+    with Image.open(io.BytesIO(png_bytes)) as decoded:
+        assert decoded.format == "PNG"
+        assert decoded.size == (16, 12)
+        assert decoded.getpixel((0, 0)) == (42, 128, 210)
+
+    # 2. Construct a 32-bit BI_BITFIELDS CF_DIBV5 buffer (8x6)
+    w, h = 8, 6
+    hdr = bytearray(124)
+    struct.pack_into("<IiiHHIIiiII", hdr, 0, 124, w, h, 1, 32, 3, w * h * 4, 0, 0, 0, 0)
+    struct.pack_into("<IIII", hdr, 40, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
+    pixels = bytes([210, 128, 42, 255] * (w * h))  # BGRA
+    dibv5_bytes = bytes(hdr) + pixels
+
+    png_v5, dims_v5 = _convert_dib_to_png(dibv5_bytes)
+    assert png_v5 is not None
+    assert dims_v5 == (8, 6)
+    with Image.open(io.BytesIO(png_v5)) as decoded_v5:
+        assert decoded_v5.format == "PNG"
+        assert decoded_v5.size == (8, 6)
+        assert decoded_v5.getpixel((0, 0)) == (42, 128, 210, 255)
+
+    # 3. Verify Win32ClipboardBackend.read_snapshot() prioritizes CF_DIBV5 using 64-bit buffer
+    buf = ctypes.create_string_buffer(dibv5_bytes, len(dibv5_bytes))
+    addr = ctypes.addressof(buf)
+    mock_user32 = MagicMock()
+    mock_kernel32 = MagicMock()
+    mock_user32.OpenClipboard.return_value = 1
+    mock_user32.RegisterClipboardFormatW.return_value = 49152
+    mock_user32.IsClipboardFormatAvailable.side_effect = lambda fmt: fmt == CF_DIBV5
+    mock_user32.GetClipboardData.return_value = addr
+    mock_kernel32.GlobalLock.return_value = addr
+    mock_kernel32.GlobalSize.return_value = len(dibv5_bytes)
+
+    backend = Win32ClipboardBackend(user32=mock_user32, kernel32=mock_kernel32)
+    snap = backend.read_snapshot()
+    assert snap.kind == "image"
+    assert snap.image_format == "PNG"
+    assert snap.image_dimensions == (8, 6)
+    assert snap.image_bytes is not None
+    assert mock_user32.IsClipboardFormatAvailable.call_args_list[-1][0][0] in (CF_DIBV5, CF_DIB)
+
+
+# --------------------------------------------- Desktop Path & Direct Execution Tests
+
+
+def test_save_to_file_resolves_strictly_to_path_home_desktop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify directory='desktop' resolves strictly to Path.home() / 'Desktop', never OneDrive."""
+    fake_home = tmp_path / "user_home"
+    onedrive_desktop = fake_home / "OneDrive" / "Desktop"
+    onedrive_desktop.mkdir(parents=True)
+    # Deliberately omit fake_home / "Desktop" to verify mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    backend = FakeClipboardBackend()
+    backend.set_text("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    service = ClipboardService(backend=backend, default_save_dir=None)
+
+    res = service.save_to_file(filename="youtube_url.txt", directory="desktop")
+    assert res["status"] == "saved"
+    expected_path = (fake_home / "Desktop" / "youtube_url.txt").resolve()
+    assert Path(res["saved_path"]) == expected_path
+    assert expected_path.is_file()
+    assert "OneDrive" not in res["saved_path"]
+    assert expected_path.read_text(encoding="utf-8") == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+async def test_default_save_clipboard_runs_without_approval_and_voice_direct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify save_clipboard_to_file executes directly in-process in ToolRegistry and Voice."""
+    from clea.surfaces.voice.backends.base import default_voice_tools
+
+    # 1. ToolRegistry default registration executes directly without PermissionDeniedError
+    fake_backend = FakeClipboardBackend()
+    fake_backend.set_text("https://youtu.be/abc123")
+    service = ClipboardService(backend=fake_backend, default_save_dir=tmp_path)
+    registry = ToolRegistry()
+    register_clipboard_tools(registry, service)
+
+    res = await registry.execute(
+        "save_clipboard_to_file",
+        {"filename": "youtube_url.txt", "directory": "desktop"},
+    )
+    assert res["status"] == "saved"
+    assert Path(res["saved_path"]).is_file()
+
+    # 2. Voice tool declarations expose save_clipboard_to_file directly and warn delegate_task
+    voice_tools = {t.name: t for t in default_voice_tools()}
+    assert "save_clipboard_to_file" in voice_tools
+    assert "transform_clipboard" in voice_tools
+    assert "save_clipboard_to_file" in voice_tools["delegate_task"].description
 
 
 # --------------------------------------------- CleaDaemon Integration Tests

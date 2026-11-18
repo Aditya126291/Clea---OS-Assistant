@@ -143,6 +143,10 @@ import type {
   OsControlSystemResult,
   OsWriteClipboardParams,
   OsWriteClipboardResult,
+  OsTransformClipboardParams,
+  OsTransformClipboardResult,
+  OsSaveClipboardToFileParams,
+  OsSaveClipboardToFileResult,
   UiElementItem,
   OsInspectUiElementsParams,
   OsInspectUiElementsResult,
@@ -311,6 +315,10 @@ export type {
   OsControlSystemResult,
   OsWriteClipboardParams,
   OsWriteClipboardResult,
+  OsTransformClipboardParams,
+  OsTransformClipboardResult,
+  OsSaveClipboardToFileParams,
+  OsSaveClipboardToFileResult,
   UiElementItem,
   OsInspectUiElementsParams,
   OsInspectUiElementsResult,
@@ -391,6 +399,8 @@ export interface MethodParamsMap {
   "os.open_url": OsOpenUrlParams;
   "os.control_system": OsControlSystemParams;
   "os.write_clipboard": OsWriteClipboardParams;
+  "os.transform_clipboard": OsTransformClipboardParams;
+  "os.save_clipboard_to_file": OsSaveClipboardToFileParams;
   "os.inspect_ui_elements": OsInspectUiElementsParams;
   "os.click_ui_element": OsClickUiElementParams;
   "os.gui_action": OsGuiActionParams;
@@ -455,6 +465,8 @@ export interface MethodResultMap {
   "os.open_url": OsOpenUrlResult;
   "os.control_system": OsControlSystemResult;
   "os.write_clipboard": OsWriteClipboardResult;
+  "os.transform_clipboard": OsTransformClipboardResult;
+  "os.save_clipboard_to_file": OsSaveClipboardToFileResult;
   "os.inspect_ui_elements": OsInspectUiElementsResult;
   "os.click_ui_element": OsClickUiElementResult;
   "os.gui_action": OsGuiActionResult;

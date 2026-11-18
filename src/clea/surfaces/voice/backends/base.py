@@ -45,8 +45,12 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="delegate_task",
             description=(
-                "Delegate a desktop, file, system, or multi-step task to Clea's background "
-                "agent loop. Runs asynchronously while conversation continues."
+                "Delegate a complex or multi-step desktop, file, or system task to Clea's "
+                "background agent loop. Runs asynchronously while conversation continues. "
+                "Do NOT use delegate_task for saving, reading, or transforming clipboard "
+                "contents (e.g., 'save my clipboard to desktop', 'save what I copied as "
+                "youtube_url.txt')—call save_clipboard_to_file, transform_clipboard, or "
+                "read_clipboard directly instead."
             ),
             parameters_schema={
                 "type": "object",
@@ -595,6 +599,66 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     },
                 },
                 "required": ["index"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="transform_clipboard",
+            description=(
+                "Run deterministic local transforms on Windows clipboard text directly in-process: "
+                "format_json, minify_json, clean_text, unwrap_text, or strip_tracking_urls. "
+                "Always call directly instead of delegate_task."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "format_json",
+                            "minify_json",
+                            "clean_text",
+                            "unwrap_text",
+                            "strip_tracking_urls",
+                        ],
+                        "description": "Transform action to run on the clipboard text.",
+                    },
+                    "update_clipboard": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to write the transformed result back to the clipboard "
+                            "(default true)."
+                        ),
+                    },
+                },
+                "required": ["action"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="save_clipboard_to_file",
+            description=(
+                "Directly save the current Windows clipboard content (text, URLs, code, or image "
+                "screenshot) to a file on Desktop or Documents (e.g., 'save my clipboard to "
+                "desktop', 'save what I copied as youtube_url.txt'). Always call this tool "
+                "directly instead of delegating to delegate_task."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional filename (auto-detects extension if omitted).",
+                    },
+                    "directory": {
+                        "type": "string",
+                        "enum": ["desktop", "documents"],
+                        "description": (
+                            "Target directory ('desktop' or 'documents', default desktop)."
+                        ),
+                    },
+                },
+                "required": [],
             },
             behavior="non_blocking",
         ),
