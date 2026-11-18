@@ -34,6 +34,10 @@ CF_UNICODETEXT = 13
 CF_HDROP = 15
 CF_DIBV5 = 17
 
+BI_RGB = 0
+DIB_RGB_COLORS = 0
+PNG_IEND_TRAILER = b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
+
 GMEM_MOVEABLE = 0x0002
 GMEM_ZEROINIT = 0x0040
 
@@ -150,7 +154,41 @@ def _parse_png_dimensions(png_bytes: bytes) -> tuple[int, int] | None:
         return None
 
 
-def _configure_win32_signatures(user32: Any, kernel32: Any, shell32: Any) -> None:
+class _WIN32_BITMAP(ctypes.Structure):
+    """Win32 GDI BITMAP structure queried via gdi32.GetObjectW."""
+
+    _fields_ = [
+        ("bmType", wintypes.LONG),
+        ("bmWidth", wintypes.LONG),
+        ("bmHeight", wintypes.LONG),
+        ("bmWidthBytes", wintypes.LONG),
+        ("bmPlanes", wintypes.WORD),
+        ("bmBitsPixel", wintypes.WORD),
+        ("bmBits", ctypes.c_void_p),
+    ]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    """40-byte Win32 BITMAPINFOHEADER for GetDIBits BI_RGB extraction."""
+
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+def _configure_win32_signatures(
+    user32: Any, kernel32: Any, shell32: Any, gdi32: Any = None
+) -> None:
     """Declare explicit 64-bit safe ctypes argtypes/restype using c_void_p for handles."""
     if isinstance(user32, ctypes.CDLL):
         user32.OpenClipboard.argtypes = [ctypes.c_void_p]
@@ -204,6 +242,120 @@ def _configure_win32_signatures(user32: Any, kernel32: Any, shell32: Any) -> Non
         ]
         shell32.DragQueryFileW.restype = wintypes.UINT
 
+    if isinstance(gdi32, ctypes.CDLL):
+        gdi32.GetObjectW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        gdi32.GetObjectW.restype = ctypes.c_int
+
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteDC.restype = wintypes.BOOL
+
+        gdi32.GetDIBits.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+        ]
+        gdi32.GetDIBits.restype = ctypes.c_int
+
+
+def _decode_registered_png(raw_bytes: bytes) -> tuple[bytes | None, tuple[int, int] | None]:
+    """Strip trailing Windows heap padding after the PNG IEND chunk and decode via Pillow."""
+    if not raw_bytes:
+        return None, None
+
+    iend_idx = raw_bytes.find(PNG_IEND_TRAILER)
+    trimmed = raw_bytes[: iend_idx + 12] if iend_idx != -1 else raw_bytes
+
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(trimmed)) as img:
+            img.load()
+            dims = img.size
+            if img.format == "PNG":
+                return trimmed, dims
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue(), dims
+    except Exception as exc:
+        logger.warning("Failed decoding registered PNG clipboard bytes: %s", exc)
+        return None, None
+
+
+def _decode_hbitmap_to_png(
+    hbitmap: Any, gdi32: Any
+) -> tuple[bytes | None, tuple[int, int] | None]:
+    """Decode a Win32 CF_BITMAP HBITMAP into lossless PNG bytes via GDI GetDIBits."""
+    if not hbitmap or not gdi32:
+        return None, None
+
+    try:
+        bmp = _WIN32_BITMAP()
+        if not gdi32.GetObjectW(hbitmap, ctypes.sizeof(_WIN32_BITMAP), ctypes.byref(bmp)):
+            logger.warning("gdi32.GetObjectW failed for CF_BITMAP handle.")
+            return None, None
+
+        w = int(bmp.bmWidth)
+        h = abs(int(bmp.bmHeight))
+        if w <= 0 or h <= 0 or w > 32768 or h > 32768:
+            logger.warning("Invalid CF_BITMAP dimensions: %dx%d", w, h)
+            return None, None
+
+        hdc = gdi32.CreateCompatibleDC(None)
+        if not hdc:
+            logger.warning("gdi32.CreateCompatibleDC failed.")
+            return None, None
+
+        try:
+            bmi = _BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+            bmi.biWidth = w
+            bmi.biHeight = -h
+            bmi.biPlanes = 1
+            bmi.biBitCount = 32
+            bmi.biCompression = BI_RGB
+
+            buf = (ctypes.c_ubyte * (w * h * 4))()
+            scanlines = gdi32.GetDIBits(
+                hdc,
+                hbitmap,
+                0,
+                h,
+                buf,
+                ctypes.byref(bmi),
+                DIB_RGB_COLORS,
+            )
+            if not scanlines:
+                logger.warning("gdi32.GetDIBits failed (scanlines=%s).", scanlines)
+                return None, None
+
+            from PIL import Image
+
+            raw_bytes = bytes(buf)
+            # 24-bit/BGRX GDI bitmaps leave every alpha byte at 0x00; promote to opaque RGBA.
+            if raw_bytes[3::4] == b"\x00" * (w * h) and any(raw_bytes):
+                img = Image.frombuffer("RGB", (w, h), raw_bytes, "raw", "BGRX", 0, 1).convert(
+                    "RGBA"
+                )
+            else:
+                img = Image.frombuffer("RGBA", (w, h), raw_bytes, "raw", "BGRA", 0, 1)
+
+            out = io.BytesIO()
+            img.save(out, format="PNG")
+            return out.getvalue(), (w, h)
+        finally:
+            with contextlib.suppress(Exception):
+                gdi32.DeleteDC(hdc)
+    except Exception as exc:
+        logger.warning("Failed decoding CF_BITMAP via GetDIBits: %s", exc, exc_info=True)
+        return None, None
+
 
 def _convert_dib_to_png(dib_bytes: bytes) -> tuple[bytes | None, tuple[int, int] | None]:
     """Convert CF_DIB / CF_DIBV5 bytes into lossless PNG bytes by prepending BITMAPFILEHEADER."""
@@ -245,16 +397,19 @@ class Win32ClipboardBackend:
         user32: Any = None,
         kernel32: Any = None,
         shell32: Any = None,
+        gdi32: Any = None,
     ) -> None:
         if sys.platform == "win32":
             self._user32 = user32 or ctypes.WinDLL("user32", use_last_error=True)
             self._kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
             self._shell32 = shell32 or ctypes.WinDLL("shell32", use_last_error=True)
+            self._gdi32 = gdi32 or ctypes.WinDLL("gdi32", use_last_error=True)
         else:
             self._user32 = user32
             self._kernel32 = kernel32
             self._shell32 = shell32
-        _configure_win32_signatures(self._user32, self._kernel32, self._shell32)
+            self._gdi32 = gdi32
+        _configure_win32_signatures(self._user32, self._kernel32, self._shell32, self._gdi32)
 
     def get_sequence_number(self) -> int:
         """Call user32.GetClipboardSequenceNumber() reading only the serial integer."""
@@ -326,7 +481,7 @@ class Win32ClipboardBackend:
         with self.open_clipboard():
             has_fmt = hasattr(self._user32, "IsClipboardFormatAvailable")
 
-            # 1. Registered PNG format
+            # 1. Registered PNG format (trim trailing Windows GlobalSize heap padding at IEND)
             cf_png = (
                 self._user32.RegisterClipboardFormatW("PNG")
                 if hasattr(self._user32, "RegisterClipboardFormatW")
@@ -336,9 +491,26 @@ class Win32ClipboardBackend:
                 image_available = True
                 h_data = self._user32.GetClipboardData(cf_png)
                 if h_data:
-                    png_bytes = self._read_global_bytes(h_data, "PNG")
+                    raw_png = self._read_global_bytes(h_data, "PNG")
+                    if raw_png:
+                        png_bytes, dims = _decode_registered_png(raw_png)
+                        if png_bytes:
+                            return ClipboardSnapshot(
+                                kind="image",
+                                image_bytes=png_bytes,
+                                image_format="PNG",
+                                image_dimensions=dims,
+                            )
+                else:
+                    logger.warning("GetClipboardData returned NULL for registered PNG format.")
+
+            # 2. CF_BITMAP (2) via GDI GetDIBits (GDI synthesizes CF_BITMAP from CF_DIBV5/CF_DIB)
+            if has_fmt and self._user32.IsClipboardFormatAvailable(CF_BITMAP):
+                image_available = True
+                h_bitmap = self._user32.GetClipboardData(CF_BITMAP)
+                if h_bitmap:
+                    png_bytes, dims = _decode_hbitmap_to_png(h_bitmap, self._gdi32)
                     if png_bytes:
-                        dims = _parse_png_dimensions(png_bytes)
                         return ClipboardSnapshot(
                             kind="image",
                             image_bytes=png_bytes,
@@ -346,9 +518,9 @@ class Win32ClipboardBackend:
                             image_dimensions=dims,
                         )
                 else:
-                    logger.warning("GetClipboardData returned NULL for registered PNG format.")
+                    logger.warning("GetClipboardData returned NULL for CF_BITMAP.")
 
-            # 2. CF_DIBV5 (17) and CF_DIB (8)
+            # 3. Fallback: CF_DIBV5 (17) and CF_DIB (8) if CF_BITMAP was unavailable
             for dib_fmt, dib_label in ((CF_DIBV5, "CF_DIBV5"), (CF_DIB, "CF_DIB")):
                 if has_fmt and self._user32.IsClipboardFormatAvailable(dib_fmt):
                     image_available = True
@@ -366,10 +538,6 @@ class Win32ClipboardBackend:
                                 )
                     else:
                         logger.warning("GetClipboardData returned NULL for %s.", dib_label)
-
-            # Check CF_BITMAP (2) so ImageGrab fallback triggers when only DDB is advertised
-            if has_fmt and self._user32.IsClipboardFormatAvailable(CF_BITMAP):
-                image_available = True
 
             # 3. CF_HDROP (15) - Copied files
             if has_fmt and self._user32.IsClipboardFormatAvailable(CF_HDROP):
@@ -991,13 +1159,17 @@ def read_clipboard(
             "preview": preview,
         }
     elif snapshot.kind == "image":
-        return {
+        res: dict[str, Any] = {
             "status": "ok",
             "kind": "image",
             "image_format": snapshot.image_format or "PNG",
             "dimensions": snapshot.image_dimensions,
             "size_bytes": len(snapshot.image_bytes) if snapshot.image_bytes else 0,
         }
+        if snapshot.image_dimensions is not None:
+            res["width"] = snapshot.image_dimensions[0]
+            res["height"] = snapshot.image_dimensions[1]
+        return res
     elif snapshot.kind == "files":
         return {
             "status": "ok",

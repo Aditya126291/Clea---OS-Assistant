@@ -1449,8 +1449,10 @@ _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT = (
 )
 
 
-def _fallback_snapshot_to_win32_dict(cap: int) -> dict[str, Any]:
-    """Read non-text clipboard formats (PNG, DIB, CF_BITMAP, CF_HDROP)."""
+def _fallback_snapshot_to_win32_dict(
+    cap: int, *, include_image_bytes: bool = False
+) -> dict[str, Any]:
+    """Read clipboard formats via Win32ClipboardBackend (PNG, CF_BITMAP, CF_HDROP, text)."""
     try:
         from clea.tools.clipboard import Win32ClipboardBackend
 
@@ -1468,6 +1470,14 @@ def _fallback_snapshot_to_win32_dict(cap: int) -> dict[str, Any]:
 
     if snap.kind == "image":
         w, h = snap.image_dimensions or (0, 0)
+        image_meta: dict[str, Any] = {
+            "width": w,
+            "height": h,
+            "format": (snap.image_format or "png").lower(),
+            "size_bytes": len(snap.image_bytes) if snap.image_bytes else 0,
+        }
+        if include_image_bytes and snap.image_bytes:
+            image_meta["image_bytes_base64"] = base64.b64encode(snap.image_bytes).decode("ascii")
         return {
             "ok": True,
             "kind": "image",
@@ -1475,12 +1485,7 @@ def _fallback_snapshot_to_win32_dict(cap: int) -> dict[str, Any]:
             "truncated": False,
             "char_count": 0,
             "total_chars": 0,
-            "image": {
-                "width": w,
-                "height": h,
-                "format": (snap.image_format or "png").lower(),
-                "size_bytes": len(snap.image_bytes) if snap.image_bytes else 0,
-            },
+            "image": image_meta,
         }
     if snap.kind == "files":
         file_text = "\n".join(snap.file_paths)
@@ -1523,8 +1528,11 @@ def _read_clipboard_win32(
     *,
     user32: Any = None,
     kernel32: Any = None,
+    include_image_bytes: bool = False,
 ) -> dict[str, Any]:
-    is_live = user32 is None and kernel32 is None
+    if user32 is None and kernel32 is None:
+        return _fallback_snapshot_to_win32_dict(cap, include_image_bytes=include_image_bytes)
+
     u32 = _get_win32_user32(user32)
     k32 = _get_win32_kernel32(kernel32)
 
@@ -1553,8 +1561,6 @@ def _read_clipboard_win32(
                     k32.GlobalUnlock(handle)
 
     if missing_unicode_text:
-        if is_live:
-            return _fallback_snapshot_to_win32_dict(cap)
         return {
             "ok": True,
             "text": "",
@@ -1566,16 +1572,13 @@ def _read_clipboard_win32(
     total_chars = len(raw_text)
     truncated = total_chars > cap
     text = raw_text[:cap] if truncated else raw_text
-    res: dict[str, Any] = {
+    return {
         "ok": True,
         "text": text,
         "truncated": truncated,
         "char_count": len(text),
         "total_chars": total_chars,
     }
-    if is_live:
-        res["kind"] = "text" if total_chars > 0 else "empty"
-    return res
 
 
 def read_clipboard(
@@ -1590,9 +1593,10 @@ def read_clipboard(
 ) -> dict[str, Any]:
     """Read UTF-16LE Unicode text or history items from the Windows clipboard.
 
-    When ``include_history=False`` (default), reads active clipboard text via classic
-    Win32 APIs. When ``include_history=True``, queries WinRT Clipboard History via
-    PowerShell 5.1, wrapping format checks in try/catch and falling back to Win32 on error.
+    When ``include_history=False`` (default), reads active clipboard content via
+    ``Win32ClipboardBackend`` (or injected Win32 test doubles). When
+    ``include_history=True``, queries WinRT Clipboard History via PowerShell 5.1,
+    falling back to Win32 on error or when the active item kind is unknown.
     """
     if isinstance(max_chars, bool):
         raise ValueError("max_chars must be an integer.")
@@ -1603,7 +1607,12 @@ def read_clipboard(
     cap = max(1, min(cap, MAX_CLIPBOARD_CHARS))
 
     if not include_history:
-        return _read_clipboard_win32(cap, user32=user32, kernel32=kernel32)
+        return _read_clipboard_win32(
+            cap,
+            user32=user32,
+            kernel32=kernel32,
+            include_image_bytes=include_image_bytes,
+        )
 
     history_enabled = False
     total_items = 0
@@ -1650,19 +1659,47 @@ def read_clipboard(
     extra_fields: dict[str, Any] = {}
     if winrt_success and items:
         top_item = items[0]
-        top_kind = str(top_item.get("kind") or "unknown")
-        if top_item.get("kind") == "text" and top_item.get("text") is not None:
+        raw_top_kind = str(top_item.get("kind") or "unknown")
+        if raw_top_kind == "text" and top_item.get("text") is not None:
+            top_kind = "text"
             text = top_item["text"]
             truncated = bool(top_item.get("truncated", False))
             total_chars = len(text)
             top_image = None
+        elif raw_top_kind == "image" and isinstance(top_item.get("image"), dict):
+            top_kind = "image"
+            text = ""
+            truncated = False
+            total_chars = 0
+            top_image = top_item.get("image")
+        elif powershell_runner is None:
+            win32_res = _read_clipboard_win32(
+                cap,
+                user32=user32,
+                kernel32=kernel32,
+                include_image_bytes=include_image_bytes,
+            )
+            text = win32_res["text"]
+            truncated = win32_res["truncated"]
+            total_chars = win32_res["total_chars"]
+            top_image = win32_res.get("image")
+            top_kind = win32_res.get("kind") or "empty"
+            if "file_paths" in win32_res:
+                extra_fields["file_paths"] = win32_res["file_paths"]
+                extra_fields["has_image_files"] = bool(win32_res.get("has_image_files", False))
         else:
+            top_kind = raw_top_kind
             text = ""
             truncated = False
             total_chars = 0
             top_image = top_item.get("image")
     else:
-        win32_res = _read_clipboard_win32(cap, user32=user32, kernel32=kernel32)
+        win32_res = _read_clipboard_win32(
+            cap,
+            user32=user32,
+            kernel32=kernel32,
+            include_image_bytes=include_image_bytes,
+        )
         text = win32_res["text"]
         truncated = win32_res["truncated"]
         total_chars = win32_res["total_chars"]

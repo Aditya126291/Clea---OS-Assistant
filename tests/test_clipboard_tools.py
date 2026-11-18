@@ -549,6 +549,8 @@ def test_read_clipboard_image_and_files() -> None:
     assert img_res["status"] == "ok"
     assert img_res["kind"] == "image"
     assert img_res["dimensions"] == (640, 480)
+    assert img_res["width"] == 640
+    assert img_res["height"] == 480
 
     backend.set_files(["C:\\test\\doc.pdf", "C:\\test\\photo.jpg"])
     files_res = read_clipboard(clipboard_service=service)
@@ -596,6 +598,20 @@ def test_win32_ctypes_64bit_void_p_signatures() -> None:
     assert backend._kernel32.GlobalUnlock.argtypes == [ctypes.c_void_p]
     assert backend._kernel32.GlobalSize.argtypes == [ctypes.c_void_p]
     assert backend._kernel32.GlobalSize.restype is ctypes.c_size_t
+    assert backend._gdi32.GetObjectW.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    assert backend._gdi32.GetObjectW.restype is ctypes.c_int
+    assert backend._gdi32.CreateCompatibleDC.argtypes == [ctypes.c_void_p]
+    assert backend._gdi32.CreateCompatibleDC.restype is ctypes.c_void_p
+    assert backend._gdi32.DeleteDC.argtypes == [ctypes.c_void_p]
+    assert backend._gdi32.GetDIBits.argtypes[0] is ctypes.c_void_p
+    assert backend._gdi32.GetDIBits.argtypes[1] is ctypes.c_void_p
+    assert backend._gdi32.GetDIBits.argtypes[4] is ctypes.c_void_p
+    assert backend._gdi32.GetDIBits.argtypes[5] is ctypes.c_void_p
+    assert backend._gdi32.GetDIBits.restype is ctypes.c_int
 
 
 def test_dib_and_dibv5_reconstruction_into_png() -> None:
@@ -941,3 +957,301 @@ def test_open_or_focus_app_resolves_desktop_relative_target_path(
     assert res["ok"] is True
     assert popen_calls
     assert str(print_file.resolve()) in popen_calls[0]
+
+
+# --------------------------------- PNG IEND Trim, CF_BITMAP GetDIBits, & Unified Read Tests
+
+
+def test_registered_png_iend_heap_padding_trim_and_decode() -> None:
+    """Verify registered PNG format strips Windows heap padding after IEND and decodes."""
+    import ctypes
+    import io
+
+    from PIL import Image
+
+    from clea.tools.clipboard import PNG_IEND_TRAILER, _decode_registered_png
+
+    src = Image.new("RGBA", (14, 10), (12, 134, 210, 200))
+    raw_buf = io.BytesIO()
+    src.save(raw_buf, format="PNG")
+    clean_png = raw_buf.getvalue()
+    assert clean_png.endswith(PNG_IEND_TRAILER)
+
+    # Simulate Windows GlobalSize heap padding after IEND chunk
+    padded_png = clean_png + b"\x00\xde\xad\xbe\xef" * 24
+
+    trimmed, dims = _decode_registered_png(padded_png)
+    assert trimmed == clean_png
+    assert dims == (14, 10)
+    with Image.open(io.BytesIO(trimmed)) as decoded:
+        assert decoded.format == "PNG"
+        assert decoded.size == (14, 10)
+        assert decoded.getpixel((0, 0)) == (12, 134, 210, 200)
+
+    # Corrupt/empty payloads return (None, None) rather than crashing
+    assert _decode_registered_png(b"") == (None, None)
+    assert _decode_registered_png(b"not a png at all" + PNG_IEND_TRAILER + b"\x00\x00") == (
+        None,
+        None,
+    )
+
+    # Full Win32ClipboardBackend.read_snapshot() path with GlobalSize returning padded length
+    cbuf = ctypes.create_string_buffer(padded_png, len(padded_png))
+    addr = ctypes.addressof(cbuf)
+    cf_png = 49155
+
+    mock_user32 = MagicMock()
+    mock_kernel32 = MagicMock()
+    mock_user32.OpenClipboard.return_value = 1
+    mock_user32.RegisterClipboardFormatW.return_value = cf_png
+    mock_user32.IsClipboardFormatAvailable.side_effect = lambda fmt: int(fmt == cf_png)
+    mock_user32.GetClipboardData.return_value = addr
+    mock_kernel32.GlobalLock.return_value = addr
+    mock_kernel32.GlobalSize.return_value = len(padded_png)
+
+    backend = Win32ClipboardBackend(
+        user32=mock_user32, kernel32=mock_kernel32, gdi32=MagicMock()
+    )
+    snap = backend.read_snapshot()
+    assert snap.kind == "image"
+    assert snap.image_format == "PNG"
+    assert snap.image_dimensions == (14, 10)
+    assert snap.image_bytes == clean_png
+
+
+def test_cf_bitmap_getdibits_32bit_bgra_extraction() -> None:
+    """Verify CF_BITMAP extraction via GetObjectW + CreateCompatibleDC + GetDIBits (BGRA)."""
+    import ctypes
+    import io
+
+    from PIL import Image
+
+    from clea.tools.clipboard import (
+        _BITMAPINFOHEADER,
+        _WIN32_BITMAP,
+        BI_RGB,
+        CF_BITMAP,
+        DIB_RGB_COLORS,
+    )
+
+    w, h = 10, 6
+    fake_hbitmap = 0x00007FF812345678
+    fake_hdc = 0x00007FF8ABCDEF00
+    bgra_pixels = bytes([210, 128, 42, 255] * (w * h))
+
+    captured_bmi: dict[str, Any] = {}
+    deleted_dcs: list[Any] = []
+
+    class _FakeGdi32:
+        def GetObjectW(self, hbm: Any, size: int, bmp_ptr: Any) -> int:
+            assert hbm == fake_hbitmap
+            assert size == ctypes.sizeof(_WIN32_BITMAP)
+            bmp = ctypes.cast(bmp_ptr, ctypes.POINTER(_WIN32_BITMAP)).contents
+            bmp.bmWidth = w
+            bmp.bmHeight = h
+            return size
+
+        def CreateCompatibleDC(self, hdc: Any) -> int:
+            assert hdc is None
+            return fake_hdc
+
+        def GetDIBits(
+            self,
+            hdc: Any,
+            hbm: Any,
+            start: int,
+            lines: int,
+            buf_ptr: Any,
+            bmi_ptr: Any,
+            usage: int,
+        ) -> int:
+            assert hdc == fake_hdc
+            assert hbm == fake_hbitmap
+            assert start == 0
+            assert lines == h
+            assert usage == DIB_RGB_COLORS
+            bmi = ctypes.cast(bmi_ptr, ctypes.POINTER(_BITMAPINFOHEADER)).contents
+            captured_bmi["biSize"] = bmi.biSize
+            captured_bmi["biWidth"] = bmi.biWidth
+            captured_bmi["biHeight"] = bmi.biHeight
+            captured_bmi["biPlanes"] = bmi.biPlanes
+            captured_bmi["biBitCount"] = bmi.biBitCount
+            captured_bmi["biCompression"] = bmi.biCompression
+            ctypes.memmove(buf_ptr, bgra_pixels, len(bgra_pixels))
+            return h
+
+        def DeleteDC(self, hdc: Any) -> int:
+            deleted_dcs.append(hdc)
+            return 1
+
+    mock_user32 = MagicMock()
+    mock_user32.OpenClipboard.return_value = 1
+    mock_user32.RegisterClipboardFormatW.return_value = 49152
+    mock_user32.IsClipboardFormatAvailable.side_effect = lambda fmt: int(fmt == CF_BITMAP)
+    mock_user32.GetClipboardData.side_effect = (
+        lambda fmt: fake_hbitmap if fmt == CF_BITMAP else None
+    )
+
+    backend = Win32ClipboardBackend(
+        user32=mock_user32,
+        kernel32=MagicMock(),
+        gdi32=_FakeGdi32(),
+    )
+    snap = backend.read_snapshot()
+
+    assert snap.kind == "image"
+    assert snap.image_format == "PNG"
+    assert snap.image_dimensions == (10, 6)
+    assert snap.image_bytes is not None
+    assert captured_bmi == {
+        "biSize": 40,
+        "biWidth": 10,
+        "biHeight": -6,
+        "biPlanes": 1,
+        "biBitCount": 32,
+        "biCompression": BI_RGB,
+    }
+    assert deleted_dcs == [fake_hdc]
+
+    with Image.open(io.BytesIO(snap.image_bytes)) as decoded:
+        assert decoded.format == "PNG"
+        assert decoded.size == (10, 6)
+        assert decoded.getpixel((0, 0)) == (42, 128, 210, 255)
+
+
+def test_cf_bitmap_getdibits_promotes_zero_alpha_bgrx_and_handles_real_gdi_bitmap() -> None:
+    """Verify GDI BGRX (all-zero alpha) promotion and real Win32 HBITMAP roundtrip."""
+    import ctypes
+    import io
+    import sys
+
+    from PIL import Image
+
+    from clea.tools.clipboard import _WIN32_BITMAP, _decode_hbitmap_to_png
+
+    w, h = 4, 3
+    bgrx_pixels = bytes([200, 100, 50, 0] * (w * h))
+    deleted_dcs: list[Any] = []
+
+    class _ZeroAlphaGdi32:
+        def GetObjectW(self, hbm: Any, size: int, bmp_ptr: Any) -> int:
+            bmp = ctypes.cast(bmp_ptr, ctypes.POINTER(_WIN32_BITMAP)).contents
+            bmp.bmWidth = w
+            bmp.bmHeight = h
+            return size
+
+        def CreateCompatibleDC(self, hdc: Any) -> int:
+            return 999
+
+        def GetDIBits(
+            self,
+            hdc: Any,
+            hbm: Any,
+            start: int,
+            lines: int,
+            buf_ptr: Any,
+            bmi_ptr: Any,
+            usage: int,
+        ) -> int:
+            ctypes.memmove(buf_ptr, bgrx_pixels, len(bgrx_pixels))
+            return h
+
+        def DeleteDC(self, hdc: Any) -> int:
+            deleted_dcs.append(hdc)
+            return 1
+
+    png_bytes, dims = _decode_hbitmap_to_png(1234, _ZeroAlphaGdi32())
+    assert dims == (4, 3)
+    assert png_bytes is not None
+    assert deleted_dcs == [999]
+    with Image.open(io.BytesIO(png_bytes)) as decoded:
+        assert decoded.getpixel((0, 0)) == (50, 100, 200, 255)
+
+    # Real Win32 in-memory HBITMAP test (never touches user clipboard)
+    if sys.platform == "win32":
+        backend = Win32ClipboardBackend()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        gdi32 = backend._gdi32
+        hdc_screen = ctypes.c_void_p(user32.GetDC(None))
+        hdc_mem = ctypes.c_void_p(gdi32.CreateCompatibleDC(hdc_screen))
+        hbmp = ctypes.c_void_p(gdi32.CreateCompatibleBitmap(hdc_screen, 6, 4))
+        old = ctypes.c_void_p(gdi32.SelectObject(hdc_mem, hbmp))
+        gdi32.PatBlt(hdc_mem, 0, 0, 6, 4, 0x00FF0062)  # WHITENESS
+        gdi32.SelectObject(hdc_mem, old)
+        try:
+            real_png, real_dims = _decode_hbitmap_to_png(hbmp, gdi32)
+            assert real_dims == (6, 4)
+            assert real_png is not None
+            with Image.open(io.BytesIO(real_png)) as real_img:
+                assert real_img.size == (6, 4)
+                assert real_img.getpixel((0, 0))[:3] == (255, 255, 255)
+        finally:
+            gdi32.DeleteObject(hbmp)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(None, hdc_screen)
+
+
+def test_windows_os_read_clipboard_unifies_live_reads_and_avoids_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify windows_os._read_clipboard_win32 delegates directly and never reports 'unknown'."""
+    import subprocess
+
+    from clea.tools import windows_os
+
+    monkeypatch.setattr(
+        windows_os,
+        "_get_win32_user32",
+        lambda _u32=None: (_ for _ in ()).throw(AssertionError("_get_win32_user32 should not run")),
+    )
+    monkeypatch.setattr(
+        Win32ClipboardBackend,
+        "read_snapshot",
+        lambda self: ClipboardSnapshot(
+            kind="image",
+            image_bytes=b"\x89PNG\r\n\x1a\nfake_png_bytes",
+            image_dimensions=(1280, 720),
+        ),
+    )
+
+    # 1. include_history=False delegates directly to Win32ClipboardBackend.read_snapshot()
+    direct_res = windows_os.read_clipboard(include_history=False)
+    assert direct_res["ok"] is True
+    assert direct_res["kind"] == "image"
+    assert direct_res["image"]["width"] == 1280
+    assert direct_res["image"]["height"] == 720
+
+    # 2. include_history=True when WinRT top item is 'unknown' (and powershell_runner is None)
+    monkeypatch.setattr(windows_os.shutil, "which", lambda _exe: "powershell.exe")
+    monkeypatch.setattr(
+        windows_os.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0] if args else ["powershell.exe"],
+            0,
+            stdout=json.dumps(
+                {
+                    "history_enabled": True,
+                    "total_items": 1,
+                    "items": [
+                        {
+                            "index": 0,
+                            "id": "{id-0}",
+                            "timestamp": "2026-11-18T14:00:00Z",
+                            "kind": "unknown",
+                            "text": None,
+                            "truncated": False,
+                            "image": None,
+                        }
+                    ],
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    hist_res = windows_os.read_clipboard(include_history=True)
+    assert hist_res["ok"] is True
+    assert hist_res["kind"] == "image"
+    assert hist_res["image"]["width"] == 1280
+    assert hist_res["image"]["height"] == 720
