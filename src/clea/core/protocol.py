@@ -56,8 +56,17 @@ class _EmptyParams(_Model):
     pass
 
 
+class ChatImageAttachment(_Model):
+    data_base64: str
+    mime_type: str = "image/png"
+    name: str | None = None
+    width: int | None = None
+    height: int | None = None
+
+
 class ChatSendParams(_Model):
-    text: str
+    text: str = ""
+    image: ChatImageAttachment | None = None
 
 
 class ChatFocusParams(_Model):
@@ -272,6 +281,12 @@ class OsSaveClipboardToFileParams(_Model):
 class OsOpenPathOrUrlParams(_Model):
     target: str | None = None
     use_clipboard: bool = False
+
+
+class OsInspectScreenParams(_Model):
+    target: str = "auto"
+    question: str = ""
+    include_image: bool = True
 
 
 GuiActionType = Literal["click_at", "type_text", "press_keys", "scroll", "wait"]
@@ -671,6 +686,11 @@ class OsOpenPathOrUrlRequest(_Request):
     params: OsOpenPathOrUrlParams = Field(default_factory=OsOpenPathOrUrlParams)
 
 
+class OsInspectScreenRequest(_Request):
+    method: Literal["os.inspect_screen"] = "os.inspect_screen"
+    params: OsInspectScreenParams = Field(default_factory=OsInspectScreenParams)
+
+
 class OsInspectUiElementsRequest(_Request):
     method: Literal["os.inspect_ui_elements"] = "os.inspect_ui_elements"
     params: OsInspectUiElementsParams = Field(default_factory=OsInspectUiElementsParams)
@@ -764,6 +784,7 @@ RequestFrame = Annotated[
     | OsTransformClipboardRequest
     | OsSaveClipboardToFileRequest
     | OsOpenPathOrUrlRequest
+    | OsInspectScreenRequest
     | OsInspectUiElementsRequest
     | OsClickUiElementRequest
     | OsGuiActionRequest
@@ -1369,6 +1390,30 @@ class OsOpenPathOrUrlResult(_Model):
     error: str | None = None
 
 
+class OsInspectScreenResult(_Model):
+    ok: bool = True
+    status: Literal[
+        "ok",
+        "minimized",
+        "not_found",
+        "empty",
+        "error",
+        "non_interactive_desktop",
+    ] = "ok"
+    source: str | None = None
+    window_title: str | None = None
+    process_name: str | None = None
+    question: str | None = None
+    width: int | None = None
+    height: int | None = None
+    artifact_path: str | None = None
+    uia_text: str | None = None
+    text: str | None = None
+    message: str | None = None
+    image_base64: str | None = None
+    image_mime_type: str | None = None
+
+
 class UiElementItem(_Model):
     index: int
     name: str = ""
@@ -1559,6 +1604,7 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "os.transform_clipboard": OsTransformClipboardResult,
     "os.save_clipboard_to_file": OsSaveClipboardToFileResult,
     "os.open_path_or_url": OsOpenPathOrUrlResult,
+    "os.inspect_screen": OsInspectScreenResult,
     "os.inspect_ui_elements": OsInspectUiElementsResult,
     "os.click_ui_element": OsClickUiElementResult,
     "os.gui_action": OsGuiActionResult,

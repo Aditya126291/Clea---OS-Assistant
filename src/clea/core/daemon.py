@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import logging
@@ -111,6 +112,7 @@ from clea.tools import (
 )
 from clea.tools.git_workspace import inspect_git_workspace
 from clea.tools.registry import ToolDefinition
+from clea.tools.vision import MAX_VISION_DIMENSION, _downscale_png
 from clea.tools.windows_os import (
     click_ui_element,
     control_media_volume,
@@ -438,6 +440,7 @@ class CleaDaemon:
                 self.port,
                 process_request=self._authenticate,
                 select_subprotocol=self._select_subprotocol,
+                max_size=24 * 1024 * 1024,
             )
             self._instance_lock.update_port(host=self.host, port=self.bound_port)
             auth.write_token(self.token, self.token_file)
@@ -1064,11 +1067,62 @@ class CleaDaemon:
                 ws, req, METHOD_RESULTS[method](session_id=session.id), session_id=session.id
             )
         elif method == "chat.send":
-            text = req.params.text.strip()
-            if not text:
+            text = (req.params.text or "").strip()
+            image_att = getattr(req.params, "image", None)
+            if not text and image_att is None:
                 await self._respond(ws, req, error="Missing non-empty 'text' parameter.")
                 return
-            conn.spawn(self._run_chat(conn, req, text))
+            image_bytes: bytes | None = None
+            image_mime_type: str | None = None
+            if image_att is not None:
+                raw_b64 = (image_att.data_base64 or "").strip()
+                if raw_b64.startswith("data:") and ";base64," in raw_b64:
+                    raw_b64 = raw_b64.split(";base64,", 1)[1]
+                raw_b64 = "".join(raw_b64.split())
+                if not raw_b64:
+                    await self._respond(ws, req, error="Invalid empty image attachment.")
+                    return
+                try:
+                    raw_img_bytes = base64.b64decode(raw_b64, validate=True)
+                except Exception:
+                    await self._respond(ws, req, error="Invalid base64 image attachment.")
+                    return
+                if not raw_img_bytes or len(raw_img_bytes) > 12 * 1024 * 1024:
+                    await self._respond(
+                        ws,
+                        req,
+                        error="Image attachment is empty or exceeds the 12 MiB limit.",
+                    )
+                    return
+                try:
+                    image_bytes, (img_w, img_h) = await asyncio.to_thread(
+                        _downscale_png, raw_img_bytes, MAX_VISION_DIMENSION
+                    )
+                except Exception as exc:
+                    await self._respond(
+                        ws, req, error=f"Failed to decode pasted image: {exc}"
+                    )
+                    return
+                image_mime_type = "image/png"
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self.artifact_store.save_png, image_bytes, "chat_paste"
+                    )
+                if not text:
+                    img_name = image_att.name or "clipboard_image.png"
+                    text = (
+                        f"Please inspect this image.\n"
+                        f"[Attached image: {img_name} · {img_w}×{img_h}]"
+                    )
+            conn.spawn(
+                self._run_chat(
+                    conn,
+                    req,
+                    text,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
+                )
+            )
         elif method == "chat.focus":
             if req.params.clear:
                 self._active_conversation_id = None
@@ -1933,6 +1987,8 @@ class CleaDaemon:
             await self._handle_os_save_clipboard_to_file(conn, req)
         elif method == "os.open_path_or_url":
             await self._handle_os_open_path_or_url(conn, req)
+        elif method == "os.inspect_screen":
+            await self._handle_os_inspect_screen(conn, req)
         elif method == "os.inspect_ui_elements":
             await self._handle_os_inspect_ui_elements(conn, req)
         elif method == "os.click_ui_element":
@@ -2878,6 +2934,54 @@ class CleaDaemon:
         filtered.setdefault("ok", res.get("status") == "opened")
         await self._respond(ws, req, model_cls(**filtered))
 
+    async def _handle_os_inspect_screen(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        p = req.params
+        try:
+            res = await asyncio.to_thread(
+                self.screen_vision_service.inspect,
+                target=p.target,
+                question=p.question,
+                include_image=p.include_image,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_inspect_screen",
+            status=res.status,
+            source=res.source,
+            window_title=res.window_title,
+            process_name=res.process_name,
+            artifact_path=res.artifact_path,
+        )
+        image_base64: str | None = None
+        image_mime_type: str | None = None
+        if isinstance(res.attachment, dict) and isinstance(res.attachment.get("data"), bytes):
+            image_base64 = base64.b64encode(res.attachment["data"]).decode("ascii")
+            image_mime_type = str(res.attachment.get("mime_type") or "image/png")
+        model_cls = METHOD_RESULTS["os.inspect_screen"]
+        await self._respond(
+            ws,
+            req,
+            model_cls(
+                ok=(res.status == "ok"),
+                status=res.status,
+                source=res.source,
+                window_title=res.window_title,
+                process_name=res.process_name,
+                question=res.question,
+                width=res.width,
+                height=res.height,
+                artifact_path=res.artifact_path,
+                uia_text=res.uia_text,
+                text=res.text,
+                message=res.message,
+                image_base64=image_base64,
+                image_mime_type=image_mime_type,
+            ),
+        )
+
     async def _handle_os_inspect_ui_elements(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         try:
@@ -3085,10 +3189,24 @@ class CleaDaemon:
 
     # ------------------------------------------------------------------ chat turns
 
-    async def _run_chat(self, conn: _Connection, req: Any, text: str) -> None:
+    async def _run_chat(
+        self,
+        conn: _Connection,
+        req: Any,
+        text: str,
+        *,
+        image_bytes: bytes | None = None,
+        image_mime_type: str | None = None,
+    ) -> None:
         """Run one chat turn as its own task so the connection keeps reading (approvals)."""
         with contextlib.suppress(ConnectionClosed):
-            await self._chat_turn(conn, req, text)
+            await self._chat_turn(
+                conn,
+                req,
+                text,
+                image_bytes=image_bytes,
+                image_mime_type=image_mime_type,
+            )
 
     async def _run_voice_chat_turn(
         self,
@@ -3115,7 +3233,15 @@ class CleaDaemon:
         finally:
             self._busy_sessions.discard(session.id)
 
-    async def _chat_turn(self, conn: _Connection, req: Any, text: str) -> None:
+    async def _chat_turn(
+        self,
+        conn: _Connection,
+        req: Any,
+        text: str,
+        *,
+        image_bytes: bytes | None = None,
+        image_mime_type: str | None = None,
+    ) -> None:
         ws = conn.ws
         session_id = req.session_id
         if session_id:
@@ -3153,6 +3279,8 @@ class CleaDaemon:
             req=req,
             broadcast_all_ui=False,
             notify_turn_start=True,
+            image_bytes=image_bytes,
+            image_mime_type=image_mime_type,
         )
 
     async def _execute_chat_turn(
@@ -3167,6 +3295,8 @@ class CleaDaemon:
         broadcast_all_ui: bool,
         notify_turn_start: bool,
         busy_already_acquired: bool = False,
+        image_bytes: bytes | None = None,
+        image_mime_type: str | None = None,
     ) -> None:
         ws = conn.ws if conn is not None else None
         if not busy_already_acquired:
@@ -3353,6 +3483,8 @@ class CleaDaemon:
                 reply = await self.agent.run_turn(
                     session=session,
                     user_text=text,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
                     on_text_delta=on_text_delta,
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,

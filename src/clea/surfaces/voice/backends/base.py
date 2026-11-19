@@ -66,6 +66,46 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="inspect_screen",
+            description=(
+                "Inspect and visually see a clipboard image, the active window, or a specific "
+                "background/occluded application window (e.g., 'vscode', 'chrome', 'terminal') "
+                "via lossless PNG capture and UI Automation text probing. Always call this tool "
+                "directly when the user asks 'what's in this image', 'what's on my clipboard "
+                "image', or 'look at VS Code' (or any app/window) rather than metadata-only "
+                "read_clipboard. Target 'auto' checks for a recently copied clipboard image "
+                "(within 10s) before falling back to the active window."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Target to inspect: 'auto' (recent clipboard image or active window), "
+                            "'clipboard' (clipboard image or text), 'active' (foreground window), "
+                            "or an application/window title query (e.g., 'vscode', 'chrome', "
+                            "'terminal'). Defaults to 'auto'."
+                        ),
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "Optional specific question or visual focus the user asked about."
+                        ),
+                    },
+                    "include_image": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to capture and deliver the visual PNG frame (default true)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="look_at_screen",
             description=(
                 "Capture a fresh live screenshot RIGHT NOW along with ground-truth active "
@@ -550,8 +590,9 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="read_clipboard",
             description=(
-                "Read plain text from the Windows clipboard, truncated to max_chars to keep "
-                "voice context bounded."
+                "Read plain text or metadata/history from the Windows clipboard, truncated to "
+                "max_chars to keep voice context bounded. To visually inspect or describe an "
+                "image on the clipboard, call inspect_screen(target='clipboard') instead."
             ),
             parameters_schema={
                 "type": "object",

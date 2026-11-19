@@ -20,6 +20,7 @@ import type {
   ChatRenameResult,
   ChatSendFromVoiceParams,
   ChatSendFromVoiceResult,
+  ChatImageAttachment,
   ChatSendParams,
   ChatSendResult,
   ChatFocusParams,
@@ -149,6 +150,8 @@ import type {
   OsSaveClipboardToFileResult,
   OsOpenPathOrUrlParams,
   OsOpenPathOrUrlResult,
+  OsInspectScreenParams,
+  OsInspectScreenResult,
   UiElementItem,
   OsInspectUiElementsParams,
   OsInspectUiElementsResult,
@@ -194,6 +197,7 @@ export type {
   ChatRenameResult,
   ChatSendFromVoiceParams,
   ChatSendFromVoiceResult,
+  ChatImageAttachment,
   ChatSendParams,
   ChatSendResult,
   ChatFocusParams,
@@ -323,6 +327,8 @@ export type {
   OsSaveClipboardToFileResult,
   OsOpenPathOrUrlParams,
   OsOpenPathOrUrlResult,
+  OsInspectScreenParams,
+  OsInspectScreenResult,
   UiElementItem,
   OsInspectUiElementsParams,
   OsInspectUiElementsResult,
@@ -406,6 +412,7 @@ export interface MethodParamsMap {
   "os.transform_clipboard": OsTransformClipboardParams;
   "os.save_clipboard_to_file": OsSaveClipboardToFileParams;
   "os.open_path_or_url": OsOpenPathOrUrlParams;
+  "os.inspect_screen": OsInspectScreenParams;
   "os.inspect_ui_elements": OsInspectUiElementsParams;
   "os.click_ui_element": OsClickUiElementParams;
   "os.gui_action": OsGuiActionParams;
@@ -473,6 +480,7 @@ export interface MethodResultMap {
   "os.transform_clipboard": OsTransformClipboardResult;
   "os.save_clipboard_to_file": OsSaveClipboardToFileResult;
   "os.open_path_or_url": OsOpenPathOrUrlResult;
+  "os.inspect_screen": OsInspectScreenResult;
   "os.inspect_ui_elements": OsInspectUiElementsResult;
   "os.click_ui_element": OsClickUiElementResult;
   "os.gui_action": OsGuiActionResult;

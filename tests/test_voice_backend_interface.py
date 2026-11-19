@@ -62,6 +62,7 @@ def test_default_voice_tools_cover_required_tools() -> None:
     by_name = {tool.name: tool for tool in tools}
     assert set(by_name) == {
         "delegate_task",
+        "inspect_screen",
         "look_at_screen",
         "watch_screen",
         "end_call",
@@ -102,6 +103,12 @@ def test_default_voice_tools_cover_required_tools() -> None:
         assert tool.behavior == "non_blocking"
 
     assert by_name["delegate_task"].parameters_schema["required"] == ["description"]
+
+    inspect_props = by_name["inspect_screen"].parameters_schema["properties"]
+    assert "target" in inspect_props
+    assert "question" in inspect_props
+    assert "include_image" in inspect_props
+    assert by_name["inspect_screen"].parameters_schema.get("required", []) == []
 
     look_props = by_name["look_at_screen"].parameters_schema["properties"]
     assert look_props["target"]["enum"] == ["active_window", "full_screen"]

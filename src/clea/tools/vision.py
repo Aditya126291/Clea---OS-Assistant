@@ -16,13 +16,15 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageOps
 from pydantic import BaseModel, Field
 
+import clea.tools.windows_os as _windows_os
 from clea.memory.store import default_data_dir
 from clea.surfaces.voice.win32 import (
     _RECT,
@@ -43,11 +45,22 @@ logger = logging.getLogger(__name__)
 
 # Win32 Constants for background capture & window filtering
 PW_RENDERFULLCONTENT = 0x00000002
+SRCCOPY = 0x00CC0020
+CAPTUREBLT = 0x40000000
+SRCCOPY_CAPTUREBLT = SRCCOPY | CAPTUREBLT
+BI_RGB = 0
+DIB_RGB_COLORS = 0
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+PROCESS_PER_MONITOR_DPI_AWARE = 2
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 MAX_VISION_DIMENSION = 1568
 DEFAULT_PROBE_MAX_CHARS = 3000
 CLIPBOARD_IMAGE_RECENCY_THRESHOLD_SECONDS = 10.0
+
+_WNDENUMPROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    wintypes.BOOL, ctypes.c_void_p, wintypes.LPARAM
+)
 
 
 # ----------------------------------------------------------------- Data Models
@@ -77,7 +90,14 @@ class WindowCapture(BaseModel):
 class ScreenInspectionResult(BaseModel):
     """Structured outcome of an inspect_screen invocation."""
 
-    status: Literal["ok", "minimized", "not_found", "empty", "error"]
+    status: Literal[
+        "ok",
+        "minimized",
+        "not_found",
+        "empty",
+        "error",
+        "non_interactive_desktop",
+    ]
     source: (
         Literal["active_window", "background_window", "clipboard", "clipboard_text"]
         | str
@@ -167,6 +187,260 @@ class _BITMAPINFO(ctypes.Structure):
     ]
 
 
+def _try_load_windll(name: str) -> Any:
+    """Load a Win32 DLL with use_last_error=True, returning None if unavailable."""
+    if sys.platform != "win32":
+        return None
+    try:
+        return ctypes.WinDLL(name, use_last_error=True)
+    except OSError:
+        return None
+
+
+def _configure_win32_dlls(
+    *,
+    user32: Any = None,
+    gdi32: Any = None,
+    dwmapi: Any = None,
+    kernel32: Any = None,
+    shcore: Any = None,
+) -> None:
+    """Assign explicit 64-bit c_void_p ctypes signatures on real Win32 DLL objects."""
+    if isinstance(user32, ctypes.CDLL):
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+
+        user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+
+        user32.IsIconic.argtypes = [ctypes.c_void_p]
+        user32.IsIconic.restype = wintypes.BOOL
+
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.GetWindowLongW.restype = ctypes.c_long
+
+        user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+
+        user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+
+        user32.EnumChildWindows.argtypes = [ctypes.c_void_p, _WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumChildWindows.restype = wintypes.BOOL
+
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.GetDC.restype = ctypes.c_void_p
+
+        user32.GetWindowDC.argtypes = [ctypes.c_void_p]
+        user32.GetWindowDC.restype = ctypes.c_void_p
+
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.ReleaseDC.restype = ctypes.c_int
+
+        user32.PrintWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
+        user32.PrintWindow.restype = wintypes.BOOL
+
+        user32.SendMessageTimeoutW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        user32.SendMessageTimeoutW.restype = ctypes.c_size_t
+
+        if hasattr(user32, "SetProcessDpiAwarenessContext"):
+            user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+
+        if hasattr(user32, "SetProcessDPIAware"):
+            user32.SetProcessDPIAware.argtypes = []
+            user32.SetProcessDPIAware.restype = wintypes.BOOL
+
+        if hasattr(user32, "GetThreadDesktop"):
+            user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+            user32.GetThreadDesktop.restype = ctypes.c_void_p
+
+        if hasattr(user32, "GetUserObjectInformationW"):
+            user32.GetUserObjectInformationW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            user32.GetUserObjectInformationW.restype = wintypes.BOOL
+
+    if isinstance(gdi32, ctypes.CDLL):
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+
+        gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+
+        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+
+        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteDC.restype = wintypes.BOOL
+
+        gdi32.BitBlt.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.DWORD,
+        ]
+        gdi32.BitBlt.restype = wintypes.BOOL
+
+        gdi32.GetDIBits.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+        ]
+        gdi32.GetDIBits.restype = ctypes.c_int
+
+    if isinstance(dwmapi, ctypes.CDLL) and hasattr(dwmapi, "DwmGetWindowAttribute"):
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+    if isinstance(kernel32, ctypes.CDLL):
+        kernel32.GetCurrentThreadId.argtypes = []
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+
+        if hasattr(kernel32, "QueryFullProcessImageNameW"):
+            kernel32.QueryFullProcessImageNameW.argtypes = [
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                wintypes.LPWSTR,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+    if isinstance(shcore, ctypes.CDLL) and hasattr(shcore, "SetProcessDpiAwareness"):
+        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+
+
+def _enable_dpi_awareness(user32: Any = None, shcore: Any = None) -> bool:
+    """Enable Per-Monitor V2 DPI awareness safely, tolerating already-initialized state."""
+    if user32 is not None and hasattr(user32, "SetProcessDpiAwarenessContext"):
+        try:
+            if hasattr(ctypes, "set_last_error"):
+                ctypes.set_last_error(0)
+            res = user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            )
+            if res or (hasattr(ctypes, "get_last_error") and ctypes.get_last_error() == 5):
+                return True
+        except Exception as exc:
+            logger.debug("SetProcessDpiAwarenessContext failed: %s", exc)
+
+    if shcore is not None and hasattr(shcore, "SetProcessDpiAwareness"):
+        try:
+            hr = shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+            if hr in (0, 0x80070005, -2147024891):
+                return True
+        except OSError as exc:
+            if getattr(exc, "winerror", None) in (-2147024891, 0x80070005):
+                return True
+            logger.debug("shcore.SetProcessDpiAwareness failed: %s", exc)
+        except Exception as exc:
+            logger.debug("shcore.SetProcessDpiAwareness failed: %s", exc)
+
+    if user32 is not None and hasattr(user32, "SetProcessDPIAware"):
+        try:
+            return bool(user32.SetProcessDPIAware())
+        except Exception as exc:
+            logger.debug("SetProcessDPIAware failed: %s", exc)
+
+    return False
+
+
+def _is_all_zero_buffer(raw_bytes: bytes) -> bool:
+    """Return True when raw pixel buffer is non-empty and completely zeroed."""
+    return bool(raw_bytes) and raw_bytes.count(0) == len(raw_bytes)
+
+
+def _promote_bgrx_alpha_if_needed(img: Image.Image) -> Image.Image:
+    """Promote all-zero-alpha BGRX or mixed DWM+GDI zero-alpha frames to opaque RGBA.
+
+    Valid premultiplied BGRA frames from DWM never contain pixels with A == 0 and non-zero
+    RGB channels; presence of all-zero alpha or RGB>0 on A==0 indicates GDI-cleared alpha.
+    """
+    if img.mode != "RGBA":
+        return img.convert("RGBA")
+    r, g, b, a = img.split()
+    a_min, a_max = a.getextrema()
+    if a_min > 0:
+        return img
+    if a_max == 0:
+        return img.convert("RGB").convert("RGBA")
+    rgb_max = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    zero_alpha_mask = a.point(lambda v: 255 if v == 0 else 0)
+    if ImageChops.darker(rgb_max, zero_alpha_mask).getextrema()[1] > 0:
+        return img.convert("RGB").convert("RGBA")
+    return img
+
+
+def _extract_dib_bytes(
+    gdi32: Any,
+    mem_dc: Any,
+    h_bitmap: Any,
+    width: int,
+    height: int,
+    hwnd: int,
+) -> bytes:
+    """Extract top-down 32-bit BI_RGB pixel bytes from an HBITMAP via GetDIBits."""
+    bmi = _BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = width
+    bmi.bmiHeader.biHeight = -height
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = BI_RGB
+
+    buf = ctypes.create_string_buffer(width * height * 4)
+    lines = gdi32.GetDIBits(
+        mem_dc,
+        h_bitmap,
+        0,
+        height,
+        buf,
+        ctypes.byref(bmi),
+        DIB_RGB_COLORS,
+    )
+    if lines == 0:
+        raise RuntimeError(f"GetDIBits failed to retrieve bitmap pixels for HWND {hwnd}")
+    if lines != height:
+        logger.warning("GetDIBits returned %d lines out of %d for HWND %s", lines, height, hwnd)
+    return buf.raw
+
+
 class Win32ScreenVisionBackend:
     """Win32 ctypes implementation for non-stealing occluded capture and UIA text probe."""
 
@@ -176,17 +450,30 @@ class Win32ScreenVisionBackend:
         gdi32: Any = None,
         dwmapi: Any = None,
         kernel32: Any = None,
+        shcore: Any = None,
     ) -> None:
         if sys.platform == "win32":
-            self._user32 = user32 or getattr(ctypes.windll, "user32", None)
-            self._gdi32 = gdi32 or getattr(ctypes.windll, "gdi32", None)
-            self._dwmapi = dwmapi or getattr(ctypes.windll, "dwmapi", None)
-            self._kernel32 = kernel32 or getattr(ctypes.windll, "kernel32", None)
+            self._user32 = user32 if user32 is not None else _try_load_windll("user32")
+            self._gdi32 = gdi32 if gdi32 is not None else _try_load_windll("gdi32")
+            self._dwmapi = dwmapi if dwmapi is not None else _try_load_windll("dwmapi")
+            self._kernel32 = kernel32 if kernel32 is not None else _try_load_windll("kernel32")
+            self._shcore = shcore if shcore is not None else _try_load_windll("shcore")
         else:
             self._user32 = user32
             self._gdi32 = gdi32
             self._dwmapi = dwmapi
             self._kernel32 = kernel32
+            self._shcore = shcore
+
+        _configure_win32_dlls(
+            user32=self._user32,
+            gdi32=self._gdi32,
+            dwmapi=self._dwmapi,
+            kernel32=self._kernel32,
+            shcore=self._shcore,
+        )
+        if isinstance(self._user32, ctypes.CDLL):
+            _enable_dpi_awareness(user32=self._user32, shcore=self._shcore)
 
     def is_minimized(self, hwnd: int) -> bool:
         """Check user32.IsIconic(hwnd)."""
@@ -202,9 +489,10 @@ class Win32ScreenVisionBackend:
         """Resolve the active foreground window."""
         if not self._user32 or not hasattr(self._user32, "GetForegroundWindow"):
             return None
-        hwnd = self._user32.GetForegroundWindow()
-        if not hwnd:
+        raw_hwnd = self._user32.GetForegroundWindow()
+        if not raw_hwnd:
             return None
+        hwnd = int(raw_hwnd)
         if hasattr(self._user32, "IsWindowVisible") and not self._user32.IsWindowVisible(hwnd):
             return None
         title = get_window_title(hwnd)
@@ -229,9 +517,22 @@ class Win32ScreenVisionBackend:
             return None
         q_stem = q[:-4] if q.endswith(".exe") else q
 
-        candidates: list[tuple[int, WindowInfo, bool, int]] = []
+        # Resolve known desktop app aliases (e.g. 'vscode'/'vs code' -> Code.exe)
+        alias_procs: set[str] = set()
+        alias_titles: set[str] = set()
+        canonical_app = _windows_os._APP_ALIASES.get(q) or _windows_os._APP_ALIASES.get(q_stem)
+        if canonical_app:
+            spec = _windows_os._KNOWN_APPS.get(canonical_app)
+            if spec is not None:
+                alias_procs.update(p.lower() for p in spec.process_names)
+                alias_titles.update(t.lower() for t in spec.title_substrings)
 
-        def enum_proc(hwnd: int, _lparam: int) -> bool:
+        candidates: list[tuple[int, WindowInfo, bool, bool, int]] = []
+
+        def enum_proc(raw_hwnd: int, _lparam: int) -> bool:
+            if not raw_hwnd:
+                return True
+            hwnd = int(raw_hwnd)
             if not self._user32.IsWindowVisible(hwnd):
                 return True
 
@@ -259,10 +560,18 @@ class Win32ScreenVisionBackend:
 
             matched = False
             priority = 0
-            if q == p_stem or q == p_lower or q_stem == p_stem:
+            if (
+                q == p_stem
+                or q == p_lower
+                or q_stem == p_stem
+                or (alias_procs and p_lower in alias_procs)
+            ):
                 matched = True
                 priority = 4
-            elif a_lower and q == a_lower:
+            elif (a_lower and q == a_lower) or (
+                alias_titles
+                and any(sub in t_lower or (a_lower and sub in a_lower) for sub in alias_titles)
+            ):
                 matched = True
                 priority = 3
             elif q in p_lower or q in p_stem or q_stem in p_stem:
@@ -274,6 +583,7 @@ class Win32ScreenVisionBackend:
 
             if matched:
                 minimized = self.is_minimized(hwnd)
+                has_title = bool(title.strip())
                 bounds = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
                 win_info = WindowInfo(
                     hwnd=hwnd,
@@ -283,13 +593,11 @@ class Win32ScreenVisionBackend:
                     is_visible=True,
                     bounds=bounds,
                 )
-                candidates.append((hwnd, win_info, minimized, priority))
+                candidates.append((hwnd, win_info, minimized, has_title, priority))
 
             return True
 
-        win_functype = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
-        wnd_enum_proc = win_functype(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        cb = wnd_enum_proc(enum_proc)
+        cb = _WNDENUMPROC(enum_proc)
         try:
             self._user32.EnumWindows(cb, 0)
         except Exception as exc:
@@ -298,8 +606,8 @@ class Win32ScreenVisionBackend:
         if not candidates:
             return None
 
-        # Sort: prefer non-minimized first, then highest match priority
-        candidates.sort(key=lambda c: (0 if not c[2] else 1, -c[3]))
+        # Sort: prefer non-minimized, then titled over untitled helpers, then highest match priority
+        candidates.sort(key=lambda c: (0 if not c[2] else 1, 0 if c[3] else 1, -c[4]))
         return candidates[0][1]
 
     def capture_window_png(self, hwnd: int) -> WindowCapture:
@@ -307,8 +615,12 @@ class Win32ScreenVisionBackend:
         if not self._user32 or not self._gdi32:
             raise RuntimeError("Win32 user32/gdi32 not available for screen vision.")
 
-        title = get_window_title(hwnd)
-        proc_name = get_window_process_name(hwnd)
+        title = ""
+        proc_name = "<unknown>"
+        with contextlib.suppress(OSError):
+            title = get_window_title(hwnd)
+        with contextlib.suppress(OSError):
+            proc_name = get_window_process_name(hwnd)
 
         # 1. Full window bounds from GetWindowRect
         win_rect = _RECT()
@@ -347,86 +659,120 @@ class Win32ScreenVisionBackend:
             self._user32.ReleaseDC(0, hdc_screen)
             raise RuntimeError("Failed to create compatible bitmap")
         old_bmp = self._gdi32.SelectObject(mem_dc, h_bitmap)
+        bitmap_selected = True
+
+        def _ensure_selected() -> None:
+            nonlocal old_bmp, bitmap_selected
+            if not bitmap_selected:
+                old_bmp = self._gdi32.SelectObject(mem_dc, h_bitmap)
+                bitmap_selected = True
+
+        def _read_dib() -> bytes:
+            # Per MSDN GetDIBits remarks, h_bitmap must not be selected into any DC.
+            nonlocal bitmap_selected
+            if bitmap_selected and old_bmp:
+                self._gdi32.SelectObject(mem_dc, old_bmp)
+                bitmap_selected = False
+            return _extract_dib_bytes(self._gdi32, hdc_screen, h_bitmap, full_w, full_h, hwnd)
 
         captured = False
+        raw_bytes: bytes | None = None
         try:
             # PW_RENDERFULLCONTENT (0x00000002) allows capturing occluded/background windows
             res = self._user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT)
             if not res:
-                # Fallback to standard PrintWindow
                 res = self._user32.PrintWindow(hwnd, mem_dc, 0)
             captured = bool(res)
+            if captured:
+                raw_bytes = _read_dib()
 
-            # Fallback for active foreground window if PrintWindow failed
-            if not captured and hasattr(self._user32, "GetForegroundWindow"):
-                if self._user32.GetForegroundWindow() == hwnd:
-                    res_blt = self._gdi32.BitBlt(
-                        mem_dc,
-                        0,
-                        0,
-                        full_w,
-                        full_h,
-                        hdc_screen,
-                        win_rect.left,
-                        win_rect.top,
-                        0x00CC0020,  # SRCCOPY
-                    )
-                    captured = bool(res_blt)
-
-            if not captured:
-                raise RuntimeError(f"PrintWindow failed to capture pixels for HWND {hwnd}")
-
-            # 4. Extract pixel bytes via GetDIBits
-            bmi = _BITMAPINFO()
-            bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
-            bmi.bmiHeader.biWidth = full_w
-            bmi.bmiHeader.biHeight = -full_h  # top-down DIB
-            bmi.bmiHeader.biPlanes = 1
-            bmi.bmiHeader.biBitCount = 32
-            bmi.bmiHeader.biCompression = 0
-
-            buf = ctypes.create_string_buffer(full_w * full_h * 4)
-            lines = self._gdi32.GetDIBits(
-                mem_dc,
-                h_bitmap,
-                0,
-                full_h,
-                buf,
-                ctypes.byref(bmi),
-                0,
+            fg = (
+                self._user32.GetForegroundWindow()
+                if hasattr(self._user32, "GetForegroundWindow")
+                else None
             )
-            if lines == 0:
-                raise RuntimeError(
-                    f"GetDIBits failed to retrieve bitmap pixels for HWND {hwnd}"
-                )
-            if lines != full_h:
-                logger.warning(
-                    "GetDIBits returned %d lines out of %d for HWND %s", lines, full_h, hwnd
-                )
+            is_foreground = isinstance(fg, int) and not isinstance(fg, bool) and fg == int(hwnd)
+
+            # Fallback for active foreground window when PrintWindow failed or returned zero buffer
+            need_fg_fallback = not captured or (
+                raw_bytes is not None and _is_all_zero_buffer(raw_bytes)
+            )
+            if need_fg_fallback and is_foreground:
+                blt_ok = False
+                if hasattr(self._user32, "GetWindowDC"):
+                    hdc_win = self._user32.GetWindowDC(hwnd)
+                    if hdc_win:
+                        try:
+                            _ensure_selected()
+                            blt_ok = bool(
+                                self._gdi32.BitBlt(
+                                    mem_dc,
+                                    0,
+                                    0,
+                                    full_w,
+                                    full_h,
+                                    hdc_win,
+                                    0,
+                                    0,
+                                    SRCCOPY_CAPTUREBLT,
+                                )
+                            )
+                        finally:
+                            if hasattr(self._user32, "ReleaseDC"):
+                                self._user32.ReleaseDC(hwnd, hdc_win)
+                if blt_ok:
+                    captured = True
+                    raw_bytes = _read_dib()
+                if not blt_ok or (raw_bytes is not None and _is_all_zero_buffer(raw_bytes)):
+                    _ensure_selected()
+                    screen_blt_ok = bool(
+                        self._gdi32.BitBlt(
+                            mem_dc,
+                            0,
+                            0,
+                            full_w,
+                            full_h,
+                            hdc_screen,
+                            win_rect.left,
+                            win_rect.top,
+                            SRCCOPY_CAPTUREBLT,
+                        )
+                    )
+                    if screen_blt_ok:
+                        captured = True
+                        raw_bytes = _read_dib()
+
+            if not captured or raw_bytes is None:
+                raise RuntimeError(f"PrintWindow failed to capture pixels for HWND {hwnd}")
         finally:
-            self._gdi32.SelectObject(mem_dc, old_bmp)
+            if bitmap_selected and old_bmp:
+                self._gdi32.SelectObject(mem_dc, old_bmp)
             self._gdi32.DeleteObject(h_bitmap)
             self._gdi32.DeleteDC(mem_dc)
             self._user32.ReleaseDC(0, hdc_screen)
 
-        img = Image.frombuffer("RGBA", (full_w, full_h), buf, "raw", "BGRA", 0, 1)
+        # Decode 32-bit top-down BGRA buffer
+        img = Image.frombuffer("RGBA", (full_w, full_h), raw_bytes, "raw", "BGRA", 0, 1).copy()
 
         # 5. Crop invisible 7-8px drop-shadow margins if DWM bounds are valid sub-rectangle
         if obtained_dwm:
             crop_w = dwm_rect.right - dwm_rect.left
             crop_h = dwm_rect.bottom - dwm_rect.top
-            crop_x = max(0, dwm_rect.left - win_rect.left)
-            crop_y = max(0, dwm_rect.top - win_rect.top)
-            # Only crop if DWM bounds are a valid sub-rectangle within the captured bitmap
             if 0 < crop_w <= full_w and 0 < crop_h <= full_h:
-                crop_x2 = min(full_w, crop_x + crop_w)
-                crop_y2 = min(full_h, crop_y + crop_h)
+                crop_x = max(0, min(full_w, dwm_rect.left - win_rect.left))
+                crop_y = max(0, min(full_h, dwm_rect.top - win_rect.top))
+                crop_x2 = max(crop_x, min(full_w, dwm_rect.right - win_rect.left))
+                crop_y2 = max(crop_y, min(full_h, dwm_rect.bottom - win_rect.top))
                 if (
                     crop_x2 > crop_x
                     and crop_y2 > crop_y
                     and (crop_x > 0 or crop_y > 0 or crop_x2 < full_w or crop_y2 < full_h)
                 ):
                     img = img.crop((crop_x, crop_y, crop_x2, crop_y2))
+
+        # Promote all-zero-alpha BGRX frames and mixed DWM+GDI zero-alpha client frames to opaque
+        # RGBA; preserve genuine premultiplied BGRA alpha where A==0 only appears on RGB==(0,0,0).
+        img = _promote_bgrx_alpha_if_needed(img)
 
         # 6. Downscale proportionally only if max(width, height) > 1568
         w, h = img.size
@@ -537,13 +883,16 @@ class Win32ScreenVisionBackend:
             child_texts: list[str] = []
             total_chars = 0
 
-            def enum_child_proc(child_hwnd: int, _lparam: int) -> bool:
+            def enum_child_proc(raw_child_hwnd: int, _lparam: int) -> bool:
                 nonlocal total_chars
+                if not raw_child_hwnd:
+                    return True
+                child_hwnd = int(raw_child_hwnd)
                 t = get_window_title(child_hwnd)
                 if not t and hasattr(self._user32, "SendMessageTimeoutW"):
                     buf_len = 512
                     buf = ctypes.create_unicode_buffer(buf_len)
-                    res_val = wintypes.DWORD()
+                    res_val = ctypes.c_size_t(0)
                     ret = self._user32.SendMessageTimeoutW(
                         child_hwnd, 0x000D, buf_len, buf, 0x0002, 50, ctypes.byref(res_val)
                     )
@@ -557,9 +906,7 @@ class Win32ScreenVisionBackend:
                         return False
                 return True
 
-            win_functype = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
-            wnd_enum_proc = win_functype(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-            cb = wnd_enum_proc(enum_child_proc)
+            cb = _WNDENUMPROC(enum_child_proc)
             with contextlib.suppress(Exception):
                 self._user32.EnumChildWindows(hwnd, cb, 0)
             if child_texts:
@@ -640,10 +987,12 @@ class ScreenVisionService:
         backend: ScreenVisionBackend | None = None,
         clipboard_service: ClipboardService | None = None,
         artifact_store: ArtifactStore | None = None,
+        desktop_name_fn: Callable[[], str | None] | None = None,
     ) -> None:
         self._backend = backend or Win32ScreenVisionBackend()
         self._clipboard = clipboard_service
         self._artifact_store = artifact_store or ArtifactStore()
+        self._desktop_name_fn = desktop_name_fn
 
     @property
     def backend(self) -> ScreenVisionBackend:
@@ -683,7 +1032,9 @@ class ScreenVisionService:
                     if snapshot.kind == "image" or (
                         snapshot.kind == "files" and snapshot.has_image_files
                     ):
-                        return self._inspect_clipboard(snapshot, question=q_norm)
+                        return self._inspect_clipboard(
+                            snapshot, question=q_norm, include_image=include_image
+                        )
             except Exception as exc:
                 logger.debug("Clipboard auto-routing poll failed: %s", exc)
             t_norm = "active"
@@ -699,15 +1050,27 @@ class ScreenVisionService:
                     question=q_norm,
                     message=f"Failed reading clipboard: {exc}",
                 )
-            return self._inspect_clipboard(snapshot, question=q_norm)
+            return self._inspect_clipboard(snapshot, question=q_norm, include_image=include_image)
 
         # 3. Active Window or Background App/Window Mode
+        source = "active_window" if t_norm.lower() == "active" else "background_window"
+        non_default = _windows_os._check_interactive_desktop(desktop_name_fn=self._desktop_name_fn)
+        if non_default is not None:
+            return ScreenInspectionResult(
+                status="non_interactive_desktop",
+                source=source,
+                question=q_norm,
+                message=(
+                    f"Screen capture is unavailable on isolated non-interactive desktop "
+                    f"'{non_default}' (expected 'WinSta0\\Default'). Launch the Clea daemon "
+                    "from your interactive desktop terminal."
+                ),
+            )
+
         if t_norm.lower() == "active":
             win = self._backend.get_foreground_window()
-            source = "active_window"
         else:
             win = self._backend.find_window(t_norm)
-            source = "background_window"
 
         if win is None:
             return ScreenInspectionResult(
@@ -794,7 +1157,11 @@ class ScreenVisionService:
         )
 
     def _inspect_clipboard(
-        self, snapshot: Any, question: str | None = None
+        self,
+        snapshot: Any,
+        question: str | None = None,
+        *,
+        include_image: bool = True,
     ) -> ScreenInspectionResult:
         """Process clipboard snapshot into a ScreenInspectionResult."""
         if snapshot.kind == "empty":
@@ -857,6 +1224,27 @@ class ScreenVisionService:
                 message="Clipboard image content could not be read.",
             )
 
+        if not include_image:
+            with Image.open(io.BytesIO(img_bytes)) as im:
+                w, h = im.size
+            msg = (
+                f"Inspected clipboard image metadata [{w}x{h}] without attaching image."
+                if not question
+                else (
+                    f"Inspected clipboard image metadata [{w}x{h}] without attaching image "
+                    f"for question: '{question}'."
+                )
+            )
+            return ScreenInspectionResult(
+                status="ok",
+                source="clipboard",
+                question=question,
+                dimensions=(w, h),
+                width=w,
+                height=h,
+                message=msg,
+            )
+
         # Normalize and cap dimensions at 1568px
         final_bytes, (w, h) = _downscale_png(img_bytes, MAX_VISION_DIMENSION)
         saved_path = self._artifact_store.save_png(final_bytes, prefix="vision_clipboard")
@@ -883,14 +1271,22 @@ class ScreenVisionService:
 def _downscale_png(png_bytes: bytes, max_side: int = 1568) -> tuple[bytes, tuple[int, int]]:
     """Ensure PNG image is proportionally capped at max_side and encoded losslessly."""
     with Image.open(io.BytesIO(png_bytes)) as img:
+        orig_format = img.format
+        transformed = False
+        exif = img.getexif() if hasattr(img, "getexif") else None
+        if exif and exif.get(0x0112, 1) not in (1, None):
+            img = ImageOps.exif_transpose(img)
+            transformed = True
         if img.mode in ("CMYK", "YCbCr", "LAB", "HSV"):
             img = img.convert("RGB")
+            transformed = True
         elif img.mode == "P" and "transparency" in img.info:
             img = img.convert("RGBA")
+            transformed = True
 
         w, h = img.size
         longest = max(w, h)
-        if longest <= max_side and img.format == "PNG":
+        if not transformed and longest <= max_side and orig_format == "PNG":
             return png_bytes, (w, h)
 
         if longest > max_side:

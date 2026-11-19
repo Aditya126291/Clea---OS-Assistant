@@ -54,7 +54,13 @@ BASE_VOICE_SYSTEM_INSTRUCTION = (
     "screen capture):\n"
     "  1. Visual / Active Screen Intent (`look_at_screen`, `watch_screen`):\n"
     "     * Trigger ONLY when the user explicitly asks about what is currently visible on their "
-    "monitor, active window, open editor/browser tab, on-screen UI, or a visual error.\n"
+    "monitor, active window, a specific background app window, a clipboard image, open "
+    "editor/browser tab, on-screen UI, or a visual error.\n"
+    "     * When the user asks 'what's in this image', 'what's on my clipboard image', or to "
+    "'look at VS Code' (or any named/background window), call `inspect_screen(target='auto' | "
+    "'clipboard' | 'active' | '<app_or_window>', question?)` rather than metadata-only "
+    "`read_clipboard`, so you receive the visual PNG image frame directly and can describe what "
+    "you see.\n"
     "     * NEVER answer questions about what is currently on the screen, which app is open, or "
     "what code/UI text says from memory of screenshots earlier in the call. ALWAYS call "
     "`look_at_screen` again on EVERY turn that asks about the current screen or app state.\n"
@@ -143,7 +149,9 @@ BASE_VOICE_SYSTEM_INSTRUCTION = (
     "`volume_up`, `volume_down`, `set_volume` (0..100), `play_pause`, `next_track`, or "
     "`previous_track`.\n"
     "     * `read_clipboard(max_chars?, include_history?, max_items?)`: read plain text (capped at "
-    "max_chars, default 8000) or recent clipboard history items from the Windows clipboard.\n"
+    "max_chars, default 8000) or recent clipboard history items from the Windows clipboard. To see "
+    "or describe an image on the clipboard, call `inspect_screen(target='clipboard')` rather than "
+    "metadata-only `read_clipboard`.\n"
     "     * `select_clipboard_item(index)`: restore a specific clipboard history item by "
     "zero-based index onto the active Windows clipboard.\n"
     "     * `write_clipboard(text)`: write plain text on the Windows clipboard.\n"
@@ -352,6 +360,7 @@ async def _daemon_rpc(
         subprotocols=auth.client_subprotocols(resolved_token),
         open_timeout=timeout,
         close_timeout=2.0,
+        max_size=24 * 1024 * 1024,
     ) as ws:
         await ws.send(req.model_dump_json())
         while True:

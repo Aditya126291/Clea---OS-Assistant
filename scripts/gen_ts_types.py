@@ -32,6 +32,7 @@ from clea.core.protocol import (
     ChatCreateAndOpenRequest,
     ChatDeleteRequest,
     ChatFocusRequest,
+    ChatImageAttachment,
     ChatRenameRequest,
     ChatSendFromVoiceRequest,
     ChatSendRequest,
@@ -81,6 +82,7 @@ from clea.core.protocol import (
     OsControlMediaVolumeRequest,
     OsControlSystemRequest,
     OsGuiActionRequest,
+    OsInspectScreenRequest,
     OsInspectUiElementsRequest,
     OsOpenOrFocusAppRequest,
     OsOpenPathOrUrlRequest,
@@ -183,6 +185,7 @@ def build_json_schema() -> dict[str, Any]:
         health_ping_request: HealthPingRequest
         session_new_request: SessionNewRequest
         chat_send_request: ChatSendRequest
+        chat_image_attachment: ChatImageAttachment
         approval_respond_request: ApprovalRespondRequest
         memory_get_request: MemoryGetRequest
         memory_get_daily_request: MemoryGetDailyRequest
@@ -241,6 +244,7 @@ def build_json_schema() -> dict[str, Any]:
         os_transform_clipboard_request: OsTransformClipboardRequest
         os_save_clipboard_to_file_request: OsSaveClipboardToFileRequest
         os_open_path_or_url_request: OsOpenPathOrUrlRequest
+        os_inspect_screen_request: OsInspectScreenRequest
         os_inspect_ui_elements_request: OsInspectUiElementsRequest
         os_click_ui_element_request: OsClickUiElementRequest
         os_gui_action_request: OsGuiActionRequest

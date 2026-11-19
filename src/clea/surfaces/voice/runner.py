@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import inspect
 import json
 import logging
 import logging.handlers
@@ -54,6 +56,8 @@ from clea.core.protocol import (
     OsControlSystemRequest,
     OsGuiActionParams,
     OsGuiActionRequest,
+    OsInspectScreenParams,
+    OsInspectScreenRequest,
     OsInspectUiElementsParams,
     OsInspectUiElementsRequest,
     OsOpenOrFocusAppParams,
@@ -146,7 +150,12 @@ from clea.surfaces.voice.memory_hooks import (
     safe_consolidate_voice_call,
     safe_store_voice_transcript,
 )
-from clea.surfaces.voice.screen import ScreenCaptureService, is_window_blocked
+from clea.surfaces.voice.screen import (
+    NATIVE_PNG_MAX_BYTES,
+    ScreenCaptureService,
+    encode_native_frame,
+    is_window_blocked,
+)
 from clea.surfaces.voice.screen_indicator import ScreenIndicator
 from clea.surfaces.voice.wake_word import WakeWordDetector, WakeWordModelNotFoundError
 from clea.surfaces.voice.win32 import (
@@ -2102,6 +2111,174 @@ class VoiceRunner:
             )
             return
 
+        if event.name == "inspect_screen":
+            target = _req_str("target") or "auto"
+            target_norm = target.strip("'\"").lower() or "auto"
+            question = _req_str("question") or ""
+            include_image = _parse_bool("include_image", default=True)
+
+            if self.config.consent_mode == "deny" and target_norm != "clipboard":
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={
+                                "status": "denied",
+                                "error": (
+                                    "Screen capture is disabled by configuration "
+                                    "(consent_mode=deny)."
+                                ),
+                            },
+                            is_error=True,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+
+            if target_norm not in ("auto", "active", "clipboard") and is_window_blocked(
+                target_norm, target_norm, self.config.blocklist
+            ):
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={
+                                "status": "blocked",
+                                "error": (
+                                    f"Target '{target}' is protected by privacy blocklist."
+                                ),
+                            },
+                            is_error=True,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+
+            try:
+                res = await self._rpc(
+                    OsInspectScreenRequest(
+                        params=OsInspectScreenParams(
+                            target=target,
+                            question=question,
+                            include_image=include_image,
+                        )
+                    ),
+                    timeout=20.0,
+                )
+            except Exception as exc:
+                await _send_error(f"Failed to inspect screen: {exc}")
+                return
+
+            source = str(res.get("source") or "")
+            win_title = str(res.get("window_title") or "")
+            proc_name = str(res.get("process_name") or "")
+            if source in ("active_window", "background_window") and is_window_blocked(
+                win_title, proc_name, self.config.blocklist
+            ):
+                raw_blocked_artifact = res.get("artifact_path")
+                if isinstance(raw_blocked_artifact, str) and raw_blocked_artifact.strip():
+                    blocked_path = Path(raw_blocked_artifact.strip())
+                    if (
+                        blocked_path.suffix.lower() == ".png"
+                        and blocked_path.parent.name.lower() == "artifacts"
+                    ):
+                        with contextlib.suppress(OSError):
+                            await asyncio.to_thread(blocked_path.unlink, missing_ok=True)
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={
+                                "status": "blocked",
+                                "error": (
+                                    f"Window '{win_title}' ({proc_name}) is protected by "
+                                    "privacy blocklist."
+                                ),
+                                "window_title": win_title or None,
+                                "process_name": proc_name or None,
+                            },
+                            is_error=True,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+
+            image_bytes: bytes | None = None
+            image_mime_type = str(res.get("image_mime_type") or "image/png").strip() or "image/png"
+            raw_b64 = res.get("image_base64")
+            if include_image and isinstance(raw_b64, str) and raw_b64.strip():
+                try:
+                    decoded = base64.b64decode("".join(raw_b64.split()), validate=True)
+                    if decoded:
+                        image_bytes = decoded
+                except Exception as exc:
+                    logger.warning("Failed decoding inspect_screen image_base64: %s", exc)
+            if include_image and image_bytes is None:
+                raw_artifact = res.get("artifact_path")
+                if isinstance(raw_artifact, str) and raw_artifact.strip():
+                    artifact_file = Path(raw_artifact.strip())
+                    try:
+                        if await asyncio.to_thread(artifact_file.is_file):
+                            disk_bytes = await asyncio.to_thread(artifact_file.read_bytes)
+                            if disk_bytes:
+                                image_bytes = disk_bytes
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed reading inspect_screen artifact %s: %s",
+                            raw_artifact,
+                            exc,
+                        )
+
+            if image_bytes and len(image_bytes) > NATIVE_PNG_MAX_BYTES:
+                try:
+                    import io
+
+                    from PIL import Image
+
+                    def _cap_live_frame(raw_data: bytes) -> tuple[bytes, str]:
+                        with Image.open(io.BytesIO(raw_data)) as img:
+                            return encode_native_frame(img)
+
+                    image_bytes, image_mime_type = await asyncio.to_thread(
+                        _cap_live_frame, image_bytes
+                    )
+                except Exception as exc:
+                    logger.warning("Failed capping oversized inspect_screen frame: %s", exc)
+
+            media_parts: list[VoiceToolMediaPart] = []
+            if image_bytes:
+                media_parts.append(
+                    VoiceToolMediaPart(
+                        data=image_bytes,
+                        mime_type=image_mime_type,
+                    )
+                )
+
+            payload = {k: v for k, v in res.items() if k != "image_base64"}
+            payload["frames_sent"] = len(media_parts)
+            if media_parts:
+                payload["mime_type"] = image_mime_type
+
+            await backend.send_tool_responses(
+                [
+                    VoiceToolResponse(
+                        call_id=event.call_id,
+                        name=event.name,
+                        response=payload,
+                        media_parts=media_parts,
+                        is_error=False,
+                        scheduling="when_idle",
+                    )
+                ]
+            )
+            return
+
         if event.name == "open_url":
             raw_url = event.arguments.get("url")
             url = "" if raw_url is None else str(raw_url).strip()
@@ -2456,9 +2633,23 @@ class VoiceRunner:
             return
 
         try:
+            connect_kwargs: dict[str, Any] = {
+                "subprotocols": auth.client_subprotocols(token),
+            }
+            connect_target = getattr(connect, "side_effect", None) or connect
+            try:
+                sig = inspect.signature(connect_target)
+                if any(
+                    param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "max_size"
+                    for param in sig.parameters.values()
+                ):
+                    connect_kwargs["max_size"] = 24 * 1024 * 1024
+            except (TypeError, ValueError):
+                connect_kwargs["max_size"] = 24 * 1024 * 1024
+
             async with connect(
                 self.daemon_url,
-                subprotocols=auth.client_subprotocols(token),  # type: ignore[arg-type]
+                **connect_kwargs,
             ) as ws:
                 self._daemon_ws = ws
                 self._daemon_listener_active = True
