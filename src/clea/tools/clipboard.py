@@ -8,7 +8,6 @@ import ctypes.wintypes as wintypes
 import io
 import json
 import logging
-import os
 import re
 import struct
 import sys
@@ -994,12 +993,63 @@ class ClipboardService:
             "kind": "text",
         }
 
+    @staticmethod
+    def _open_resolved_target(
+        target_str: str,
+        *,
+        kind: Literal["file", "url"],
+        browser_fallback_url: str,
+        filename: str | None = None,
+        opener_fn: Callable[[str], Any] | None = None,
+        desktop_name_fn: Callable[[], str | None] | None = None,
+    ) -> dict[str, Any]:
+        """Verify an interactive desktop and open a validated file path or HTTP/HTTPS URL."""
+        from clea.tools.windows_os import _check_interactive_desktop, _open_via_shell
+
+        non_default = _check_interactive_desktop(desktop_name_fn)
+        if non_default is not None:
+            res_non_interactive: dict[str, Any] = {
+                "ok": False,
+                "status": "non_interactive_desktop",
+                "kind": kind,
+                "target": target_str,
+                "error": (
+                    f"Cannot open '{target_str}' visibly because the daemon is running on "
+                    f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'. Start "
+                    "the Clea daemon from an interactive Windows Terminal / PowerShell session."
+                ),
+            }
+            if filename is not None:
+                res_non_interactive["filename"] = filename
+            return res_non_interactive
+
+        try:
+            if opener_fn is not None:
+                opener_fn(target_str)
+            elif sys.platform == "win32":
+                _open_via_shell(target_str)
+            else:
+                webbrowser.open(browser_fallback_url)
+        except Exception as exc:
+            logger.warning("Failed opening %s %s: %s", kind, target_str, exc)
+            return {"status": "error", "error": f"Failed to open {kind}: {exc}"}
+
+        opened_res: dict[str, Any] = {
+            "status": "opened",
+            "kind": kind,
+            "target": target_str,
+        }
+        if filename is not None:
+            opened_res["filename"] = filename
+        return opened_res
+
     def open_path_or_url(
         self,
         target: str | None = None,
         *,
         use_clipboard: bool = False,
         opener_fn: Callable[[str], Any] | None = None,
+        desktop_name_fn: Callable[[], str | None] | None = None,
     ) -> dict[str, Any]:
         """Open a local file (Desktop/Documents/last saved) or http/https URL on Windows."""
         candidate = target.strip() if isinstance(target, str) else ""
@@ -1041,21 +1091,13 @@ class ClipboardService:
             parsed = urllib.parse.urlsplit(candidate)
             if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
                 return {"status": "error", "error": f"Invalid HTTP/HTTPS URL: {candidate}"}
-            try:
-                if opener_fn is not None:
-                    opener_fn(candidate)
-                elif hasattr(os, "startfile"):
-                    os.startfile(candidate)
-                else:
-                    webbrowser.open(candidate)
-            except Exception as exc:
-                logger.warning("Failed opening URL %s: %s", candidate, exc)
-                return {"status": "error", "error": f"Failed to open URL: {exc}"}
-            return {
-                "status": "opened",
-                "kind": "url",
-                "target": candidate,
-            }
+            return self._open_resolved_target(
+                candidate,
+                kind="url",
+                browser_fallback_url=candidate,
+                opener_fn=opener_fn,
+                desktop_name_fn=desktop_name_fn,
+            )
 
         # Reject shell binaries
         first_tok = re.split(r"[\s/\\]", lower)[0]
@@ -1097,24 +1139,14 @@ class ClipboardService:
         if resolved_file is None or not resolved_file.is_file():
             return {"status": "error", "error": f"File not found on disk: {candidate}"}
 
-        try:
-            target_str = str(resolved_file)
-            if opener_fn is not None:
-                opener_fn(target_str)
-            elif hasattr(os, "startfile"):
-                os.startfile(target_str)
-            else:
-                webbrowser.open(resolved_file.as_uri())
-        except Exception as exc:
-            logger.warning("Failed opening file %s: %s", resolved_file, exc)
-            return {"status": "error", "error": f"Failed to open file: {exc}"}
-
-        return {
-            "status": "opened",
-            "kind": "file",
-            "target": str(resolved_file),
-            "filename": resolved_file.name,
-        }
+        return self._open_resolved_target(
+            str(resolved_file),
+            kind="file",
+            browser_fallback_url=resolved_file.as_uri(),
+            filename=resolved_file.name,
+            opener_fn=opener_fn,
+            desktop_name_fn=desktop_name_fn,
+        )
 
 
 # ---------------------------------------------------- Tool Handlers & Registry
@@ -1233,11 +1265,15 @@ def open_path_or_url(
     *,
     clipboard_service: ClipboardService | None = None,
     opener_fn: Callable[[str], Any] | None = None,
+    desktop_name_fn: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     """Open a saved local file (e.g. Desktop/Documents) or http/https URL on Windows."""
     service = clipboard_service or get_default_clipboard_service()
     return service.open_path_or_url(
-        target=target, use_clipboard=use_clipboard, opener_fn=opener_fn
+        target=target,
+        use_clipboard=use_clipboard,
+        opener_fn=opener_fn,
+        desktop_name_fn=desktop_name_fn,
     )
 
 

@@ -83,6 +83,7 @@ from clea.core.protocol import (
     OsGuiActionRequest,
     OsInspectUiElementsRequest,
     OsOpenOrFocusAppRequest,
+    OsOpenPathOrUrlRequest,
     OsOpenUrlRequest,
     OsReadClipboardRequest,
     OsSaveClipboardToFileRequest,
@@ -239,6 +240,7 @@ def build_json_schema() -> dict[str, Any]:
         os_write_clipboard_request: OsWriteClipboardRequest
         os_transform_clipboard_request: OsTransformClipboardRequest
         os_save_clipboard_to_file_request: OsSaveClipboardToFileRequest
+        os_open_path_or_url_request: OsOpenPathOrUrlRequest
         os_inspect_ui_elements_request: OsInspectUiElementsRequest
         os_click_ui_element_request: OsClickUiElementRequest
         os_gui_action_request: OsGuiActionRequest

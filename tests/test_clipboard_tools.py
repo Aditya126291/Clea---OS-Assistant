@@ -1319,3 +1319,53 @@ def test_windows_os_read_clipboard_unifies_live_reads_and_avoids_unknown(
     parsed_model = OsReadClipboardResult(**hist_res)
     assert parsed_model.kind == "image"
     assert parsed_model.items[0].kind == "image"
+
+
+def test_open_path_or_url_detects_non_interactive_desktop_and_voice_instruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify open_path_or_url refuses non-Default desktops and Voice prompt exposes it."""
+    from clea.surfaces.voice.backends.base import default_voice_tools
+    from clea.surfaces.voice.memory_hooks import BASE_VOICE_SYSTEM_INSTRUCTION
+
+    desktop_dir = tmp_path / "Desktop"
+    desktop_dir.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    sample = desktop_dir / "test.txt"
+    sample.write_text("hello", encoding="utf-8")
+
+    opened: list[str] = []
+    backend = FakeClipboardBackend()
+    service = ClipboardService(backend=backend, default_save_dir=desktop_dir)
+
+    res_file = open_path_or_url(
+        "test.txt",
+        clipboard_service=service,
+        opener_fn=opened.append,
+        desktop_name_fn=lambda: "exebox-R3HAT",
+    )
+    assert res_file["ok"] is False
+    assert res_file["status"] == "non_interactive_desktop"
+    assert res_file["kind"] == "file"
+    assert res_file["filename"] == "test.txt"
+    assert "WinSta0\\Default" in str(res_file["error"])
+    assert opened == []
+
+    res_url = open_path_or_url(
+        "https://example.com",
+        clipboard_service=service,
+        opener_fn=opened.append,
+        desktop_name_fn=lambda: "exebox-R3HAT",
+    )
+    assert res_url["ok"] is False
+    assert res_url["status"] == "non_interactive_desktop"
+    assert res_url["kind"] == "url"
+    assert "WinSta0\\Default" in str(res_url["error"])
+    assert opened == []
+
+    voice_tools = {t.name: t for t in default_voice_tools()}
+    assert "open_path_or_url" in voice_tools
+    assert "open_path_or_url" in voice_tools["delegate_task"].description
+    assert "open_path_or_url" in BASE_VOICE_SYSTEM_INSTRUCTION
+    assert "non_interactive_desktop" in BASE_VOICE_SYSTEM_INSTRUCTION

@@ -49,7 +49,8 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                 "background agent loop. Runs asynchronously while conversation continues. "
                 "Do NOT use delegate_task for saving, reading, or transforming clipboard "
                 "contents (e.g., 'save my clipboard to desktop', 'save what I copied as "
-                "youtube_url.txt')—call save_clipboard_to_file, transform_clipboard, or "
+                "youtube_url.txt') or opening saved files/clipboard URLs—call "
+                "save_clipboard_to_file, open_path_or_url, transform_clipboard, or "
                 "read_clipboard directly instead."
             ),
             parameters_schema={
@@ -655,6 +656,36 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                         "enum": ["desktop", "documents"],
                         "description": (
                             "Target directory ('desktop' or 'documents', default desktop)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="open_path_or_url",
+            description=(
+                "Open a saved local file (e.g., on Desktop or Documents, or the most recently "
+                "saved clipboard file) or an http/https URL (explicit target or extracted from "
+                "clipboard) visibly using Windows default application or browser. Always call "
+                "this directly when asked to open a saved file or copied link instead of "
+                "calling open_or_focus_app without a path or delegating to delegate_task."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Optional file path, filename (e.g. 'test.txt'), or http/https URL. "
+                            "Omit to open the most recently saved file or clipboard URL."
+                        ),
+                    },
+                    "use_clipboard": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, read and open the URL or path directly from clipboard."
                         ),
                     },
                 },

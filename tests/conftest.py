@@ -39,3 +39,14 @@ def _sandbox_clea_environment(
                 (tmp_path / "session_token").write_text(
                     host_token.read_text(encoding="utf-8"), encoding="utf-8"
                 )
+
+    import clea.tools.windows_os as _windows_os
+
+    _orig_get_desktop_name = _windows_os._get_current_desktop_name
+
+    def _default_test_desktop_name(*, user32: object = None, kernel32: object = None) -> str | None:
+        if user32 is not None or kernel32 is not None:
+            return _orig_get_desktop_name(user32=user32, kernel32=kernel32)
+        return "Default"
+
+    monkeypatch.setattr(_windows_os, "_get_current_desktop_name", _default_test_desktop_name)

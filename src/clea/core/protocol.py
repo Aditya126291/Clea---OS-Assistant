@@ -269,6 +269,11 @@ class OsSaveClipboardToFileParams(_Model):
     directory: Literal["desktop", "documents"] = "desktop"
 
 
+class OsOpenPathOrUrlParams(_Model):
+    target: str | None = None
+    use_clipboard: bool = False
+
+
 GuiActionType = Literal["click_at", "type_text", "press_keys", "scroll", "wait"]
 GuiClickButton = Literal["left", "right", "double"]
 
@@ -661,6 +666,11 @@ class OsSaveClipboardToFileRequest(_Request):
     params: OsSaveClipboardToFileParams = Field(default_factory=OsSaveClipboardToFileParams)
 
 
+class OsOpenPathOrUrlRequest(_Request):
+    method: Literal["os.open_path_or_url"] = "os.open_path_or_url"
+    params: OsOpenPathOrUrlParams = Field(default_factory=OsOpenPathOrUrlParams)
+
+
 class OsInspectUiElementsRequest(_Request):
     method: Literal["os.inspect_ui_elements"] = "os.inspect_ui_elements"
     params: OsInspectUiElementsParams = Field(default_factory=OsInspectUiElementsParams)
@@ -753,6 +763,7 @@ RequestFrame = Annotated[
     | OsWriteClipboardRequest
     | OsTransformClipboardRequest
     | OsSaveClipboardToFileRequest
+    | OsOpenPathOrUrlRequest
     | OsInspectUiElementsRequest
     | OsClickUiElementRequest
     | OsGuiActionRequest
@@ -1245,12 +1256,13 @@ class ActivityCancelResult(_Model):
 
 class OsOpenOrFocusAppResult(_Model):
     ok: bool = True
-    status: Literal["focused", "launched"]
+    status: Literal["focused", "launched", "non_interactive_desktop"]
     app: str
     window_title: str | None = None
     hwnd: int | None = None
     executable: str | None = None
     target_path: str | None = None
+    error: str | None = None
 
 
 class OsControlMediaVolumeResult(_Model):
@@ -1345,6 +1357,15 @@ class OsSaveClipboardToFileResult(_Model):
     filename: str = ""
     size_bytes: int = 0
     kind: str = "text"
+    error: str | None = None
+
+
+class OsOpenPathOrUrlResult(_Model):
+    ok: bool = True
+    status: Literal["opened", "error", "non_interactive_desktop"] = "opened"
+    kind: Literal["file", "url"] | None = None
+    target: str = ""
+    filename: str | None = None
     error: str | None = None
 
 
@@ -1537,6 +1558,7 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "os.write_clipboard": OsWriteClipboardResult,
     "os.transform_clipboard": OsTransformClipboardResult,
     "os.save_clipboard_to_file": OsSaveClipboardToFileResult,
+    "os.open_path_or_url": OsOpenPathOrUrlResult,
     "os.inspect_ui_elements": OsInspectUiElementsResult,
     "os.click_ui_element": OsClickUiElementResult,
     "os.gui_action": OsGuiActionResult,

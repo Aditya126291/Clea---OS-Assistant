@@ -58,6 +58,8 @@ from clea.core.protocol import (
     OsInspectUiElementsRequest,
     OsOpenOrFocusAppParams,
     OsOpenOrFocusAppRequest,
+    OsOpenPathOrUrlParams,
+    OsOpenPathOrUrlRequest,
     OsOpenUrlParams,
     OsOpenUrlRequest,
     OsReadClipboardParams,
@@ -2085,6 +2087,18 @@ class VoiceRunner:
                     )
                 ),
                 error_prefix="Failed to save clipboard to file",
+            )
+            return
+
+        if event.name == "open_path_or_url":
+            await _execute_rpc_tool(
+                OsOpenPathOrUrlRequest(
+                    params=OsOpenPathOrUrlParams(
+                        target=_req_str("target"),
+                        use_clipboard=_parse_bool("use_clipboard", default=False),
+                    )
+                ),
+                error_prefix="Failed to open path or URL",
             )
             return
 

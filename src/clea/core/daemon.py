@@ -1897,6 +1897,8 @@ class CleaDaemon:
             await self._handle_os_transform_clipboard(conn, req)
         elif method == "os.save_clipboard_to_file":
             await self._handle_os_save_clipboard_to_file(conn, req)
+        elif method == "os.open_path_or_url":
+            await self._handle_os_open_path_or_url(conn, req)
         elif method == "os.inspect_ui_elements":
             await self._handle_os_inspect_ui_elements(conn, req)
         elif method == "os.click_ui_element":
@@ -2555,11 +2557,14 @@ class CleaDaemon:
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
             return
-        self._audit_log(
-            "os_open_or_focus_app",
-            app=res.get("app"),
-            status=res.get("status"),
-        )
+        audit_details: dict[str, Any] = {
+            "app": res.get("app"),
+            "status": res.get("status"),
+        }
+        logged_target = res.get("target_path") or req.params.target_path
+        if logged_target:
+            audit_details["target_path"] = logged_target
+        self._audit_log("os_open_or_focus_app", **audit_details)
         await self._respond(ws, req, METHOD_RESULTS["os.open_or_focus_app"](**res))
 
     async def _handle_os_control_media_volume(self, conn: _Connection, req: Any) -> None:
@@ -2809,6 +2814,34 @@ class CleaDaemon:
         model_cls = METHOD_RESULTS["os.save_clipboard_to_file"]
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_open_path_or_url(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                self.clipboard_service.open_path_or_url,
+                req.params.target,
+                use_clipboard=req.params.use_clipboard,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_open_path_or_url",
+            target=res.get("target") or req.params.target,
+            status=res.get("status"),
+            kind=res.get("kind"),
+        )
+        if res.get("status") == "error":
+            await self._respond(
+                ws, req, error=str(res.get("error") or "Failed to open path or URL")
+            )
+            return
+        model_cls = METHOD_RESULTS["os.open_path_or_url"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        filtered.setdefault("ok", res.get("status") == "opened")
         await self._respond(ws, req, model_cls(**filtered))
 
     async def _handle_os_inspect_ui_elements(self, conn: _Connection, req: Any) -> None:

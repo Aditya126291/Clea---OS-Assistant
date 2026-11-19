@@ -32,10 +32,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Window show/focus constants
+SW_SHOWNORMAL: int = 1
 SW_MAXIMIZE: int = 3
 SW_MINIMIZE: int = 6
 SW_RESTORE: int = 9
 WM_CLOSE: int = 0x0010
+UOI_NAME: int = 2
+_STARTF_USESHOWWINDOW: int = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
 
 # Virtual key codes for media & step volume controls
 VK_VOLUME_MUTE: int = 0xAD
@@ -488,6 +491,134 @@ def _get_win32_kernel32(kernel32: Any = None) -> Any:
     return k32
 
 
+def _get_current_desktop_name(
+    *,
+    user32: Any = None,
+    kernel32: Any = None,
+) -> str | None:
+    """Return the active Win32 thread desktop name (e.g. 'Default' or 'exebox-...')."""
+    if sys.platform != "win32" and user32 is None and kernel32 is None:
+        return None
+    try:
+        u32 = _get_win32_user32(user32)
+        k32 = _get_win32_kernel32(kernel32)
+
+        if isinstance(k32, ctypes.CDLL):
+            k32.GetCurrentThreadId.argtypes = []
+            k32.GetCurrentThreadId.restype = ctypes.c_uint32
+
+        if isinstance(u32, ctypes.CDLL):
+            u32.GetThreadDesktop.argtypes = [ctypes.c_uint32]
+            u32.GetThreadDesktop.restype = ctypes.c_void_p
+            u32.GetUserObjectInformationW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            u32.GetUserObjectInformationW.restype = ctypes.c_int
+
+        tid = k32.GetCurrentThreadId()
+        hdesk = u32.GetThreadDesktop(tid)
+        if not hdesk:
+            return None
+        buf = ctypes.create_unicode_buffer(256)
+        needed = ctypes.c_uint32(0)
+        ok = u32.GetUserObjectInformationW(
+            hdesk,
+            UOI_NAME,
+            buf,
+            ctypes.sizeof(buf),
+            ctypes.byref(needed),
+        )
+        if not ok:
+            return None
+        name = buf.value.strip()
+        return name or None
+    except Exception:
+        return None
+
+
+def _check_interactive_desktop(
+    desktop_name_fn: Callable[[], str | None] | None = None,
+) -> str | None:
+    """Return the non-default desktop name if isolated from WinSta0\\Default, else None."""
+    fn = desktop_name_fn or _get_current_desktop_name
+    name = fn()
+    if isinstance(name, str) and name.strip() and name.strip().lower() != "default":
+        return name.strip()
+    return None
+
+
+def _build_gui_popen_kwargs() -> dict[str, Any]:
+    """Build subprocess.Popen kwargs that ensure visible normal-window GUI launches."""
+    kwargs: dict[str, Any] = {
+        "shell": False,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32" and hasattr(subprocess, "STARTUPINFO"):
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= _STARTF_USESHOWWINDOW
+        si.wShowWindow = SW_SHOWNORMAL
+        kwargs["startupinfo"] = si
+    return kwargs
+
+
+def _open_via_shell(
+    target: str,
+    *,
+    startfile_fn: Callable[[str], Any] | None = None,
+    popen_fn: Callable[..., Any] = subprocess.Popen,
+) -> None:
+    """Open a local file or URL visibly via the Windows shell."""
+    if startfile_fn is not None:
+        startfile_fn(target)
+        return
+    if hasattr(os, "startfile"):
+        os.startfile(target)
+        return
+    if sys.platform == "win32":
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        res = shell32.ShellExecuteW(None, "open", target, None, None, SW_SHOWNORMAL)
+        if int(res or 0) <= 32:
+            raise OSError(f"ShellExecuteW failed opening '{target}' (code={int(res or 0)}).")
+        return
+    popen_fn(["explorer.exe", target], **_build_gui_popen_kwargs())
+
+
+def _non_interactive_desktop_result(
+    app_label: str,
+    non_default: str,
+    resolved_target: Path | None = None,
+) -> dict[str, Any]:
+    """Return a structured non_interactive_desktop response for sandboxed daemons."""
+    return {
+        "ok": False,
+        "status": "non_interactive_desktop",
+        "app": app_label,
+        "window_title": None,
+        "hwnd": None,
+        "executable": None,
+        "target_path": str(resolved_target) if resolved_target is not None else None,
+        "error": (
+            f"Cannot launch or focus '{app_label}' visibly because the daemon is running on "
+            f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'. Start the Clea "
+            "daemon from an interactive Windows Terminal / PowerShell session."
+        ),
+    }
+
+
 # --------------------------------------------------------------------------- App Launcher / Focuser
 
 
@@ -864,6 +995,8 @@ def open_or_focus_app(
     popen_fn: Callable[..., Any] = subprocess.Popen,
     env: dict[str, str] | None = None,
     app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
+    startfile_fn: Callable[[str], Any] | None = None,
+    desktop_name_fn: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     """Focus a running application window or launch an allowed desktop application.
 
@@ -888,15 +1021,16 @@ def open_or_focus_app(
                     app_name = "notepad"
                     resolved_target = file_target
                 else:
-                    if hasattr(os, "startfile"):
-                        os.startfile(str(file_target))
-                    else:
-                        popen_fn(
-                            ["explorer.exe", str(file_target)],
-                            shell=False,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
+                    non_default = _check_interactive_desktop(desktop_name_fn)
+                    if non_default is not None:
+                        return _non_interactive_desktop_result(
+                            file_target.name, non_default, file_target
                         )
+                    _open_via_shell(
+                        str(file_target),
+                        startfile_fn=startfile_fn,
+                        popen_fn=popen_fn,
+                    )
                     return {
                         "ok": True,
                         "status": "launched",
@@ -929,6 +1063,9 @@ def open_or_focus_app(
 
         for win in windows:
             if _window_matches_spec(win, spec):
+                non_default = _check_interactive_desktop(desktop_name_fn)
+                if non_default is not None:
+                    return _non_interactive_desktop_result(spec.canonical_name, non_default)
                 if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
                     u32.ShowWindow(win.hwnd, SW_RESTORE)
                 u32.SetForegroundWindow(win.hwnd)
@@ -954,12 +1091,13 @@ def open_or_focus_app(
             if resolved_target is not None:
                 cmd = [*cmd, str(resolved_target)]
 
-            popen_fn(
-                cmd,
-                shell=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            non_default = _check_interactive_desktop(desktop_name_fn)
+            if non_default is not None:
+                return _non_interactive_desktop_result(
+                    launched_spec.canonical_name, non_default, resolved_target
+                )
+
+            popen_fn(cmd, **_build_gui_popen_kwargs())
             return {
                 "ok": True,
                 "status": "launched",
@@ -1006,6 +1144,9 @@ def open_or_focus_app(
                 w_title = (win.title or "").lower()
                 w_proc = (win.process_name or "").lower()
                 if matched_name.lower() in w_title or matched_name.lower() in w_proc:
+                    non_default = _check_interactive_desktop(desktop_name_fn)
+                    if non_default is not None:
+                        return _non_interactive_desktop_result(matched_name, non_default)
                     if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
                         u32.ShowWindow(win.hwnd, SW_RESTORE)
                     u32.SetForegroundWindow(win.hwnd)
@@ -1019,15 +1160,14 @@ def open_or_focus_app(
                         "target_path": None,
                     }
 
+        non_default = _check_interactive_desktop(desktop_name_fn)
+        if non_default is not None:
+            return _non_interactive_desktop_result(matched_name, non_default, resolved_target)
+
         launch_cmd = ["explorer.exe", f"shell:AppsFolder\\{matched_appid}"]
         if resolved_target is not None:
             launch_cmd.append(str(resolved_target))
-        popen_fn(
-            launch_cmd,
-            shell=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        popen_fn(launch_cmd, **_build_gui_popen_kwargs())
         return {
             "ok": True,
             "status": "launched",
@@ -1843,6 +1983,7 @@ def open_url(
     popen_fn: Callable[..., Any] = subprocess.Popen,
     which_fn: Callable[[str], str | None] = shutil.which,
     env: dict[str, str] | None = None,
+    desktop_name_fn: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     """Validate and open an http/https URL in the default or specified browser."""
     if not isinstance(url, str):
@@ -1897,16 +2038,20 @@ def open_url(
         raise ValueError(f"Invalid URL: host/domain is required in {url!r}")
 
     if browser is None:
-        starter = startfile_fn or getattr(os, "startfile", None)
-        if starter is not None:
-            starter(target_url)
-        else:
-            popen_fn(
-                ["explorer.exe", target_url],
-                shell=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        non_default = _check_interactive_desktop(desktop_name_fn)
+        if non_default is not None:
+            return {
+                "ok": False,
+                "success": False,
+                "url": target_url,
+                "browser": "default",
+                "status": "non_interactive_desktop",
+                "message": (
+                    f"Cannot open '{target_url}' visibly because the daemon is running on "
+                    f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
+                ),
+            }
+        _open_via_shell(target_url, startfile_fn=startfile_fn, popen_fn=popen_fn)
         return {
             "ok": True,
             "success": True,
@@ -1940,12 +2085,21 @@ def open_url(
     if not browser_exe:
         raise ValueError(f"Browser '{browser}' could not be resolved to an executable.")
 
-    popen_fn(
-        [browser_exe, target_url],
-        shell=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    non_default = _check_interactive_desktop(desktop_name_fn)
+    if non_default is not None:
+        return {
+            "ok": False,
+            "success": False,
+            "url": target_url,
+            "browser": b_clean,
+            "status": "non_interactive_desktop",
+            "message": (
+                f"Cannot open '{target_url}' visibly because the daemon is running on "
+                f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
+            ),
+        }
+
+    popen_fn([browser_exe, target_url], **_build_gui_popen_kwargs())
     return {
         "ok": True,
         "success": True,

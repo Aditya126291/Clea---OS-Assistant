@@ -86,6 +86,7 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "write_clipboard",
         "transform_clipboard",
         "save_clipboard_to_file",
+        "open_path_or_url",
         "inspect_git_workspace",
         "select_clipboard_item",
         "open_url",
@@ -185,6 +186,10 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert by_name["open_url"].parameters_schema["required"] == ["url"]
     assert by_name["open_url"].parameters_schema["properties"]["url"]["type"] == "string"
     assert "browser" in by_name["open_url"].parameters_schema["properties"]
+
+    assert by_name["open_path_or_url"].parameters_schema.get("required", []) == []
+    assert "target" in by_name["open_path_or_url"].parameters_schema["properties"]
+    assert "use_clipboard" in by_name["open_path_or_url"].parameters_schema["properties"]
 
     assert by_name["control_system"].parameters_schema["required"] == ["action"]
     cs_actions = by_name["control_system"].parameters_schema["properties"]["action"]["enum"]
