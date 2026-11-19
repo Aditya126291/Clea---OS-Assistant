@@ -58,12 +58,18 @@ from clea.core.protocol import (
     OsInspectUiElementsRequest,
     OsOpenOrFocusAppParams,
     OsOpenOrFocusAppRequest,
+    OsOpenPathOrUrlParams,
+    OsOpenPathOrUrlRequest,
     OsOpenUrlParams,
     OsOpenUrlRequest,
     OsReadClipboardParams,
     OsReadClipboardRequest,
+    OsSaveClipboardToFileParams,
+    OsSaveClipboardToFileRequest,
     OsSelectClipboardItemParams,
     OsSelectClipboardItemRequest,
+    OsTransformClipboardParams,
+    OsTransformClipboardRequest,
     OsUiActParams,
     OsUiActRequest,
     OsUiBatchParams,
@@ -2039,6 +2045,60 @@ class VoiceRunner:
             await _execute_rpc_tool(
                 OsSelectClipboardItemRequest(params=OsSelectClipboardItemParams(index=index)),
                 error_prefix="Failed to select clipboard item",
+            )
+            return
+
+        if event.name == "transform_clipboard":
+            action = (_req_str("action") or "").strip()
+            valid_actions = (
+                "format_json",
+                "minify_json",
+                "clean_text",
+                "unwrap_text",
+                "strip_tracking_urls",
+            )
+            if action not in valid_actions:
+                await _send_error(
+                    "action must be one of: " + ", ".join(valid_actions) + "."
+                )
+                return
+            await _execute_rpc_tool(
+                OsTransformClipboardRequest(
+                    params=OsTransformClipboardParams(
+                        action=action,  # type: ignore[arg-type]
+                        update_clipboard=_parse_bool("update_clipboard", default=True),
+                    )
+                ),
+                error_prefix="Failed to transform clipboard",
+            )
+            return
+
+        if event.name == "save_clipboard_to_file":
+            filename = _req_str("filename")
+            directory = (_req_str("directory") or "desktop").lower()
+            if directory not in ("desktop", "documents"):
+                await _send_error("directory must be 'desktop' or 'documents'.")
+                return
+            await _execute_rpc_tool(
+                OsSaveClipboardToFileRequest(
+                    params=OsSaveClipboardToFileParams(
+                        filename=filename,
+                        directory=directory,  # type: ignore[arg-type]
+                    )
+                ),
+                error_prefix="Failed to save clipboard to file",
+            )
+            return
+
+        if event.name == "open_path_or_url":
+            await _execute_rpc_tool(
+                OsOpenPathOrUrlRequest(
+                    params=OsOpenPathOrUrlParams(
+                        target=_req_str("target"),
+                        use_clipboard=_parse_bool("use_clipboard", default=False),
+                    )
+                ),
+                error_prefix="Failed to open path or URL",
             )
             return
 

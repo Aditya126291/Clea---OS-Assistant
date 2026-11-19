@@ -3726,3 +3726,230 @@ async def test_daemon_rpc_validation_with_real_tool_outputs() -> None:
     assert validated_batch.steps_executed == 1
     assert validated_batch.diff is not None
     assert validated_batch.snapshot is not None
+
+
+def test_open_or_focus_app_visible_launch_flags_and_target_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify GUI launches pass target_path without CREATE_NO_WINDOW or SW_HIDE."""
+    import subprocess
+    import sys
+
+    from clea.tools import windows_os
+
+    desktop_dir = tmp_path / "Desktop"
+    desktop_dir.mkdir()
+    target_file = desktop_dir / "test.txt"
+    target_file.write_text("sample content", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    popen_calls: list[tuple[list[str], dict[str, Any]]] = []
+    res = open_or_focus_app(
+        "notepad",
+        target_path="test.txt",
+        user32=_FakeWindowUser32(),
+        window_enumerator=list,
+        which_fn=lambda n: r"C:\Windows\System32\notepad.exe" if "notepad" in n.lower() else None,
+        popen_fn=lambda cmd, **kw: popen_calls.append((list(cmd), dict(kw))) or object(),
+        desktop_name_fn=lambda: "Default",
+    )
+
+    assert res["ok"] is True
+    assert res["status"] == "launched"
+    assert res["target_path"] == str(target_file.resolve())
+    assert len(popen_calls) == 1
+    cmd, kwargs = popen_calls[0]
+    assert cmd == [r"C:\Windows\System32\notepad.exe", str(target_file.resolve())]
+    assert kwargs["shell"] is False
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert (kwargs.get("creationflags", 0) & create_no_window) == 0
+    if sys.platform == "win32":
+        si = kwargs.get("startupinfo")
+        assert si is not None
+        assert (si.dwFlags & windows_os._STARTF_USESHOWWINDOW) != 0
+        assert si.wShowWindow == windows_os.SW_SHOWNORMAL
+
+
+def test_get_current_desktop_name_and_non_interactive_desktop_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Win32 desktop name check and non_interactive_desktop errors."""
+    import ctypes
+
+    from clea.tools import windows_os
+
+    desktop_dir = tmp_path / "Desktop"
+    desktop_dir.mkdir()
+    target_file = desktop_dir / "test.txt"
+    target_file.write_text("sample content", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    def _make_fake_win32(desk_name: str) -> tuple[Any, Any]:
+        class _FakeK32:
+            def GetCurrentThreadId(self) -> int:
+                return 4242
+
+        class _FakeU32:
+            def GetThreadDesktop(self, tid: int) -> int:
+                assert tid == 4242
+                return 777
+
+            def GetUserObjectInformationW(
+                self,
+                hdesk: int,
+                index: int,
+                buf: Any,
+                size: int,
+                needed_ptr: Any,
+            ) -> int:
+                assert hdesk == 777
+                assert index == windows_os.UOI_NAME
+                raw = ctypes.create_unicode_buffer(desk_name)
+                copy_len = min(size, ctypes.sizeof(raw))
+                ctypes.memmove(buf, raw, copy_len)
+                return 1
+
+        return _FakeU32(), _FakeK32()
+
+    u_def, k_def = _make_fake_win32("Default")
+    assert windows_os._get_current_desktop_name(user32=u_def, kernel32=k_def) == "Default"
+    assert windows_os._check_interactive_desktop(lambda: "Default") is None
+
+    u_iso, k_iso = _make_fake_win32("exebox-R3HAT")
+    assert windows_os._get_current_desktop_name(user32=u_iso, kernel32=k_iso) == "exebox-R3HAT"
+    assert windows_os._check_interactive_desktop(lambda: "exebox-R3HAT") == "exebox-R3HAT"
+
+    popen_calls: list[Any] = []
+    startfile_calls: list[str] = []
+
+    res_app = open_or_focus_app(
+        "notepad",
+        target_path="test.txt",
+        user32=_FakeWindowUser32(),
+        window_enumerator=list,
+        which_fn=lambda n: r"C:\Windows\System32\notepad.exe" if "notepad" in n.lower() else None,
+        popen_fn=lambda *a, **kw: popen_calls.append((a, kw)),
+        desktop_name_fn=lambda: "exebox-R3HAT",
+    )
+    assert res_app["ok"] is False
+    assert res_app["status"] == "non_interactive_desktop"
+    assert "WinSta0\\Default" in res_app["error"]
+    assert popen_calls == []
+
+    res_url = open_url(
+        "https://example.com",
+        startfile_fn=startfile_calls.append,
+        desktop_name_fn=lambda: "exebox-R3HAT",
+    )
+    assert res_url["ok"] is False
+    assert res_url["success"] is False
+    assert res_url["status"] == "non_interactive_desktop"
+    assert "WinSta0\\Default" in res_url["message"]
+    assert startfile_calls == []
+
+    # Invalid apps/paths still raise ValueError before desktop checks trigger.
+    with pytest.raises(ValueError, match="disallowed"):
+        open_or_focus_app("cmd.exe", desktop_name_fn=lambda: "exebox-R3HAT")
+
+
+@pytest.mark.asyncio
+async def test_daemon_audit_logs_target_path_and_voice_open_path_or_url_e2e(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify audit target_path logging and VoiceRunner -> Daemon os.open_path_or_url RPC."""
+    import clea.core.daemon as daemon_mod
+    from clea.core.protocol import OsOpenOrFocusAppResult, OsOpenPathOrUrlResult
+    from clea.tools.clipboard import ClipboardService, ClipboardSnapshot
+
+    class _FakeBackend:
+        def get_sequence_number(self) -> int:
+            return 1
+
+        def read_snapshot(self) -> ClipboardSnapshot:
+            return ClipboardSnapshot(kind="text", text="https://example.com/clip")
+
+        def write_text(self, text: str) -> None:
+            return None
+
+    desktop_dir = tmp_path / "Desktop"
+    desktop_dir.mkdir()
+    test_file = desktop_dir / "test.txt"
+    test_file.write_text("hello", encoding="utf-8")
+
+    monkeypatch.setattr(
+        daemon_mod,
+        "open_or_focus_app",
+        lambda app_name, target_path=None: {
+            "ok": True,
+            "status": "launched",
+            "app": app_name,
+            "window_title": None,
+            "hwnd": None,
+            "executable": r"C:\Windows\System32\notepad.exe",
+            "target_path": target_path,
+        },
+    )
+
+    opened_targets: list[str] = []
+    fake_service = ClipboardService(backend=_FakeBackend(), default_save_dir=desktop_dir)
+
+    async with _running_voice_daemon_env(tmp_path) as (daemon, _runner, backend):
+        import os
+
+        daemon.clipboard_service = fake_service
+        monkeypatch.setattr(
+            os, "startfile", lambda target: opened_targets.append(target), raising=False
+        )
+
+        r_app = await _invoke_voice_tool(
+            backend,
+            call_id="c-open-app-target",
+            name="open_or_focus_app",
+            arguments={"app_name": "notepad", "target_path": str(test_file)},
+        )
+        assert r_app.is_error is False
+        app_model = OsOpenOrFocusAppResult.model_validate(r_app.response)
+        assert app_model.status == "launched"
+        assert app_model.target_path == str(test_file)
+
+        r_open = await _invoke_voice_tool(
+            backend,
+            call_id="c-open-path",
+            name="open_path_or_url",
+            arguments={"target": "test.txt"},
+        )
+        assert r_open.is_error is False
+        open_model = OsOpenPathOrUrlResult.model_validate(r_open.response)
+        assert open_model.status == "opened"
+        assert open_model.kind == "file"
+        assert open_model.filename == "test.txt"
+        assert opened_targets == [str(test_file.resolve())]
+
+        import clea.tools.windows_os as windows_os_mod
+
+        monkeypatch.setattr(
+            windows_os_mod,
+            "_get_current_desktop_name",
+            lambda *, user32=None, kernel32=None: "exebox-999",
+        )
+        r_blocked = await _invoke_voice_tool(
+            backend,
+            call_id="c-open-blocked",
+            name="open_path_or_url",
+            arguments={"target": "test.txt"},
+        )
+        assert r_blocked.is_error is False
+        blocked_model = OsOpenPathOrUrlResult.model_validate(r_blocked.response)
+        assert blocked_model.ok is False
+        assert blocked_model.status == "non_interactive_desktop"
+        assert "WinSta0\\Default" in str(blocked_model.error)
+
+    audit_lines = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    app_audits = [e for e in audit_lines if e.get("action") == "os_open_or_focus_app"]
+    assert app_audits
+    assert app_audits[-1]["details"].get("target_path") == str(test_file)

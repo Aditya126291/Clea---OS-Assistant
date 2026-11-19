@@ -45,8 +45,13 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="delegate_task",
             description=(
-                "Delegate a desktop, file, system, or multi-step task to Clea's background "
-                "agent loop. Runs asynchronously while conversation continues."
+                "Delegate a complex or multi-step desktop, file, or system task to Clea's "
+                "background agent loop. Runs asynchronously while conversation continues. "
+                "Do NOT use delegate_task for saving, reading, or transforming clipboard "
+                "contents (e.g., 'save my clipboard to desktop', 'save what I copied as "
+                "youtube_url.txt') or opening saved files/clipboard URLs—call "
+                "save_clipboard_to_file, open_path_or_url, transform_clipboard, or "
+                "read_clipboard directly instead."
             ),
             parameters_schema={
                 "type": "object",
@@ -595,6 +600,96 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     },
                 },
                 "required": ["index"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="transform_clipboard",
+            description=(
+                "Run deterministic local transforms on Windows clipboard text directly in-process: "
+                "format_json, minify_json, clean_text, unwrap_text, or strip_tracking_urls. "
+                "Always call directly instead of delegate_task."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "format_json",
+                            "minify_json",
+                            "clean_text",
+                            "unwrap_text",
+                            "strip_tracking_urls",
+                        ],
+                        "description": "Transform action to run on the clipboard text.",
+                    },
+                    "update_clipboard": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to write the transformed result back to the clipboard "
+                            "(default true)."
+                        ),
+                    },
+                },
+                "required": ["action"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="save_clipboard_to_file",
+            description=(
+                "Directly save the current Windows clipboard content (text, URLs, code, or image "
+                "screenshot) to a file on Desktop or Documents (e.g., 'save my clipboard to "
+                "desktop', 'save what I copied as youtube_url.txt'). Always call this tool "
+                "directly instead of delegating to delegate_task."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional filename (auto-detects extension if omitted).",
+                    },
+                    "directory": {
+                        "type": "string",
+                        "enum": ["desktop", "documents"],
+                        "description": (
+                            "Target directory ('desktop' or 'documents', default desktop)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="open_path_or_url",
+            description=(
+                "Open a saved local file (e.g., on Desktop or Documents, or the most recently "
+                "saved clipboard file) or an http/https URL (explicit target or extracted from "
+                "clipboard) visibly using Windows default application or browser. Always call "
+                "this directly when asked to open a saved file or copied link instead of "
+                "calling open_or_focus_app without a path or delegating to delegate_task."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Optional file path, filename (e.g. 'test.txt'), or http/https URL. "
+                            "Omit to open the most recently saved file or clipboard URL."
+                        ),
+                    },
+                    "use_clipboard": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, read and open the URL or path directly from clipboard."
+                        ),
+                    },
+                },
+                "required": [],
             },
             behavior="non_blocking",
         ),

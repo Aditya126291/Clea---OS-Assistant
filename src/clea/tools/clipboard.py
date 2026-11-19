@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import ctypes.wintypes as wintypes
 import io
 import json
 import logging
@@ -12,7 +13,8 @@ import struct
 import sys
 import time
 import urllib.parse
-from collections.abc import Iterator
+import webbrowser
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +32,10 @@ CF_DIB = 8
 CF_UNICODETEXT = 13
 CF_HDROP = 15
 CF_DIBV5 = 17
+
+BI_RGB = 0
+DIB_RGB_COLORS = 0
+PNG_IEND_TRAILER = b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
 
 GMEM_MOVEABLE = 0x0002
 GMEM_ZEROINIT = 0x0040
@@ -50,6 +56,31 @@ TRACKING_PARAMS = {
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"]+")
 ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+_DISALLOWED_OPEN_BINARIES: frozenset[str] = frozenset(
+    {
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "bash",
+        "bash.exe",
+        "sh",
+        "sh.exe",
+        "wscript",
+        "wscript.exe",
+        "cscript",
+        "cscript.exe",
+        "mshta",
+        "mshta.exe",
+        "rundll32",
+        "rundll32.exe",
+        "regsvr32",
+        "regsvr32.exe",
+    }
+)
 
 
 # ----------------------------------------------------------- Error Classes & Snapshots
@@ -110,44 +141,250 @@ def _parse_png_dimensions(png_bytes: bytes) -> tuple[int, int] | None:
     if len(png_bytes) >= 24 and png_bytes[:8] == b"\x89PNG\r\n\x1a\n":
         try:
             return struct.unpack(">II", png_bytes[16:24])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed unpacking PNG IHDR dimensions: %s", exc)
     try:
         from PIL import Image
 
         with Image.open(io.BytesIO(png_bytes)) as img:
             return img.size
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed reading PNG dimensions via PIL: %s", exc)
         return None
 
 
-def _convert_dib_to_png(dib_bytes: bytes) -> tuple[bytes | None, tuple[int, int] | None]:
-    """Convert CF_DIB bytes to lossless PNG bytes and return (png_bytes, dimensions)."""
-    try:
-        from PIL import BmpImagePlugin, Image
+class _WIN32_BITMAP(ctypes.Structure):
+    """Win32 GDI BITMAP structure queried via gdi32.GetObjectW."""
 
-        with BmpImagePlugin.DibImageFile(io.BytesIO(dib_bytes)) as dib_img:
+    _fields_ = [
+        ("bmType", wintypes.LONG),
+        ("bmWidth", wintypes.LONG),
+        ("bmHeight", wintypes.LONG),
+        ("bmWidthBytes", wintypes.LONG),
+        ("bmPlanes", wintypes.WORD),
+        ("bmBitsPixel", wintypes.WORD),
+        ("bmBits", ctypes.c_void_p),
+    ]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    """40-byte Win32 BITMAPINFOHEADER for GetDIBits BI_RGB extraction."""
+
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+def _configure_win32_signatures(
+    user32: Any, kernel32: Any, shell32: Any, gdi32: Any = None
+) -> None:
+    """Declare explicit 64-bit safe ctypes argtypes/restype using c_void_p for handles."""
+    if isinstance(user32, ctypes.CDLL):
+        user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard.restype = wintypes.BOOL
+
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+
+        user32.EmptyClipboard.argtypes = []
+        user32.EmptyClipboard.restype = wintypes.BOOL
+
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = ctypes.c_void_p
+
+        user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+
+        user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+        user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+
+        user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+        if hasattr(user32, "GetClipboardSequenceNumber"):
+            user32.GetClipboardSequenceNumber.argtypes = []
+            user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+
+    if isinstance(kernel32, ctypes.CDLL):
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+        kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+
+        if hasattr(kernel32, "GlobalFree"):
+            kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    if isinstance(shell32, ctypes.CDLL) and hasattr(shell32, "DragQueryFileW"):
+        shell32.DragQueryFileW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.LPWSTR,
+            wintypes.UINT,
+        ]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+
+    if isinstance(gdi32, ctypes.CDLL):
+        gdi32.GetObjectW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        gdi32.GetObjectW.restype = ctypes.c_int
+
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteDC.restype = wintypes.BOOL
+
+        gdi32.GetDIBits.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+        ]
+        gdi32.GetDIBits.restype = ctypes.c_int
+
+
+def _decode_registered_png(raw_bytes: bytes) -> tuple[bytes | None, tuple[int, int] | None]:
+    """Strip trailing Windows heap padding after the PNG IEND chunk and decode via Pillow."""
+    if not raw_bytes:
+        return None, None
+
+    iend_idx = raw_bytes.find(PNG_IEND_TRAILER)
+    trimmed = raw_bytes[: iend_idx + 12] if iend_idx != -1 else raw_bytes
+
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(trimmed)) as img:
+            img.load()
+            dims = img.size
+            if img.format == "PNG":
+                return trimmed, dims
             buf = io.BytesIO()
-            dib_img.save(buf, format="PNG")
-            return buf.getvalue(), dib_img.size
-    except Exception:
-        pass
+            img.save(buf, format="PNG")
+            return buf.getvalue(), dims
+    except Exception as exc:
+        logger.warning("Failed decoding registered PNG clipboard bytes: %s", exc)
+        return None, None
+
+
+def _decode_hbitmap_to_png(
+    hbitmap: Any, gdi32: Any
+) -> tuple[bytes | None, tuple[int, int] | None]:
+    """Decode a Win32 CF_BITMAP HBITMAP into lossless PNG bytes via GDI GetDIBits."""
+    if not hbitmap or not gdi32:
+        return None, None
+
+    try:
+        bmp = _WIN32_BITMAP()
+        if not gdi32.GetObjectW(hbitmap, ctypes.sizeof(_WIN32_BITMAP), ctypes.byref(bmp)):
+            logger.warning("gdi32.GetObjectW failed for CF_BITMAP handle.")
+            return None, None
+
+        w = int(bmp.bmWidth)
+        h = abs(int(bmp.bmHeight))
+        if w <= 0 or h <= 0 or w > 32768 or h > 32768:
+            logger.warning("Invalid CF_BITMAP dimensions: %dx%d", w, h)
+            return None, None
+
+        hdc = gdi32.CreateCompatibleDC(None)
+        if not hdc:
+            logger.warning("gdi32.CreateCompatibleDC failed.")
+            return None, None
+
+        try:
+            bmi = _BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+            bmi.biWidth = w
+            bmi.biHeight = -h
+            bmi.biPlanes = 1
+            bmi.biBitCount = 32
+            bmi.biCompression = BI_RGB
+
+            buf = (ctypes.c_ubyte * (w * h * 4))()
+            scanlines = gdi32.GetDIBits(
+                hdc,
+                hbitmap,
+                0,
+                h,
+                buf,
+                ctypes.byref(bmi),
+                DIB_RGB_COLORS,
+            )
+            if not scanlines:
+                logger.warning("gdi32.GetDIBits failed (scanlines=%s).", scanlines)
+                return None, None
+
+            from PIL import Image
+
+            raw_bytes = bytes(buf)
+            # 24-bit/BGRX GDI bitmaps leave every alpha byte at 0x00; promote to opaque RGBA.
+            if raw_bytes[3::4] == b"\x00" * (w * h):
+                img = Image.frombuffer("RGB", (w, h), raw_bytes, "raw", "BGRX", 0, 1).convert(
+                    "RGBA"
+                )
+            else:
+                img = Image.frombuffer("RGBA", (w, h), raw_bytes, "raw", "BGRA", 0, 1)
+
+            out = io.BytesIO()
+            img.save(out, format="PNG")
+            return out.getvalue(), (w, h)
+        finally:
+            with contextlib.suppress(Exception):
+                gdi32.DeleteDC(hdc)
+    except Exception as exc:
+        logger.warning("Failed decoding CF_BITMAP via GetDIBits: %s", exc, exc_info=True)
+        return None, None
+
+
+def _convert_dib_to_png(dib_bytes: bytes) -> tuple[bytes | None, tuple[int, int] | None]:
+    """Convert CF_DIB / CF_DIBV5 bytes into lossless PNG bytes by prepending BITMAPFILEHEADER."""
+    if len(dib_bytes) < 40:
+        logger.warning("DIB buffer too short (%d bytes) to parse BITMAPINFOHEADER.", len(dib_bytes))
+        return None, None
 
     try:
         from PIL import Image
 
         bi_size = struct.unpack_from("<I", dib_bytes, 0)[0]
         bit_count = struct.unpack_from("<H", dib_bytes, 14)[0]
+        compression = struct.unpack_from("<I", dib_bytes, 16)[0]
         clr_used = struct.unpack_from("<I", dib_bytes, 32)[0] if bi_size >= 36 else 0
-        num_colors = clr_used if clr_used else (1 << bit_count if bit_count <= 8 else 0)
-        off_bits = 14 + bi_size + (num_colors * 4)
+
+        # BITMAPINFOHEADER (biSize == 40) with BI_BITFIELDS (3) appends 3 DWORD masks (12 bytes)
+        # before pixel data. V4 (108) and V5 (124) headers already embed masks inside biSize.
+        masks_bytes = 12 if (bi_size == 40 and compression == 3) else 0
+        palette_entries = (
+            clr_used if clr_used > 0 else ((1 << bit_count) if bit_count <= 8 else 0)
+        )
+        off_bits = 14 + bi_size + masks_bytes + (palette_entries * 4)
+
         bmp_header = struct.pack("<2sIHHI", b"BM", 14 + len(dib_bytes), 0, 0, off_bits)
         with Image.open(io.BytesIO(bmp_header + dib_bytes)) as img:
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             return buf.getvalue(), img.size
     except Exception as exc:
-        logger.debug("Failed converting DIB bytes to PNG: %s", exc)
+        logger.warning("Failed converting CF_DIB/CF_DIBV5 bytes to PNG: %s", exc, exc_info=True)
         return None, None
 
 
@@ -159,15 +396,19 @@ class Win32ClipboardBackend:
         user32: Any = None,
         kernel32: Any = None,
         shell32: Any = None,
+        gdi32: Any = None,
     ) -> None:
         if sys.platform == "win32":
-            self._user32 = user32 or getattr(ctypes.windll, "user32", None)
-            self._kernel32 = kernel32 or getattr(ctypes.windll, "kernel32", None)
-            self._shell32 = shell32 or getattr(ctypes.windll, "shell32", None)
+            self._user32 = user32 or ctypes.WinDLL("user32", use_last_error=True)
+            self._kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+            self._shell32 = shell32 or ctypes.WinDLL("shell32", use_last_error=True)
+            self._gdi32 = gdi32 or ctypes.WinDLL("gdi32", use_last_error=True)
         else:
             self._user32 = user32
             self._kernel32 = kernel32
             self._shell32 = shell32
+            self._gdi32 = gdi32
+        _configure_win32_signatures(self._user32, self._kernel32, self._shell32, self._gdi32)
 
     def get_sequence_number(self) -> int:
         """Call user32.GetClipboardSequenceNumber() reading only the serial integer."""
@@ -176,7 +417,7 @@ class Win32ClipboardBackend:
         try:
             return int(self._user32.GetClipboardSequenceNumber())
         except Exception as exc:
-            logger.debug("Error getting clipboard sequence number: %s", exc)
+            logger.warning("Error getting clipboard sequence number: %s", exc)
             return 0
 
     @contextmanager
@@ -190,7 +431,8 @@ class Win32ClipboardBackend:
         for attempt in range(attempts):
             try:
                 res = self._user32.OpenClipboard(None)
-            except Exception:
+            except Exception as exc:
+                logger.warning("OpenClipboard raised exception on attempt %d: %s", attempt + 1, exc)
                 res = 0
             if res:
                 opened = True
@@ -210,52 +452,81 @@ class Win32ClipboardBackend:
                 with contextlib.suppress(Exception):
                     self._user32.CloseClipboard()
 
+    def _read_global_bytes(self, h_data: Any, fmt_label: str) -> bytes | None:
+        """Lock an HGLOBAL handle and copy its raw bytes safely on 64-bit Windows."""
+        p_data = self._kernel32.GlobalLock(h_data)
+        if not p_data:
+            logger.warning(
+                "GlobalLock failed for clipboard format %s (last_error=%s).",
+                fmt_label,
+                ctypes.get_last_error() if sys.platform == "win32" else None,
+            )
+            return None
+        try:
+            size = int(self._kernel32.GlobalSize(h_data))
+            if size <= 0:
+                logger.warning("GlobalSize returned %d for clipboard format %s.", size, fmt_label)
+                return None
+            return ctypes.string_at(p_data, size)
+        finally:
+            self._kernel32.GlobalUnlock(h_data)
+
     def read_snapshot(self) -> ClipboardSnapshot:
         """Read clipboard content according to format priority."""
         if not self._user32 or not self._kernel32:
             return ClipboardSnapshot(kind="empty")
 
+        image_available = False
         with self.open_clipboard():
-            # 1. Registered PNG format
+            has_fmt = hasattr(self._user32, "IsClipboardFormatAvailable")
+
+            # 1. Registered PNG format (trim trailing Windows GlobalSize heap padding at IEND)
             cf_png = (
                 self._user32.RegisterClipboardFormatW("PNG")
                 if hasattr(self._user32, "RegisterClipboardFormatW")
                 else 0
             )
-            if (
-                cf_png
-                and hasattr(self._user32, "IsClipboardFormatAvailable")
-                and self._user32.IsClipboardFormatAvailable(cf_png)
-            ):
+            if cf_png and has_fmt and self._user32.IsClipboardFormatAvailable(cf_png):
+                image_available = True
                 h_data = self._user32.GetClipboardData(cf_png)
                 if h_data:
-                    p_data = self._kernel32.GlobalLock(h_data)
-                    if p_data:
-                        try:
-                            size = self._kernel32.GlobalSize(h_data)
-                            png_bytes = ctypes.string_at(p_data, size)
-                            dims = _parse_png_dimensions(png_bytes)
+                    raw_png = self._read_global_bytes(h_data, "PNG")
+                    if raw_png:
+                        png_bytes, dims = _decode_registered_png(raw_png)
+                        if png_bytes:
                             return ClipboardSnapshot(
                                 kind="image",
                                 image_bytes=png_bytes,
                                 image_format="PNG",
                                 image_dimensions=dims,
                             )
-                        finally:
-                            self._kernel32.GlobalUnlock(h_data)
+                else:
+                    logger.warning("GetClipboardData returned NULL for registered PNG format.")
 
-            # 2. CF_DIB (8)
-            if (
-                hasattr(self._user32, "IsClipboardFormatAvailable")
-                and self._user32.IsClipboardFormatAvailable(CF_DIB)
-            ):
-                h_data = self._user32.GetClipboardData(CF_DIB)
-                if h_data:
-                    p_data = self._kernel32.GlobalLock(h_data)
-                    if p_data:
-                        try:
-                            size = self._kernel32.GlobalSize(h_data)
-                            dib_bytes = ctypes.string_at(p_data, size)
+            # 2. CF_BITMAP (2) via GDI GetDIBits (GDI synthesizes CF_BITMAP from CF_DIBV5/CF_DIB)
+            if has_fmt and self._user32.IsClipboardFormatAvailable(CF_BITMAP):
+                image_available = True
+                h_bitmap = self._user32.GetClipboardData(CF_BITMAP)
+                if h_bitmap:
+                    png_bytes, dims = _decode_hbitmap_to_png(h_bitmap, self._gdi32)
+                    if png_bytes:
+                        return ClipboardSnapshot(
+                            kind="image",
+                            image_bytes=png_bytes,
+                            image_format="PNG",
+                            image_dimensions=dims,
+                        )
+                else:
+                    logger.warning("GetClipboardData returned NULL for CF_BITMAP.")
+
+            # 3. Fallback: CF_DIBV5 (17) and CF_DIB (8) if CF_BITMAP was unavailable
+            for dib_fmt, dib_label in ((CF_DIBV5, "CF_DIBV5"), (CF_DIB, "CF_DIB")):
+                if has_fmt and self._user32.IsClipboardFormatAvailable(dib_fmt):
+                    image_available = True
+                    h_data = self._user32.GetClipboardData(dib_fmt)
+                    if h_data:
+                        dib_bytes = self._read_global_bytes(h_data, dib_label)
+                        if dib_bytes:
                             png_bytes, dims = _convert_dib_to_png(dib_bytes)
                             if png_bytes:
                                 return ClipboardSnapshot(
@@ -264,32 +535,11 @@ class Win32ClipboardBackend:
                                     image_format="PNG",
                                     image_dimensions=dims,
                                 )
-                        finally:
-                            self._kernel32.GlobalUnlock(h_data)
-
-            # Fallback for images: PIL.ImageGrab if available
-            try:
-                from PIL import Image, ImageGrab
-
-                grabbed = ImageGrab.grabclipboard()
-                if isinstance(grabbed, Image.Image):
-                    buf = io.BytesIO()
-                    grabbed.save(buf, format="PNG")
-                    png_bytes = buf.getvalue()
-                    return ClipboardSnapshot(
-                        kind="image",
-                        image_bytes=png_bytes,
-                        image_format="PNG",
-                        image_dimensions=grabbed.size,
-                    )
-            except Exception:
-                pass
+                    else:
+                        logger.warning("GetClipboardData returned NULL for %s.", dib_label)
 
             # 3. CF_HDROP (15) - Copied files
-            if (
-                hasattr(self._user32, "IsClipboardFormatAvailable")
-                and self._user32.IsClipboardFormatAvailable(CF_HDROP)
-            ):
+            if has_fmt and self._user32.IsClipboardFormatAvailable(CF_HDROP):
                 h_data = self._user32.GetClipboardData(CF_HDROP)
                 if h_data and self._shell32 and hasattr(self._shell32, "DragQueryFileW"):
                     count = self._shell32.DragQueryFileW(h_data, 0xFFFFFFFF, None, 0)
@@ -304,10 +554,7 @@ class Win32ClipboardBackend:
                     )
 
             # 4. CF_UNICODETEXT (13)
-            if (
-                hasattr(self._user32, "IsClipboardFormatAvailable")
-                and self._user32.IsClipboardFormatAvailable(CF_UNICODETEXT)
-            ):
+            if has_fmt and self._user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
                 h_data = self._user32.GetClipboardData(CF_UNICODETEXT)
                 if h_data:
                     p_data = self._kernel32.GlobalLock(h_data)
@@ -320,9 +567,34 @@ class Win32ClipboardBackend:
                             )
                         finally:
                             self._kernel32.GlobalUnlock(h_data)
+                    else:
+                        logger.warning("GlobalLock failed for CF_UNICODETEXT.")
 
-            # 5. Empty/unsupported
-            return ClipboardSnapshot(kind="empty")
+        # Fallback outside OpenClipboard lock: PIL.ImageGrab if image formats failed or CF_BITMAP
+        if image_available:
+            try:
+                from PIL import Image, ImageGrab
+
+                grabbed = ImageGrab.grabclipboard()
+                if isinstance(grabbed, Image.Image):
+                    buf = io.BytesIO()
+                    grabbed.save(buf, format="PNG")
+                    png_bytes = buf.getvalue()
+                    return ClipboardSnapshot(
+                        kind="image",
+                        image_bytes=png_bytes,
+                        image_format="PNG",
+                        image_dimensions=grabbed.size,
+                    )
+                if isinstance(grabbed, list) and grabbed:
+                    return ClipboardSnapshot(
+                        kind="files",
+                        file_paths=[str(p) for p in grabbed],
+                    )
+            except Exception as exc:
+                logger.warning("PIL.ImageGrab fallback failed to decode clipboard image: %s", exc)
+
+        return ClipboardSnapshot(kind="empty")
 
     def write_text(self, text: str) -> None:
         """Write Unicode text to clipboard using Movable Global Memory."""
@@ -452,6 +724,7 @@ class ClipboardService:
     ) -> None:
         self._backend = backend or Win32ClipboardBackend()
         self.default_save_dir = default_save_dir
+        self.last_saved_path: Path | None = None
         self._last_sequence: int | None = None
         self._last_changed_monotonic: float = time.monotonic()
 
@@ -675,10 +948,17 @@ class ClipboardService:
 
             final_path = _resolve_collision(target_dir / clean_name)
             final_path.write_bytes(img_bytes)
+            saved_path = final_path.resolve()
+            if not saved_path.is_file():
+                raise RuntimeError(
+                    f"Clipboard image write completed but file was not found at {saved_path}."
+                )
+            self.last_saved_path = saved_path
             return {
-                "status": "ok",
-                "path": str(final_path.resolve()),
-                "filename": final_path.name,
+                "status": "saved",
+                "saved_path": str(saved_path),
+                "path": str(saved_path),
+                "filename": saved_path.name,
                 "size_bytes": len(img_bytes),
                 "kind": "image",
             }
@@ -698,13 +978,175 @@ class ClipboardService:
 
         final_path = _resolve_collision(target_dir / final_filename)
         final_path.write_text(content, encoding="utf-8")
+        saved_path = final_path.resolve()
+        if not saved_path.is_file():
+            raise RuntimeError(
+                f"Clipboard text write completed but file was not found at {saved_path}."
+            )
+        self.last_saved_path = saved_path
         return {
-            "status": "ok",
-            "path": str(final_path.resolve()),
-            "filename": final_path.name,
+            "status": "saved",
+            "saved_path": str(saved_path),
+            "path": str(saved_path),
+            "filename": saved_path.name,
             "size_bytes": len(content.encode("utf-8")),
             "kind": "text",
         }
+
+    @staticmethod
+    def _open_resolved_target(
+        target_str: str,
+        *,
+        kind: Literal["file", "url"],
+        browser_fallback_url: str,
+        filename: str | None = None,
+        opener_fn: Callable[[str], Any] | None = None,
+        desktop_name_fn: Callable[[], str | None] | None = None,
+    ) -> dict[str, Any]:
+        """Verify an interactive desktop and open a validated file path or HTTP/HTTPS URL."""
+        from clea.tools.windows_os import _check_interactive_desktop, _open_via_shell
+
+        non_default = _check_interactive_desktop(desktop_name_fn)
+        if non_default is not None:
+            res_non_interactive: dict[str, Any] = {
+                "ok": False,
+                "status": "non_interactive_desktop",
+                "kind": kind,
+                "target": target_str,
+                "error": (
+                    f"Cannot open '{target_str}' visibly because the daemon is running on "
+                    f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'. Start "
+                    "the Clea daemon from an interactive Windows Terminal / PowerShell session."
+                ),
+            }
+            if filename is not None:
+                res_non_interactive["filename"] = filename
+            return res_non_interactive
+
+        try:
+            if opener_fn is not None:
+                opener_fn(target_str)
+            elif sys.platform == "win32":
+                _open_via_shell(target_str)
+            else:
+                webbrowser.open(browser_fallback_url)
+        except Exception as exc:
+            logger.warning("Failed opening %s %s: %s", kind, target_str, exc)
+            return {"status": "error", "error": f"Failed to open {kind}: {exc}"}
+
+        opened_res: dict[str, Any] = {
+            "status": "opened",
+            "kind": kind,
+            "target": target_str,
+        }
+        if filename is not None:
+            opened_res["filename"] = filename
+        return opened_res
+
+    def open_path_or_url(
+        self,
+        target: str | None = None,
+        *,
+        use_clipboard: bool = False,
+        opener_fn: Callable[[str], Any] | None = None,
+        desktop_name_fn: Callable[[], str | None] | None = None,
+    ) -> dict[str, Any]:
+        """Open a local file (Desktop/Documents/last saved) or http/https URL on Windows."""
+        candidate = target.strip() if isinstance(target, str) else ""
+        if use_clipboard:
+            snapshot = self._backend.read_snapshot()
+            if snapshot.kind == "text" and snapshot.text and snapshot.text.strip():
+                url_match = URL_REGEX.search(snapshot.text)
+                if url_match:
+                    candidate = url_match.group(0).rstrip(".,);:!?'\"")
+                else:
+                    candidate = snapshot.text.strip()
+        elif not candidate:
+            if self.last_saved_path is not None and self.last_saved_path.is_file():
+                candidate = str(self.last_saved_path)
+            else:
+                snapshot = self._backend.read_snapshot()
+                if snapshot.kind == "text" and snapshot.text and snapshot.text.strip():
+                    url_match = URL_REGEX.search(snapshot.text)
+                    if url_match:
+                        candidate = url_match.group(0).rstrip(".,);:!?'\"")
+                    else:
+                        candidate = snapshot.text.strip()
+
+        if not candidate:
+            return {
+                "status": "error",
+                "error": (
+                    "No target path or URL provided, and clipboard does not contain a "
+                    "URL or file path."
+                ),
+            }
+
+        if any(ord(ch) < 32 for ch in candidate):
+            return {"status": "error", "error": "Target contains invalid control characters."}
+
+        # Open http/https URL
+        lower = candidate.lower()
+        if lower.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlsplit(candidate)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+                return {"status": "error", "error": f"Invalid HTTP/HTTPS URL: {candidate}"}
+            return self._open_resolved_target(
+                candidate,
+                kind="url",
+                browser_fallback_url=candidate,
+                opener_fn=opener_fn,
+                desktop_name_fn=desktop_name_fn,
+            )
+
+        # Reject shell binaries
+        first_tok = re.split(r"[\s/\\]", lower)[0]
+        if first_tok in _DISALLOWED_OPEN_BINARIES:
+            return {"status": "error", "error": f"Opening executable '{first_tok}' is disallowed."}
+
+        # Resolve local file path
+        raw_path = Path(candidate).expanduser()
+        resolved_file: Path | None = None
+        if raw_path.is_absolute() and raw_path.is_file():
+            resolved_file = raw_path.resolve()
+        else:
+            candidates: list[Path] = []
+            if self.default_save_dir is not None:
+                candidates.append(self.default_save_dir / raw_path.name)
+                candidates.append(self.default_save_dir / candidate)
+            home = Path.home()
+            candidates.extend(
+                [
+                    home / "Desktop" / candidate,
+                    home / "Desktop" / raw_path.name,
+                    home / "Documents" / candidate,
+                    home / "Documents" / raw_path.name,
+                    home / candidate,
+                ]
+            )
+            if (
+                self.last_saved_path is not None
+                and self.last_saved_path.name.lower() == raw_path.name.lower()
+            ):
+                candidates.append(self.last_saved_path)
+
+            for cand in candidates:
+                with contextlib.suppress(OSError):
+                    if cand.is_file():
+                        resolved_file = cand.resolve()
+                        break
+
+        if resolved_file is None or not resolved_file.is_file():
+            return {"status": "error", "error": f"File not found on disk: {candidate}"}
+
+        return self._open_resolved_target(
+            str(resolved_file),
+            kind="file",
+            browser_fallback_url=resolved_file.as_uri(),
+            filename=resolved_file.name,
+            opener_fn=opener_fn,
+            desktop_name_fn=desktop_name_fn,
+        )
 
 
 # ---------------------------------------------------- Tool Handlers & Registry
@@ -749,13 +1191,17 @@ def read_clipboard(
             "preview": preview,
         }
     elif snapshot.kind == "image":
-        return {
+        res: dict[str, Any] = {
             "status": "ok",
             "kind": "image",
             "image_format": snapshot.image_format or "PNG",
             "dimensions": snapshot.image_dimensions,
             "size_bytes": len(snapshot.image_bytes) if snapshot.image_bytes else 0,
         }
+        if snapshot.image_dimensions is not None:
+            res["width"] = snapshot.image_dimensions[0]
+            res["height"] = snapshot.image_dimensions[1]
+        return res
     elif snapshot.kind == "files":
         return {
             "status": "ok",
@@ -813,15 +1259,34 @@ def save_clipboard_to_file(
     return service.save_to_file(filename=filename, directory=directory)
 
 
+def open_path_or_url(
+    target: str | None = None,
+    use_clipboard: bool = False,
+    *,
+    clipboard_service: ClipboardService | None = None,
+    opener_fn: Callable[[str], Any] | None = None,
+    desktop_name_fn: Callable[[], str | None] | None = None,
+) -> dict[str, Any]:
+    """Open a saved local file (e.g. Desktop/Documents) or http/https URL on Windows."""
+    service = clipboard_service or get_default_clipboard_service()
+    return service.open_path_or_url(
+        target=target,
+        use_clipboard=use_clipboard,
+        opener_fn=opener_fn,
+        desktop_name_fn=desktop_name_fn,
+    )
+
+
 def register_clipboard_tools(
     registry: ToolRegistry,
     clipboard_service: ClipboardService | None = None,
     *,
     read_risk: RiskLevel = RiskLevel.READ_ONLY,
     transform_risk: RiskLevel = RiskLevel.READ_ONLY,
-    save_risk: RiskLevel = RiskLevel.REVERSIBLE,
+    save_risk: RiskLevel = RiskLevel.READ_ONLY,
+    open_risk: RiskLevel = RiskLevel.READ_ONLY,
 ) -> None:
-    """Register read_clipboard, transform_clipboard, and save_clipboard_to_file in ToolRegistry."""
+    """Register clipboard inspection, transform, save, and open tools in ToolRegistry."""
     service = clipboard_service or get_default_clipboard_service()
 
     registry.register(
@@ -886,8 +1351,11 @@ def register_clipboard_tools(
     registry.register(
         name="save_clipboard_to_file",
         description=(
-            "Save current clipboard text, code, or image to a file on desktop or documents "
-            "with auto-detected extension (.json, .py, .md, .txt, .png) and collision-safe naming."
+            "Directly save the current Windows clipboard content (text, URLs, code, or image "
+            "screenshot) to a file on Desktop or Documents with auto-detected extension "
+            "(.json, .py, .md, .txt, .png) and collision-safe naming. Always invoke this tool "
+            "directly whenever the user asks to save their clipboard or copied item to a file "
+            "(e.g., 'save my clipboard to desktop', 'save what I copied as youtube_url.txt')."
         ),
         input_schema={
             "type": "object",
@@ -908,5 +1376,38 @@ def register_clipboard_tools(
         risk_level=save_risk,
         handler=lambda filename=None, directory="desktop": save_clipboard_to_file(
             filename=filename, directory=directory, clipboard_service=service
+        ),
+    )
+
+    registry.register(
+        name="open_path_or_url",
+        description=(
+            "Open a saved local file (e.g., on Desktop or Documents, or the most recently saved "
+            "clipboard file) or an http/https URL (explicitly provided or extracted from the "
+            "clipboard) using Windows default application / browser."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Optional file path, filename (e.g. 'print.txt'), or http/https URL. "
+                        "If omitted, uses the clipboard URL/path or most recently saved file."
+                    ),
+                },
+                "use_clipboard": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "When true, reads the URL or path directly from the active clipboard."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+        risk_level=open_risk,
+        handler=lambda target=None, use_clipboard=False: open_path_or_url(
+            target=target, use_clipboard=use_clipboard, clipboard_service=service
         ),
     )
