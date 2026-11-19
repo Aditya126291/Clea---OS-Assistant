@@ -32,10 +32,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Window show/focus constants
+SW_SHOWNORMAL: int = 1
 SW_MAXIMIZE: int = 3
 SW_MINIMIZE: int = 6
 SW_RESTORE: int = 9
 WM_CLOSE: int = 0x0010
+UOI_NAME: int = 2
+_STARTF_USESHOWWINDOW: int = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
 
 # Virtual key codes for media & step volume controls
 VK_VOLUME_MUTE: int = 0xAD
@@ -488,6 +491,134 @@ def _get_win32_kernel32(kernel32: Any = None) -> Any:
     return k32
 
 
+def _get_current_desktop_name(
+    *,
+    user32: Any = None,
+    kernel32: Any = None,
+) -> str | None:
+    """Return the active Win32 thread desktop name (e.g. 'Default' or 'exebox-...')."""
+    if sys.platform != "win32" and user32 is None and kernel32 is None:
+        return None
+    try:
+        u32 = _get_win32_user32(user32)
+        k32 = _get_win32_kernel32(kernel32)
+
+        if isinstance(k32, ctypes.CDLL):
+            k32.GetCurrentThreadId.argtypes = []
+            k32.GetCurrentThreadId.restype = ctypes.c_uint32
+
+        if isinstance(u32, ctypes.CDLL):
+            u32.GetThreadDesktop.argtypes = [ctypes.c_uint32]
+            u32.GetThreadDesktop.restype = ctypes.c_void_p
+            u32.GetUserObjectInformationW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            u32.GetUserObjectInformationW.restype = ctypes.c_int
+
+        tid = k32.GetCurrentThreadId()
+        hdesk = u32.GetThreadDesktop(tid)
+        if not hdesk:
+            return None
+        buf = ctypes.create_unicode_buffer(256)
+        needed = ctypes.c_uint32(0)
+        ok = u32.GetUserObjectInformationW(
+            hdesk,
+            UOI_NAME,
+            buf,
+            ctypes.sizeof(buf),
+            ctypes.byref(needed),
+        )
+        if not ok:
+            return None
+        name = buf.value.strip()
+        return name or None
+    except Exception:
+        return None
+
+
+def _check_interactive_desktop(
+    desktop_name_fn: Callable[[], str | None] | None = None,
+) -> str | None:
+    """Return the non-default desktop name if isolated from WinSta0\\Default, else None."""
+    fn = desktop_name_fn or _get_current_desktop_name
+    name = fn()
+    if isinstance(name, str) and name.strip() and name.strip().lower() != "default":
+        return name.strip()
+    return None
+
+
+def _build_gui_popen_kwargs() -> dict[str, Any]:
+    """Build subprocess.Popen kwargs that ensure visible normal-window GUI launches."""
+    kwargs: dict[str, Any] = {
+        "shell": False,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32" and hasattr(subprocess, "STARTUPINFO"):
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= _STARTF_USESHOWWINDOW
+        si.wShowWindow = SW_SHOWNORMAL
+        kwargs["startupinfo"] = si
+    return kwargs
+
+
+def _open_via_shell(
+    target: str,
+    *,
+    startfile_fn: Callable[[str], Any] | None = None,
+    popen_fn: Callable[..., Any] = subprocess.Popen,
+) -> None:
+    """Open a local file or URL visibly via the Windows shell."""
+    if startfile_fn is not None:
+        startfile_fn(target)
+        return
+    if hasattr(os, "startfile"):
+        os.startfile(target)
+        return
+    if sys.platform == "win32":
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        res = shell32.ShellExecuteW(None, "open", target, None, None, SW_SHOWNORMAL)
+        if int(res or 0) <= 32:
+            raise OSError(f"ShellExecuteW failed opening '{target}' (code={int(res or 0)}).")
+        return
+    popen_fn(["explorer.exe", target], **_build_gui_popen_kwargs())
+
+
+def _non_interactive_desktop_result(
+    app_label: str,
+    non_default: str,
+    resolved_target: Path | None = None,
+) -> dict[str, Any]:
+    """Return a structured non_interactive_desktop response for sandboxed daemons."""
+    return {
+        "ok": False,
+        "status": "non_interactive_desktop",
+        "app": app_label,
+        "window_title": None,
+        "hwnd": None,
+        "executable": None,
+        "target_path": str(resolved_target) if resolved_target is not None else None,
+        "error": (
+            f"Cannot launch or focus '{app_label}' visibly because the daemon is running on "
+            f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'. Start the Clea "
+            "daemon from an interactive Windows Terminal / PowerShell session."
+        ),
+    }
+
+
 # --------------------------------------------------------------------------- App Launcher / Focuser
 
 
@@ -708,7 +839,14 @@ def _validate_target_path(
 
     env_map = dict(os.environ) if env is None else env
     expanded = _expand_env_vars(stripped, env_map)
-    resolved = Path(expanded).expanduser().resolve()
+    cand_path = Path(expanded).expanduser()
+    resolved = cand_path.resolve()
+    if not resolved.exists() and not cand_path.is_absolute():
+        home = Path.home()
+        for base in (home / "Desktop", home / "Documents", home):
+            alt = (base / cand_path).resolve()
+            if alt.exists():
+                return alt
     if not resolved.exists():
         raise ValueError(f"target_path does not exist: {target_path!r}")
     return resolved
@@ -857,6 +995,8 @@ def open_or_focus_app(
     popen_fn: Callable[..., Any] = subprocess.Popen,
     env: dict[str, str] | None = None,
     app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
+    startfile_fn: Callable[[str], Any] | None = None,
+    desktop_name_fn: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     """Focus a running application window or launch an allowed desktop application.
 
@@ -865,6 +1005,42 @@ def open_or_focus_app(
     launches the validated executable or Start Menu / UWP app with ``shell=False``.
     """
     resolved_target = _validate_target_path(target_path, env=env)
+    if resolved_target is None and isinstance(app_name, str):
+        app_stripped = app_name.strip()
+        app_norm = " ".join(app_stripped.lower().split())
+        text_exts = {".txt", ".md", ".json", ".py", ".log"}
+        media_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"}
+        suffix = Path(app_stripped).suffix.lower()
+        if app_norm not in _APP_ALIASES and suffix in (text_exts | media_exts):
+            try:
+                file_target = _validate_target_path(app_stripped, env=env)
+            except ValueError:
+                file_target = None
+            if file_target is not None and file_target.is_file():
+                if suffix in text_exts:
+                    app_name = "notepad"
+                    resolved_target = file_target
+                else:
+                    non_default = _check_interactive_desktop(desktop_name_fn)
+                    if non_default is not None:
+                        return _non_interactive_desktop_result(
+                            file_target.name, non_default, file_target
+                        )
+                    _open_via_shell(
+                        str(file_target),
+                        startfile_fn=startfile_fn,
+                        popen_fn=popen_fn,
+                    )
+                    return {
+                        "ok": True,
+                        "status": "launched",
+                        "app": file_target.name,
+                        "window_title": None,
+                        "hwnd": None,
+                        "executable": "explorer.exe",
+                        "target_path": str(file_target),
+                    }
+
     spec: _AppSpec | None = None
     resolve_err: Exception | None = None
     try:
@@ -887,6 +1063,9 @@ def open_or_focus_app(
 
         for win in windows:
             if _window_matches_spec(win, spec):
+                non_default = _check_interactive_desktop(desktop_name_fn)
+                if non_default is not None:
+                    return _non_interactive_desktop_result(spec.canonical_name, non_default)
                 if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
                     u32.ShowWindow(win.hwnd, SW_RESTORE)
                 u32.SetForegroundWindow(win.hwnd)
@@ -912,12 +1091,13 @@ def open_or_focus_app(
             if resolved_target is not None:
                 cmd = [*cmd, str(resolved_target)]
 
-            popen_fn(
-                cmd,
-                shell=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            non_default = _check_interactive_desktop(desktop_name_fn)
+            if non_default is not None:
+                return _non_interactive_desktop_result(
+                    launched_spec.canonical_name, non_default, resolved_target
+                )
+
+            popen_fn(cmd, **_build_gui_popen_kwargs())
             return {
                 "ok": True,
                 "status": "launched",
@@ -964,6 +1144,9 @@ def open_or_focus_app(
                 w_title = (win.title or "").lower()
                 w_proc = (win.process_name or "").lower()
                 if matched_name.lower() in w_title or matched_name.lower() in w_proc:
+                    non_default = _check_interactive_desktop(desktop_name_fn)
+                    if non_default is not None:
+                        return _non_interactive_desktop_result(matched_name, non_default)
                     if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
                         u32.ShowWindow(win.hwnd, SW_RESTORE)
                     u32.SetForegroundWindow(win.hwnd)
@@ -977,15 +1160,14 @@ def open_or_focus_app(
                         "target_path": None,
                     }
 
+        non_default = _check_interactive_desktop(desktop_name_fn)
+        if non_default is not None:
+            return _non_interactive_desktop_result(matched_name, non_default, resolved_target)
+
         launch_cmd = ["explorer.exe", f"shell:AppsFolder\\{matched_appid}"]
         if resolved_target is not None:
             launch_cmd.append(str(resolved_target))
-        popen_fn(
-            launch_cmd,
-            shell=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        popen_fn(launch_cmd, **_build_gui_popen_kwargs())
         return {
             "ok": True,
             "status": "launched",
@@ -1291,7 +1473,10 @@ for ($i = 0; $i -lt $limit; $i++) {
                     $streamType = __WINRT_STREAM_TYPE__
                     $raStream = Await-AsyncOp $streamOp $streamType
                     $streamExt = [System.IO.WindowsRuntimeStreamExtensions]
-                    $netStream = $streamExt::AsStreamForRead($raStream)
+                    $asStreamMethod = $streamExt.GetMethods() | Where-Object {
+                        $_.Name -eq 'AsStreamForRead' -and $_.GetParameters().Count -eq 1
+                    } | Select-Object -First 1
+                    $netStream = $asStreamMethod.Invoke($null, @($raStream))
                     $img = [System.Drawing.Image]::FromStream($netStream)
                     $w = $img.Width
                     $h = $img.Height
@@ -1404,49 +1589,125 @@ _POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT = (
 )
 
 
+def _fallback_snapshot_to_win32_dict(
+    cap: int, *, include_image_bytes: bool = False
+) -> dict[str, Any]:
+    """Read clipboard formats via Win32ClipboardBackend (PNG, CF_BITMAP, CF_HDROP, text)."""
+    try:
+        from clea.tools.clipboard import Win32ClipboardBackend
+
+        snap = Win32ClipboardBackend().read_snapshot()
+    except Exception as exc:
+        logger.warning("Win32ClipboardBackend snapshot fallback failed: %s", exc)
+        return {
+            "ok": True,
+            "kind": "empty",
+            "text": "",
+            "truncated": False,
+            "char_count": 0,
+            "total_chars": 0,
+        }
+
+    if snap.kind == "image":
+        w, h = snap.image_dimensions or (0, 0)
+        image_meta: dict[str, Any] = {
+            "width": w,
+            "height": h,
+            "format": (snap.image_format or "png").lower(),
+            "size_bytes": len(snap.image_bytes) if snap.image_bytes else 0,
+        }
+        if include_image_bytes and snap.image_bytes:
+            image_meta["image_bytes_base64"] = base64.b64encode(snap.image_bytes).decode("ascii")
+        return {
+            "ok": True,
+            "kind": "image",
+            "text": "",
+            "truncated": False,
+            "char_count": 0,
+            "total_chars": 0,
+            "image": image_meta,
+        }
+    if snap.kind == "files":
+        file_text = "\n".join(snap.file_paths)
+        truncated = len(file_text) > cap
+        shown = file_text[:cap] if truncated else file_text
+        return {
+            "ok": True,
+            "kind": "files",
+            "text": shown,
+            "truncated": truncated,
+            "char_count": len(shown),
+            "total_chars": len(file_text),
+            "file_paths": list(snap.file_paths),
+            "has_image_files": snap.has_image_files,
+        }
+    if snap.kind == "text" and snap.text is not None:
+        total_chars = len(snap.text)
+        truncated = total_chars > cap
+        shown = snap.text[:cap] if truncated else snap.text
+        return {
+            "ok": True,
+            "kind": "text" if total_chars > 0 else "empty",
+            "text": shown,
+            "truncated": truncated,
+            "char_count": len(shown),
+            "total_chars": total_chars,
+        }
+    return {
+        "ok": True,
+        "kind": "empty",
+        "text": "",
+        "truncated": False,
+        "char_count": 0,
+        "total_chars": 0,
+    }
+
+
 def _read_clipboard_win32(
     cap: int,
     *,
     user32: Any = None,
     kernel32: Any = None,
+    include_image_bytes: bool = False,
 ) -> dict[str, Any]:
+    if user32 is None and kernel32 is None:
+        return _fallback_snapshot_to_win32_dict(cap, include_image_bytes=include_image_bytes)
+
     u32 = _get_win32_user32(user32)
     k32 = _get_win32_kernel32(kernel32)
 
+    missing_unicode_text = False
     with _open_clipboard(u32):
         if hasattr(u32, "IsClipboardFormatAvailable") and not u32.IsClipboardFormatAvailable(
             CF_UNICODETEXT
         ):
-            return {
-                "ok": True,
-                "text": "",
-                "truncated": False,
-                "char_count": 0,
-                "total_chars": 0,
-            }
-
-        handle = u32.GetClipboardData(CF_UNICODETEXT)
-        if not handle:
-            return {
-                "ok": True,
-                "text": "",
-                "truncated": False,
-                "char_count": 0,
-                "total_chars": 0,
-            }
-
-        ptr = k32.GlobalLock(handle)
-        if not ptr:
-            raise RuntimeError("Failed to lock clipboard data handle.")
-        try:
-            if isinstance(ptr, str):
-                raw_text = ptr
-            elif isinstance(ptr, (bytes, bytearray)):
-                raw_text = bytes(ptr).decode("utf-16-le").rstrip("\x00")
+            missing_unicode_text = True
+        else:
+            handle = u32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                missing_unicode_text = True
             else:
-                raw_text = ctypes.wstring_at(ptr)
-        finally:
-            k32.GlobalUnlock(handle)
+                ptr = k32.GlobalLock(handle)
+                if not ptr:
+                    raise RuntimeError("Failed to lock clipboard data handle.")
+                try:
+                    if isinstance(ptr, str):
+                        raw_text = ptr
+                    elif isinstance(ptr, (bytes, bytearray)):
+                        raw_text = bytes(ptr).decode("utf-16-le").rstrip("\x00")
+                    else:
+                        raw_text = ctypes.wstring_at(ptr)
+                finally:
+                    k32.GlobalUnlock(handle)
+
+    if missing_unicode_text:
+        return {
+            "ok": True,
+            "text": "",
+            "truncated": False,
+            "char_count": 0,
+            "total_chars": 0,
+        }
 
     total_chars = len(raw_text)
     truncated = total_chars > cap
@@ -1472,9 +1733,10 @@ def read_clipboard(
 ) -> dict[str, Any]:
     """Read UTF-16LE Unicode text or history items from the Windows clipboard.
 
-    When ``include_history=False`` (default), reads active clipboard text via classic
-    Win32 APIs. When ``include_history=True``, queries WinRT Clipboard History via
-    PowerShell 5.1, wrapping format checks in try/catch and falling back to Win32 on error.
+    When ``include_history=False`` (default), reads active clipboard content via
+    ``Win32ClipboardBackend`` (or injected Win32 test doubles). When
+    ``include_history=True``, queries WinRT Clipboard History via PowerShell 5.1,
+    falling back to Win32 on error or when the active item kind is unknown.
     """
     if isinstance(max_chars, bool):
         raise ValueError("max_chars must be an integer.")
@@ -1485,7 +1747,12 @@ def read_clipboard(
     cap = max(1, min(cap, MAX_CLIPBOARD_CHARS))
 
     if not include_history:
-        return _read_clipboard_win32(cap, user32=user32, kernel32=kernel32)
+        return _read_clipboard_win32(
+            cap,
+            user32=user32,
+            kernel32=kernel32,
+            include_image_bytes=include_image_bytes,
+        )
 
     history_enabled = False
     total_items = 0
@@ -1528,24 +1795,68 @@ def read_clipboard(
         except Exception as exc:
             logger.debug("WinRT clipboard history failed (%s); falling back to Win32.", exc)
 
+    top_kind: str | None = None
+    extra_fields: dict[str, Any] = {}
     if winrt_success and items:
         top_item = items[0]
-        if top_item.get("kind") == "text" and top_item.get("text") is not None:
+        raw_top_kind = str(top_item.get("kind") or "unknown")
+        if raw_top_kind == "text" and top_item.get("text") is not None:
+            top_kind = "text"
             text = top_item["text"]
             truncated = bool(top_item.get("truncated", False))
             total_chars = len(text)
             top_image = None
+        elif raw_top_kind == "image" and isinstance(top_item.get("image"), dict):
+            top_kind = "image"
+            text = ""
+            truncated = False
+            total_chars = 0
+            top_image = top_item.get("image")
+        elif powershell_runner is None:
+            win32_res = _read_clipboard_win32(
+                cap,
+                user32=user32,
+                kernel32=kernel32,
+                include_image_bytes=include_image_bytes,
+            )
+            text = win32_res["text"]
+            truncated = win32_res["truncated"]
+            total_chars = win32_res["total_chars"]
+            top_image = win32_res.get("image")
+            top_kind = win32_res.get("kind") or "empty"
+            if "file_paths" in win32_res:
+                extra_fields["file_paths"] = win32_res["file_paths"]
+                extra_fields["has_image_files"] = bool(win32_res.get("has_image_files", False))
+            if top_kind in ("image", "files", "text"):
+                patched_item = dict(top_item)
+                patched_item["kind"] = top_kind
+                if top_kind == "image" and top_image is not None:
+                    patched_item["image"] = top_image
+                elif top_kind in ("text", "files"):
+                    patched_item["text"] = text
+                    patched_item["truncated"] = truncated
+                items = [patched_item, *items[1:]]
         else:
+            top_kind = raw_top_kind
             text = ""
             truncated = False
             total_chars = 0
             top_image = top_item.get("image")
     else:
-        win32_res = _read_clipboard_win32(cap, user32=user32, kernel32=kernel32)
+        win32_res = _read_clipboard_win32(
+            cap,
+            user32=user32,
+            kernel32=kernel32,
+            include_image_bytes=include_image_bytes,
+        )
         text = win32_res["text"]
         truncated = win32_res["truncated"]
         total_chars = win32_res["total_chars"]
-        top_image = None
+        top_image = win32_res.get("image")
+        top_kind = win32_res.get("kind")
+        if "file_paths" in win32_res:
+            extra_fields["file_paths"] = win32_res["file_paths"]
+            extra_fields["has_image_files"] = bool(win32_res.get("has_image_files", False))
 
     res: dict[str, Any] = {
         "ok": True,
@@ -1557,8 +1868,11 @@ def read_clipboard(
         "total_items": total_items,
         "items": items,
     }
+    if top_kind is not None:
+        res["kind"] = top_kind
     if top_image is not None:
         res["image"] = top_image
+    res.update(extra_fields)
     return res
 
 
@@ -1669,6 +1983,7 @@ def open_url(
     popen_fn: Callable[..., Any] = subprocess.Popen,
     which_fn: Callable[[str], str | None] = shutil.which,
     env: dict[str, str] | None = None,
+    desktop_name_fn: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     """Validate and open an http/https URL in the default or specified browser."""
     if not isinstance(url, str):
@@ -1723,16 +2038,20 @@ def open_url(
         raise ValueError(f"Invalid URL: host/domain is required in {url!r}")
 
     if browser is None:
-        starter = startfile_fn or getattr(os, "startfile", None)
-        if starter is not None:
-            starter(target_url)
-        else:
-            popen_fn(
-                ["explorer.exe", target_url],
-                shell=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        non_default = _check_interactive_desktop(desktop_name_fn)
+        if non_default is not None:
+            return {
+                "ok": False,
+                "success": False,
+                "url": target_url,
+                "browser": "default",
+                "status": "non_interactive_desktop",
+                "message": (
+                    f"Cannot open '{target_url}' visibly because the daemon is running on "
+                    f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
+                ),
+            }
+        _open_via_shell(target_url, startfile_fn=startfile_fn, popen_fn=popen_fn)
         return {
             "ok": True,
             "success": True,
@@ -1766,12 +2085,21 @@ def open_url(
     if not browser_exe:
         raise ValueError(f"Browser '{browser}' could not be resolved to an executable.")
 
-    popen_fn(
-        [browser_exe, target_url],
-        shell=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    non_default = _check_interactive_desktop(desktop_name_fn)
+    if non_default is not None:
+        return {
+            "ok": False,
+            "success": False,
+            "url": target_url,
+            "browser": b_clean,
+            "status": "non_interactive_desktop",
+            "message": (
+                f"Cannot open '{target_url}' visibly because the daemon is running on "
+                f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
+            ),
+        }
+
+    popen_fn([browser_exe, target_url], **_build_gui_popen_kwargs())
     return {
         "ok": True,
         "success": True,

@@ -29,7 +29,8 @@ class Message(BaseModel):
     tool_name: str | None = None
     is_error: bool = False
     thought_signature: str | None = None
-    thought_signature: str | None = None
+    image_bytes: bytes | None = Field(default=None, exclude=True)
+    image_mime_type: str | None = Field(default=None, exclude=True)
 
 
 class TokenUsage(BaseModel):

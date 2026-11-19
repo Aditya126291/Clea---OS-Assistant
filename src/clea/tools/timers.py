@@ -381,11 +381,13 @@ class TimerManager:
         on_event: Callable[[BaseEvent], Any] | None = None,
         notifier: Callable[[str, str], Any] | None = None,
         poll_interval: float = 1.0,
+        on_tick: Callable[[], Any] | None = None,
     ) -> None:
         self.storage_path = (storage_path or (default_data_dir() / "timers.json")).resolve()
         self.on_event = on_event
         self.notifier = notifier or send_windows_toast_and_chime
         self.poll_interval = poll_interval
+        self.on_tick = on_tick
         self._items: dict[str, dict[str, Any]] = {}
         self._loop_task: asyncio.Task[None] | None = None
         self._stopped = False
@@ -457,6 +459,13 @@ class TimerManager:
             while not self._stopped:
                 await asyncio.sleep(self.poll_interval)
                 await self._check_due_items()
+                if self.on_tick is not None:
+                    try:
+                        tick_res = self.on_tick()
+                        if inspect.isawaitable(tick_res):
+                            await tick_res
+                    except Exception as exc:
+                        logger.debug("Unhandled error in TimerManager on_tick: %s", exc)
         except asyncio.CancelledError:
             pass
         except Exception as exc:

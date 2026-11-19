@@ -4,6 +4,7 @@ import type {
   AppView,
   ApprovalDecision,
   CallState,
+  ChatImageAttachment,
   ChatMessage,
   CleaEvent,
   ConnectionState,
@@ -108,7 +109,7 @@ export interface CleaStoreState {
   clearError: () => void;
 
   newSession: () => Promise<void>;
-  sendMessage: (text: string) => Promise<void>;
+  sendMessage: (text: string, image?: ChatImageAttachment) => Promise<void>;
   respondApproval: (approvalId: string, decision: ApprovalDecision) => Promise<void>;
 
   loadConversations: () => Promise<void>;
@@ -492,9 +493,9 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     }
   },
 
-  sendMessage: async (rawText: string) => {
+  sendMessage: async (rawText: string, image?: ChatImageAttachment) => {
     const text = rawText.trim();
-    if (!text || !activeClient?.isConnected) return;
+    if ((!text && !image) || get().sending || !activeClient?.isConnected) return;
 
     const epoch = ++sessionEpoch;
     let sessionId = get().sessionId;
@@ -513,10 +514,15 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
     }
 
     const requestId = nextRequestId();
+    const displayText =
+      text ||
+      (image
+        ? `Please inspect this image.\n[Attached image: ${image.name ?? "clipboard_image.png"}]`
+        : "");
     const userMsg: ChatMessage = {
       id: `user-${requestId}`,
       role: "user",
-      content: text,
+      content: displayText,
       streaming: false,
       toolCalls: [],
       approvals: [],
@@ -543,7 +549,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       // chat.send may wait for tool calls and user approvals; give it a generous timeout (10m)
       const res = await activeClient.request(
         "chat.send",
-        { text },
+        image ? { text, image } : { text },
         { id: requestId, sessionId, timeoutMs: 600_000 },
       );
       if (epoch !== sessionEpoch) return;

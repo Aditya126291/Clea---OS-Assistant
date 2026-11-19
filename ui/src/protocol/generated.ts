@@ -60,6 +60,10 @@ export type Request =
   | OsOpenUrlRequest
   | OsControlSystemRequest
   | OsWriteClipboardRequest
+  | OsTransformClipboardRequest
+  | OsSaveClipboardToFileRequest
+  | OsOpenPathOrUrlRequest
+  | OsInspectScreenRequest
   | OsInspectUiElementsRequest
   | OsClickUiElementRequest
   | OsGuiActionRequest
@@ -80,6 +84,11 @@ export type Id2 = string;
 export type SessionId2 = string | null;
 export type Method2 = "chat.send";
 export type Text = string;
+export type DataBase64 = string;
+export type MimeType = string;
+export type Name = string | null;
+export type Width = number | null;
+export type Height = number | null;
 export type FrameType3 = "request";
 export type Id3 = string;
 export type SessionId3 = string | null;
@@ -432,21 +441,46 @@ export type Text1 = string;
 export type FrameType54 = "request";
 export type Id55 = string;
 export type SessionId64 = string | null;
-export type Method54 = "os.inspect_ui_elements";
-export type AppName2 = string | null;
-export type MaxElements = number;
+export type Method54 = "os.transform_clipboard";
+export type Action2 = "format_json" | "minify_json" | "clean_text" | "unwrap_text" | "strip_tracking_urls";
+export type UpdateClipboard = boolean;
 export type FrameType55 = "request";
 export type Id56 = string;
 export type SessionId65 = string | null;
-export type Method55 = "os.click_ui_element";
-export type Name = string;
-export type ControlType = string | null;
-export type AppName3 = string | null;
+export type Method55 = "os.save_clipboard_to_file";
+export type Filename = string | null;
+export type Directory = "desktop" | "documents";
 export type FrameType56 = "request";
 export type Id57 = string;
 export type SessionId66 = string | null;
-export type Method56 = "os.gui_action";
-export type Action2 = "click_at" | "type_text" | "press_keys" | "scroll" | "wait";
+export type Method56 = "os.open_path_or_url";
+export type Target = string | null;
+export type UseClipboard = boolean;
+export type FrameType57 = "request";
+export type Id58 = string;
+export type SessionId67 = string | null;
+export type Method57 = "os.inspect_screen";
+export type Target1 = string;
+export type Question = string;
+export type IncludeImage = boolean;
+export type FrameType58 = "request";
+export type Id59 = string;
+export type SessionId68 = string | null;
+export type Method58 = "os.inspect_ui_elements";
+export type AppName2 = string | null;
+export type MaxElements = number;
+export type FrameType59 = "request";
+export type Id60 = string;
+export type SessionId69 = string | null;
+export type Method59 = "os.click_ui_element";
+export type Name1 = string;
+export type ControlType = string | null;
+export type AppName3 = string | null;
+export type FrameType60 = "request";
+export type Id61 = string;
+export type SessionId70 = string | null;
+export type Method60 = "os.gui_action";
+export type Action3 = "click_at" | "type_text" | "press_keys" | "scroll" | "wait";
 export type X = number | null;
 export type Y = number | null;
 export type Text2 = string | null;
@@ -455,28 +489,28 @@ export type Clicks = number;
 export type Button = "left" | "right" | "double";
 export type Delta = number;
 export type Seconds = number;
-export type FrameType57 = "request";
-export type Id58 = string;
-export type SessionId67 = string | null;
-export type Method57 = "os.ui_snapshot";
+export type FrameType61 = "request";
+export type Id62 = string;
+export type SessionId71 = string | null;
+export type Method61 = "os.ui_snapshot";
 export type AppName4 = string | null;
 export type MaxElements1 = number;
 export type InteractiveOnly = boolean;
-export type FrameType58 = "request";
-export type Id59 = string;
-export type SessionId68 = string | null;
-export type Method58 = "os.ui_act";
+export type FrameType62 = "request";
+export type Id63 = string;
+export type SessionId72 = string | null;
+export type Method62 = "os.ui_act";
 export type Ref = string;
-export type Action3 = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click";
+export type Action4 = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click";
 export type Value = string | null;
 export type IntervalMs = number;
-export type FrameType59 = "request";
-export type Id60 = string;
-export type SessionId69 = string | null;
-export type Method59 = "os.ui_batch";
+export type FrameType63 = "request";
+export type Id64 = string;
+export type SessionId73 = string | null;
+export type Method63 = "os.ui_batch";
 export type Op = "act" | "press_keys" | "scroll" | "wait" | "click_at";
 export type Ref1 = string | null;
-export type Action4 = ("click" | "set_value" | "type" | "clear" | "double_click" | "right_click") | null;
+export type Action5 = ("click" | "set_value" | "type" | "clear" | "double_click" | "right_click") | null;
 export type Value1 = string | null;
 export type Keys1 = string[] | null;
 export type Delta1 = number | null;
@@ -489,17 +523,17 @@ export type IntervalMs1 = number | null;
 export type Steps = UiBatchStep[];
 export type StopOnError = boolean;
 export type StopOnWindowChange = boolean;
-export type FrameType60 = "request";
-export type Id61 = string;
-export type SessionId70 = string | null;
-export type Method60 = "workspace.git_inspect";
+export type FrameType64 = "request";
+export type Id65 = string;
+export type SessionId74 = string | null;
+export type Method64 = "workspace.git_inspect";
 export type RepoPath = string | null;
 export type IncludeDiff = boolean;
 export type DiffStatOnly = boolean;
-export type FrameType61 = "response";
-export type Id62 = string;
+export type FrameType65 = "response";
+export type Id66 = string;
 export type Ok = boolean;
-export type SessionId71 = string | null;
+export type SessionId75 = string | null;
 export type Error = string | null;
 export type Event =
   | AssistantTokenEvent
@@ -522,49 +556,49 @@ export type Event =
   | MemoryUpdatedEvent
   | TimerFiredEvent
   | ReminderFiredEvent;
-export type FrameType62 = "event";
+export type FrameType66 = "event";
 export type RequestId = string | null;
-export type SessionId72 = string | null;
+export type SessionId76 = string | null;
 export type Event1 = "assistant_token";
 export type Text3 = string;
-export type FrameType63 = "event";
+export type FrameType67 = "event";
 export type RequestId1 = string | null;
-export type SessionId73 = string | null;
+export type SessionId77 = string | null;
 export type Event2 = "tool_call_started";
 export type CallId2 = string;
-export type Name1 = string;
+export type Name2 = string;
 export type RiskLevel = "read_only" | "reversible" | "destructive";
-export type FrameType64 = "event";
+export type FrameType68 = "event";
 export type RequestId2 = string | null;
-export type SessionId74 = string | null;
+export type SessionId78 = string | null;
 export type Event3 = "tool_call_finished";
 export type CallId3 = string;
-export type Name2 = string;
+export type Name3 = string;
 export type IsError = boolean;
 export type Output = string;
 /**
  * Execution time, excluding time spent awaiting approval
  */
 export type DurationMs = number;
-export type FrameType65 = "event";
+export type FrameType69 = "event";
 export type RequestId3 = string | null;
-export type SessionId75 = string | null;
+export type SessionId79 = string | null;
 export type Event4 = "approval_requested";
 export type ApprovalId1 = string;
 export type CallId4 = string | null;
 export type Tool = string;
 export type RiskLevel1 = "read_only" | "reversible" | "destructive";
 export type TimeoutSeconds = number;
-export type FrameType66 = "event";
+export type FrameType70 = "event";
 export type RequestId4 = string | null;
-export type SessionId76 = string | null;
+export type SessionId80 = string | null;
 export type Event5 = "approval_resolved";
 export type ApprovalId2 = string;
 export type Decision1 = "allow" | "deny";
 export type Reason1 = "user" | "timeout";
-export type FrameType67 = "event";
+export type FrameType71 = "event";
 export type RequestId5 = string | null;
-export type SessionId77 = string | null;
+export type SessionId81 = string | null;
 export type Event6 = "task_status";
 export type TaskId1 = string;
 export type Title4 = string;
@@ -574,46 +608,46 @@ export type Kind = "chat_turn" | "background_task" | "scheduled" | "agent_run";
 export type FinishedAt = string | null;
 export type NextRunAt = string | null;
 export type Detail = string | null;
-export type FrameType68 = "event";
+export type FrameType72 = "event";
 export type RequestId6 = string | null;
-export type SessionId78 = string | null;
+export type SessionId82 = string | null;
 export type Event7 = "voice_state";
 export type State = "idle" | "listening" | "thinking" | "speaking" | "reconnecting" | "error";
 export type Error1 = string | null;
-export type FrameType69 = "event";
+export type FrameType73 = "event";
 export type RequestId7 = string | null;
-export type SessionId79 = string | null;
+export type SessionId83 = string | null;
 export type Event8 = "call_started";
 export type CallId5 = string;
 export type CallState = "idle" | "connecting" | "active" | "ending";
 export type StartedAt1 = string | null;
-export type FrameType70 = "event";
+export type FrameType74 = "event";
 export type RequestId8 = string | null;
-export type SessionId80 = string | null;
+export type SessionId84 = string | null;
 export type Event9 = "call_ended";
 export type CallId6 = string;
 export type CallState1 = "idle" | "connecting" | "active" | "ending";
 export type Reason2 = string | null;
 export type DurationSeconds = number | null;
-export type FrameType71 = "event";
+export type FrameType75 = "event";
 export type RequestId9 = string | null;
-export type SessionId81 = string | null;
+export type SessionId85 = string | null;
 export type Event10 = "transcript";
 export type Role = "user" | "assistant";
 export type Text4 = string;
 export type Final = boolean;
 export type CallId7 = string | null;
 export type Timestamp = string | null;
-export type FrameType72 = "event";
+export type FrameType76 = "event";
 export type RequestId10 = string | null;
-export type SessionId82 = string | null;
+export type SessionId86 = string | null;
 export type Event11 = "screen_capture_state";
 export type Active = boolean;
-export type Target = ("active_window" | "full_screen") | null;
+export type Target2 = ("active_window" | "full_screen") | null;
 export type CallId8 = string | null;
-export type FrameType73 = "event";
+export type FrameType77 = "event";
 export type RequestId11 = string | null;
-export type SessionId83 = string | null;
+export type SessionId87 = string | null;
 export type Event12 = "usage";
 export type CallId9 = string | null;
 export type InputTokens = number;
@@ -621,17 +655,17 @@ export type OutputTokens = number;
 export type TotalTokens = number;
 export type CachedTokens = number | null;
 export type ThoughtTokens = number | null;
-export type FrameType74 = "event";
+export type FrameType78 = "event";
 export type RequestId12 = string | null;
-export type SessionId84 = string | null;
+export type SessionId88 = string | null;
 export type Event13 = "error";
 export type Message = string;
 export type Code = string | null;
-export type FrameType75 = "event";
+export type FrameType79 = "event";
 export type RequestId13 = string | null;
-export type SessionId85 = string | null;
+export type SessionId89 = string | null;
 export type Event14 = "conversation_updated";
-export type SessionId86 = string;
+export type SessionId90 = string;
 export type Title5 = string | null;
 export type Pinned1 = boolean | null;
 export type UpdatedAt = string | null;
@@ -639,59 +673,59 @@ export type UserMessage = string | null;
 export type AssistantMessage = string | null;
 export type Turns = number | null;
 export type RequestId14 = string | null;
-export type FrameType76 = "event";
+export type FrameType80 = "event";
 export type RequestId15 = string | null;
-export type SessionId87 = string | null;
+export type SessionId91 = string | null;
 export type Event15 = "conversation_deleted";
 export type SessionIds = string[];
 export type All = boolean;
-export type FrameType77 = "event";
+export type FrameType81 = "event";
 export type RequestId16 = string | null;
-export type SessionId88 = string | null;
+export type SessionId92 = string | null;
 export type Event16 = "ui.navigate";
 export type View1 = "chat" | "voice" | "activity" | "memory" | "settings";
 export type ConversationId5 = string | null;
 export type OpenCommandPalette1 = boolean;
-export type FrameType78 = "event";
+export type FrameType82 = "event";
 export type RequestId17 = string | null;
-export type SessionId89 = string | null;
+export type SessionId93 = string | null;
 export type Event17 = "conversation_created";
-export type SessionId90 = string;
+export type SessionId94 = string;
 export type Title6 = string;
 export type StartedAt2 = string;
 export type UpdatedAt1 = string;
 export type Turns1 = number;
 export type InitialMessage = string | null;
 export type OpenInUi1 = boolean;
-export type FrameType79 = "event";
+export type FrameType83 = "event";
 export type RequestId18 = string | null;
-export type SessionId91 = string | null;
+export type SessionId95 = string | null;
 export type Event18 = "memory.updated";
-export type Action5 = "added" | "deleted" | "updated";
+export type Action6 = "added" | "deleted" | "updated";
 export type FactId = string | null;
 export type Section = string | null;
 export type Text5 = string | null;
 export type RemovedCount = number;
 export type RemovedIds = string[];
-export type FrameType80 = "event";
+export type FrameType84 = "event";
 export type RequestId19 = string | null;
-export type SessionId92 = string | null;
+export type SessionId96 = string | null;
 export type Event19 = "timer.fired";
 export type TimerId = string;
 export type Label1 = string;
 export type DurationSeconds1 = number;
 export type FiresAt = string;
 export type FiredAt = string;
-export type FrameType81 = "event";
+export type FrameType85 = "event";
 export type RequestId20 = string | null;
-export type SessionId93 = string | null;
+export type SessionId97 = string | null;
 export type Event20 = "reminder.fired";
 export type ReminderId = string;
 export type Message1 = string;
 export type DueAt = string;
 export type FiredAt1 = string;
 export type Status1 = "ok";
-export type SessionId94 = string;
+export type SessionId98 = string;
 export type Text6 = string;
 export type ActiveConversationId = string | null;
 export type ApprovalId3 = string;
@@ -706,13 +740,13 @@ export type FailedConsolidation = string | null;
 export type Date2 = string;
 export type Content2 = string;
 export type Date3 = string;
-export type SessionId95 = string;
+export type SessionId99 = string;
 export type Time = string;
 export type Summary = string;
 export type Trivial = boolean;
 export type Episodes = EpisodeItem[];
-export type Name3 = string;
-export type Id63 = string;
+export type Name4 = string;
+export type Id67 = string;
 export type Date4 = string;
 export type Source = string;
 export type Text7 = string;
@@ -720,7 +754,7 @@ export type Entries = MemoryFactItem[];
 export type Sections = MemorySectionItem[];
 export type LastConsolidated1 = string | null;
 export type FailedConsolidation1 = string | null;
-export type Id64 = string;
+export type Id68 = string;
 export type Date5 = string;
 export type Source1 = string;
 export type Text8 = string;
@@ -729,7 +763,7 @@ export type Reason3 = string | null;
 export type Entries1 = MemoryArchiveItem[];
 export type Raw = string;
 export type LastConsolidatedAt = string | null;
-export type SessionId96 = string;
+export type SessionId100 = string;
 export type Status2 = string;
 export type RetryCount = number;
 export type Error2 = string | null;
@@ -738,19 +772,19 @@ export type NextRetryAt = string | null;
 export type Pending = ConsolidationSessionStatus[];
 export type Failed = ConsolidationSessionStatus[];
 export type CompletedCount = number;
-export type SessionId97 = string;
+export type SessionId101 = string;
 export type Ok1 = boolean;
 export type Status3 = string;
 export type Error3 = string | null;
 export type Ok2 = boolean;
 export type RemovedCount1 = number;
 export type RemovedIds1 = string[];
-export type SessionId98 = string;
+export type SessionId102 = string;
 export type StartedAt3 = string;
 export type Title7 = string;
 export type MessageCount = number;
 export type Transcripts = TranscriptSummaryItem[];
-export type SessionId99 = string;
+export type SessionId103 = string;
 export type StartedAt4 = string;
 export type Title8 = string;
 export type Role1 = string;
@@ -762,7 +796,7 @@ export type ToolCalls = {
 export type Messages = TranscriptMessageItem[];
 export type Status4 = "ok";
 export type Date6 = string;
-export type SessionId100 = string;
+export type SessionId104 = string;
 export type ConversationId6 = string;
 export type Title9 = string;
 export type Turns2 = number;
@@ -773,12 +807,12 @@ export type UpdatedAt2 = string;
 export type EpisodeSummary = string;
 export type Conversations = ConversationSummary[];
 export type Date7 = string;
-export type SessionId101 = string;
+export type SessionId105 = string;
 export type Time1 = string;
 export type User = string;
 export type Assistant = string;
 export type Turns3 = ConversationTurn[];
-export type SessionId102 = string;
+export type SessionId106 = string;
 export type Title10 = string;
 export type Pinned3 = boolean;
 export type Role2 = "user" | "assistant";
@@ -788,15 +822,15 @@ export type ToolCalls1 = {
   [k: string]: unknown | undefined;
 }[];
 export type Messages1 = ConversationResumeMessage[];
-export type SessionId103 = string;
+export type SessionId107 = string;
 export type Title11 = string;
-export type SessionId104 = string;
+export type SessionId108 = string;
 export type Pinned4 = boolean;
-export type SessionId105 = string;
+export type SessionId109 = string;
 export type Title12 = string;
-export type Filename = string;
+export type Filename1 = string;
 export type Content3 = string;
-export type SessionId106 = string;
+export type SessionId110 = string;
 export type Deleted = boolean;
 export type UndoWindowSeconds = number;
 export type DeletedCount = number;
@@ -808,7 +842,7 @@ export type Model = string;
 export type Host = string;
 export type Port = number;
 export type ApprovalTimeoutSeconds = number;
-export type Name4 = string;
+export type Name5 = string;
 export type Description1 = string;
 export type RiskLevel2 = "read_only" | "reversible" | "destructive";
 export type Tools = ToolInfo[];
@@ -830,14 +864,14 @@ export type ScreenCaptureTarget = ("active_window" | "full_screen") | null;
 export type TaskId2 = string;
 export type Status5 = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type Output1 = string;
-export type SessionId107 = string;
+export type SessionId111 = string;
 export type Role3 = "user" | "assistant";
 export type Text11 = string;
 export type Timestamp3 = string;
 export type CallId13 = string | null;
 export type Messages2 = VoiceHistoryMessageItem[];
 export type ConversationId7 = string;
-export type SessionId108 = string;
+export type SessionId112 = string;
 export type Title13 = string;
 export type UpdatedAt3 = string;
 export type TurnCount1 = number;
@@ -847,7 +881,7 @@ export type Date8 = string;
 export type LastTime1 = string;
 export type Pinned5 = boolean;
 export type Conversations1 = VoiceConversationListItem[];
-export type SessionId109 = string;
+export type SessionId113 = string;
 export type ConversationId8 = string;
 export type Title14 = string;
 export type UpdatedAt4 = string;
@@ -868,7 +902,7 @@ export type CallId14 = string | null;
 export type Results = ConversationSearchHit[];
 export type Found = boolean;
 export type ConversationId9 = string;
-export type SessionId110 = string;
+export type SessionId114 = string;
 export type Title15 = string;
 export type UpdatedAt5 = string;
 export type EpisodeSummary3 = string;
@@ -884,7 +918,7 @@ export type ItemId = string;
 export type Section1 = string;
 export type Date9 = string;
 export type Source3 = string;
-export type SessionId111 = string;
+export type SessionId115 = string;
 export type ConversationId10 = string;
 export type Text12 = string;
 export type Score1 = number;
@@ -892,7 +926,7 @@ export type SemanticScore1 = number | null;
 export type LexicalScore1 = number;
 export type Results1 = MemorySearchHit[];
 export type Ok3 = boolean;
-export type SessionId112 = string | null;
+export type SessionId116 = string | null;
 export type Title16 = string | null;
 export type Message3 = string;
 export type Ok4 = boolean;
@@ -900,20 +934,20 @@ export type View2 = "chat" | "voice" | "activity" | "memory" | "settings";
 export type ActiveConversationId1 = string | null;
 export type OpenCommandPalette2 = boolean;
 export type Ok5 = boolean;
-export type SessionId113 = string;
+export type SessionId117 = string;
 export type Title17 = string;
 export type Message4 = string;
 export type OpenInUi2 = boolean;
 export type Ok6 = boolean;
-export type SessionId114 = string;
+export type SessionId118 = string;
 export type Title18 = string;
 export type RequestId21 = string;
 export type Status6 = string;
 export type Ok7 = boolean;
-export type SessionId115 = string;
+export type SessionId119 = string;
 export type Title19 = string;
 export type Ok8 = boolean;
-export type SessionId116 = string;
+export type SessionId120 = string;
 export type Deleted1 = boolean;
 export type RequiresConfirmation = boolean;
 export type EpisodesRemoved = number;
@@ -929,14 +963,15 @@ export type TaskId3 = string;
 export type Status7 = string;
 export type Message6 = string;
 export type Ok12 = boolean;
-export type Status8 = "focused" | "launched";
+export type Status8 = "focused" | "launched" | "non_interactive_desktop";
 export type App = string;
 export type WindowTitle1 = string | null;
 export type Hwnd1 = number | null;
 export type Executable = string | null;
 export type TargetPath1 = string | null;
+export type Error4 = string | null;
 export type Ok13 = boolean;
-export type Action6 =
+export type Action7 =
   | "mute"
   | "unmute"
   | "toggle_mute"
@@ -948,26 +983,32 @@ export type Action6 =
   | "previous_track";
 export type Level2 = number | null;
 export type Ok14 = boolean;
+export type Kind2 = string;
 export type Text13 = string;
 export type Truncated1 = boolean;
 export type CharCount = number;
 export type TotalChars = number;
+export type Image = {
+  [k: string]: unknown | undefined;
+} | null;
+export type FilePaths = string[];
+export type HasImageFiles = boolean;
 export type HistoryEnabled = boolean;
 export type TotalItems = number;
 export type Index1 = number;
-export type Id65 = string;
+export type Id69 = string;
 export type Timestamp7 = string;
-export type Kind2 = string;
+export type Kind3 = string;
 export type Text14 = string | null;
 export type Truncated2 = boolean;
 export type CharCount1 = number;
 export type TotalChars1 = number;
-export type Width = number | null;
-export type Height = number | null;
+export type Width1 = number | null;
+export type Height1 = number | null;
 export type Format = string | null;
 export type ImageBytesBase64 = string | null;
 export type SizeBytes = number | null;
-export type Image = {
+export type Image1 = {
   [k: string]: unknown | undefined;
 } | null;
 export type Items = ClipboardItem[];
@@ -985,7 +1026,7 @@ export type Browser1 = string | null;
 export type Message8 = string | null;
 export type Ok17 = boolean;
 export type Success2 = boolean;
-export type Action7 = string;
+export type Action8 = string;
 export type Status11 = string;
 export type Level3 = number | null;
 export type CurrentBrightness = number | null;
@@ -997,26 +1038,60 @@ export type Message9 = string | null;
 export type Ok18 = boolean;
 export type CharCount2 = number;
 export type Ok19 = boolean;
-export type WindowTitle3 = string;
+export type Status12 = string;
+export type Action9 = string;
+export type UpdatedClipboard = boolean;
+export type Preview = string;
+export type Error5 = string | null;
+export type Ok20 = boolean;
+export type Status13 = string;
+export type SavedPath = string;
+export type Path = string;
+export type Filename2 = string;
+export type SizeBytes1 = number;
+export type Kind4 = string;
+export type Error6 = string | null;
+export type Ok21 = boolean;
+export type Status14 = "opened" | "error" | "non_interactive_desktop";
+export type Kind5 = ("file" | "url") | null;
+export type Target3 = string;
+export type Filename3 = string | null;
+export type Error7 = string | null;
+export type Ok22 = boolean;
+export type Status15 = "ok" | "minimized" | "not_found" | "empty" | "error" | "non_interactive_desktop";
+export type Source4 = string | null;
+export type WindowTitle3 = string | null;
+export type ProcessName = string | null;
+export type Question1 = string | null;
+export type Width2 = number | null;
+export type Height2 = number | null;
+export type ArtifactPath = string | null;
+export type UiaText = string | null;
+export type Text15 = string | null;
+export type Message10 = string | null;
+export type ImageBase64 = string | null;
+export type ImageMimeType = string | null;
+export type Ok23 = boolean;
+export type WindowTitle4 = string;
 export type Count = number;
 export type Index3 = number;
-export type Name5 = string;
+export type Name6 = string;
 export type AutomationId = string;
 export type ControlType1 = string;
 export type Value2 = string | null;
 export type X2 = number;
 export type Y2 = number;
 export type Elements = UiElementItem[];
-export type Ok20 = boolean;
-export type Status12 = string;
-export type Name6 = string;
+export type Ok24 = boolean;
+export type Status16 = string;
+export type Name7 = string;
 export type ControlType2 = string;
 export type X3 = number;
 export type Y3 = number;
-export type Method61 = string;
-export type Ok21 = boolean;
-export type Status13 = string;
-export type Action8 = string;
+export type Method65 = string;
+export type Ok25 = boolean;
+export type Status17 = string;
+export type Action10 = string;
 export type X4 = number | null;
 export type Y4 = number | null;
 export type Clicks2 = number | null;
@@ -1025,14 +1100,14 @@ export type CharCount3 = number | null;
 export type Keys2 = string[] | null;
 export type Delta2 = number | null;
 export type Seconds2 = number | null;
-export type Ok22 = boolean;
+export type Ok26 = boolean;
 export type SnapshotId = string;
-export type WindowTitle4 = string;
+export type WindowTitle5 = string;
 export type Count1 = number;
 export type ElementCount = number | null;
 export type Ref2 = string;
 export type Role7 = string;
-export type Name7 = string;
+export type Name8 = string;
 export type Value3 = string | null;
 export type X5 = number;
 export type Y5 = number;
@@ -1041,43 +1116,43 @@ export type ControlType3 = string;
 export type Enabled = boolean;
 export type Focused = boolean;
 export type Elements1 = UiSnapshotElement[];
-export type Ok23 = boolean;
-export type Status14 = string;
+export type Ok27 = boolean;
+export type Status18 = string;
 export type SnapshotId1 = string;
-export type Action9 = string;
+export type Action11 = string;
 export type Ref3 = string;
 export type Role8 = string;
-export type Name8 = string;
-export type Method62 = string;
+export type Name9 = string;
+export type Method66 = string;
 export type X6 = number | null;
 export type Y6 = number | null;
 export type CharCount4 = number | null;
 export type IntervalMs2 = number | null;
 export type WindowChanged = boolean;
-export type WindowTitle5 = string;
+export type WindowTitle6 = string;
 export type Ref4 = string;
 export type Role9 = string;
-export type Name9 = string;
+export type Name10 = string;
 export type OldValue = string | null;
 export type NewValue = string | null;
 export type ChangedValues = UiDiffChangedValue[];
 export type AddedElements = UiSnapshotElement[];
 export type RemovedCount3 = number;
-export type Ok24 = boolean;
-export type Status15 = "completed" | "stopped_on_window_change" | "partial_error";
+export type Ok28 = boolean;
+export type Status19 = "completed" | "stopped_on_window_change" | "partial_error";
 export type StepsExecuted = number;
 export type StepResults = {
   [k: string]: unknown | undefined;
 }[];
-export type Ok25 = boolean;
+export type Ok29 = boolean;
 export type RepoPath1 = string;
 export type Branch = string;
 export type IsClean = boolean;
-export type Status16 = string;
+export type Status20 = string;
 export type Staged = string[];
 export type Unstaged = string[];
 export type Untracked = string[];
-export type Path = string;
+export type Path1 = string;
 export type Head = string;
 export type Branch1 = string;
 export type Worktrees = GitWorktreeItem[];
@@ -1131,6 +1206,7 @@ export interface CleaProtocolSchema {
   health_ping_request: HealthPingRequest;
   session_new_request: SessionNewRequest;
   chat_send_request: ChatSendRequest;
+  chat_image_attachment: ChatImageAttachment;
   approval_respond_request: ApprovalRespondRequest;
   memory_get_request: MemoryGetRequest;
   memory_get_daily_request: MemoryGetDailyRequest;
@@ -1186,6 +1262,10 @@ export interface CleaProtocolSchema {
   os_open_url_request: OsOpenUrlRequest;
   os_control_system_request: OsControlSystemRequest;
   os_write_clipboard_request: OsWriteClipboardRequest;
+  os_transform_clipboard_request: OsTransformClipboardRequest;
+  os_save_clipboard_to_file_request: OsSaveClipboardToFileRequest;
+  os_open_path_or_url_request: OsOpenPathOrUrlRequest;
+  os_inspect_screen_request: OsInspectScreenRequest;
   os_inspect_ui_elements_request: OsInspectUiElementsRequest;
   os_click_ui_element_request: OsClickUiElementRequest;
   os_gui_action_request: OsGuiActionRequest;
@@ -1258,7 +1338,15 @@ export interface ChatSendRequest {
   params: ChatSendParams;
 }
 export interface ChatSendParams {
-  text: Text;
+  text?: Text;
+  image?: ChatImageAttachment | null;
+}
+export interface ChatImageAttachment {
+  data_base64: DataBase64;
+  mime_type?: MimeType;
+  name?: Name;
+  width?: Width;
+  height?: Height;
 }
 export interface ChatFocusRequest {
   frame_type?: FrameType3;
@@ -1798,11 +1886,56 @@ export interface OsWriteClipboardRequest {
 export interface OsWriteClipboardParams {
   text: Text1;
 }
-export interface OsInspectUiElementsRequest {
+export interface OsTransformClipboardRequest {
   frame_type?: FrameType54;
   id?: Id55;
   session_id?: SessionId64;
   method?: Method54;
+  params: OsTransformClipboardParams;
+}
+export interface OsTransformClipboardParams {
+  action: Action2;
+  update_clipboard?: UpdateClipboard;
+}
+export interface OsSaveClipboardToFileRequest {
+  frame_type?: FrameType55;
+  id?: Id56;
+  session_id?: SessionId65;
+  method?: Method55;
+  params?: OsSaveClipboardToFileParams;
+}
+export interface OsSaveClipboardToFileParams {
+  filename?: Filename;
+  directory?: Directory;
+}
+export interface OsOpenPathOrUrlRequest {
+  frame_type?: FrameType56;
+  id?: Id57;
+  session_id?: SessionId66;
+  method?: Method56;
+  params?: OsOpenPathOrUrlParams;
+}
+export interface OsOpenPathOrUrlParams {
+  target?: Target;
+  use_clipboard?: UseClipboard;
+}
+export interface OsInspectScreenRequest {
+  frame_type?: FrameType57;
+  id?: Id58;
+  session_id?: SessionId67;
+  method?: Method57;
+  params?: OsInspectScreenParams;
+}
+export interface OsInspectScreenParams {
+  target?: Target1;
+  question?: Question;
+  include_image?: IncludeImage;
+}
+export interface OsInspectUiElementsRequest {
+  frame_type?: FrameType58;
+  id?: Id59;
+  session_id?: SessionId68;
+  method?: Method58;
   params?: OsInspectUiElementsParams;
 }
 export interface OsInspectUiElementsParams {
@@ -1810,26 +1943,26 @@ export interface OsInspectUiElementsParams {
   max_elements?: MaxElements;
 }
 export interface OsClickUiElementRequest {
-  frame_type?: FrameType55;
-  id?: Id56;
-  session_id?: SessionId65;
-  method?: Method55;
+  frame_type?: FrameType59;
+  id?: Id60;
+  session_id?: SessionId69;
+  method?: Method59;
   params: OsClickUiElementParams;
 }
 export interface OsClickUiElementParams {
-  name: Name;
+  name: Name1;
   control_type?: ControlType;
   app_name?: AppName3;
 }
 export interface OsGuiActionRequest {
-  frame_type?: FrameType56;
-  id?: Id57;
-  session_id?: SessionId66;
-  method?: Method56;
+  frame_type?: FrameType60;
+  id?: Id61;
+  session_id?: SessionId70;
+  method?: Method60;
   params: OsGuiActionParams;
 }
 export interface OsGuiActionParams {
-  action: Action2;
+  action: Action3;
   x?: X;
   y?: Y;
   text?: Text2;
@@ -1840,10 +1973,10 @@ export interface OsGuiActionParams {
   seconds?: Seconds;
 }
 export interface OsUiSnapshotRequest {
-  frame_type?: FrameType57;
-  id?: Id58;
-  session_id?: SessionId67;
-  method?: Method57;
+  frame_type?: FrameType61;
+  id?: Id62;
+  session_id?: SessionId71;
+  method?: Method61;
   params?: OsUiSnapshotParams;
 }
 export interface OsUiSnapshotParams {
@@ -1852,23 +1985,23 @@ export interface OsUiSnapshotParams {
   interactive_only?: InteractiveOnly;
 }
 export interface OsUiActRequest {
-  frame_type?: FrameType58;
-  id?: Id59;
-  session_id?: SessionId68;
-  method?: Method58;
+  frame_type?: FrameType62;
+  id?: Id63;
+  session_id?: SessionId72;
+  method?: Method62;
   params: OsUiActParams;
 }
 export interface OsUiActParams {
   ref: Ref;
-  action: Action3;
+  action: Action4;
   value?: Value;
   interval_ms?: IntervalMs;
 }
 export interface OsUiBatchRequest {
-  frame_type?: FrameType59;
-  id?: Id60;
-  session_id?: SessionId69;
-  method?: Method59;
+  frame_type?: FrameType63;
+  id?: Id64;
+  session_id?: SessionId73;
+  method?: Method63;
   params: OsUiBatchParams;
 }
 export interface OsUiBatchParams {
@@ -1879,7 +2012,7 @@ export interface OsUiBatchParams {
 export interface UiBatchStep {
   op: Op;
   ref?: Ref1;
-  action?: Action4;
+  action?: Action5;
   value?: Value1;
   keys?: Keys1;
   delta?: Delta1;
@@ -1891,10 +2024,10 @@ export interface UiBatchStep {
   interval_ms?: IntervalMs1;
 }
 export interface WorkspaceGitInspectRequest {
-  frame_type?: FrameType60;
-  id?: Id61;
-  session_id?: SessionId70;
-  method?: Method60;
+  frame_type?: FrameType64;
+  id?: Id65;
+  session_id?: SessionId74;
+  method?: Method64;
   params?: WorkspaceGitInspectParams;
 }
 export interface WorkspaceGitInspectParams {
@@ -1906,10 +2039,10 @@ export interface WorkspaceGitInspectParams {
  * Daemon-to-client response paired with a request ID.
  */
 export interface ResponseFrame {
-  frame_type?: FrameType61;
-  id: Id62;
+  frame_type?: FrameType65;
+  id: Id66;
   ok?: Ok;
-  session_id?: SessionId71;
+  session_id?: SessionId75;
   result?: Result;
   error?: Error;
 }
@@ -1917,9 +2050,9 @@ export interface Result {
   [k: string]: unknown | undefined;
 }
 export interface AssistantTokenEvent {
-  frame_type?: FrameType62;
+  frame_type?: FrameType66;
   request_id?: RequestId;
-  session_id?: SessionId72;
+  session_id?: SessionId76;
   event?: Event1;
   data: AssistantTokenData;
 }
@@ -1927,15 +2060,15 @@ export interface AssistantTokenData {
   text: Text3;
 }
 export interface ToolCallStartedEvent {
-  frame_type?: FrameType63;
+  frame_type?: FrameType67;
   request_id?: RequestId1;
-  session_id?: SessionId73;
+  session_id?: SessionId77;
   event?: Event2;
   data: ToolCallStartedData;
 }
 export interface ToolCallStartedData {
   call_id: CallId2;
-  name: Name1;
+  name: Name2;
   arguments?: Arguments;
   risk_level: RiskLevel;
 }
@@ -1943,23 +2076,23 @@ export interface Arguments {
   [k: string]: unknown | undefined;
 }
 export interface ToolCallFinishedEvent {
-  frame_type?: FrameType64;
+  frame_type?: FrameType68;
   request_id?: RequestId2;
-  session_id?: SessionId74;
+  session_id?: SessionId78;
   event?: Event3;
   data: ToolCallFinishedData;
 }
 export interface ToolCallFinishedData {
   call_id: CallId3;
-  name: Name2;
+  name: Name3;
   is_error: IsError;
   output: Output;
   duration_ms: DurationMs;
 }
 export interface ApprovalRequestedEvent {
-  frame_type?: FrameType65;
+  frame_type?: FrameType69;
   request_id?: RequestId3;
-  session_id?: SessionId75;
+  session_id?: SessionId79;
   event?: Event4;
   data: ApprovalRequestedData;
 }
@@ -1975,9 +2108,9 @@ export interface Arguments1 {
   [k: string]: unknown | undefined;
 }
 export interface ApprovalResolvedEvent {
-  frame_type?: FrameType66;
+  frame_type?: FrameType70;
   request_id?: RequestId4;
-  session_id?: SessionId76;
+  session_id?: SessionId80;
   event?: Event5;
   data: ApprovalResolvedData;
 }
@@ -1987,9 +2120,9 @@ export interface ApprovalResolvedData {
   reason: Reason1;
 }
 export interface TaskStatusEvent {
-  frame_type?: FrameType67;
+  frame_type?: FrameType71;
   request_id?: RequestId5;
-  session_id?: SessionId77;
+  session_id?: SessionId81;
   event?: Event6;
   data: TaskStatusData;
 }
@@ -2004,9 +2137,9 @@ export interface TaskStatusData {
   detail?: Detail;
 }
 export interface VoiceStateEvent {
-  frame_type?: FrameType68;
+  frame_type?: FrameType72;
   request_id?: RequestId6;
-  session_id?: SessionId78;
+  session_id?: SessionId82;
   event?: Event7;
   data: VoiceStateData;
 }
@@ -2015,9 +2148,9 @@ export interface VoiceStateData {
   error?: Error1;
 }
 export interface CallStartedEvent {
-  frame_type?: FrameType69;
+  frame_type?: FrameType73;
   request_id?: RequestId7;
-  session_id?: SessionId79;
+  session_id?: SessionId83;
   event?: Event8;
   data: CallStartedData;
 }
@@ -2027,9 +2160,9 @@ export interface CallStartedData {
   started_at?: StartedAt1;
 }
 export interface CallEndedEvent {
-  frame_type?: FrameType70;
+  frame_type?: FrameType74;
   request_id?: RequestId8;
-  session_id?: SessionId80;
+  session_id?: SessionId84;
   event?: Event9;
   data: CallEndedData;
 }
@@ -2040,9 +2173,9 @@ export interface CallEndedData {
   duration_seconds?: DurationSeconds;
 }
 export interface TranscriptEvent {
-  frame_type?: FrameType71;
+  frame_type?: FrameType75;
   request_id?: RequestId9;
-  session_id?: SessionId81;
+  session_id?: SessionId85;
   event?: Event10;
   data: TranscriptData;
 }
@@ -2054,21 +2187,21 @@ export interface TranscriptData {
   timestamp?: Timestamp;
 }
 export interface ScreenCaptureStateEvent {
-  frame_type?: FrameType72;
+  frame_type?: FrameType76;
   request_id?: RequestId10;
-  session_id?: SessionId82;
+  session_id?: SessionId86;
   event?: Event11;
   data: ScreenCaptureStateData;
 }
 export interface ScreenCaptureStateData {
   active: Active;
-  target?: Target;
+  target?: Target2;
   call_id?: CallId8;
 }
 export interface UsageEvent {
-  frame_type?: FrameType73;
+  frame_type?: FrameType77;
   request_id?: RequestId11;
-  session_id?: SessionId83;
+  session_id?: SessionId87;
   event?: Event12;
   data: UsageData;
 }
@@ -2081,9 +2214,9 @@ export interface UsageData {
   thought_tokens?: ThoughtTokens;
 }
 export interface ErrorEvent {
-  frame_type?: FrameType74;
+  frame_type?: FrameType78;
   request_id?: RequestId12;
-  session_id?: SessionId84;
+  session_id?: SessionId88;
   event?: Event13;
   data: ErrorData;
 }
@@ -2092,14 +2225,14 @@ export interface ErrorData {
   code?: Code;
 }
 export interface ConversationUpdatedEvent {
-  frame_type?: FrameType75;
+  frame_type?: FrameType79;
   request_id?: RequestId13;
-  session_id?: SessionId85;
+  session_id?: SessionId89;
   event?: Event14;
   data: ConversationUpdatedData;
 }
 export interface ConversationUpdatedData {
-  session_id: SessionId86;
+  session_id: SessionId90;
   title?: Title5;
   pinned?: Pinned1;
   updated_at?: UpdatedAt;
@@ -2109,9 +2242,9 @@ export interface ConversationUpdatedData {
   request_id?: RequestId14;
 }
 export interface ConversationDeletedEvent {
-  frame_type?: FrameType76;
+  frame_type?: FrameType80;
   request_id?: RequestId15;
-  session_id?: SessionId87;
+  session_id?: SessionId91;
   event?: Event15;
   data: ConversationDeletedData;
 }
@@ -2120,9 +2253,9 @@ export interface ConversationDeletedData {
   all?: All;
 }
 export interface UiNavigateEvent {
-  frame_type?: FrameType77;
+  frame_type?: FrameType81;
   request_id?: RequestId16;
-  session_id?: SessionId88;
+  session_id?: SessionId92;
   event?: Event16;
   data: UiNavigateData;
 }
@@ -2132,14 +2265,14 @@ export interface UiNavigateData {
   open_command_palette?: OpenCommandPalette1;
 }
 export interface ConversationCreatedEvent {
-  frame_type?: FrameType78;
+  frame_type?: FrameType82;
   request_id?: RequestId17;
-  session_id?: SessionId89;
+  session_id?: SessionId93;
   event?: Event17;
   data: ConversationCreatedData;
 }
 export interface ConversationCreatedData {
-  session_id: SessionId90;
+  session_id: SessionId94;
   title: Title6;
   started_at?: StartedAt2;
   updated_at?: UpdatedAt1;
@@ -2148,14 +2281,14 @@ export interface ConversationCreatedData {
   open_in_ui?: OpenInUi1;
 }
 export interface MemoryUpdatedEvent {
-  frame_type?: FrameType79;
+  frame_type?: FrameType83;
   request_id?: RequestId18;
-  session_id?: SessionId91;
+  session_id?: SessionId95;
   event?: Event18;
   data: MemoryUpdatedData;
 }
 export interface MemoryUpdatedData {
-  action?: Action5;
+  action?: Action6;
   fact_id?: FactId;
   section?: Section;
   text?: Text5;
@@ -2163,9 +2296,9 @@ export interface MemoryUpdatedData {
   removed_ids?: RemovedIds;
 }
 export interface TimerFiredEvent {
-  frame_type?: FrameType80;
+  frame_type?: FrameType84;
   request_id?: RequestId19;
-  session_id?: SessionId92;
+  session_id?: SessionId96;
   event?: Event19;
   data: TimerFiredData;
 }
@@ -2177,9 +2310,9 @@ export interface TimerFiredData {
   fired_at: FiredAt;
 }
 export interface ReminderFiredEvent {
-  frame_type?: FrameType81;
+  frame_type?: FrameType85;
   request_id?: RequestId20;
-  session_id?: SessionId93;
+  session_id?: SessionId97;
   event?: Event20;
   data: ReminderFiredData;
 }
@@ -2244,6 +2377,10 @@ export interface MethodResults {
   os_open_url: OsOpenUrlResult;
   os_control_system: OsControlSystemResult;
   os_write_clipboard: OsWriteClipboardResult;
+  os_transform_clipboard: OsTransformClipboardResult;
+  os_save_clipboard_to_file: OsSaveClipboardToFileResult;
+  os_open_path_or_url: OsOpenPathOrUrlResult;
+  os_inspect_screen: OsInspectScreenResult;
   os_inspect_ui_elements: OsInspectUiElementsResult;
   os_click_ui_element: OsClickUiElementResult;
   os_gui_action: OsGuiActionResult;
@@ -2256,7 +2393,7 @@ export interface HealthPingResult {
   status?: Status1;
 }
 export interface SessionNewResult {
-  session_id: SessionId94;
+  session_id: SessionId98;
 }
 export interface ChatSendResult {
   text: Text6;
@@ -2283,7 +2420,7 @@ export interface MemoryEpisodesResult {
 }
 export interface EpisodeItem {
   date: Date3;
-  session_id: SessionId95;
+  session_id: SessionId99;
   time: Time;
   summary: Summary;
   trivial?: Trivial;
@@ -2294,11 +2431,11 @@ export interface MemoryFactsResult {
   failed_consolidation?: FailedConsolidation1;
 }
 export interface MemorySectionItem {
-  name: Name3;
+  name: Name4;
   entries?: Entries;
 }
 export interface MemoryFactItem {
-  id: Id63;
+  id: Id67;
   date: Date4;
   source: Source;
   text: Text7;
@@ -2308,7 +2445,7 @@ export interface MemoryArchiveResult {
   raw?: Raw;
 }
 export interface MemoryArchiveItem {
-  id: Id64;
+  id: Id68;
   date: Date5;
   source: Source1;
   text: Text8;
@@ -2322,7 +2459,7 @@ export interface MemoryStatusResult {
   completed_count?: CompletedCount;
 }
 export interface ConsolidationSessionStatus {
-  session_id: SessionId96;
+  session_id: SessionId100;
   status: Status2;
   retry_count: RetryCount;
   error?: Error2;
@@ -2330,7 +2467,7 @@ export interface ConsolidationSessionStatus {
   next_retry_at?: NextRetryAt;
 }
 export interface MemoryReconsolidateResult {
-  session_id: SessionId97;
+  session_id: SessionId101;
   ok: Ok1;
   status: Status3;
   error?: Error3;
@@ -2344,13 +2481,13 @@ export interface TranscriptsListResult {
   transcripts: Transcripts;
 }
 export interface TranscriptSummaryItem {
-  session_id: SessionId98;
+  session_id: SessionId102;
   started_at: StartedAt3;
   title: Title7;
   message_count: MessageCount;
 }
 export interface TranscriptsGetResult {
-  session_id: SessionId99;
+  session_id: SessionId103;
   started_at: StartedAt4;
   title: Title8;
   messages: Messages;
@@ -2369,7 +2506,7 @@ export interface ConversationsListResult {
 }
 export interface ConversationSummary {
   date: Date6;
-  session_id: SessionId100;
+  session_id: SessionId104;
   conversation_id?: ConversationId6;
   title: Title9;
   turns: Turns2;
@@ -2381,7 +2518,7 @@ export interface ConversationSummary {
 }
 export interface ConversationsGetResult {
   date: Date7;
-  session_id: SessionId101;
+  session_id: SessionId105;
   turns: Turns3;
 }
 export interface ConversationTurn {
@@ -2390,7 +2527,7 @@ export interface ConversationTurn {
   assistant: Assistant;
 }
 export interface ConversationResumeResult {
-  session_id: SessionId102;
+  session_id: SessionId106;
   title: Title10;
   pinned?: Pinned3;
   messages: Messages1;
@@ -2402,21 +2539,21 @@ export interface ConversationResumeMessage {
   tool_calls?: ToolCalls1;
 }
 export interface ConversationRenameResult {
-  session_id: SessionId103;
+  session_id: SessionId107;
   title: Title11;
 }
 export interface ConversationPinResult {
-  session_id: SessionId104;
+  session_id: SessionId108;
   pinned: Pinned4;
 }
 export interface ConversationExportResult {
-  session_id: SessionId105;
+  session_id: SessionId109;
   title: Title12;
-  filename: Filename;
+  filename: Filename1;
   content: Content3;
 }
 export interface ConversationDeleteResult {
-  session_id: SessionId106;
+  session_id: SessionId110;
   deleted: Deleted;
   undo_window_seconds?: UndoWindowSeconds;
 }
@@ -2441,7 +2578,7 @@ export interface SettingsGetResult {
   permission_tiers: PermissionTiers;
 }
 export interface ToolInfo {
-  name: Name4;
+  name: Name5;
   description: Description1;
   risk_level: RiskLevel2;
 }
@@ -2473,7 +2610,7 @@ export interface VoiceDelegateTaskResult {
   output?: Output1;
 }
 export interface VoiceHistoryResult {
-  session_id?: SessionId107;
+  session_id?: SessionId111;
   messages?: Messages2;
 }
 export interface VoiceHistoryMessageItem {
@@ -2487,7 +2624,7 @@ export interface VoiceListConversationsResult {
 }
 export interface VoiceConversationListItem {
   conversation_id?: ConversationId7;
-  session_id?: SessionId108;
+  session_id?: SessionId112;
   title: Title13;
   updated_at?: UpdatedAt3;
   turn_count?: TurnCount1;
@@ -2501,7 +2638,7 @@ export interface VoiceSearchConversationsResult {
   results?: Results;
 }
 export interface ConversationSearchHit {
-  session_id?: SessionId109;
+  session_id?: SessionId113;
   conversation_id?: ConversationId8;
   title: Title14;
   updated_at?: UpdatedAt4;
@@ -2525,7 +2662,7 @@ export interface ConversationSearchSnippet {
 export interface VoiceReadConversationResult {
   found?: Found;
   conversation_id?: ConversationId9;
-  session_id?: SessionId110;
+  session_id?: SessionId114;
   title?: Title15;
   updated_at?: UpdatedAt5;
   episode_summary?: EpisodeSummary3;
@@ -2548,7 +2685,7 @@ export interface MemorySearchHit {
   section?: Section1;
   date?: Date9;
   source?: Source3;
-  session_id?: SessionId111;
+  session_id?: SessionId115;
   conversation_id?: ConversationId10;
   text: Text12;
   score?: Score1;
@@ -2557,7 +2694,7 @@ export interface MemorySearchHit {
 }
 export interface VoicePostToActiveChatResult {
   ok: Ok3;
-  session_id?: SessionId112;
+  session_id?: SessionId116;
   title?: Title16;
   message?: Message3;
 }
@@ -2569,26 +2706,26 @@ export interface UiNavigateResult {
 }
 export interface ChatCreateAndOpenResult {
   ok?: Ok5;
-  session_id: SessionId113;
+  session_id: SessionId117;
   title: Title17;
   message?: Message4;
   open_in_ui?: OpenInUi2;
 }
 export interface ChatSendFromVoiceResult {
   ok?: Ok6;
-  session_id: SessionId114;
+  session_id: SessionId118;
   title?: Title18;
   request_id?: RequestId21;
   status?: Status6;
 }
 export interface ChatRenameResult {
   ok?: Ok7;
-  session_id: SessionId115;
+  session_id: SessionId119;
   title: Title19;
 }
 export interface ChatDeleteResult {
   ok?: Ok8;
-  session_id: SessionId116;
+  session_id: SessionId120;
   deleted?: Deleted1;
   requires_confirmation?: RequiresConfirmation;
   episodes_removed?: EpisodesRemoved;
@@ -2621,37 +2758,42 @@ export interface OsOpenOrFocusAppResult {
   hwnd?: Hwnd1;
   executable?: Executable;
   target_path?: TargetPath1;
+  error?: Error4;
 }
 export interface OsControlMediaVolumeResult {
   ok?: Ok13;
-  action: Action6;
+  action: Action7;
   level?: Level2;
 }
 export interface OsReadClipboardResult {
   ok?: Ok14;
+  kind?: Kind2;
   text?: Text13;
   truncated?: Truncated1;
   char_count?: CharCount;
   total_chars?: TotalChars;
+  image?: Image;
+  file_paths?: FilePaths;
+  has_image_files?: HasImageFiles;
   history_enabled?: HistoryEnabled;
   total_items?: TotalItems;
   items?: Items;
 }
 export interface ClipboardItem {
   index?: Index1;
-  id?: Id65;
+  id?: Id69;
   timestamp?: Timestamp7;
-  kind?: Kind2;
+  kind?: Kind3;
   text?: Text14;
   truncated?: Truncated2;
   char_count?: CharCount1;
   total_chars?: TotalChars1;
-  width?: Width;
-  height?: Height;
+  width?: Width1;
+  height?: Height1;
   format?: Format;
   image_bytes_base64?: ImageBytesBase64;
   size_bytes?: SizeBytes;
-  image?: Image;
+  image?: Image1;
 }
 export interface OsSelectClipboardItemResult {
   ok?: Ok15;
@@ -2672,7 +2814,7 @@ export interface OsOpenUrlResult {
 export interface OsControlSystemResult {
   ok?: Ok17;
   success?: Success2;
-  action?: Action7;
+  action?: Action8;
   status?: Status11;
   level?: Level3;
   current_brightness?: CurrentBrightness;
@@ -2686,15 +2828,57 @@ export interface OsWriteClipboardResult {
   ok?: Ok18;
   char_count?: CharCount2;
 }
-export interface OsInspectUiElementsResult {
+export interface OsTransformClipboardResult {
   ok?: Ok19;
+  status?: Status12;
+  action?: Action9;
+  updated_clipboard?: UpdatedClipboard;
+  preview?: Preview;
+  error?: Error5;
+}
+export interface OsSaveClipboardToFileResult {
+  ok?: Ok20;
+  status?: Status13;
+  saved_path?: SavedPath;
+  path?: Path;
+  filename?: Filename2;
+  size_bytes?: SizeBytes1;
+  kind?: Kind4;
+  error?: Error6;
+}
+export interface OsOpenPathOrUrlResult {
+  ok?: Ok21;
+  status?: Status14;
+  kind?: Kind5;
+  target?: Target3;
+  filename?: Filename3;
+  error?: Error7;
+}
+export interface OsInspectScreenResult {
+  ok?: Ok22;
+  status?: Status15;
+  source?: Source4;
   window_title?: WindowTitle3;
+  process_name?: ProcessName;
+  question?: Question1;
+  width?: Width2;
+  height?: Height2;
+  artifact_path?: ArtifactPath;
+  uia_text?: UiaText;
+  text?: Text15;
+  message?: Message10;
+  image_base64?: ImageBase64;
+  image_mime_type?: ImageMimeType;
+}
+export interface OsInspectUiElementsResult {
+  ok?: Ok23;
+  window_title?: WindowTitle4;
   count?: Count;
   elements?: Elements;
 }
 export interface UiElementItem {
   index: Index3;
-  name?: Name5;
+  name?: Name6;
   automation_id?: AutomationId;
   control_type?: ControlType1;
   value?: Value2;
@@ -2702,18 +2886,18 @@ export interface UiElementItem {
   y?: Y2;
 }
 export interface OsClickUiElementResult {
-  ok?: Ok20;
-  status?: Status12;
-  name?: Name6;
+  ok?: Ok24;
+  status?: Status16;
+  name?: Name7;
   control_type?: ControlType2;
   x?: X3;
   y?: Y3;
-  method?: Method61;
+  method?: Method65;
 }
 export interface OsGuiActionResult {
-  ok?: Ok21;
-  status?: Status13;
-  action?: Action8;
+  ok?: Ok25;
+  status?: Status17;
+  action?: Action10;
   x?: X4;
   y?: Y4;
   clicks?: Clicks2;
@@ -2724,9 +2908,9 @@ export interface OsGuiActionResult {
   seconds?: Seconds2;
 }
 export interface OsUiSnapshotResult {
-  ok?: Ok22;
+  ok?: Ok26;
   snapshot_id?: SnapshotId;
-  window_title?: WindowTitle4;
+  window_title?: WindowTitle5;
   count?: Count1;
   element_count?: ElementCount;
   elements?: Elements1;
@@ -2734,7 +2918,7 @@ export interface OsUiSnapshotResult {
 export interface UiSnapshotElement {
   ref: Ref2;
   role?: Role7;
-  name?: Name7;
+  name?: Name8;
   value?: Value3;
   x?: X5;
   y?: Y5;
@@ -2744,14 +2928,14 @@ export interface UiSnapshotElement {
   focused?: Focused;
 }
 export interface OsUiActResult {
-  ok?: Ok23;
-  status?: Status14;
+  ok?: Ok27;
+  status?: Status18;
   snapshot_id?: SnapshotId1;
-  action?: Action9;
+  action?: Action11;
   ref?: Ref3;
   role?: Role8;
-  name?: Name8;
-  method?: Method62;
+  name?: Name9;
+  method?: Method66;
   x?: X6;
   y?: Y6;
   char_count?: CharCount4;
@@ -2761,7 +2945,7 @@ export interface OsUiActResult {
 }
 export interface UiDiff {
   window_changed?: WindowChanged;
-  window_title?: WindowTitle5;
+  window_title?: WindowTitle6;
   changed_values?: ChangedValues;
   added_elements?: AddedElements;
   removed_count?: RemovedCount3;
@@ -2769,24 +2953,24 @@ export interface UiDiff {
 export interface UiDiffChangedValue {
   ref?: Ref4;
   role?: Role9;
-  name?: Name9;
+  name?: Name10;
   old_value?: OldValue;
   new_value?: NewValue;
 }
 export interface OsUiBatchResult {
-  ok?: Ok24;
-  status?: Status15;
+  ok?: Ok28;
+  status?: Status19;
   steps_executed?: StepsExecuted;
   step_results?: StepResults;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
 }
 export interface WorkspaceGitInspectResult {
-  ok?: Ok25;
+  ok?: Ok29;
   repo_path: RepoPath1;
   branch: Branch;
   is_clean?: IsClean;
-  status?: Status16;
+  status?: Status20;
   staged?: Staged;
   unstaged?: Unstaged;
   untracked?: Untracked;
@@ -2796,7 +2980,7 @@ export interface WorkspaceGitInspectResult {
   diff_truncated?: DiffTruncated;
 }
 export interface GitWorktreeItem {
-  path: Path;
+  path: Path1;
   head?: Head;
   branch?: Branch1;
 }

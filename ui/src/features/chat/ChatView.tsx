@@ -1,12 +1,41 @@
-import { ArrowLeft, ArrowUp, MessageSquarePlus, RefreshCw, Sparkles } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { ArrowLeft, ArrowUp, ImageIcon, MessageSquarePlus, RefreshCw, Sparkles, X } from "lucide-react";
+import { useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { cn } from "@/lib/utils";
 import { useCleaStore } from "@/protocol/store";
+import type { ChatImageAttachment } from "@/protocol/types";
 import { MarkdownContent } from "./MarkdownContent";
 import { ToolCallCard } from "./ToolCallCard";
+
+interface PastedImageInfo {
+  name: string;
+  width: number;
+  height: number;
+  mimeType: string;
+  dataBase64: string;
+}
+
+const MAX_PASTE_IMAGE_BYTES = 12 * 1024 * 1024;
+const IMAGE_EXTENSION_RE = /\.(png|jpe?g|webp|gif|bmp)$/i;
+
+function isImageFileCandidate(file: File | null | undefined, itemType = ""): file is File {
+  if (!file) return false;
+  if (file.type.startsWith("image/") || itemType.startsWith("image/")) return true;
+  return IMAGE_EXTENSION_RE.test(file.name);
+}
+
+function inferImageMimeType(file: File, fallbackMimeType: string): string {
+  if (file.type.startsWith("image/")) return file.type;
+  if (fallbackMimeType.startsWith("image/")) return fallbackMimeType;
+  const lower = file.name.toLowerCase();
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".bmp")) return "image/bmp";
+  return "image/png";
+}
 
 function StreamingIndicator() {
   const [stillWorking, setStillWorking] = useState(false);
@@ -44,8 +73,22 @@ export function ChatView() {
   const callOverlayOpen = useCleaStore((s) => s.callOverlayOpen);
 
   const [draft, setDraft] = useState("");
+  const [pastedImage, setPastedImage] = useState<PastedImageInfo | null>(null);
+  const [attachingImage, setAttachingImage] = useState(false);
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const pasteSeqRef = useRef(0);
+  const pendingPasteRef = useRef<Promise<PastedImageInfo | null> | null>(null);
+  const submittingRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  const clearPastedImage = () => {
+    pasteSeqRef.current += 1;
+    pendingPasteRef.current = null;
+    setAttachingImage(false);
+    setPastedImage(null);
+    setPasteError(null);
+  };
 
   useEffect(() => {
     if (!selectedConversation) {
@@ -66,17 +109,156 @@ export function ChatView() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [draft]);
 
-  const handleSubmit = () => {
+  const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    let file: File | null = null;
+    let fallbackMimeType = "";
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type.startsWith("image/") || item.kind === "file") {
+          const candidate = item.getAsFile();
+          if (isImageFileCandidate(candidate, item.type)) {
+            file = candidate;
+            fallbackMimeType = item.type;
+            break;
+          }
+        }
+      }
+    }
+    if (!file && e.clipboardData?.files?.length) {
+      for (let i = 0; i < e.clipboardData.files.length; i++) {
+        const candidate = e.clipboardData.files[i];
+        if (isImageFileCandidate(candidate)) {
+          file = candidate;
+          fallbackMimeType = candidate.type;
+          break;
+        }
+      }
+    }
+    if (!file) return;
+
+    e.preventDefault();
+    if (file.size > MAX_PASTE_IMAGE_BYTES) {
+      pasteSeqRef.current += 1;
+      pendingPasteRef.current = null;
+      setAttachingImage(false);
+      setPastedImage(null);
+      setPasteError("Pasted image exceeds the 12 MiB limit.");
+      return;
+    }
+
+    const seq = ++pasteSeqRef.current;
+    const targetFile = file;
+    const mimeType = inferImageMimeType(targetFile, fallbackMimeType);
+    const imageName =
+      targetFile.name && targetFile.name !== "image.png" ? targetFile.name : "clipboard_image.png";
+
+    setPasteError(null);
+    setPastedImage(null);
+    setAttachingImage(true);
+
+    const readPromise = new Promise<PastedImageInfo | null>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (pasteSeqRef.current !== seq) {
+          resolve(null);
+          return;
+        }
+        const result = typeof reader.result === "string" ? reader.result : "";
+        const commaIdx = result.indexOf(",");
+        const dataBase64 = commaIdx !== -1 ? result.slice(commaIdx + 1) : result;
+        if (!dataBase64) {
+          setAttachingImage(false);
+          setPasteError("Couldn't read pasted image.");
+          resolve(null);
+          return;
+        }
+        const hasObjUrl = typeof URL.createObjectURL === "function";
+        const imgUrl = hasObjUrl ? URL.createObjectURL(targetFile) : result;
+        const img = new window.Image();
+        const finalize = (width: number, height: number) => {
+          if (hasObjUrl) URL.revokeObjectURL?.(imgUrl);
+          if (pasteSeqRef.current !== seq) {
+            resolve(null);
+            return;
+          }
+          const info: PastedImageInfo = {
+            name: imageName,
+            width,
+            height,
+            mimeType,
+            dataBase64,
+          };
+          setPastedImage(info);
+          setAttachingImage(false);
+          resolve(info);
+        };
+        img.onload = () => finalize(img.naturalWidth || 800, img.naturalHeight || 600);
+        img.onerror = () => finalize(800, 600);
+        img.src = imgUrl;
+      };
+      reader.onerror = () => {
+        if (pasteSeqRef.current === seq) {
+          setAttachingImage(false);
+          setPasteError("Couldn't read pasted image.");
+        }
+        resolve(null);
+      };
+      reader.readAsDataURL(targetFile);
+    });
+
+    pendingPasteRef.current = readPromise;
+    void readPromise.finally(() => {
+      if (pendingPasteRef.current === readPromise) {
+        pendingPasteRef.current = null;
+      }
+    });
+  };
+
+  const handleSubmit = async () => {
+    if (sending || submittingRef.current) return;
     const trimmed = draft.trim();
-    if (!trimmed || sending) return;
+    const pendingPromise = pendingPasteRef.current;
+    if (!trimmed && !pastedImage && !pendingPromise) return;
+
+    let resolvedImage = pastedImage;
+    if (!resolvedImage && pendingPromise) {
+      submittingRef.current = true;
+      try {
+        resolvedImage = await pendingPromise;
+      } finally {
+        submittingRef.current = false;
+      }
+      if (!trimmed && !resolvedImage) return;
+    }
+
+    let textToSend = trimmed;
+    let attachment: ChatImageAttachment | undefined;
+    if (resolvedImage) {
+      const imageTag = `[Attached image: ${resolvedImage.name} · ${resolvedImage.width}×${resolvedImage.height}]`;
+      textToSend = trimmed ? `${trimmed}\n${imageTag}` : `Please inspect this image.\n${imageTag}`;
+      attachment = {
+        data_base64: resolvedImage.dataBase64,
+        mime_type: resolvedImage.mimeType,
+        name: resolvedImage.name,
+        width: resolvedImage.width,
+        height: resolvedImage.height,
+      };
+      clearPastedImage();
+    }
     setDraft("");
-    void sendMessage(trimmed);
+    if (attachment) {
+      void sendMessage(textToSend, attachment);
+    } else {
+      void sendMessage(textToSend);
+    }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      handleSubmit();
+      void handleSubmit();
     }
   };
 
@@ -268,11 +450,67 @@ export function ChatView() {
           callOverlayOpen ? "pl-6 pr-68" : "px-6",
         )}
       >
+        {pasteError && (
+          <div
+            role="alert"
+            className="mx-auto mb-2 flex max-w-2xl items-center justify-between rounded-lg border border-red-500/35 bg-red-500/10 px-3 py-1.5 text-xs text-[var(--danger)]"
+          >
+            <span className="truncate">{pasteError}</span>
+            <button
+              type="button"
+              onClick={() => setPasteError(null)}
+              aria-label="Dismiss image error"
+              className="ml-2 rounded p-0.5 hover:bg-red-500/15"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        )}
+        {!pastedImage && attachingImage && (
+          <div
+            data-testid="pasted-image-loading"
+            className="mx-auto mb-2 flex max-w-2xl items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs text-[var(--text-subtle)] shadow-xs"
+          >
+            <div className="flex items-center gap-2 truncate">
+              <ImageIcon className="h-3.5 w-3.5 shrink-0 animate-pulse text-[var(--text-muted)]" aria-hidden="true" />
+              <span className="truncate">Attaching image…</span>
+            </div>
+            <button
+              type="button"
+              onClick={clearPastedImage}
+              aria-label="Cancel image attachment"
+              className="ml-2 rounded p-0.5 text-[var(--text-subtle)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text)]"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        )}
+        {pastedImage && (
+          <div
+            data-testid="pasted-image-badge"
+            className="mx-auto mb-2 flex max-w-2xl items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs text-[var(--text)] shadow-xs"
+          >
+            <div className="flex items-center gap-2 truncate">
+              <ImageIcon className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" aria-hidden="true" />
+              <span className="truncate font-medium">
+                {pastedImage.name} · {pastedImage.width}×{pastedImage.height}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={clearPastedImage}
+              aria-label="Remove attached image"
+              className="ml-2 rounded p-0.5 text-[var(--text-subtle)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text)]"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        )}
         <form
           className="mx-auto flex max-w-2xl items-end gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 focus-within:border-[var(--border-strong)]"
           onSubmit={(e) => {
             e.preventDefault();
-            handleSubmit();
+            void handleSubmit();
           }}
         >
           <textarea
@@ -281,6 +519,7 @@ export function ChatView() {
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             placeholder="Message Clea…"
             aria-label="Message Clea"
             className="max-h-40 min-h-[38px] min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-[var(--text)] placeholder:text-[var(--text-subtle)] focus:outline-none"
@@ -288,7 +527,7 @@ export function ChatView() {
           <Button
             type="submit"
             size="icon"
-            disabled={!draft.trim() || sending}
+            disabled={(!draft.trim() && !pastedImage && !attachingImage) || sending}
             aria-label="Send message"
             className="shrink-0 rounded-lg"
           >

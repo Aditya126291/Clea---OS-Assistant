@@ -248,3 +248,52 @@ async def test_gemini_provider_captures_thought_signature_and_retries(
     assert tool_chunk.thought_signature == "sig_completed_456"
     done_chunk = next(c for c in chunks if c.type == "done")
     assert done_chunk.thought_signature == "sig_completed_456"
+
+
+def test_to_gemini_steps_attaches_image_on_tool_and_user_messages() -> None:
+    raw_png = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15c4"
+    )
+    messages = [
+        Message(
+            role="user",
+            content="Here is an image",
+            image_bytes=raw_png,
+            image_mime_type="image/png",
+        ),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="c_inspect", name="inspect_screen", arguments={})],
+        ),
+        Message(
+            role="tool",
+            content='{"status": "ok"}',
+            tool_call_id="c_inspect",
+            tool_name="inspect_screen",
+            image_bytes=raw_png,
+            image_mime_type="image/png",
+        ),
+    ]
+
+    steps = _to_gemini_steps(messages)
+    assert len(steps) == 3
+
+    # User message contains text and image
+    user_step = steps[0]
+    assert user_step["type"] == "user_input"
+    assert len(user_step["content"]) == 2
+    assert user_step["content"][0]["type"] == "text"
+    assert user_step["content"][1]["type"] == "image"
+    assert user_step["content"][1]["mime_type"] == "image/png"
+
+    # Tool message contains function_result with text and image
+    tool_step = steps[2]
+    assert tool_step["type"] == "function_result"
+    assert isinstance(tool_step["result"], list)
+    assert len(tool_step["result"]) == 2
+    assert tool_step["result"][0]["type"] == "text"
+    assert tool_step["result"][1]["type"] == "image"
+    assert tool_step["result"][1]["mime_type"] == "image/png"
+

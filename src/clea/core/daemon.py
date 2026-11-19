@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import logging
@@ -87,20 +88,31 @@ from clea.memory.store import FIXED_SECTIONS, VOICE_COMPANION_SESSION_ID, Memory
 from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
+    ArtifactStore,
+    ClipboardService,
     RiskLevel,
+    ScreenVisionService,
     TimerManager,
     ToolRegistry,
+    get_default_clipboard_service,
+    get_default_screen_vision_service,
     get_default_timer_manager,
     register_builtin_tools,
+    register_clipboard_tools,
     register_file_tools,
     register_memory_tools,
     register_system_control_tools,
     register_timer_tools,
+    register_vision_tools,
     requires_approval,
+    set_default_clipboard_service,
+    set_default_screen_vision_service,
     set_default_timer_manager,
+    transform_clipboard,
 )
 from clea.tools.git_workspace import inspect_git_workspace
 from clea.tools.registry import ToolDefinition
+from clea.tools.vision import MAX_VISION_DIMENSION, _downscale_png
 from clea.tools.windows_os import (
     click_ui_element,
     control_media_volume,
@@ -229,6 +241,8 @@ class CleaDaemon:
         allowed_origins: Iterable[str] | None = None,
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
         timer_manager: TimerManager | None = None,
+        clipboard_service: ClipboardService | None = None,
+        screen_vision_service: ScreenVisionService | None = None,
     ) -> None:
         self.host = _validate_localhost(host)
         self.port = port
@@ -303,6 +317,46 @@ class CleaDaemon:
             self.agent.registry.get("set_timer")
         except KeyError:
             register_timer_tools(self.agent.registry, self.timer_manager)
+        self.clipboard_service = clipboard_service or ClipboardService()
+        if hasattr(self.timer_manager, "on_tick") and self.timer_manager.on_tick is None:
+            self.timer_manager.on_tick = self._on_housekeeping_tick
+        set_default_clipboard_service(self.clipboard_service)
+        try:
+            self.agent.registry.get("read_clipboard")
+        except KeyError:
+            register_clipboard_tools(self.agent.registry, self.clipboard_service)
+        data_base_dir = (
+            agent.memory.base_dir.parent
+            if agent.memory.base_dir.name == "memory"
+            else agent.memory.base_dir
+        )
+        if screen_vision_service is not None:
+            self.screen_vision_service = screen_vision_service
+            self.artifact_store = (
+                getattr(screen_vision_service, "artifact_store", None)
+                or ArtifactStore(data_dir=data_base_dir)
+            )
+        else:
+            self.artifact_store = ArtifactStore(data_dir=data_base_dir)
+            self.screen_vision_service = ScreenVisionService(
+                clipboard_service=self.clipboard_service,
+                artifact_store=self.artifact_store,
+            )
+        set_default_screen_vision_service(self.screen_vision_service)
+        try:
+            self.agent.registry.get("inspect_screen")
+        except KeyError:
+            register_vision_tools(self.agent.registry, self.screen_vision_service)
+
+    def _on_housekeeping_tick(self) -> None:
+        """Periodic housekeeping tick called by background monitor loop."""
+        self.clipboard_service.poll_sequence()
+        with contextlib.suppress(Exception):
+            self.artifact_store.prune_expired()
+
+    def housekeeping_tick(self) -> None:
+        """Explicit entry point for the periodic housekeeping tick."""
+        self._on_housekeeping_tick()
 
     def _schedule_diagnostic_log_pruning(self) -> asyncio.Task[Any] | None:
         """Schedule diagnostic log pruning in the background if not already running."""
@@ -374,6 +428,10 @@ class CleaDaemon:
         except Exception as exc:
             logger.warning("Failed pruning diagnostic logs on daemon startup: %s", exc)
         self._reconcile_orphaned_tasks()
+        with contextlib.suppress(Exception):
+            self.clipboard_service.poll_sequence()
+        with contextlib.suppress(Exception):
+            self.artifact_store.prune_expired()
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
             self._server = await serve(
@@ -382,6 +440,7 @@ class CleaDaemon:
                 self.port,
                 process_request=self._authenticate,
                 select_subprotocol=self._select_subprotocol,
+                max_size=24 * 1024 * 1024,
             )
             self._instance_lock.update_port(host=self.host, port=self.bound_port)
             auth.write_token(self.token, self.token_file)
@@ -405,6 +464,10 @@ class CleaDaemon:
             await self.timer_manager.stop()
         if get_default_timer_manager() is self.timer_manager:
             set_default_timer_manager(None)
+        if get_default_clipboard_service() is self.clipboard_service:
+            set_default_clipboard_service(None)
+        if get_default_screen_vision_service() is self.screen_vision_service:
+            set_default_screen_vision_service(None)
         for t in list(self._idle_tasks.values()):
             if not t.done():
                 t.cancel()
@@ -1004,11 +1067,62 @@ class CleaDaemon:
                 ws, req, METHOD_RESULTS[method](session_id=session.id), session_id=session.id
             )
         elif method == "chat.send":
-            text = req.params.text.strip()
-            if not text:
+            text = (req.params.text or "").strip()
+            image_att = getattr(req.params, "image", None)
+            if not text and image_att is None:
                 await self._respond(ws, req, error="Missing non-empty 'text' parameter.")
                 return
-            conn.spawn(self._run_chat(conn, req, text))
+            image_bytes: bytes | None = None
+            image_mime_type: str | None = None
+            if image_att is not None:
+                raw_b64 = (image_att.data_base64 or "").strip()
+                if raw_b64.startswith("data:") and ";base64," in raw_b64:
+                    raw_b64 = raw_b64.split(";base64,", 1)[1]
+                raw_b64 = "".join(raw_b64.split())
+                if not raw_b64:
+                    await self._respond(ws, req, error="Invalid empty image attachment.")
+                    return
+                try:
+                    raw_img_bytes = base64.b64decode(raw_b64, validate=True)
+                except Exception:
+                    await self._respond(ws, req, error="Invalid base64 image attachment.")
+                    return
+                if not raw_img_bytes or len(raw_img_bytes) > 12 * 1024 * 1024:
+                    await self._respond(
+                        ws,
+                        req,
+                        error="Image attachment is empty or exceeds the 12 MiB limit.",
+                    )
+                    return
+                try:
+                    image_bytes, (img_w, img_h) = await asyncio.to_thread(
+                        _downscale_png, raw_img_bytes, MAX_VISION_DIMENSION
+                    )
+                except Exception as exc:
+                    await self._respond(
+                        ws, req, error=f"Failed to decode pasted image: {exc}"
+                    )
+                    return
+                image_mime_type = "image/png"
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self.artifact_store.save_png, image_bytes, "chat_paste"
+                    )
+                if not text:
+                    img_name = image_att.name or "clipboard_image.png"
+                    text = (
+                        f"Please inspect this image.\n"
+                        f"[Attached image: {img_name} · {img_w}×{img_h}]"
+                    )
+            conn.spawn(
+                self._run_chat(
+                    conn,
+                    req,
+                    text,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
+                )
+            )
         elif method == "chat.focus":
             if req.params.clear:
                 self._active_conversation_id = None
@@ -1867,6 +1981,14 @@ class CleaDaemon:
             await self._handle_os_control_system(conn, req)
         elif method == "os.write_clipboard":
             await self._handle_os_write_clipboard(conn, req)
+        elif method == "os.transform_clipboard":
+            await self._handle_os_transform_clipboard(conn, req)
+        elif method == "os.save_clipboard_to_file":
+            await self._handle_os_save_clipboard_to_file(conn, req)
+        elif method == "os.open_path_or_url":
+            await self._handle_os_open_path_or_url(conn, req)
+        elif method == "os.inspect_screen":
+            await self._handle_os_inspect_screen(conn, req)
         elif method == "os.inspect_ui_elements":
             await self._handle_os_inspect_ui_elements(conn, req)
         elif method == "os.click_ui_element":
@@ -2525,11 +2647,14 @@ class CleaDaemon:
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
             return
-        self._audit_log(
-            "os_open_or_focus_app",
-            app=res.get("app"),
-            status=res.get("status"),
-        )
+        audit_details: dict[str, Any] = {
+            "app": res.get("app"),
+            "status": res.get("status"),
+        }
+        logged_target = res.get("target_path") or req.params.target_path
+        if logged_target:
+            audit_details["target_path"] = logged_target
+        self._audit_log("os_open_or_focus_app", **audit_details)
         await self._respond(ws, req, METHOD_RESULTS["os.open_or_focus_app"](**res))
 
     async def _handle_os_control_media_volume(self, conn: _Connection, req: Any) -> None:
@@ -2568,6 +2693,7 @@ class CleaDaemon:
             return
         self._audit_log(
             "os_read_clipboard",
+            kind=res.get("kind"),
             char_count=res.get("char_count"),
             truncated=res.get("truncated"),
             history_enabled=res.get("history_enabled"),
@@ -2576,6 +2702,12 @@ class CleaDaemon:
         model_cls = METHOD_RESULTS["os.read_clipboard"]
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
+        top_img = filtered.get("image")
+        if isinstance(top_img, dict):
+            norm_top_img = dict(top_img)
+            if "bytes" in norm_top_img and "image_bytes_base64" not in norm_top_img:
+                norm_top_img["image_bytes_base64"] = norm_top_img.pop("bytes")
+            filtered["image"] = norm_top_img
         raw_items = res.get("items")
         if isinstance(raw_items, list):
             normalized_items: list[dict[str, Any]] = []
@@ -2727,6 +2859,128 @@ class CleaDaemon:
             return
         self._audit_log("os_write_clipboard", char_count=res.get("char_count"))
         await self._respond(ws, req, METHOD_RESULTS["os.write_clipboard"](**res))
+
+    async def _handle_os_transform_clipboard(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                transform_clipboard,
+                req.params.action,
+                req.params.update_clipboard,
+                clipboard_service=self.clipboard_service,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        if res.get("status") == "error":
+            err = str(res.get("error") or "Clipboard transform failed")
+            await self._respond(ws, req, error=err)
+            return
+        self._audit_log("os_transform_clipboard", action=req.params.action)
+        model_cls = METHOD_RESULTS["os.transform_clipboard"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_save_clipboard_to_file(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                self.clipboard_service.save_to_file,
+                req.params.filename,
+                req.params.directory,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        if res.get("status") == "error":
+            await self._respond(ws, req, error=str(res.get("error") or "Clipboard save failed"))
+            return
+        self._audit_log(
+            "os_save_clipboard_to_file",
+            directory=req.params.directory,
+            filename=res.get("filename"),
+        )
+        model_cls = METHOD_RESULTS["os.save_clipboard_to_file"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_open_path_or_url(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        try:
+            res = await asyncio.to_thread(
+                self.clipboard_service.open_path_or_url,
+                req.params.target,
+                use_clipboard=req.params.use_clipboard,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_open_path_or_url",
+            target=res.get("target") or req.params.target,
+            status=res.get("status"),
+            kind=res.get("kind"),
+        )
+        if res.get("status") == "error":
+            await self._respond(
+                ws, req, error=str(res.get("error") or "Failed to open path or URL")
+            )
+            return
+        model_cls = METHOD_RESULTS["os.open_path_or_url"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        filtered.setdefault("ok", res.get("status") == "opened")
+        await self._respond(ws, req, model_cls(**filtered))
+
+    async def _handle_os_inspect_screen(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        p = req.params
+        try:
+            res = await asyncio.to_thread(
+                self.screen_vision_service.inspect,
+                target=p.target,
+                question=p.question,
+                include_image=p.include_image,
+            )
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+        self._audit_log(
+            "os_inspect_screen",
+            status=res.status,
+            source=res.source,
+            window_title=res.window_title,
+            process_name=res.process_name,
+            artifact_path=res.artifact_path,
+        )
+        image_base64: str | None = None
+        image_mime_type: str | None = None
+        if isinstance(res.attachment, dict) and isinstance(res.attachment.get("data"), bytes):
+            image_base64 = base64.b64encode(res.attachment["data"]).decode("ascii")
+            image_mime_type = str(res.attachment.get("mime_type") or "image/png")
+        model_cls = METHOD_RESULTS["os.inspect_screen"]
+        await self._respond(
+            ws,
+            req,
+            model_cls(
+                ok=(res.status == "ok"),
+                status=res.status,
+                source=res.source,
+                window_title=res.window_title,
+                process_name=res.process_name,
+                question=res.question,
+                width=res.width,
+                height=res.height,
+                artifact_path=res.artifact_path,
+                uia_text=res.uia_text,
+                text=res.text,
+                message=res.message,
+                image_base64=image_base64,
+                image_mime_type=image_mime_type,
+            ),
+        )
 
     async def _handle_os_inspect_ui_elements(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
@@ -2935,10 +3189,24 @@ class CleaDaemon:
 
     # ------------------------------------------------------------------ chat turns
 
-    async def _run_chat(self, conn: _Connection, req: Any, text: str) -> None:
+    async def _run_chat(
+        self,
+        conn: _Connection,
+        req: Any,
+        text: str,
+        *,
+        image_bytes: bytes | None = None,
+        image_mime_type: str | None = None,
+    ) -> None:
         """Run one chat turn as its own task so the connection keeps reading (approvals)."""
         with contextlib.suppress(ConnectionClosed):
-            await self._chat_turn(conn, req, text)
+            await self._chat_turn(
+                conn,
+                req,
+                text,
+                image_bytes=image_bytes,
+                image_mime_type=image_mime_type,
+            )
 
     async def _run_voice_chat_turn(
         self,
@@ -2965,7 +3233,15 @@ class CleaDaemon:
         finally:
             self._busy_sessions.discard(session.id)
 
-    async def _chat_turn(self, conn: _Connection, req: Any, text: str) -> None:
+    async def _chat_turn(
+        self,
+        conn: _Connection,
+        req: Any,
+        text: str,
+        *,
+        image_bytes: bytes | None = None,
+        image_mime_type: str | None = None,
+    ) -> None:
         ws = conn.ws
         session_id = req.session_id
         if session_id:
@@ -3003,6 +3279,8 @@ class CleaDaemon:
             req=req,
             broadcast_all_ui=False,
             notify_turn_start=True,
+            image_bytes=image_bytes,
+            image_mime_type=image_mime_type,
         )
 
     async def _execute_chat_turn(
@@ -3017,6 +3295,8 @@ class CleaDaemon:
         broadcast_all_ui: bool,
         notify_turn_start: bool,
         busy_already_acquired: bool = False,
+        image_bytes: bytes | None = None,
+        image_mime_type: str | None = None,
     ) -> None:
         ws = conn.ws if conn is not None else None
         if not busy_already_acquired:
@@ -3203,6 +3483,8 @@ class CleaDaemon:
                 reply = await self.agent.run_turn(
                     session=session,
                     user_text=text,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
                     on_text_delta=on_text_delta,
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
@@ -3509,6 +3791,7 @@ def build_daemon(
     allowed_origins: Iterable[str] | None = None,
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     timer_manager: TimerManager | None = None,
+    clipboard_service: ClipboardService | None = None,
 ) -> CleaDaemon:
     """Assemble a CleaDaemon wired with default memory, tools, and Gemini provider."""
     resolved_memory = memory or MemoryStore()
@@ -3540,6 +3823,11 @@ def build_daemon(
         resolved_registry.get("manage_window")
     except KeyError:
         register_system_control_tools(resolved_registry)
+    resolved_clipboard_service = clipboard_service or ClipboardService()
+    try:
+        resolved_registry.get("read_clipboard")
+    except KeyError:
+        register_clipboard_tools(resolved_registry, resolved_clipboard_service)
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,
@@ -3556,6 +3844,7 @@ def build_daemon(
         allowed_origins=allowed_origins,
         approval_timeout=approval_timeout,
         timer_manager=resolved_timer_manager,
+        clipboard_service=resolved_clipboard_service,
     )
 
 

@@ -167,4 +167,64 @@ describe("CleaClient", () => {
 
     client.dispose();
   });
+
+  it("transmits chat.send with ChatImageAttachment over WebSocket", async () => {
+    let created: MockSocket | null = null;
+    const client = new CleaClient({
+      resolveConnection: async () => ({
+        ok: true,
+        info: { token: "img-tok", wsUrl: "ws://127.0.0.1:8767" },
+      }),
+      createWebSocket: (url, protocols) => {
+        created = new MockSocket(url, protocols);
+        return created;
+      },
+    });
+
+    await client.connect();
+    created!.triggerOpen();
+
+    const sendPromise = client.request(
+      "chat.send",
+      {
+        text: "Describe this screenshot",
+        image: {
+          data_base64: "iVBORw0KGgo=",
+          mime_type: "image/png",
+          name: "shot.png",
+          width: 640,
+          height: 480,
+        },
+      },
+      { id: "req-img-1", sessionId: "sess-1" },
+    );
+
+    const frame = JSON.parse(created!.sent[0]);
+    expect(frame).toMatchObject({
+      frame_type: "request",
+      id: "req-img-1",
+      session_id: "sess-1",
+      method: "chat.send",
+      params: {
+        text: "Describe this screenshot",
+        image: {
+          data_base64: "iVBORw0KGgo=",
+          mime_type: "image/png",
+          name: "shot.png",
+          width: 640,
+          height: 480,
+        },
+      },
+    });
+
+    created!.triggerMessage({
+      frame_type: "response",
+      id: "req-img-1",
+      ok: true,
+      result: { text: "Looks like a screenshot." },
+    });
+
+    await expect(sendPromise).resolves.toEqual({ text: "Looks like a screenshot." });
+    client.dispose();
+  });
 });

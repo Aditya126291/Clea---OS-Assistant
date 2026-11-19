@@ -62,6 +62,7 @@ def test_default_voice_tools_cover_required_tools() -> None:
     by_name = {tool.name: tool for tool in tools}
     assert set(by_name) == {
         "delegate_task",
+        "inspect_screen",
         "look_at_screen",
         "watch_screen",
         "end_call",
@@ -84,6 +85,9 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "control_media_volume",
         "read_clipboard",
         "write_clipboard",
+        "transform_clipboard",
+        "save_clipboard_to_file",
+        "open_path_or_url",
         "inspect_git_workspace",
         "select_clipboard_item",
         "open_url",
@@ -99,6 +103,12 @@ def test_default_voice_tools_cover_required_tools() -> None:
         assert tool.behavior == "non_blocking"
 
     assert by_name["delegate_task"].parameters_schema["required"] == ["description"]
+
+    inspect_props = by_name["inspect_screen"].parameters_schema["properties"]
+    assert "target" in inspect_props
+    assert "question" in inspect_props
+    assert "include_image" in inspect_props
+    assert by_name["inspect_screen"].parameters_schema.get("required", []) == []
 
     look_props = by_name["look_at_screen"].parameters_schema["properties"]
     assert look_props["target"]["enum"] == ["active_window", "full_screen"]
@@ -183,6 +193,10 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert by_name["open_url"].parameters_schema["required"] == ["url"]
     assert by_name["open_url"].parameters_schema["properties"]["url"]["type"] == "string"
     assert "browser" in by_name["open_url"].parameters_schema["properties"]
+
+    assert by_name["open_path_or_url"].parameters_schema.get("required", []) == []
+    assert "target" in by_name["open_path_or_url"].parameters_schema["properties"]
+    assert "use_clipboard" in by_name["open_path_or_url"].parameters_schema["properties"]
 
     assert by_name["control_system"].parameters_schema["required"] == ["action"]
     cs_actions = by_name["control_system"].parameters_schema["properties"]["action"]["enum"]

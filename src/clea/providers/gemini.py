@@ -32,13 +32,25 @@ def _to_gemini_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
 
 
 def _to_gemini_steps(messages: list[Message]) -> list[dict[str, Any]]:
+    import base64
+
     steps: list[dict[str, Any]] = []
     for msg in messages:
         if msg.role == "user":
+            user_content: list[dict[str, Any]] = [{"type": "text", "text": msg.content}]
+            if getattr(msg, "image_bytes", None):
+                b64 = base64.b64encode(msg.image_bytes).decode("ascii")
+                user_content.append(
+                    {
+                        "type": "image",
+                        "data": b64,
+                        "mime_type": getattr(msg, "image_mime_type", None) or "image/png",
+                    }
+                )
             steps.append(
                 {
                     "type": "user_input",
-                    "content": [{"type": "text", "text": msg.content}],
+                    "content": user_content,
                 }
             )
         elif msg.role == "assistant":
@@ -66,15 +78,34 @@ def _to_gemini_steps(messages: list[Message]) -> list[dict[str, Any]]:
                     }
                 )
         elif msg.role == "tool":
-            steps.append(
-                {
-                    "type": "function_result",
-                    "call_id": msg.tool_call_id or "",
-                    "name": msg.tool_name or "",
-                    "result": msg.content,
-                    "is_error": msg.is_error,
-                }
-            )
+            if getattr(msg, "image_bytes", None):
+                b64 = base64.b64encode(msg.image_bytes).decode("ascii")
+                steps.append(
+                    {
+                        "type": "function_result",
+                        "call_id": msg.tool_call_id or "",
+                        "name": msg.tool_name or "",
+                        "result": [
+                            {"type": "text", "text": msg.content},
+                            {
+                                "type": "image",
+                                "data": b64,
+                                "mime_type": getattr(msg, "image_mime_type", None) or "image/png",
+                            },
+                        ],
+                        "is_error": msg.is_error,
+                    }
+                )
+            else:
+                steps.append(
+                    {
+                        "type": "function_result",
+                        "call_id": msg.tool_call_id or "",
+                        "name": msg.tool_name or "",
+                        "result": msg.content,
+                        "is_error": msg.is_error,
+                    }
+                )
     return steps
 
 
