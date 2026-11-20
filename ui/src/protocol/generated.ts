@@ -406,7 +406,7 @@ export type Level1 = number | null;
  */
 export type Step = number | null;
 /**
- * Window action: minimize, maximize, restore, close
+ * Window action: minimize, maximize, restore, close, snap_left, snap_right
  */
 export type WindowAction = string | null;
 /**
@@ -417,6 +417,10 @@ export type WindowTitle = string | null;
  * Window title or substring (alias for window_title)
  */
 export type Title3 = string | null;
+/**
+ * Window title or app substring alias
+ */
+export type TitleQuery = string | null;
 /**
  * Window handle (HWND)
  */
@@ -489,11 +493,19 @@ export type Clicks = number;
 export type Button = "left" | "right" | "double";
 export type Delta = number;
 export type Seconds = number;
+/**
+ * Optional target application or window title for focus precondition enforcement.
+ */
+export type AppName4 = string | null;
+/**
+ * Optional explicit target HWND for focus precondition enforcement.
+ */
+export type ExpectedHwnd = number | null;
 export type FrameType61 = "request";
 export type Id62 = string;
 export type SessionId71 = string | null;
 export type Method61 = "os.ui_snapshot";
-export type AppName4 = string | null;
+export type AppName5 = string | null;
 export type MaxElements1 = number;
 export type InteractiveOnly = boolean;
 export type FrameType62 = "request";
@@ -972,6 +984,7 @@ export type TargetPath1 = string | null;
 export type Error4 = string | null;
 export type Verified = boolean;
 export type Status9 = string;
+export type OutcomeKind = ("verified" | "unavailable" | "failed") | null;
 export type Reason4 = string;
 export type ElapsedMs = number;
 export type Ok13 = boolean;
@@ -1039,16 +1052,29 @@ export type Hwnd2 = number | null;
 export type Page1 = string | null;
 export type Uri1 = string | null;
 export type Message9 = string | null;
+export type Rect = {
+  [k: string]: number | undefined;
+} | null;
+export type Status13 = string;
+export type Reason5 = string;
+export type StepLabel = string;
+export type ExpectedHwnd1 = number | null;
+export type ExpectedTitle = string;
+export type ExpectedProcess = string;
+export type ActualHwnd = number | null;
+export type ActualTitle = string;
+export type ActualProcess = string;
+export type Message10 = string;
 export type Ok18 = boolean;
 export type CharCount2 = number;
 export type Ok19 = boolean;
-export type Status13 = string;
+export type Status14 = string;
 export type Action9 = string;
 export type UpdatedClipboard = boolean;
 export type Preview = string;
 export type Error5 = string | null;
 export type Ok20 = boolean;
-export type Status14 = string;
+export type Status15 = string;
 export type SavedPath = string;
 export type Path = string;
 export type Filename2 = string;
@@ -1056,13 +1082,13 @@ export type SizeBytes1 = number;
 export type Kind4 = string;
 export type Error6 = string | null;
 export type Ok21 = boolean;
-export type Status15 = "opened" | "error" | "non_interactive_desktop";
+export type Status16 = "opened" | "error" | "non_interactive_desktop";
 export type Kind5 = ("file" | "url") | null;
 export type Target3 = string;
 export type Filename3 = string | null;
 export type Error7 = string | null;
 export type Ok22 = boolean;
-export type Status16 = "ok" | "minimized" | "not_found" | "empty" | "error" | "non_interactive_desktop";
+export type Status17 = "ok" | "minimized" | "not_found" | "empty" | "error" | "non_interactive_desktop";
 export type Source4 = string | null;
 export type WindowTitle3 = string | null;
 export type ProcessName = string | null;
@@ -1072,7 +1098,7 @@ export type Height2 = number | null;
 export type ArtifactPath = string | null;
 export type UiaText = string | null;
 export type Text15 = string | null;
-export type Message10 = string | null;
+export type Message11 = string | null;
 export type ImageBase64 = string | null;
 export type ImageMimeType = string | null;
 export type Ok23 = boolean;
@@ -1087,24 +1113,14 @@ export type X2 = number;
 export type Y2 = number;
 export type Elements = UiElementItem[];
 export type Ok24 = boolean;
-export type Status17 = string;
+export type Status18 = string;
 export type Name7 = string;
 export type ControlType2 = string;
 export type X3 = number;
 export type Y3 = number;
 export type Method65 = string;
-export type Reason5 = string | null;
+export type Reason6 = string | null;
 export type Error8 = string | null;
-export type Status18 = string;
-export type Reason6 = string;
-export type StepLabel = string;
-export type ExpectedHwnd = number | null;
-export type ExpectedTitle = string;
-export type ExpectedProcess = string;
-export type ActualHwnd = number | null;
-export type ActualTitle = string;
-export type ActualProcess = string;
-export type Message11 = string;
 export type Ok25 = boolean;
 export type Status19 = string;
 export type Action10 = string;
@@ -1893,6 +1909,7 @@ export interface OsControlSystemParams {
   window_action?: WindowAction;
   window_title?: WindowTitle;
   title?: Title3;
+  title_query?: TitleQuery;
   hwnd?: Hwnd;
   app_name?: AppName1;
   page?: Page;
@@ -1993,6 +2010,8 @@ export interface OsGuiActionParams {
   button?: Button;
   delta?: Delta;
   seconds?: Seconds;
+  app_name?: AppName4;
+  expected_hwnd?: ExpectedHwnd;
 }
 export interface OsUiSnapshotRequest {
   frame_type?: FrameType61;
@@ -2002,7 +2021,7 @@ export interface OsUiSnapshotRequest {
   params?: OsUiSnapshotParams;
 }
 export interface OsUiSnapshotParams {
-  app_name?: AppName4;
+  app_name?: AppName5;
   max_elements?: MaxElements1;
   interactive_only?: InteractiveOnly;
 }
@@ -2786,6 +2805,7 @@ export interface OsOpenOrFocusAppResult {
 export interface ActionVerificationInfo {
   verified: Verified;
   status?: Status9;
+  outcome_kind?: OutcomeKind;
   reason?: Reason4;
   actual?: Actual;
   elapsed_ms?: ElapsedMs;
@@ -2857,7 +2877,21 @@ export interface OsControlSystemResult {
   page?: Page1;
   uri?: Uri1;
   message?: Message9;
+  rect?: Rect;
   verification?: ActionVerificationInfo | null;
+  aborted_precondition?: PreconditionAbortInfo | null;
+}
+export interface PreconditionAbortInfo {
+  status?: Status13;
+  reason?: Reason5;
+  step_label?: StepLabel;
+  expected_hwnd?: ExpectedHwnd1;
+  expected_title?: ExpectedTitle;
+  expected_process?: ExpectedProcess;
+  actual_hwnd?: ActualHwnd;
+  actual_title?: ActualTitle;
+  actual_process?: ActualProcess;
+  message?: Message10;
 }
 export interface OsWriteClipboardResult {
   ok?: Ok18;
@@ -2865,7 +2899,7 @@ export interface OsWriteClipboardResult {
 }
 export interface OsTransformClipboardResult {
   ok?: Ok19;
-  status?: Status13;
+  status?: Status14;
   action?: Action9;
   updated_clipboard?: UpdatedClipboard;
   preview?: Preview;
@@ -2873,7 +2907,7 @@ export interface OsTransformClipboardResult {
 }
 export interface OsSaveClipboardToFileResult {
   ok?: Ok20;
-  status?: Status14;
+  status?: Status15;
   saved_path?: SavedPath;
   path?: Path;
   filename?: Filename2;
@@ -2883,7 +2917,7 @@ export interface OsSaveClipboardToFileResult {
 }
 export interface OsOpenPathOrUrlResult {
   ok?: Ok21;
-  status?: Status15;
+  status?: Status16;
   kind?: Kind5;
   target?: Target3;
   filename?: Filename3;
@@ -2891,7 +2925,7 @@ export interface OsOpenPathOrUrlResult {
 }
 export interface OsInspectScreenResult {
   ok?: Ok22;
-  status?: Status16;
+  status?: Status17;
   source?: Source4;
   window_title?: WindowTitle3;
   process_name?: ProcessName;
@@ -2901,7 +2935,7 @@ export interface OsInspectScreenResult {
   artifact_path?: ArtifactPath;
   uia_text?: UiaText;
   text?: Text15;
-  message?: Message10;
+  message?: Message11;
   image_base64?: ImageBase64;
   image_mime_type?: ImageMimeType;
 }
@@ -2922,27 +2956,15 @@ export interface UiElementItem {
 }
 export interface OsClickUiElementResult {
   ok?: Ok24;
-  status?: Status17;
+  status?: Status18;
   name?: Name7;
   control_type?: ControlType2;
   x?: X3;
   y?: Y3;
   method?: Method65;
-  reason?: Reason5;
+  reason?: Reason6;
   error?: Error8;
   aborted_precondition?: PreconditionAbortInfo | null;
-}
-export interface PreconditionAbortInfo {
-  status?: Status18;
-  reason?: Reason6;
-  step_label?: StepLabel;
-  expected_hwnd?: ExpectedHwnd;
-  expected_title?: ExpectedTitle;
-  expected_process?: ExpectedProcess;
-  actual_hwnd?: ActualHwnd;
-  actual_title?: ActualTitle;
-  actual_process?: ActualProcess;
-  message?: Message11;
 }
 export interface OsGuiActionResult {
   ok?: Ok25;

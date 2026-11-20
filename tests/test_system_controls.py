@@ -691,6 +691,9 @@ async def test_tool_registry_registration_and_execution(tmp_path: Any) -> None:
     assert definitions["manage_window"].risk_level == RiskLevel.READ_ONLY
     assert definitions["system_control"].risk_level == RiskLevel.READ_ONLY
     assert definitions["system_diagnostics"].risk_level == RiskLevel.READ_ONLY
+    assert "snap_left" in definitions["manage_window"].description
+    assert "snap_right" in definitions["manage_window"].description
+    assert "Calculator" in definitions["manage_window"].description
 
     # Execute system_diagnostics via registry
     with patch("clea.tools.system_controls._get_battery_info") as mock_bat:
@@ -698,3 +701,97 @@ async def test_tool_registry_registration_and_execution(tmp_path: Any) -> None:
         res = await reg.execute("system_diagnostics", {"check": "battery"})
         assert res["ok"] is True
         assert res["battery"]["percentage"] == 95
+
+
+def test_manage_window_snap_calculator_alias() -> None:
+    u32 = _create_mock_user32(
+        windows=[
+            (101, "Clea", True),
+            (202, "Calculator", True),
+        ],
+        foreground_hwnd=101,
+        work_area=(0, 0, 1920, 1040),
+    )
+    res = manage_window("snap_right", title_query="calc", user32=u32)
+    assert res["ok"] is True
+    assert res["hwnd"] == 202
+    assert res["title"] == "Calculator"
+    assert res["rect"] == {"x": 960, "y": 0, "width": 960, "height": 1040}
+
+
+def test_focus_window_hwnd_sc_attaches_cur_tid_to_fg_tid() -> None:
+    from clea.tools import system_controls as sc
+
+    calls: list[tuple[Any, ...]] = []
+    fg_holder = {"hwnd": 111}
+
+    class _LockU32:
+        def IsIconic(self, hwnd: int) -> int:
+            return 0
+
+        def SetForegroundWindow(self, hwnd: int) -> int:
+            calls.append(("SetForegroundWindow", hwnd))
+            if ("AttachThreadInput", 555, 666, True) in calls:
+                fg_holder["hwnd"] = hwnd
+                return 1
+            return 0
+
+        def GetForegroundWindow(self) -> int:
+            return fg_holder["hwnd"]
+
+        def GetWindowThreadProcessId(self, hwnd: int, pid_ptr: Any) -> int:
+            return 666 if hwnd == 111 else 777
+
+        def AttachThreadInput(self, id_attach: int, id_attach_to: int, attach: bool) -> int:
+            calls.append(("AttachThreadInput", id_attach, id_attach_to, bool(attach)))
+            return 1
+
+        def BringWindowToTop(self, hwnd: int) -> int:
+            calls.append(("BringWindowToTop", hwnd))
+            return 1
+
+        def ShowWindow(self, hwnd: int, cmd: int) -> int:
+            calls.append(("ShowWindow", hwnd, cmd))
+            return 1
+
+    class _K32:
+        def GetCurrentThreadId(self) -> int:
+            return 555
+
+    sc._focus_window_hwnd_sc(
+        _LockU32(),
+        222,
+        kernel32=_K32(),
+        attach_fallback=True,
+    )
+    assert fg_holder["hwnd"] == 222
+    assert ("AttachThreadInput", 555, 666, True) in calls
+    assert ("AttachThreadInput", 555, 666, False) in calls
+
+
+def test_manage_window_keeps_minimized_cloaked_uwp_and_skips_unminimized_cloaked() -> None:
+    u32 = _create_mock_user32(
+        windows=[
+            (101, "Clea", True),
+            (202, "Calculator", True),
+            (303, "Ghost Cloaked Window", True),
+        ],
+        foreground_hwnd=101,
+        work_area=(0, 0, 1920, 1040),
+    )
+    u32.IsIconic.side_effect = lambda hwnd: 1 if hwnd == 202 else 0
+
+    with patch(
+        "clea.tools.system_controls._is_window_cloaked_sc",
+        side_effect=lambda hwnd, _u32: hwnd in (202, 303),
+    ):
+        listed = manage_window("list", user32=u32)
+        titles = {w["title"] for w in listed["windows"]}
+        assert "Calculator" in titles
+        assert "Ghost Cloaked Window" not in titles
+
+        snapped = manage_window("snap_left", title_query="calc", user32=u32)
+        assert snapped["ok"] is True
+        assert snapped["hwnd"] == 202
+        assert snapped["rect"] == {"x": 0, "y": 0, "width": 960, "height": 1040}
+

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import ctypes
 import ctypes.wintypes as wintypes
@@ -13,7 +14,7 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
-from clea.surfaces.voice.win32 import _MONITORINFOEXW, _RECT
+from clea.surfaces.voice.win32 import _MONITORINFOEXW, _RECT, DWMWA_EXTENDED_FRAME_BOUNDS
 from clea.tools.guards import (
     ActionVerifier,
     FocusPreconditionBackend,
@@ -39,6 +40,7 @@ SW_RESTORE = 9
 
 WM_CLOSE = 0x0010
 MONITOR_DEFAULTTONEAREST = 2
+GA_ROOT = 2
 
 # Win32 Virtual Key codes
 VK_VOLUME_MUTE = 0xAD  # 173
@@ -133,6 +135,33 @@ def _configure_system_controls_user32(u32: Any) -> Any:
     if hasattr(u32, "IsWindowVisible"):
         u32.IsWindowVisible.argtypes = [ctypes.c_void_p]
         u32.IsWindowVisible.restype = wintypes.BOOL
+    if hasattr(u32, "IsIconic"):
+        u32.IsIconic.argtypes = [ctypes.c_void_p]
+        u32.IsIconic.restype = wintypes.BOOL
+    if hasattr(u32, "IsZoomed"):
+        u32.IsZoomed.argtypes = [ctypes.c_void_p]
+        u32.IsZoomed.restype = wintypes.BOOL
+    if hasattr(u32, "GetAncestor"):
+        u32.GetAncestor.argtypes = [ctypes.c_void_p, wintypes.UINT]
+        u32.GetAncestor.restype = ctypes.c_void_p
+    if hasattr(u32, "IsChild"):
+        u32.IsChild.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        u32.IsChild.restype = wintypes.BOOL
+    if hasattr(u32, "GetWindowThreadProcessId"):
+        u32.GetWindowThreadProcessId.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    if hasattr(u32, "BringWindowToTop"):
+        u32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+        u32.BringWindowToTop.restype = wintypes.BOOL
+    if hasattr(u32, "AttachThreadInput"):
+        u32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        u32.AttachThreadInput.restype = wintypes.BOOL
+    if hasattr(u32, "GetWindowRect"):
+        u32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+        u32.GetWindowRect.restype = wintypes.BOOL
     if hasattr(u32, "GetWindowTextLengthW"):
         u32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
         u32.GetWindowTextLengthW.restype = ctypes.c_int
@@ -217,6 +246,9 @@ def _configure_system_controls_kernel32(k32: Any) -> Any:
     """Attach explicit Win32 ctypes signatures to kernel32."""
     if k32 is None:
         return None
+    if hasattr(k32, "GetCurrentThreadId"):
+        k32.GetCurrentThreadId.argtypes = []
+        k32.GetCurrentThreadId.restype = wintypes.DWORD
     if hasattr(k32, "GetSystemPowerStatus"):
         k32.GetSystemPowerStatus.argtypes = [ctypes.c_void_p]
         k32.GetSystemPowerStatus.restype = wintypes.BOOL
@@ -226,6 +258,23 @@ def _configure_system_controls_kernel32(k32: Any) -> Any:
     return k32
 
 
+def _enable_dpi_awareness_sc(user32: Any) -> None:
+    if sys.platform != "win32" or not isinstance(user32, ctypes.CDLL):
+        return
+    with contextlib.suppress(Exception):
+        if hasattr(user32, "SetProcessDpiAwarenessContext"):
+            user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+    with contextlib.suppress(Exception):
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        if hasattr(shcore, "SetProcessDpiAwareness"):
+            shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+            shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+            shcore.SetProcessDpiAwareness(2)
+
+
 def _get_user32(user32: Any = None) -> Any:
     global _SYSTEM_CONTROLS_USER32
     if user32 is not None:
@@ -233,9 +282,11 @@ def _get_user32(user32: Any = None) -> Any:
     if _SYSTEM_CONTROLS_USER32 is not None:
         return _SYSTEM_CONTROLS_USER32
     if sys.platform == "win32" and hasattr(ctypes, "WinDLL"):
-        _SYSTEM_CONTROLS_USER32 = _configure_system_controls_user32(
+        loaded = _configure_system_controls_user32(
             ctypes.WinDLL("user32", use_last_error=True)
         )
+        _enable_dpi_awareness_sc(loaded)
+        _SYSTEM_CONTROLS_USER32 = loaded
         return _SYSTEM_CONTROLS_USER32
     return None
 
@@ -287,6 +338,32 @@ def _get_window_title_ctypes(hwnd: int, user32: Any) -> str:
     return buf.value
 
 
+def _is_window_cloaked_sc(hwnd: int, user32: Any) -> bool:
+    if sys.platform != "win32" or not isinstance(user32, ctypes.CDLL):
+        return False
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+            return False
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+        cloaked = ctypes.c_uint32(0)
+        hr = dwmapi.DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            14,  # DWMWA_CLOAKED
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+        return hr == 0 and bool(cloaked.value)
+    except Exception:
+        return False
+
+
 def _enumerate_windows_ctypes(user32: Any) -> list[dict[str, Any]]:
     windows: list[dict[str, Any]] = []
     seen_hwnds: set[int] = set()
@@ -305,6 +382,11 @@ def _enumerate_windows_ctypes(user32: Any) -> list[dict[str, Any]]:
                 return True
             if hasattr(user32, "IsWindowVisible") and not bool(user32.IsWindowVisible(h)):
                 return True
+            cloaked = _is_window_cloaked_sc(h, user32)
+            if cloaked:
+                is_iconic = bool(hasattr(user32, "IsIconic") and user32.IsIconic(h))
+                if not is_iconic:
+                    return True
             title = _get_window_title_ctypes(h, user32).strip()
             if not title:
                 return True
@@ -357,6 +439,41 @@ def _enumerate_windows_ctypes(user32: Any) -> list[dict[str, Any]]:
     return windows
 
 
+_WINDOW_TITLE_ALIASES: dict[str, tuple[str, ...]] = {
+    "calc": ("calculator",),
+    "calc.exe": ("calculator",),
+    "calculator": ("calculator",),
+    "calculator.exe": ("calculator",),
+    "vscode": ("visual studio code", "code"),
+    "vs code": ("visual studio code", "code"),
+    "code": ("visual studio code",),
+    "wt": ("terminal", "windows terminal", "powershell", "command prompt"),
+    "terminal": ("windows terminal", "powershell", "command prompt"),
+    "windows terminal": ("terminal", "windows terminal", "powershell", "command prompt"),
+    "edge": ("microsoft edge", "edge"),
+    "msedge": ("microsoft edge", "edge"),
+    "msedge.exe": ("microsoft edge", "edge"),
+    "chrome": ("google chrome", "chrome"),
+    "google chrome": ("google chrome", "chrome"),
+    "explorer": ("file explorer", "explorer"),
+    "file explorer": ("file explorer", "explorer"),
+    "notepad.exe": ("notepad",),
+    "cursor": ("cursor",),
+    "antigravity": ("antigravity",),
+    "spotify": ("spotify",),
+}
+
+
+def _resolve_root_hwnd_sc(hwnd: int, user32: Any) -> int:
+    if not hwnd or not isinstance(user32, ctypes.CDLL) or not hasattr(user32, "GetAncestor"):
+        return int(hwnd)
+    with contextlib.suppress(Exception):
+        root = user32.GetAncestor(int(hwnd), GA_ROOT)
+        if root and (not hasattr(user32, "IsWindowVisible") or bool(user32.IsWindowVisible(root))):
+            return int(root)
+    return int(hwnd)
+
+
 def _resolve_target_window(
     user32: Any,
     title_query: str | int | None = None,
@@ -368,6 +485,13 @@ def _resolve_target_window(
         else:
             raise ValueError("title_query must be a string or integer HWND.")
 
+    def _rank_key(item: dict[str, Any]) -> tuple[int, int, int]:
+        return (
+            0 if item.get("is_foreground") else 1,
+            1 if _is_window_cloaked_sc(item["hwnd"], user32) else 0,
+            len(item["title"]),
+        )
+
     if title_query and title_query.strip():
         q = title_query.strip()
         q_lower = q.lower()
@@ -378,24 +502,35 @@ def _resolve_target_window(
             target_hwnd = int(q)
             for w in windows:
                 if w["hwnd"] == target_hwnd:
-                    return w["hwnd"], w["title"]
+                    resolved = _resolve_root_hwnd_sc(w["hwnd"], user32)
+                    return resolved, _get_window_title_ctypes(resolved, user32) or w["title"]
 
         # 2. Exact match (case-insensitive)
-        for w in windows:
-            if w["title"].strip().lower() == q_lower:
-                return w["hwnd"], w["title"]
+        exact = [w for w in windows if w["title"].strip().lower() == q_lower]
+        if exact:
+            exact.sort(key=_rank_key)
+            chosen = exact[0]
+            resolved = _resolve_root_hwnd_sc(chosen["hwnd"], user32)
+            return resolved, _get_window_title_ctypes(resolved, user32) or chosen["title"]
 
-        # 3. Substring match (case-insensitive, prioritize shortest title)
+        # 3. Substring match (case-insensitive, prioritize foreground/uncloaked then shortest title)
         matches = [w for w in windows if q_lower in w["title"].lower()]
+        if not matches:
+            for alias_term in _WINDOW_TITLE_ALIASES.get(q_lower, ()):
+                matches = [w for w in windows if alias_term in w["title"].lower()]
+                if matches:
+                    break
         if matches:
-            matches.sort(key=lambda item: len(item["title"]))
-            return matches[0]["hwnd"], matches[0]["title"]
+            matches.sort(key=_rank_key)
+            chosen = matches[0]
+            resolved = _resolve_root_hwnd_sc(chosen["hwnd"], user32)
+            return resolved, _get_window_title_ctypes(resolved, user32) or chosen["title"]
         raise ValueError(f"No visible window found matching title_query={title_query!r}.")
 
     if hasattr(user32, "GetForegroundWindow"):
         fg = user32.GetForegroundWindow()
         if fg:
-            hwnd = int(fg)
+            hwnd = _resolve_root_hwnd_sc(int(fg), user32)
             title = _get_window_title_ctypes(hwnd, user32)
             return hwnd, title
     raise RuntimeError("No active foreground window found.")
@@ -426,6 +561,169 @@ def _get_monitor_work_area(hwnd: int, user32: Any) -> tuple[int, int, int, int]:
     return left, top, right, bottom
 
 
+def _is_same_window_tree_sc(u32: Any, expected_hwnd: int, actual_hwnd: int) -> bool:
+    if not expected_hwnd or not actual_hwnd:
+        return False
+    if int(expected_hwnd) == int(actual_hwnd):
+        return True
+    if hasattr(u32, "IsChild"):
+        with contextlib.suppress(Exception):
+            if bool(u32.IsChild(expected_hwnd, actual_hwnd)) or bool(
+                u32.IsChild(actual_hwnd, expected_hwnd)
+            ):
+                return True
+    if hasattr(u32, "GetAncestor"):
+        with contextlib.suppress(Exception):
+            exp_root = u32.GetAncestor(expected_hwnd, GA_ROOT)
+            act_root = u32.GetAncestor(actual_hwnd, GA_ROOT)
+            if exp_root and act_root and int(exp_root) == int(act_root):
+                return True
+    return False
+
+
+def _focus_window_hwnd_sc(
+    u32: Any,
+    hwnd: int,
+    *,
+    kernel32: Any = None,
+    restore_if_iconic: bool = True,
+    attach_fallback: bool | None = None,
+) -> None:
+    """Bring *hwnd* to foreground cleanly, using cur_tid<->fg_tid AttachThreadInput on Win32."""
+    use_fallback = (
+        isinstance(u32, ctypes.CDLL) if attach_fallback is None else bool(attach_fallback)
+    )
+    if not use_fallback:
+        if restore_if_iconic and hasattr(u32, "ShowWindow"):
+            u32.ShowWindow(hwnd, SW_RESTORE)
+        if hasattr(u32, "SetForegroundWindow"):
+            u32.SetForegroundWindow(hwnd)
+        return
+
+    if restore_if_iconic and hasattr(u32, "IsIconic"):
+        with contextlib.suppress(Exception):
+            if bool(u32.IsIconic(hwnd)) and hasattr(u32, "ShowWindow"):
+                u32.ShowWindow(hwnd, SW_RESTORE)
+    fg_ok = bool(u32.SetForegroundWindow(hwnd)) if hasattr(u32, "SetForegroundWindow") else False
+    with contextlib.suppress(Exception):
+        fg_after = u32.GetForegroundWindow() if hasattr(u32, "GetForegroundWindow") else 0
+        if fg_ok and fg_after and _is_same_window_tree_sc(u32, hwnd, int(fg_after)):
+            return
+        k32 = _get_kernel32(kernel32)
+        cur_tid = (
+            int(k32.GetCurrentThreadId() or 0)
+            if (k32 is not None and hasattr(k32, "GetCurrentThreadId"))
+            else 0
+        )
+        fg_tid = (
+            int(u32.GetWindowThreadProcessId(fg_after, None) or 0)
+            if (fg_after and hasattr(u32, "GetWindowThreadProcessId"))
+            else 0
+        )
+        target_tid = (
+            int(u32.GetWindowThreadProcessId(hwnd, None) or 0)
+            if hasattr(u32, "GetWindowThreadProcessId")
+            else 0
+        )
+        attached_fg = False
+        attached_target = False
+        if cur_tid and hasattr(u32, "AttachThreadInput"):
+            if fg_tid and fg_tid != cur_tid:
+                attached_fg = bool(u32.AttachThreadInput(cur_tid, fg_tid, True))
+            if target_tid and target_tid not in (cur_tid, fg_tid):
+                attached_target = bool(u32.AttachThreadInput(cur_tid, target_tid, True))
+        try:
+            if hasattr(u32, "BringWindowToTop"):
+                u32.BringWindowToTop(hwnd)
+            if hasattr(u32, "ShowWindow"):
+                u32.ShowWindow(hwnd, SW_SHOW)
+            if hasattr(u32, "SetForegroundWindow"):
+                u32.SetForegroundWindow(hwnd)
+        finally:
+            if attached_target:
+                with contextlib.suppress(Exception):
+                    u32.AttachThreadInput(cur_tid, target_tid, False)
+            if attached_fg:
+                with contextlib.suppress(Exception):
+                    u32.AttachThreadInput(cur_tid, fg_tid, False)
+
+
+def _get_dwm_frame_insets_sc(hwnd: int, u32: Any) -> tuple[int, int, int, int]:
+    """Return invisible DWM resize-border insets (left, top, right, bottom)."""
+    if sys.platform != "win32" or not isinstance(u32, ctypes.CDLL):
+        return (0, 0, 0, 0)
+    if not hasattr(u32, "GetWindowRect"):
+        return (0, 0, 0, 0)
+    if hasattr(u32, "IsIconic") and bool(u32.IsIconic(hwnd)):
+        return (0, 0, 0, 0)
+    if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)):
+        return (0, 0, 0, 0)
+    with contextlib.suppress(Exception):
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+            return (0, 0, 0, 0)
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+        win_rect = RECT()
+        frame_rect = RECT()
+        if not u32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
+            return (0, 0, 0, 0)
+        hr = dwmapi.DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(frame_rect),
+            ctypes.sizeof(frame_rect),
+        )
+        if hr != 0:
+            return (0, 0, 0, 0)
+        inset_left = max(0, min(32, int(frame_rect.left) - int(win_rect.left)))
+        inset_top = max(0, min(32, int(frame_rect.top) - int(win_rect.top)))
+        inset_right = max(0, min(32, int(win_rect.right) - int(frame_rect.right)))
+        inset_bottom = max(0, min(32, int(win_rect.bottom) - int(frame_rect.bottom)))
+        return (inset_left, inset_top, inset_right, inset_bottom)
+    return (0, 0, 0, 0)
+
+
+def _move_window_snap_sc(
+    u32: Any,
+    hwnd: int,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    *,
+    snap_restore_guard: PreconditionGuard | None = None,
+) -> None:
+    """Restore/unmaximize as needed and MoveWindow compensating for invisible DWM borders."""
+    is_live = isinstance(u32, ctypes.CDLL)
+    if is_live:
+        if hasattr(u32, "IsIconic") and bool(u32.IsIconic(hwnd)) and hasattr(u32, "ShowWindow"):
+            u32.ShowWindow(hwnd, SW_RESTORE)
+        if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)) and hasattr(u32, "ShowWindow"):
+            u32.ShowWindow(hwnd, SW_SHOWNORMAL)
+    elif hasattr(u32, "ShowWindow"):
+        u32.ShowWindow(hwnd, SW_RESTORE)
+
+    if snap_restore_guard is not None:
+        snap_restore_guard.assert_ready("snap_move_window")
+
+    if hasattr(u32, "MoveWindow"):
+        inset_l, inset_t, inset_r, inset_b = _get_dwm_frame_insets_sc(hwnd, u32)
+        u32.MoveWindow(
+            hwnd,
+            x - inset_l,
+            y - inset_t,
+            w + inset_l + inset_r,
+            h + inset_t + inset_b,
+            True,
+        )
+
+
 def manage_window(
     action: str,
     title_query: str | None = None,
@@ -433,7 +731,7 @@ def manage_window(
     user32: Any = None,
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
-    verify_timeout_s: float = 0.6,
+    verify_timeout_s: float = 1.0,
 ) -> dict[str, Any]:
     """Manage application windows using Win32 ctypes."""
     if not isinstance(action, str):
@@ -470,10 +768,7 @@ def manage_window(
     )
 
     if norm_action == "focus":
-        if hasattr(u32, "ShowWindow"):
-            u32.ShowWindow(hwnd, SW_RESTORE)
-        if hasattr(u32, "SetForegroundWindow"):
-            u32.SetForegroundWindow(hwnd)
+        _focus_window_hwnd_sc(u32, hwnd, restore_if_iconic=True)
         result: dict[str, Any] = {
             "ok": True,
             "action": "focus",
@@ -517,14 +812,9 @@ def manage_window(
                     allow_minimized=True,
                 ) as guard:
                     guard.assert_ready("snap_restore")
-                    if hasattr(u32, "ShowWindow"):
-                        u32.ShowWindow(hwnd, SW_RESTORE)
-                    guard.assert_ready("snap_move_window")
-                    if hasattr(u32, "MoveWindow"):
-                        u32.MoveWindow(hwnd, x, y, w, h, True)
+                    _move_window_snap_sc(u32, hwnd, x, y, w, h, snap_restore_guard=guard)
                     guard.assert_ready("snap_focus")
-                    if hasattr(u32, "SetForegroundWindow"):
-                        u32.SetForegroundWindow(hwnd)
+                    _focus_window_hwnd_sc(u32, hwnd, restore_if_iconic=False)
             except PreconditionFailedError as exc:
                 payload = exc.to_abort_payload()
                 payload["action"] = norm_action
@@ -532,12 +822,8 @@ def manage_window(
                 payload["title"] = title
                 return payload
         else:
-            if hasattr(u32, "ShowWindow"):
-                u32.ShowWindow(hwnd, SW_RESTORE)
-            if hasattr(u32, "MoveWindow"):
-                u32.MoveWindow(hwnd, x, y, w, h, True)
-            if hasattr(u32, "SetForegroundWindow"):
-                u32.SetForegroundWindow(hwnd)
+            _move_window_snap_sc(u32, hwnd, x, y, w, h)
+            _focus_window_hwnd_sc(u32, hwnd, restore_if_iconic=False)
 
         result = {
             "ok": True,
@@ -558,8 +844,7 @@ def manage_window(
     if norm_action == "maximize":
         if hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_MAXIMIZE)
-        if hasattr(u32, "SetForegroundWindow"):
-            u32.SetForegroundWindow(hwnd)
+        _focus_window_hwnd_sc(u32, hwnd, restore_if_iconic=False)
         result = {"ok": True, "action": "maximize", "hwnd": hwnd, "title": title}
         if active_verifier is not None:
             outcome = active_verifier.verify_window_state(
@@ -586,8 +871,7 @@ def manage_window(
     if norm_action == "restore":
         if hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_RESTORE)
-        if hasattr(u32, "SetForegroundWindow"):
-            u32.SetForegroundWindow(hwnd)
+        _focus_window_hwnd_sc(u32, hwnd, restore_if_iconic=False)
         result = {"ok": True, "action": "restore", "hwnd": hwnd, "title": title}
         if active_verifier is not None:
             outcome = active_verifier.verify_window_state(
@@ -1741,9 +2025,13 @@ def register_system_control_tools(
         name="manage_window",
         description=(
             "Inspect and control application window placement on Windows. "
-            "Supported actions: 'list' (all visible windows), 'focus', 'snap_left' (left 50%), "
-            "'snap_right' (right 50%), 'maximize', 'minimize', 'restore', 'close'. "
-            "Target window can be specified by title_query, or defaults to foreground window."
+            "Supported actions: 'list' (all visible windows), 'focus', "
+            "'snap_left' (snap window to left half / 50% of screen), "
+            "'snap_right' (snap window to right half / 50% of screen), "
+            "'maximize', 'minimize', 'restore', 'close'. "
+            "Specify the target window by app name or window title substring in `title_query` "
+            "(e.g., 'Calculator', 'Notepad', 'Chrome'), or omit `title_query` to act on the "
+            "current foreground window."
         ),
         input_schema={
             "type": "object",
@@ -1755,7 +2043,10 @@ def register_system_control_tools(
                 },
                 "title_query": {
                     "type": "string",
-                    "description": "Optional window title substring to match.",
+                    "description": (
+                        "Optional application name or window title substring to match "
+                        "(e.g., 'Calculator', 'Notepad'), or omit for the active foreground window."
+                    ),
                 },
             },
             "required": ["action"],

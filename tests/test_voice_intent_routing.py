@@ -189,6 +189,10 @@ def test_route_4_system_instruction_covers_general_windows_os_tools() -> None:
     assert "maximize_window" in prompt
     assert "restore_window" in prompt
     assert "close_window" in prompt
+    assert "snap_left" in prompt
+    assert "snap_right" in prompt
+    assert "winrt_unavailable" in prompt
+    assert "no_media_session" in prompt
     assert "lock_screen" in prompt
     assert "open_settings" in prompt
     assert "read_clipboard(max_chars?, include_history?, max_items?)" in prompt

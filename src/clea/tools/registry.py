@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections.abc import Awaitable, Callable
@@ -195,7 +196,11 @@ class ToolRegistry:
                 raise PermissionDeniedError(msg)
 
         try:
-            result = await _maybe_await(tool.handler(**args))
+            if inspect.iscoroutinefunction(tool.handler):
+                result = await tool.handler(**args)
+            else:
+                raw_result = await asyncio.to_thread(tool.handler, **args)
+                result = await raw_result if inspect.isawaitable(raw_result) else raw_result
         except Exception as exc:
             self._audit.record(
                 tool_name=name,

@@ -6,6 +6,7 @@ import asyncio
 import ctypes
 import json
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,18 +14,28 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from websockets.asyncio.client import connect
 
+from clea.core import auth
 from clea.core.agent import _BASE_SYSTEM_PROMPT, AgentLoop
 from clea.core.daemon import CleaDaemon, build_daemon
 from clea.core.protocol import (
     METHOD_RESULTS,
+    ChatSendParams,
+    ChatSendRequest,
+    ErrorEvent,
+    HealthPingRequest,
     OsClickUiElementResult,
     OsControlMediaVolumeResult,
     OsControlSystemResult,
+    OsGuiActionParams,
+    OsGuiActionRequest,
     OsGuiActionResult,
     OsOpenOrFocusAppResult,
     OsUiActResult,
     OsUiBatchResult,
+    ResponseFrame,
+    ToolCallFinishedEvent,
     parse_frame,
 )
 from clea.core.sessions import Session
@@ -37,11 +48,12 @@ from clea.tools.guards import (
     MediaSessionState,
     PreconditionFailedError,
     PreconditionGuard,
+    VerificationOutcome,
     Win32FocusPreconditionBackend,
     WindowContext,
     WinRTMediaVerificationBackend,
 )
-from clea.tools.registry import ToolRegistry
+from clea.tools.registry import AuditLogger, ToolRegistry
 from clea.tools.system_controls import (
     manage_window,
     register_system_control_tools,
@@ -54,6 +66,7 @@ from clea.tools.windows_os import (
     control_system,
     gui_action,
     open_or_focus_app,
+    register_windows_os_tools,
     set_ui_snapshot_state,
     ui_act,
     ui_batch,
@@ -1362,3 +1375,840 @@ def test_verify_window_state_rejects_invalid_expectations() -> None:
 
     with pytest.raises(ValueError, match="expected_bounds"):
         verifier.verify_window_state(901, expected_bounds=(0, 0, 0, 100))
+
+
+def test_control_system_snap_left_right_with_guard_and_daemon_rpc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notepad = _FakeWindowState(
+        hwnd=0x1_0000_7100,
+        title="Untitled - Notepad",
+        process_name="notepad.exe",
+        bounds=(200, 100, 1000, 700),
+        work_area=(0, 0, 1920, 1040),
+    )
+    calc = _FakeWindowState(
+        hwnd=0x1_0000_7200,
+        title="Calculator",
+        process_name="ApplicationFrameHost.exe",
+        bounds=(100, 100, 500, 600),
+        work_area=(0, 0, 1920, 1040),
+    )
+    focus_backend = FakeFocusPreconditionBackend(
+        windows={notepad.hwnd: notepad, calc.hwnd: calc},
+        foreground_hwnd=notepad.hwnd,
+    )
+    u32 = _FakeUser32ForControls(focus_backend, allow_resize=True)
+    clock = _FakeClock()
+    verifier = ActionVerifier(
+        focus_backend=focus_backend,
+        monotonic_fn=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    # 1. Direct snap_left targeting app_name="notepad"
+    res_left = control_system(
+        "snap_left",
+        app_name="notepad",
+        user32=u32,
+        window_enumerator=lambda: [
+            EnumeratedWindow(
+                hwnd=notepad.hwnd,
+                title=notepad.title,
+                process_name=notepad.process_name,
+                is_visible=True,
+            ),
+            EnumeratedWindow(
+                hwnd=calc.hwnd,
+                title=calc.title,
+                process_name=calc.process_name,
+                is_visible=True,
+            ),
+        ],
+        focus_backend=focus_backend,
+        verifier=verifier,
+    )
+    assert res_left["ok"] is True
+    assert res_left["action"] == "snap_left"
+    assert res_left["rect"] == {"x": 0, "y": 0, "width": 960, "height": 1040}
+    assert res_left["verification"]["verified"] is True
+
+    # 2. window + window_action="snap_right" targeting window_title="Calculator"
+    res_right = control_system(
+        "window",
+        window_action="snap_right",
+        window_title="Calculator",
+        user32=u32,
+        window_enumerator=lambda: [
+            EnumeratedWindow(
+                hwnd=notepad.hwnd,
+                title=notepad.title,
+                process_name=notepad.process_name,
+                is_visible=True,
+            ),
+            EnumeratedWindow(
+                hwnd=calc.hwnd,
+                title=calc.title,
+                process_name=calc.process_name,
+                is_visible=True,
+            ),
+        ],
+        focus_backend=focus_backend,
+        verifier=verifier,
+    )
+    assert res_right["ok"] is True
+    assert res_right["action"] == "snap_right"
+    assert res_right["rect"] == {"x": 960, "y": 0, "width": 960, "height": 1040}
+    assert res_right["verification"]["verified"] is True
+
+    # 3. Foreground fallback when no app_name/title passed
+    focus_backend.foreground_hwnd = notepad.hwnd
+    res_fg = control_system(
+        "snap_right",
+        user32=u32,
+        focus_backend=focus_backend,
+        verifier=verifier,
+    )
+    assert res_fg["ok"] is True
+    assert res_fg["hwnd"] == notepad.hwnd
+    assert res_fg["verification"]["verified"] is True
+
+    # 4. PreconditionGuard aborts cleanly if target is already invalid/closed
+    notepad.valid = False
+    res_closed = control_system(
+        "snap_left",
+        hwnd=notepad.hwnd,
+        user32=u32,
+        focus_backend=focus_backend,
+        verifier=verifier,
+    )
+    assert res_closed["ok"] is False
+    assert res_closed["status"] == "aborted_precondition"
+    assert res_closed["aborted_precondition"]["reason"] == "no_target_window"
+
+    # 5. Daemon RPC round-trip for os.control_system snap_left
+    notepad.valid = True
+
+    def _patched_control_system(
+        action: str,
+        *,
+        focus_backend: Any = None,
+        verifier: Any = None,
+        **kw: Any,
+    ) -> dict[str, Any]:
+        return control_system(
+            action,
+            user32=u32,
+            window_enumerator=lambda: [
+                EnumeratedWindow(
+                    hwnd=notepad.hwnd,
+                    title=notepad.title,
+                    process_name=notepad.process_name,
+                    is_visible=True,
+                )
+            ],
+            focus_backend=focus_backend,
+            verifier=verifier,
+            **kw,
+        )
+
+    monkeypatch.setattr("clea.core.daemon.control_system", _patched_control_system)
+    mem = MemoryStore(base_dir=tmp_path / "mem")
+    mem.ensure_initialized()
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        memory=mem,
+        provider=SimpleNamespace(provider_name="fake", model_name="fake"),
+        focus_backend=focus_backend,
+        action_verifier=verifier,
+    )
+    rpc_res = _rpc_call(
+        daemon,
+        "os.control_system",
+        {"action": "snap_left", "app_name": "notepad"},
+    )
+    validated = OsControlSystemResult.model_validate(rpc_res)
+    assert validated.action == "snap_left"
+    assert validated.rect == {"x": 0, "y": 0, "width": 960, "height": 1040}
+    assert validated.verification is not None and validated.verification.verified is True
+
+
+async def test_chat_gui_action_typing_minimized_abort_and_nonblocking_ws(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notepad = _FakeWindowState(
+        hwnd=0x1_0000_8100,
+        title="Untitled - Notepad",
+        process_name="notepad.exe",
+        bounds=(100, 100, 900, 700),
+        work_area=(0, 0, 1920, 1040),
+    )
+    modal = _FakeWindowState(
+        hwnd=0x1_0000_8200,
+        title="Windows Security",
+        process_name="CredentialUIBroker.exe",
+    )
+    focus_backend = FakeFocusPreconditionBackend(
+        windows={notepad.hwnd: notepad, modal.hwnd: modal},
+        foreground_hwnd=notepad.hwnd,
+    )
+    fake_u32 = _FakeUser32ForControls(focus_backend)
+    worker_threads: list[int] = []
+    main_thread = threading.get_ident()
+    steal_on_sleep = False
+
+    def _sleep_maybe_steal(_sec: float) -> None:
+        if steal_on_sleep:
+            focus_backend.foreground_hwnd = modal.hwnd
+
+    def _mock_gui_action(action: str, **kwargs: Any) -> dict[str, Any]:
+        worker_threads.append(threading.get_ident())
+        # Verify ToolRegistry.execute offloaded sync call off the event loop thread
+        return gui_action(
+            action,
+            user32=fake_u32,
+            sleep_fn=_sleep_maybe_steal,
+            focus_backend=focus_backend,
+            **{k: v for k, v in kwargs.items() if k not in ("user32", "focus_backend")},
+        )
+
+    monkeypatch.setattr(windows_os, "gui_action", _mock_gui_action)
+
+    class _ChatGuiProvider(LLMProvider):
+        provider_name = "fake"
+        model_name = "fake"
+
+        def __init__(self) -> None:
+            self.mode = "type"
+
+        async def stream_turn(
+            self,
+            *,
+            messages: list[Message],
+            tools: list[Any],
+            system_prompt: str,
+            response_format: dict[str, Any] | None = None,
+        ) -> Any:
+            if tools:
+                tool_names = {t.name for t in tools}
+                assert {
+                    "gui_action",
+                    "ui_act",
+                    "ui_batch",
+                    "click_ui_element",
+                    "manage_window",
+                } <= tool_names
+            tool_msgs = [m for m in messages if m.role == "tool"]
+            if self.mode == "timeout":
+                raise TimeoutError()
+            if tool_msgs:
+                yield StreamChunk(type="text_delta", text=f"Result: {tool_msgs[-1].content}")
+                yield StreamChunk(type="done")
+                return
+            yield StreamChunk(
+                type="tool_call",
+                tool_call=ToolCall(
+                    id="call_gui_1",
+                    name="gui_action",
+                    arguments={"action": "type_text", "text": "hello", "interval_ms": 10},
+                ),
+            )
+            yield StreamChunk(type="done")
+
+    mem = MemoryStore(base_dir=tmp_path / "mem")
+    mem.ensure_initialized()
+    audit_path = tmp_path / "logs" / "audit.jsonl"
+    reg = ToolRegistry(audit_logger=AuditLogger(audit_path))
+    provider = _ChatGuiProvider()
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=provider,
+        memory=mem,
+        registry=reg,
+        focus_backend=focus_backend,
+    )
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            # 1. Normal Chat typing executes off main event loop thread and writes audit.jsonl
+            req1 = ChatSendRequest(params=ChatSendParams(text="Type hello in Notepad"))
+            await ws.send(req1.model_dump_json())
+
+            ping_req = HealthPingRequest()
+            await ws.send(ping_req.model_dump_json())
+
+            events1: list[Any] = []
+            got_ping = False
+            final1: ResponseFrame | None = None
+            while final1 is None or not got_ping:
+                frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                if isinstance(frame, ResponseFrame) and frame.id == ping_req.id:
+                    assert frame.ok is True
+                    got_ping = True
+                elif isinstance(frame, ResponseFrame) and frame.id == req1.id:
+                    final1 = frame
+                else:
+                    events1.append(frame)
+
+            assert final1.ok is True
+            assert worker_threads and worker_threads[0] != main_thread
+            finished1 = next(e for e in events1 if isinstance(e, ToolCallFinishedEvent))
+            assert finished1.data.is_error is False
+            parsed1 = json.loads(finished1.data.output)
+            assert parsed1["ok"] is True
+            assert parsed1["status"] == "completed"
+            assert parsed1["char_count"] == 5
+
+            # 2. Minimized-window Chat input aborts cleanly without crashing daemon/WS
+            notepad.minimized = True
+            req2 = ChatSendRequest(params=ChatSendParams(text="Type into minimized Notepad"))
+            await ws.send(req2.model_dump_json())
+
+            events2: list[Any] = []
+            final2: ResponseFrame | None = None
+            while final2 is None:
+                frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                if isinstance(frame, ResponseFrame) and frame.id == req2.id:
+                    final2 = frame
+                else:
+                    events2.append(frame)
+
+            assert final2.ok is True
+            finished2 = next(e for e in events2 if isinstance(e, ToolCallFinishedEvent))
+            assert finished2.data.is_error is False
+            parsed2 = json.loads(finished2.data.output)
+            assert parsed2["ok"] is False
+            assert parsed2["status"] == "aborted_precondition"
+            assert parsed2["aborted_precondition"]["reason"] == "window_minimized"
+
+            # 3. Focus-loss mid-typing in Chat aborts cleanly
+            notepad.minimized = False
+            focus_backend.foreground_hwnd = notepad.hwnd
+            steal_on_sleep = True
+            req3 = ChatSendRequest(params=ChatSendParams(text="Type while modal steals focus"))
+            await ws.send(req3.model_dump_json())
+
+            events3: list[Any] = []
+            final3: ResponseFrame | None = None
+            while final3 is None:
+                frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                if isinstance(frame, ResponseFrame) and frame.id == req3.id:
+                    final3 = frame
+                else:
+                    events3.append(frame)
+
+            assert final3.ok is True
+            finished3 = next(e for e in events3 if isinstance(e, ToolCallFinishedEvent))
+            parsed3 = json.loads(finished3.data.output)
+            assert parsed3["status"] == "aborted_precondition"
+            assert parsed3["aborted_precondition"]["actual_title"] == "Windows Security"
+
+            # 4. Empty TimeoutError() never returns blank error string ("Daemon request failed")
+            provider.mode = "timeout"
+            req4 = ChatSendRequest(params=ChatSendParams(text="Trigger empty timeout"))
+            await ws.send(req4.model_dump_json())
+
+            events4: list[Any] = []
+            final4: ResponseFrame | None = None
+            while final4 is None:
+                frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                if isinstance(frame, ResponseFrame) and frame.id == req4.id:
+                    final4 = frame
+                else:
+                    events4.append(frame)
+
+            assert final4.ok is False
+            assert final4.error and "TimeoutError" in final4.error
+            err_evt = next(e for e in events4 if isinstance(e, ErrorEvent))
+            assert err_evt.data.message
+
+            audit_lines = [
+                json.loads(line)
+                for line in audit_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            assert len([a for a in audit_lines if a["tool"] == "gui_action"]) == 3
+    finally:
+        await daemon.stop()
+
+
+def test_verification_outcome_classification_and_winrt_import_and_prompts() -> None:
+    ok_out = VerificationOutcome(verified=True, reason="media_state_matched", status="verified")
+    unavail_winrt = VerificationOutcome(
+        verified=False, reason="winrt_unavailable", status="unavailable"
+    )
+    unavail_session = VerificationOutcome(
+        verified=False, reason="no_media_session", status="unavailable"
+    )
+    fail_bounds = VerificationOutcome(
+        verified=False, reason="bounds_mismatch", status="timeout"
+    )
+    assert ok_out.outcome_kind == "verified"
+    assert unavail_winrt.outcome_kind == "unavailable"
+    assert unavail_session.outcome_kind == "unavailable"
+    assert fail_bounds.outcome_kind == "failed"
+
+    for prompt in (_BASE_SYSTEM_PROMPT, BASE_VOICE_SYSTEM_INSTRUCTION):
+        assert "winrt_unavailable" in prompt
+        assert "no_media_session" in prompt
+        assert "bounds_mismatch" in prompt
+        assert 'do NOT say "I can\'t do that"' in prompt
+
+    if sys.platform == "win32":
+        import winrt.windows.media.control as mc
+
+        assert hasattr(mc, "GlobalSystemMediaTransportControlsSessionManager")
+
+
+def test_open_or_focus_app_notepad_child_and_root_hwnd_verification() -> None:
+    root_hwnd = 0x1_0000_A000
+    child_fg_hwnd = 0x1_0000_A010
+    other_hwnd = 0x1_0000_B000
+    closed_handles: list[int] = []
+
+    class _Win11NotepadUser32:
+        def __init__(self) -> None:
+            self.fg = other_hwnd
+
+        def IsWindow(self, hwnd: int) -> bool:
+            return hwnd in (root_hwnd, child_fg_hwnd, other_hwnd)
+
+        def IsWindowVisible(self, hwnd: int) -> bool:
+            return self.IsWindow(hwnd)
+
+        def IsIconic(self, hwnd: int) -> bool:
+            return False
+
+        def GetAncestor(self, hwnd: int, flags: int) -> int:
+            if hwnd in (root_hwnd, child_fg_hwnd) and flags in (2, 3):
+                return root_hwnd
+            return hwnd
+
+        def IsChild(self, parent: int, child: int) -> bool:
+            return parent == root_hwnd and child == child_fg_hwnd
+
+        def GetForegroundWindow(self) -> int:
+            return self.fg
+
+        def GetWindowTextLengthW(self, hwnd: int) -> int:
+            return len(self._title(hwnd))
+
+        def GetWindowTextW(self, hwnd: int, buf: Any, max_count: int) -> int:
+            title = self._title(hwnd)
+            buf.value = title[: max_count - 1]
+            return len(buf.value)
+
+        def _title(self, hwnd: int) -> str:
+            if hwnd in (root_hwnd, child_fg_hwnd):
+                return "Untitled - Notepad"
+            return "Other App"
+
+        def GetWindowThreadProcessId(self, hwnd: int, pid_ptr: Any) -> int:
+            if pid_ptr is not None:
+                pid_val = 4141 if hwnd in (root_hwnd, child_fg_hwnd) else 9191
+                ctypes.cast(pid_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value = pid_val
+            return 101
+
+        def GetWindowRect(self, hwnd: int, rect_ptr: Any) -> bool:
+            obj = getattr(rect_ptr, "_obj", None)
+            if obj is not None:
+                obj.left, obj.top, obj.right, obj.bottom = 100, 100, 900, 700
+            return True
+
+        def MonitorFromWindow(self, hwnd: int, flags: int) -> int:
+            return 1
+
+        def GetMonitorInfoW(self, hmon: int, mi_ptr: Any) -> bool:
+            obj = getattr(mi_ptr, "_obj", None)
+            if obj is not None:
+                obj.rcWork.left, obj.rcWork.top, obj.rcWork.right, obj.rcWork.bottom = (
+                    0,
+                    0,
+                    1920,
+                    1040,
+                )
+            return True
+
+        def ShowWindow(self, hwnd: int, cmd: int) -> bool:
+            return True
+
+        def SetForegroundWindow(self, hwnd: int) -> bool:
+            # Simulate Windows 11 WinUI3 Notepad returning inner child HWND as foreground
+            if hwnd == root_hwnd:
+                self.fg = child_fg_hwnd
+                return True
+            return False
+
+    class _Kernel32:
+        def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+            return 0x1_0000_0055
+
+        def QueryFullProcessImageNameW(
+            self, handle: int, flags: int, buf: Any, size_ptr: Any
+        ) -> bool:
+            buf.value = r"C:\Windows\System32\notepad.exe"
+            return True
+
+        def CloseHandle(self, handle: int) -> bool:
+            closed_handles.append(int(handle))
+            return True
+
+    u32 = _Win11NotepadUser32()
+    k32 = _Kernel32()
+    backend = Win32FocusPreconditionBackend(user32=u32, dwmapi=SimpleNamespace(), kernel32=k32)
+    assert backend.is_same_window_tree(root_hwnd, child_fg_hwnd) is True
+    assert backend.is_same_window_tree(root_hwnd, other_hwnd) is False
+
+    clock = _FakeClock()
+    verifier = ActionVerifier(
+        focus_backend=backend,
+        monotonic_fn=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+    res = open_or_focus_app(
+        "notepad",
+        user32=u32,
+        kernel32=k32,
+        window_enumerator=lambda: [
+            EnumeratedWindow(
+                hwnd=child_fg_hwnd,
+                title="Untitled - Notepad",
+                process_name="notepad.exe",
+                is_visible=True,
+            )
+        ],
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res["status"] == "focused"
+    assert res["hwnd"] == root_hwnd
+    assert res["verification"]["verified"] is True
+    assert res["verification"]["reason"] == "window_state_matched"
+    assert closed_handles
+
+
+def test_verification_outcome_normalizes_contradictory_status() -> None:
+    failed = VerificationOutcome(verified=False, reason="bounds_mismatch")
+    assert failed.status == "failed"
+    assert failed.outcome_kind == "failed"
+    assert failed.to_dict()["outcome_kind"] == "failed"
+
+    unavail = VerificationOutcome(verified=False, reason="winrt_unavailable")
+    assert unavail.status == "unavailable"
+    assert unavail.outcome_kind == "unavailable"
+    assert unavail.to_dict()["outcome_kind"] == "unavailable"
+
+
+def test_focus_window_hwnd_attaches_cur_tid_to_fg_tid() -> None:
+    calls: list[tuple[str, Any]] = []
+    fg_holder = {"hwnd": 111}
+
+    class _LockUser32:
+        def IsIconic(self, hwnd: int) -> int:
+            return 0
+
+        def SetForegroundWindow(self, hwnd: int) -> int:
+            calls.append(("SetForegroundWindow", hwnd))
+            # Fail until cur_tid is attached to fg_tid
+            if ("AttachThreadInput", 777, 888, True) in calls:
+                fg_holder["hwnd"] = hwnd
+                return 1
+            return 0
+
+        def GetForegroundWindow(self) -> int:
+            return fg_holder["hwnd"]
+
+        def GetWindowThreadProcessId(self, hwnd: int, pid_ptr: Any) -> int:
+            return 888 if hwnd == 111 else 999
+
+        def AttachThreadInput(self, id_attach: int, id_attach_to: int, attach: bool) -> int:
+            calls.append(("AttachThreadInput", id_attach, id_attach_to, bool(attach)))
+            return 1
+
+        def BringWindowToTop(self, hwnd: int) -> int:
+            calls.append(("BringWindowToTop", hwnd))
+            return 1
+
+        def ShowWindow(self, hwnd: int, cmd: int) -> int:
+            calls.append(("ShowWindow", hwnd, cmd))
+            return 1
+
+    class _CurKernel32:
+        def GetCurrentThreadId(self) -> int:
+            return 777
+
+    windows_os._focus_window_hwnd(
+        _LockUser32(),
+        222,
+        kernel32=_CurKernel32(),
+        attach_fallback=True,
+    )
+    assert fg_holder["hwnd"] == 222
+    assert ("AttachThreadInput", 777, 888, True) in calls
+    assert ("AttachThreadInput", 777, 888, False) in calls
+
+
+def test_send_unicode_text_dispatches_vk_return_and_tab_and_app_name_minimized_aborts() -> None:
+    sent_vk_and_flags: list[tuple[int, int, int]] = []
+    show_calls: list[tuple[int, int]] = []
+
+    class _FakeInputUser32:
+        def EnumWindows(self, cb: Any, lparam: int) -> int:
+            cb(301, lparam)
+            return 1
+
+        def IsWindowVisible(self, hwnd: int) -> int:
+            return 1
+
+        def IsIconic(self, hwnd: int) -> int:
+            return 1 if hwnd == 301 else 0
+
+        def ShowWindow(self, hwnd: int, cmd: int) -> int:
+            show_calls.append((hwnd, cmd))
+            return 1
+
+        def GetWindowTextLengthW(self, hwnd: int) -> int:
+            return len("Untitled - Notepad")
+
+        def GetWindowTextW(self, hwnd: int, buf: Any, max_len: int) -> int:
+            buf.value = "Untitled - Notepad"
+            return len(buf.value)
+
+        def GetWindowThreadProcessId(self, hwnd: int, pid_ptr: Any) -> int:
+            if pid_ptr is not None:
+                ctypes.cast(pid_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value = 500
+            return 1
+
+        def GetForegroundWindow(self) -> int:
+            return 999
+
+        def SendInput(self, count: int, ptr: Any, size: int) -> int:
+            arr = ctypes.cast(ptr, ctypes.POINTER(windows_os._INPUT * count)).contents
+            for item in arr:
+                ki = item.union.ki
+                sent_vk_and_flags.append((int(ki.wVk), int(ki.wScan), int(ki.dwFlags)))
+            return count
+
+    class _FakeKernel32:
+        def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+            return 77
+
+        def QueryFullProcessImageNameW(
+            self, handle: int, flags: int, buf: Any, size_ptr: Any
+        ) -> bool:
+            buf.value = r"C:\Windows\System32\notepad.exe"
+            return True
+
+        def CloseHandle(self, handle: int) -> bool:
+            return True
+
+    u32 = _FakeInputUser32()
+    k32 = _FakeKernel32()
+    notepad_win = _FakeWindowState(
+        hwnd=301,
+        title="Untitled - Notepad",
+        process_name="notepad.exe",
+        minimized=True,
+    )
+    chrome_win = _FakeWindowState(hwnd=999, title="Clea", process_name="chrome.exe")
+    backend = FakeFocusPreconditionBackend(
+        windows={301: notepad_win, 999: chrome_win},
+        foreground_hwnd=999,
+    )
+
+    # Minimized target app specified via app_name must abort WITHOUT restoring or sending keys
+    abort_res = gui_action(
+        "type_text",
+        text="Hello",
+        app_name="notepad",
+        user32=u32,
+        kernel32=k32,
+        focus_backend=backend,
+    )
+    assert abort_res["ok"] is False
+    assert abort_res["status"] == "aborted_precondition"
+    assert abort_res["reason"] == "window_minimized"
+    assert show_calls == []
+    assert sent_vk_and_flags == []
+
+    # Missing target app returns clean aborted_precondition instead of crashing
+    missing_res = gui_action(
+        "type_text",
+        text="Hello",
+        app_name="NonExistentAppXYZ",
+        user32=u32,
+        kernel32=k32,
+        focus_backend=backend,
+    )
+    assert missing_res["ok"] is False
+    assert missing_res["status"] == "aborted_precondition"
+    assert missing_res["reason"] == "no_target_window"
+
+    # Non-minimized foreground Notepad dispatches VK_RETURN (0x0D) and VK_TAB (0x09)
+    notepad_win.minimized = False
+    backend.foreground_hwnd = 301
+    ok_res = gui_action(
+        "type_text",
+        text="A\r\nB\tC",
+        app_name="notepad",
+        interval_ms=0,
+        user32=u32,
+        kernel32=k32,
+        focus_backend=backend,
+    )
+    assert ok_res["ok"] is True
+    assert ok_res["char_count"] == len("A\r\nB\tC")
+    assert (0x0D, 0, 0) in sent_vk_and_flags
+    assert (0x0D, 0, windows_os.KEYEVENTF_KEYUP) in sent_vk_and_flags
+    assert (0x09, 0, 0) in sent_vk_and_flags
+    assert (0x09, 0, windows_os.KEYEVENTF_KEYUP) in sent_vk_and_flags
+
+
+async def test_chat_gui_action_handles_null_optional_args_and_daemon_survives_error(
+    tmp_path: Path,
+) -> None:
+    notepad = _FakeWindowState(hwnd=501, title="Untitled - Notepad", process_name="notepad.exe")
+    backend = FakeFocusPreconditionBackend(windows={501: notepad}, foreground_hwnd=501)
+    u32 = SimpleNamespace(
+        SendInput=lambda c, p, s: c,
+    )
+
+    reg = ToolRegistry(audit_logger=AuditLogger(tmp_path / "audit.jsonl"))
+    register_windows_os_tools(reg, focus_backend=backend, user32=u32)
+
+    # Chat models sometimes pass explicit None for defaulted optional args
+    tool_res = await reg.execute(
+        "gui_action",
+        {
+            "action": "type_text",
+            "text": "hi",
+            "clicks": None,
+            "button": None,
+            "delta": None,
+            "seconds": None,
+            "interval_ms": None,
+            "expected_hwnd": 501,
+        },
+    )
+    assert tool_res["ok"] is True
+    assert tool_res["status"] == "completed"
+
+    # WebSocket loop must survive unexpected exceptions in _dispatch_request
+    mem = MemoryStore(base_dir=tmp_path / "mem")
+    mem.ensure_initialized()
+    daemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=SimpleNamespace(),  # type: ignore[arg-type]
+        memory=mem,
+        registry=reg,
+        focus_backend=backend,
+    )
+    orig_dispatch = daemon._dispatch_request
+
+    async def _flaky_dispatch(conn: Any, frame: Any) -> None:
+        if getattr(frame, "method", "") == "os.gui_action" and getattr(
+            getattr(frame, "params", None), "action", ""
+        ) == "wait":
+            raise RuntimeError("boom inside dispatch")
+        await orig_dispatch(conn, frame)
+
+    daemon._dispatch_request = _flaky_dispatch  # type: ignore[method-assign]
+    await daemon.start()
+    try:
+        url = f"ws://127.0.0.1:{daemon.bound_port}"
+        async with connect(
+            url,
+            subprotocols=auth.client_subprotocols(daemon.token),  # type: ignore[arg-type]
+        ) as ws:
+            bad_req = OsGuiActionRequest(params=OsGuiActionParams(action="wait", seconds=0.2))
+            await ws.send(bad_req.model_dump_json())
+            err_frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert isinstance(err_frame, ResponseFrame)
+            assert err_frame.id == bad_req.id
+            assert err_frame.ok is False
+            assert err_frame.error is not None
+            assert "boom inside dispatch" in str(err_frame.error)
+
+            # Connection remains alive for subsequent requests including os.gui_action
+            ping_req = HealthPingRequest()
+            await ws.send(ping_req.model_dump_json())
+            ping_frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert isinstance(ping_frame, ResponseFrame)
+            assert ping_frame.id == ping_req.id
+            assert ping_frame.ok is True
+
+            notepad.minimized = True
+            min_req = OsGuiActionRequest(
+                params=OsGuiActionParams(
+                    action="type_text",
+                    text="hello",
+                    expected_hwnd=501,
+                )
+            )
+            await ws.send(min_req.model_dump_json())
+            min_frame = parse_frame(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert isinstance(min_frame, ResponseFrame)
+            assert min_frame.id == min_req.id
+            assert min_frame.ok is True
+            assert min_frame.result is not None
+            assert min_frame.result["status"] == "aborted_precondition"
+            assert min_frame.result["reason"] == "window_minimized"
+    finally:
+        await daemon.stop()
+
+
+def test_control_system_snap_calculator_known_app_spec() -> None:
+    calc = _FakeWindowState(hwnd=811, title="Calculator", process_name="CalculatorApp.exe")
+    backend = FakeFocusPreconditionBackend(windows={811: calc}, foreground_hwnd=811)
+    moved: list[tuple[int, int, int, int, int]] = []
+
+    class _CalcUser32:
+        def ShowWindow(self, hwnd: int, cmd: int) -> int:
+            return 1
+
+        def MoveWindow(self, hwnd: int, x: int, y: int, w: int, h: int, repaint: bool) -> int:
+            moved.append((hwnd, x, y, w, h))
+            calc.bounds = (x, y, x + w, y + h)
+            return 1
+
+        def SetForegroundWindow(self, hwnd: int) -> int:
+            backend.foreground_hwnd = hwnd
+            return 1
+
+    clock = _FakeClock()
+    verifier = ActionVerifier(
+        focus_backend=backend,
+        monotonic_fn=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+    res = control_system(
+        "snap_left",
+        app_name="calculator",
+        user32=_CalcUser32(),
+        window_enumerator=lambda: [
+            EnumeratedWindow(
+                hwnd=811,
+                title="Calculator",
+                process_name="CalculatorApp.exe",
+                is_visible=True,
+            )
+        ],
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res["ok"] is True
+    assert res["action"] == "snap_left"
+    assert res["hwnd"] == 811
+    assert moved == [(811, 0, 0, 960, 1040)]
+    assert res["verification"]["verified"] is True
+
+

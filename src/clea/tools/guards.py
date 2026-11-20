@@ -32,7 +32,26 @@ from clea.surfaces.voice.win32 import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_BOUNDS_TOLERANCE_PX = 16
+_DEFAULT_BOUNDS_TOLERANCE_PX = 24
+
+
+def _enable_dpi_awareness_guards(user32: Any) -> None:
+    """Ensure Win32 coordinates match DWM physical pixels across DPI scales."""
+    if sys.platform != "win32" or not isinstance(user32, ctypes.CDLL):
+        return
+    with contextlib.suppress(Exception):
+        if hasattr(user32, "SetProcessDpiAwarenessContext"):
+            user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+    with contextlib.suppress(Exception):
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        if hasattr(shcore, "SetProcessDpiAwareness"):
+            shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+            shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+            shcore.SetProcessDpiAwareness(2)
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +205,17 @@ class PreconditionFailedError(RuntimeError):
         }
 
 
+UNAVAILABLE_VERIFICATION_REASONS = frozenset(
+    {
+        "winrt_unavailable",
+        "no_media_session",
+        "no_active_session",
+        "media_verification_unavailable",
+        "winrt_timeout",
+    }
+)
+
+
 @dataclass(frozen=True)
 class VerificationOutcome:
     """Result of deterministic closed-loop post-action verification."""
@@ -203,10 +233,36 @@ class VerificationOutcome:
     elapsed_ms: float = 0.0
     actual: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not self.verified and self.status == "verified":
+            inferred = "unavailable" if self.is_unavailable else "failed"
+            object.__setattr__(self, "status", inferred)
+
+    @property
+    def is_unavailable(self) -> bool:
+        """True when verification could not read OS state rather than observing a mismatch."""
+        if self.verified:
+            return False
+        if self.status == "unavailable":
+            return True
+        return self.reason in UNAVAILABLE_VERIFICATION_REASONS or self.reason.startswith(
+            "winrt_error"
+        )
+
+    @property
+    def outcome_kind(self) -> str:
+        """Distinguish 'verified', 'unavailable', and real 'failed' outcomes."""
+        if self.verified:
+            return "verified"
+        if self.is_unavailable:
+            return "unavailable"
+        return "failed"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "verified": self.verified,
             "status": self.status,
+            "outcome_kind": self.outcome_kind,
             "reason": self.reason,
             "actual": dict(self.actual),
             "elapsed_ms": round(self.elapsed_ms, 2),
@@ -302,6 +358,14 @@ def _configure_guard_win32_dlls(
         ]
         user32.GetMonitorInfoW.restype = wintypes.BOOL
 
+        if hasattr(user32, "GetAncestor"):
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, wintypes.UINT]
+            user32.GetAncestor.restype = ctypes.c_void_p
+
+        if hasattr(user32, "IsChild"):
+            user32.IsChild.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            user32.IsChild.restype = wintypes.BOOL
+
     if isinstance(dwmapi, ctypes.CDLL) and hasattr(dwmapi, "DwmGetWindowAttribute"):
         dwmapi.DwmGetWindowAttribute.argtypes = [
             ctypes.c_void_p,
@@ -341,6 +405,7 @@ class Win32FocusPreconditionBackend:
         self._user32 = user32 if user32 is not None else _load_windll("user32")
         self._dwmapi = dwmapi if dwmapi is not None else _load_windll("dwmapi")
         self._kernel32 = kernel32 if kernel32 is not None else _load_windll("kernel32")
+        _enable_dpi_awareness_guards(self._user32)
         _configure_guard_win32_dlls(
             user32=self._user32,
             dwmapi=self._dwmapi,
@@ -489,6 +554,54 @@ class Win32FocusPreconditionBackend:
             minimized=minimized,
         )
 
+    def get_root_hwnd(self, hwnd: int) -> int:
+        if not hwnd or hwnd <= 0 or self._user32 is None:
+            return int(hwnd) if hwnd else 0
+        if hasattr(self._user32, "GetAncestor"):
+            with contextlib.suppress(Exception):
+                root = self._user32.GetAncestor(hwnd, 2)
+                if root:
+                    return int(root)
+        return int(hwnd)
+
+    def get_root_owner_hwnd(self, hwnd: int) -> int:
+        if not hwnd or hwnd <= 0 or self._user32 is None:
+            return int(hwnd) if hwnd else 0
+        if hasattr(self._user32, "GetAncestor"):
+            with contextlib.suppress(Exception):
+                root_owner = self._user32.GetAncestor(hwnd, 3)
+                if root_owner:
+                    return int(root_owner)
+        return int(hwnd)
+
+    def is_same_window_tree(self, expected_hwnd: int, actual_hwnd: int) -> bool:
+        if not expected_hwnd or not actual_hwnd or expected_hwnd <= 0 or actual_hwnd <= 0:
+            return False
+        if int(expected_hwnd) == int(actual_hwnd):
+            return True
+        if self._user32 is None:
+            return False
+        if hasattr(self._user32, "IsChild"):
+            with contextlib.suppress(Exception):
+                if bool(self._user32.IsChild(expected_hwnd, actual_hwnd)) or bool(
+                    self._user32.IsChild(actual_hwnd, expected_hwnd)
+                ):
+                    return True
+        if hasattr(self._user32, "GetAncestor"):
+            exp_root = self.get_root_hwnd(expected_hwnd)
+            act_root = self.get_root_hwnd(actual_hwnd)
+            if exp_root and act_root and exp_root == act_root:
+                return True
+            exp_owner = self.get_root_owner_hwnd(expected_hwnd)
+            act_owner = self.get_root_owner_hwnd(actual_hwnd)
+            if exp_owner and act_owner and (
+                exp_owner == act_owner
+                or exp_owner == int(actual_hwnd)
+                or act_owner == int(expected_hwnd)
+            ):
+                return True
+        return False
+
     def get_foreground_context(self) -> WindowContext | None:
         if self._user32 is None or not hasattr(self._user32, "GetForegroundWindow"):
             return None
@@ -577,7 +690,14 @@ class PreconditionGuard:
 
         if self._require_foreground:
             fg = self._backend.get_foreground_context()
-            if fg is None or fg.hwnd != target.hwnd:
+            fg_matches = fg is not None and fg.hwnd == target.hwnd
+            if (
+                not fg_matches
+                and fg is not None
+                and hasattr(self._backend, "is_same_window_tree")
+            ):
+                fg_matches = bool(self._backend.is_same_window_tree(target.hwnd, fg.hwnd))
+            if not fg_matches:
                 raise PreconditionFailedError(
                     reason="focus_lost",
                     expected_hwnd=target.hwnd,
@@ -651,14 +771,14 @@ class WinRTMediaVerificationBackend:
             return MediaSessionState(
                 playback_status="unavailable",
                 available=True,
-                error="no_active_session",
+                error="no_media_session",
             )
         session = manager.get_current_session()
         if session is None:
             return MediaSessionState(
                 playback_status="unavailable",
                 available=True,
-                error="no_active_session",
+                error="no_media_session",
             )
 
         playback_status = "unknown"
@@ -766,7 +886,7 @@ class WinRTMediaVerificationBackend:
         return MediaSessionState(
             playback_status="unavailable",
             available=True,
-            error="no_active_session",
+            error="no_media_session",
         )
 
 
@@ -858,7 +978,7 @@ class ActionVerifier:
         last_session = MediaSessionState(
             playback_status="unavailable",
             available=False,
-            error="no_active_session",
+            error="no_media_session",
         )
         last_reason = "media_state_mismatch"
 
@@ -869,7 +989,7 @@ class ActionVerifier:
                 session = MediaSessionState(
                     playback_status="unavailable",
                     available=True,
-                    error="no_active_session",
+                    error="no_media_session",
                 )
             else:
                 session = raw
@@ -891,7 +1011,7 @@ class ActionVerifier:
 
             actual_stat = session.playback_status.strip().lower()
             if actual_stat == "unavailable":
-                last_reason = session.error or "no_active_session"
+                last_reason = session.error or "no_media_session"
             else:
                 status_ok = True
                 if norm_expected is not None:
@@ -1067,7 +1187,16 @@ class ActionVerifier:
                     if matched and norm_state == "focused":
                         fg = backend.get_foreground_context()
                         last_foreground_hwnd = fg.hwnd if fg is not None else None
-                        if last_foreground_hwnd != hwnd:
+                        fg_matches = last_foreground_hwnd == hwnd
+                        if (
+                            not fg_matches
+                            and last_foreground_hwnd is not None
+                            and hasattr(backend, "is_same_window_tree")
+                        ):
+                            fg_matches = bool(
+                                backend.is_same_window_tree(hwnd, last_foreground_hwnd)
+                            )
+                        if not fg_matches:
                             matched = False
                             last_reason = "not_foreground"
 

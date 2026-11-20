@@ -38,16 +38,25 @@ from clea.tools.guards import (
     PreconditionGuard,
     Win32FocusPreconditionBackend,
 )
+from clea.tools.registry import RiskLevel, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 # Window show/focus constants
 SW_SHOWNORMAL: int = 1
 SW_MAXIMIZE: int = 3
+SW_SHOW: int = 5
 SW_MINIMIZE: int = 6
 SW_RESTORE: int = 9
 WM_CLOSE: int = 0x0010
 UOI_NAME: int = 2
+GA_ROOT: int = 2
+GW_OWNER: int = 4
+DWMWA_EXTENDED_FRAME_BOUNDS: int = 9
+DWMWA_CLOAKED: int = 14
+VK_TAB_OS: int = 0x09
+VK_RETURN_OS: int = 0x0D
+MONITOR_DEFAULTTONEAREST: int = 2
 _STARTF_USESHOWWINDOW: int = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
 
 # Virtual key codes for media & step volume controls
@@ -149,6 +158,10 @@ VALID_SYSTEM_ACTIONS: tuple[str, ...] = (
     "maximize_window",
     "restore_window",
     "close_window",
+    "snap_left",
+    "snap_right",
+    "snap_left_window",
+    "snap_right_window",
     "minimize",
     "maximize",
     "restore",
@@ -310,6 +323,13 @@ _KNOWN_APPS: dict[str, _AppSpec] = {
             r"%SystemRoot%\notepad.exe",
         ),
     ),
+    "calculator": _AppSpec(
+        canonical_name="calculator",
+        process_names=("calculatorapp.exe", "calculator.exe", "applicationframehost.exe"),
+        title_substrings=("calculator",),
+        candidate_exes=("calc.exe",),
+        install_paths=(r"%SystemRoot%\System32\calc.exe",),
+    ),
     "settings": _AppSpec(
         canonical_name="settings",
         process_names=("systemsettings.exe", "applicationframehost.exe"),
@@ -355,6 +375,10 @@ _APP_ALIASES: dict[str, str] = {
     "google antigravity": "antigravity",
     "notepad": "notepad",
     "notepad.exe": "notepad",
+    "calculator": "calculator",
+    "calc": "calculator",
+    "calc.exe": "calculator",
+    "calculator.exe": "calculator",
     "settings": "settings",
     "windows settings": "settings",
     "ms-settings": "settings",
@@ -461,6 +485,63 @@ def _get_win32_user32(user32: Any = None) -> Any:
         u32.LockWorkStation.argtypes = []
         u32.LockWorkStation.restype = wintypes.BOOL
 
+    if hasattr(u32, "GetAncestor"):
+        u32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        u32.GetAncestor.restype = wintypes.HWND
+
+    if hasattr(u32, "IsChild"):
+        u32.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
+        u32.IsChild.restype = wintypes.BOOL
+
+    if hasattr(u32, "GetWindow"):
+        u32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        u32.GetWindow.restype = wintypes.HWND
+
+    if hasattr(u32, "BringWindowToTop"):
+        u32.BringWindowToTop.argtypes = [wintypes.HWND]
+        u32.BringWindowToTop.restype = wintypes.BOOL
+
+    if hasattr(u32, "MonitorFromWindow"):
+        u32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        u32.MonitorFromWindow.restype = ctypes.c_void_p
+
+    if hasattr(u32, "GetMonitorInfoW"):
+        u32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        u32.GetMonitorInfoW.restype = wintypes.BOOL
+
+    if hasattr(u32, "MoveWindow"):
+        u32.MoveWindow.argtypes = [
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.BOOL,
+        ]
+        u32.MoveWindow.restype = wintypes.BOOL
+
+    if hasattr(u32, "IsZoomed"):
+        u32.IsZoomed.argtypes = [wintypes.HWND]
+        u32.IsZoomed.restype = wintypes.BOOL
+
+    if hasattr(u32, "GetWindowRect"):
+        u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        u32.GetWindowRect.restype = wintypes.BOOL
+
+    if hasattr(u32, "AttachThreadInput"):
+        u32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        u32.AttachThreadInput.restype = wintypes.BOOL
+
+    if hasattr(u32, "AllowSetForegroundWindow"):
+        u32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+        u32.AllowSetForegroundWindow.restype = wintypes.BOOL
+
+    with contextlib.suppress(Exception):
+        if hasattr(u32, "SetProcessDpiAwarenessContext"):
+            u32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            u32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+            u32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+
     return u32
 
 
@@ -474,6 +555,10 @@ def _get_win32_kernel32(kernel32: Any = None) -> Any:
     import ctypes.wintypes as wintypes
 
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    if hasattr(k32, "GetCurrentThreadId"):
+        k32.GetCurrentThreadId.argtypes = []
+        k32.GetCurrentThreadId.restype = wintypes.DWORD
 
     k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k32.OpenProcess.restype = wintypes.HANDLE
@@ -761,6 +846,158 @@ def resolve_app_spec(
     return spec.canonical_name, cmd
 
 
+def _is_window_cloaked_ctypes(hwnd: int, user32: Any) -> bool:
+    """Return True when running on live Win32 and DWM reports the window is cloaked."""
+    if sys.platform != "win32" or not isinstance(user32, ctypes.CDLL):
+        return False
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+            return False
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+        cloaked = ctypes.c_uint32(0)
+        hr = dwmapi.DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            DWMWA_CLOAKED,
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+        return hr == 0 and bool(cloaked.value)
+    except Exception:
+        return False
+
+
+def _resolve_root_window_hwnd(hwnd: int, user32: Any) -> int:
+    """Resolve top-level GA_ROOT HWND when running against Win32 user32."""
+    if not hwnd or user32 is None or not hasattr(user32, "GetAncestor"):
+        return int(hwnd)
+    try:
+        root = user32.GetAncestor(int(hwnd), GA_ROOT)
+        if root and (not hasattr(user32, "IsWindowVisible") or bool(user32.IsWindowVisible(root))):
+            return int(root)
+    except Exception:
+        pass
+    return int(hwnd)
+
+
+def _pick_best_matching_window(
+    matches: list[EnumeratedWindow],
+    user32: Any,
+) -> EnumeratedWindow:
+    """Prefer foreground, non-minimized, unowned top-level windows when multiple match."""
+    if len(matches) == 1:
+        return matches[0]
+    fg_hwnd = 0
+    if user32 is not None and hasattr(user32, "GetForegroundWindow"):
+        with contextlib.suppress(Exception):
+            fg = user32.GetForegroundWindow()
+            fg_hwnd = int(fg) if fg else 0
+
+    def _score(win: EnumeratedWindow) -> tuple[int, int, int, int, int]:
+        fg_root = _resolve_root_window_hwnd(fg_hwnd, user32) if fg_hwnd else 0
+        is_fg = 1 if (fg_hwnd and (win.hwnd == fg_hwnd or win.hwnd == fg_root)) else 0
+        uncloaked = 0 if _is_window_cloaked_ctypes(win.hwnd, user32) else 1
+        is_not_min = 1
+        if user32 is not None and hasattr(user32, "IsIconic"):
+            with contextlib.suppress(Exception):
+                is_not_min = 0 if bool(user32.IsIconic(win.hwnd)) else 1
+        unowned = 1
+        if user32 is not None and hasattr(user32, "GetWindow"):
+            with contextlib.suppress(Exception):
+                unowned = 0 if user32.GetWindow(win.hwnd, GW_OWNER) else 1
+        return (is_fg, uncloaked, is_not_min, unowned, len(win.title or ""))
+
+    return max(matches, key=_score)
+
+
+def _is_same_window_tree_os(u32: Any, expected_hwnd: int, actual_hwnd: int) -> bool:
+    if not expected_hwnd or not actual_hwnd:
+        return False
+    if int(expected_hwnd) == int(actual_hwnd):
+        return True
+    if hasattr(u32, "IsChild"):
+        with contextlib.suppress(Exception):
+            if bool(u32.IsChild(expected_hwnd, actual_hwnd)) or bool(
+                u32.IsChild(actual_hwnd, expected_hwnd)
+            ):
+                return True
+    if hasattr(u32, "GetAncestor"):
+        with contextlib.suppress(Exception):
+            exp_root = u32.GetAncestor(int(expected_hwnd), GA_ROOT)
+            act_root = u32.GetAncestor(int(actual_hwnd), GA_ROOT)
+            if exp_root and act_root and int(exp_root) == int(act_root):
+                return True
+    return False
+
+
+def _focus_window_hwnd(
+    u32: Any,
+    hwnd: int,
+    *,
+    kernel32: Any = None,
+    restore_if_iconic: bool = True,
+    attach_fallback: bool | None = None,
+) -> None:
+    """Restore if minimized and bring *hwnd* to foreground with cur_tid<->fg_tid attach fallback."""
+    if restore_if_iconic and hasattr(u32, "IsIconic") and bool(u32.IsIconic(hwnd)):
+        u32.ShowWindow(hwnd, SW_RESTORE)
+    fg_ok = bool(u32.SetForegroundWindow(hwnd))
+    use_fallback = (
+        isinstance(u32, ctypes.CDLL) if attach_fallback is None else bool(attach_fallback)
+    )
+    if not use_fallback:
+        return
+    with contextlib.suppress(Exception):
+        fg_after = u32.GetForegroundWindow() if hasattr(u32, "GetForegroundWindow") else 0
+        if fg_ok and fg_after and _is_same_window_tree_os(u32, hwnd, int(fg_after)):
+            return
+        k32: Any = None
+        with contextlib.suppress(Exception):
+            k32 = _get_win32_kernel32(kernel32)
+        cur_tid = (
+            int(k32.GetCurrentThreadId() or 0)
+            if (k32 is not None and hasattr(k32, "GetCurrentThreadId"))
+            else 0
+        )
+        fg_tid = (
+            int(u32.GetWindowThreadProcessId(fg_after, None) or 0)
+            if (fg_after and hasattr(u32, "GetWindowThreadProcessId"))
+            else 0
+        )
+        target_tid = (
+            int(u32.GetWindowThreadProcessId(hwnd, None) or 0)
+            if hasattr(u32, "GetWindowThreadProcessId")
+            else 0
+        )
+        attached_fg = False
+        attached_target = False
+        if cur_tid and hasattr(u32, "AttachThreadInput"):
+            if fg_tid and fg_tid != cur_tid:
+                attached_fg = bool(u32.AttachThreadInput(cur_tid, fg_tid, True))
+            if target_tid and target_tid not in (cur_tid, fg_tid):
+                attached_target = bool(u32.AttachThreadInput(cur_tid, target_tid, True))
+        try:
+            if hasattr(u32, "BringWindowToTop"):
+                u32.BringWindowToTop(hwnd)
+            if hasattr(u32, "ShowWindow"):
+                u32.ShowWindow(hwnd, SW_SHOW)
+            if hasattr(u32, "SetForegroundWindow"):
+                u32.SetForegroundWindow(hwnd)
+        finally:
+            if attached_target:
+                with contextlib.suppress(Exception):
+                    u32.AttachThreadInput(cur_tid, target_tid, False)
+            if attached_fg:
+                with contextlib.suppress(Exception):
+                    u32.AttachThreadInput(cur_tid, fg_tid, False)
+
+
 def _enumerate_windows_ctypes(user32: Any, kernel32: Any) -> list[EnumeratedWindow]:
     """Enumerate visible top-level windows using Win32 ctypes."""
     import ctypes.wintypes as wintypes
@@ -789,6 +1026,10 @@ def _enumerate_windows_ctypes(user32: Any, kernel32: Any) -> list[EnumeratedWind
 
     def _on_window(hwnd: int, _lparam: int) -> bool:
         if bool(user32.IsWindowVisible(hwnd)):
+            if _is_window_cloaked_ctypes(int(hwnd), user32) and not (
+                hasattr(user32, "IsIconic") and bool(user32.IsIconic(hwnd))
+            ):
+                return True
             length = int(user32.GetWindowTextLengthW(hwnd))
             title = ""
             if length > 0:
@@ -1013,7 +1254,7 @@ def open_or_focus_app(
     desktop_name_fn: Callable[[], str | None] | None = None,
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
-    verify_timeout_s: float = 0.6,
+    verify_timeout_s: float = 1.2,
 ) -> dict[str, Any]:
     """Focus a running application window or launch an allowed desktop application.
 
@@ -1078,36 +1319,36 @@ def open_or_focus_app(
             k32 = _get_win32_kernel32(kernel32)
             windows = _enumerate_windows_ctypes(u32, k32)
 
-        for win in windows:
-            if _window_matches_spec(win, spec):
-                non_default = _check_interactive_desktop(desktop_name_fn)
-                if non_default is not None:
-                    return _non_interactive_desktop_result(spec.canonical_name, non_default)
-                if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
-                    u32.ShowWindow(win.hwnd, SW_RESTORE)
-                u32.SetForegroundWindow(win.hwnd)
-                res_focus: dict[str, Any] = {
-                    "ok": True,
-                    "status": "focused",
-                    "app": spec.canonical_name,
-                    "window_title": win.title,
-                    "hwnd": int(win.hwnd),
-                    "executable": None,
-                    "target_path": None,
-                }
-                if (
-                    verifier is not None
-                    or focus_backend is not None
-                    or (user32 is None and window_enumerator is None)
-                ):
-                    active_verifier = verifier or ActionVerifier(focus_backend=focus_backend)
-                    outcome = active_verifier.verify_window_state(
-                        int(win.hwnd),
-                        expected_state="focused",
-                        timeout_s=verify_timeout_s,
-                    )
-                    res_focus["verification"] = outcome.to_dict()
-                return res_focus
+        known_matches = [win for win in windows if _window_matches_spec(win, spec)]
+        if known_matches:
+            win = _pick_best_matching_window(known_matches, u32)
+            non_default = _check_interactive_desktop(desktop_name_fn)
+            if non_default is not None:
+                return _non_interactive_desktop_result(spec.canonical_name, non_default)
+            target_hwnd = _resolve_root_window_hwnd(int(win.hwnd), u32)
+            _focus_window_hwnd(u32, target_hwnd)
+            res_focus: dict[str, Any] = {
+                "ok": True,
+                "status": "focused",
+                "app": spec.canonical_name,
+                "window_title": win.title,
+                "hwnd": target_hwnd,
+                "executable": None,
+                "target_path": None,
+            }
+            if (
+                verifier is not None
+                or focus_backend is not None
+                or (user32 is None and window_enumerator is None)
+            ):
+                active_verifier = verifier or ActionVerifier(focus_backend=focus_backend)
+                outcome = active_verifier.verify_window_state(
+                    target_hwnd,
+                    expected_state="focused",
+                    timeout_s=verify_timeout_s,
+                )
+                res_focus["verification"] = outcome.to_dict()
+            return res_focus
 
     if spec is not None:
         try:
@@ -1168,40 +1409,44 @@ def open_or_focus_app(
                 k32 = _get_win32_kernel32(kernel32)
                 windows = _enumerate_windows_ctypes(u32, k32)
 
-            for win in windows:
-                if not win.is_visible:
-                    continue
-                w_title = (win.title or "").lower()
-                w_proc = (win.process_name or "").lower()
-                if matched_name.lower() in w_title or matched_name.lower() in w_proc:
-                    non_default = _check_interactive_desktop(desktop_name_fn)
-                    if non_default is not None:
-                        return _non_interactive_desktop_result(matched_name, non_default)
-                    if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
-                        u32.ShowWindow(win.hwnd, SW_RESTORE)
-                    u32.SetForegroundWindow(win.hwnd)
-                    res_matched_focus: dict[str, Any] = {
-                        "ok": True,
-                        "status": "focused",
-                        "app": matched_name,
-                        "window_title": win.title,
-                        "hwnd": int(win.hwnd),
-                        "executable": None,
-                        "target_path": None,
-                    }
-                    if (
-                        verifier is not None
-                        or focus_backend is not None
-                        or (user32 is None and window_enumerator is None)
-                    ):
-                        active_verifier = verifier or ActionVerifier(focus_backend=focus_backend)
-                        outcome = active_verifier.verify_window_state(
-                            int(win.hwnd),
-                            expected_state="focused",
-                            timeout_s=verify_timeout_s,
-                        )
-                        res_matched_focus["verification"] = outcome.to_dict()
-                    return res_matched_focus
+            start_matches = [
+                win
+                for win in windows
+                if win.is_visible
+                and (
+                    matched_name.lower() in (win.title or "").lower()
+                    or matched_name.lower() in (win.process_name or "").lower()
+                )
+            ]
+            if start_matches:
+                win = _pick_best_matching_window(start_matches, u32)
+                non_default = _check_interactive_desktop(desktop_name_fn)
+                if non_default is not None:
+                    return _non_interactive_desktop_result(matched_name, non_default)
+                target_hwnd = _resolve_root_window_hwnd(int(win.hwnd), u32)
+                _focus_window_hwnd(u32, target_hwnd)
+                res_matched_focus: dict[str, Any] = {
+                    "ok": True,
+                    "status": "focused",
+                    "app": matched_name,
+                    "window_title": win.title,
+                    "hwnd": target_hwnd,
+                    "executable": None,
+                    "target_path": None,
+                }
+                if (
+                    verifier is not None
+                    or focus_backend is not None
+                    or (user32 is None and window_enumerator is None)
+                ):
+                    active_verifier = verifier or ActionVerifier(focus_backend=focus_backend)
+                    outcome = active_verifier.verify_window_state(
+                        target_hwnd,
+                        expected_state="focused",
+                        timeout_s=verify_timeout_s,
+                    )
+                    res_matched_focus["verification"] = outcome.to_dict()
+                return res_matched_focus
 
         non_default = _check_interactive_desktop(desktop_name_fn)
         if non_default is not None:
@@ -2276,19 +2521,25 @@ def _resolve_window_hwnd(
             canonical = _APP_ALIASES.get(normalized_app)
             if canonical is not None:
                 spec = _KNOWN_APPS[canonical]
-                for win in windows:
-                    if _window_matches_spec(win, spec):
-                        return int(win.hwnd)
+                spec_matches = [win for win in windows if _window_matches_spec(win, spec)]
+                if spec_matches:
+                    best = _pick_best_matching_window(spec_matches, u32)
+                    return _resolve_root_window_hwnd(int(best.hwnd), u32)
 
+        fallback_matches: list[EnumeratedWindow] = []
         for win in windows:
             if not win.is_visible:
                 continue
             w_title = (win.title or "").lower()
             w_proc = (win.process_name or "").lower()
             if target_title and target_title in w_title:
-                return int(win.hwnd)
-            if target_app and (target_app in w_proc or target_app in w_title):
-                return int(win.hwnd)
+                fallback_matches.append(win)
+            elif target_app and (target_app in w_proc or target_app in w_title):
+                fallback_matches.append(win)
+
+        if fallback_matches:
+            best = _pick_best_matching_window(fallback_matches, u32)
+            return _resolve_root_window_hwnd(int(best.hwnd), u32)
 
         raise ValueError(
             f"No visible window found matching app_name={app_name!r}, title={title!r}."
@@ -2297,9 +2548,140 @@ def _resolve_window_hwnd(
     if hasattr(u32, "GetForegroundWindow"):
         fg = u32.GetForegroundWindow()
         if fg:
-            return int(fg)
+            return _resolve_root_window_hwnd(int(fg), u32)
 
     raise RuntimeError("No active foreground window found.")
+
+
+class _OSRECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _OSMONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("rcMonitor", _OSRECT),
+        ("rcWork", _OSRECT),
+        ("dwFlags", ctypes.c_uint32),
+    ]
+
+
+def _get_monitor_work_area_os(hwnd: int, user32: Any) -> tuple[int, int, int, int]:
+    """Return (left, top, right, bottom) work area of the window's monitor."""
+    h_monitor = 0
+    if hasattr(user32, "MonitorFromWindow"):
+        with contextlib.suppress(Exception):
+            h_monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    mi = _OSMONITORINFO()
+    mi.cbSize = ctypes.sizeof(_OSMONITORINFO)
+    if h_monitor and hasattr(user32, "GetMonitorInfoW"):
+        with contextlib.suppress(Exception):
+            user32.GetMonitorInfoW(h_monitor, ctypes.byref(mi))
+    left = int(mi.rcWork.left)
+    top = int(mi.rcWork.top)
+    right = int(mi.rcWork.right)
+    bottom = int(mi.rcWork.bottom)
+    if right <= left:
+        right = left + 1920
+    if bottom <= top:
+        bottom = top + 1080
+    return left, top, right, bottom
+
+
+def _read_window_title_os(hwnd: int, user32: Any, focus_backend: Any = None) -> str | None:
+    if user32 is not None and hasattr(user32, "GetWindowTextLengthW") and hasattr(
+        user32, "GetWindowTextW"
+    ):
+        with contextlib.suppress(Exception):
+            length = int(user32.GetWindowTextLengthW(hwnd) or 0)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                copied = user32.GetWindowTextW(hwnd, buf, length + 1)
+                val = buf if isinstance(copied, str) else buf.value
+                if isinstance(copied, str):
+                    val = copied
+                if val:
+                    return str(val)
+    if focus_backend is not None and hasattr(focus_backend, "get_window_context"):
+        with contextlib.suppress(Exception):
+            ctx = focus_backend.get_window_context(hwnd)
+            if ctx is not None and ctx.title:
+                return ctx.title
+    return None
+
+
+def _get_dwm_frame_insets_os(hwnd: int, u32: Any) -> tuple[int, int, int, int]:
+    """Return invisible DWM border insets (left, top, right, bottom) to compensate MoveWindow."""
+    if sys.platform != "win32" or not isinstance(u32, ctypes.CDLL):
+        return (0, 0, 0, 0)
+    if not hasattr(u32, "GetWindowRect"):
+        return (0, 0, 0, 0)
+    if hasattr(u32, "IsIconic") and bool(u32.IsIconic(hwnd)):
+        return (0, 0, 0, 0)
+    if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)):
+        return (0, 0, 0, 0)
+    with contextlib.suppress(Exception):
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+            return (0, 0, 0, 0)
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+        win_rect = _OSRECT()
+        frame_rect = _OSRECT()
+        if not u32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
+            return (0, 0, 0, 0)
+        hr = dwmapi.DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(frame_rect),
+            ctypes.sizeof(frame_rect),
+        )
+        if hr != 0:
+            return (0, 0, 0, 0)
+        return (
+            max(0, min(32, int(frame_rect.left) - int(win_rect.left))),
+            max(0, min(32, int(frame_rect.top) - int(win_rect.top))),
+            max(0, min(32, int(win_rect.right) - int(frame_rect.right))),
+            max(0, min(32, int(win_rect.bottom) - int(frame_rect.bottom))),
+        )
+    return (0, 0, 0, 0)
+
+
+def _move_window_snap_os(
+    u32: Any,
+    hwnd: int,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    *,
+    guard: PreconditionGuard | None = None,
+) -> None:
+    """Restore/unmaximize target window and MoveWindow with DWM invisible-border compensation."""
+    if isinstance(u32, ctypes.CDLL):
+        if hasattr(u32, "IsIconic") and bool(u32.IsIconic(hwnd)) and hasattr(u32, "ShowWindow"):
+            u32.ShowWindow(hwnd, SW_RESTORE)
+        if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)) and hasattr(u32, "ShowWindow"):
+            u32.ShowWindow(hwnd, SW_SHOWNORMAL)
+    elif hasattr(u32, "ShowWindow"):
+        u32.ShowWindow(hwnd, SW_RESTORE)
+
+    if guard is not None:
+        guard.assert_ready("snap_move_window")
+
+    if hasattr(u32, "MoveWindow"):
+        il, it, ir, ib = _get_dwm_frame_insets_os(hwnd, u32)
+        u32.MoveWindow(hwnd, x - il, y - it, w + il + ir, h + it + ib, True)
 
 
 def control_system(
@@ -2313,6 +2695,7 @@ def control_system(
     app_name: str | None = None,
     title: str | None = None,
     window_title: str | None = None,
+    title_query: str | None = None,
     window_action: str | None = None,
     user32: Any = None,
     kernel32: Any = None,
@@ -2324,7 +2707,7 @@ def control_system(
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
-    verify_timeout_s: float = 0.6,
+    verify_timeout_s: float = 1.0,
     **_extra: Any,
 ) -> dict[str, Any]:
     """Control Windows display brightness, window state, screen lock, or settings navigation."""
@@ -2336,7 +2719,16 @@ def control_system(
         w_act = window_action.strip().lower()
         if w_act in ("minimize", "maximize", "restore", "close"):
             normalized = f"{w_act}_window"
-        elif w_act in ("minimize_window", "maximize_window", "restore_window", "close_window"):
+        elif w_act in (
+            "minimize_window",
+            "maximize_window",
+            "restore_window",
+            "close_window",
+            "snap_left",
+            "snap_right",
+            "snap_left_window",
+            "snap_right_window",
+        ):
             normalized = w_act
         else:
             normalized = w_act
@@ -2422,8 +2814,16 @@ def control_system(
         "restore",
         "close_window",
         "close",
+        "snap_left",
+        "snap_left_window",
+        "snap_right",
+        "snap_right_window",
     ):
-        effective_title = window_title if title is None else title
+        effective_title = (
+            title
+            if title is not None
+            else (window_title if window_title is not None else title_query)
+        )
         target_hwnd = _resolve_window_hwnd(
             hwnd=hwnd,
             app_name=app_name,
@@ -2443,6 +2843,76 @@ def control_system(
             if verifier is not None
             else (ActionVerifier(focus_backend=focus_backend) if should_verify else None)
         )
+        active_focus_backend = (
+            focus_backend
+            if focus_backend is not None
+            else (active_verifier._get_focus_backend() if active_verifier is not None else None)
+        )
+        resolved_title = _read_window_title_os(target_hwnd, u32, active_focus_backend)
+
+        if normalized in ("snap_left", "snap_left_window", "snap_right", "snap_right_window"):
+            is_left = normalized in ("snap_left", "snap_left_window")
+            canon_snap = "snap_left" if is_left else "snap_right"
+            snap_side = "left" if is_left else "right"
+            left, top, right, bottom = _get_monitor_work_area_os(target_hwnd, u32)
+            if (
+                active_focus_backend is not None
+                and user32 is not None
+                and not hasattr(u32, "GetMonitorInfoW")
+            ):
+                backend_work = active_focus_backend.get_monitor_work_area(target_hwnd)
+                if backend_work is not None:
+                    left, top, right, bottom = backend_work
+            work_width = right - left
+            work_height = bottom - top
+            half_width = work_width // 2
+            if is_left:
+                x, y, w, h = left, top, half_width, work_height
+            else:
+                x, y, w, h = left + half_width, top, work_width - half_width, work_height
+
+            if active_focus_backend is not None:
+                try:
+                    with PreconditionGuard(
+                        active_focus_backend,
+                        expected_hwnd=target_hwnd,
+                        require_foreground=False,
+                        allow_minimized=True,
+                    ) as guard:
+                        guard.assert_ready("snap_restore")
+                        _move_window_snap_os(u32, target_hwnd, x, y, w, h, guard=guard)
+                        guard.assert_ready("snap_focus")
+                        if hasattr(u32, "SetForegroundWindow"):
+                            _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
+                except PreconditionFailedError as exc:
+                    payload = exc.to_abort_payload()
+                    payload["success"] = False
+                    payload["action"] = canon_snap
+                    payload["hwnd"] = target_hwnd
+                    if resolved_title:
+                        payload["window_title"] = resolved_title
+                    return payload
+            else:
+                _move_window_snap_os(u32, target_hwnd, x, y, w, h)
+                if hasattr(u32, "SetForegroundWindow"):
+                    _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
+
+            res_snap: dict[str, Any] = {
+                "ok": True,
+                "success": True,
+                "action": canon_snap,
+                "hwnd": target_hwnd,
+                "rect": {"x": x, "y": y, "width": w, "height": h},
+            }
+            if resolved_title:
+                res_snap["window_title"] = resolved_title
+            if active_verifier is not None:
+                res_snap["verification"] = active_verifier.verify_window_state(
+                    target_hwnd,
+                    expected_snap=snap_side,
+                    timeout_s=verify_timeout_s,
+                ).to_dict()
+            return res_snap
 
         if normalized in ("minimize_window", "minimize"):
             u32.ShowWindow(target_hwnd, SW_MINIMIZE)
@@ -3611,43 +4081,90 @@ def _send_unicode_text(
     if not text:
         return clamped_interval
 
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+
     def _encode_char_events(chunk: str) -> list[_INPUT]:
-        utf16_bytes = chunk.encode("utf-16-le")
         chunk_events: list[_INPUT] = []
-        for idx in range(0, len(utf16_bytes), 2):
-            code_unit = int.from_bytes(utf16_bytes[idx : idx + 2], "little")
-            chunk_events.append(
-                _INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUT_UNION(
-                        ki=_KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)
-                    ),
+        for ch in chunk:
+            if ch == "\n":
+                chunk_events.append(
+                    _INPUT(
+                        type=INPUT_KEYBOARD,
+                        union=_INPUT_UNION(
+                            ki=_KEYBDINPUT(wVk=VK_RETURN_OS, wScan=0, dwFlags=0)
+                        ),
+                    )
                 )
-            )
-            chunk_events.append(
-                _INPUT(
-                    type=INPUT_KEYBOARD,
-                    union=_INPUT_UNION(
-                        ki=_KEYBDINPUT(
-                            wVk=0,
-                            wScan=code_unit,
-                            dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                        )
-                    ),
+                chunk_events.append(
+                    _INPUT(
+                        type=INPUT_KEYBOARD,
+                        union=_INPUT_UNION(
+                            ki=_KEYBDINPUT(
+                                wVk=VK_RETURN_OS,
+                                wScan=0,
+                                dwFlags=KEYEVENTF_KEYUP,
+                            )
+                        ),
+                    )
                 )
-            )
+                continue
+            if ch == "\t":
+                chunk_events.append(
+                    _INPUT(
+                        type=INPUT_KEYBOARD,
+                        union=_INPUT_UNION(
+                            ki=_KEYBDINPUT(wVk=VK_TAB_OS, wScan=0, dwFlags=0)
+                        ),
+                    )
+                )
+                chunk_events.append(
+                    _INPUT(
+                        type=INPUT_KEYBOARD,
+                        union=_INPUT_UNION(
+                            ki=_KEYBDINPUT(
+                                wVk=VK_TAB_OS,
+                                wScan=0,
+                                dwFlags=KEYEVENTF_KEYUP,
+                            )
+                        ),
+                    )
+                )
+                continue
+            utf16_bytes = ch.encode("utf-16-le")
+            for idx in range(0, len(utf16_bytes), 2):
+                code_unit = int.from_bytes(utf16_bytes[idx : idx + 2], "little")
+                chunk_events.append(
+                    _INPUT(
+                        type=INPUT_KEYBOARD,
+                        union=_INPUT_UNION(
+                            ki=_KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)
+                        ),
+                    )
+                )
+                chunk_events.append(
+                    _INPUT(
+                        type=INPUT_KEYBOARD,
+                        union=_INPUT_UNION(
+                            ki=_KEYBDINPUT(
+                                wVk=0,
+                                wScan=code_unit,
+                                dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                            )
+                        ),
+                    )
+                )
         return chunk_events
 
     if clamped_interval == 0:
         if guard is not None:
             guard.assert_ready(step_label)
-        _send_win32_inputs(u32, _encode_char_events(text))
+        _send_win32_inputs(u32, _encode_char_events(normalized_text))
         return clamped_interval
 
     sleeper = sleep_fn or time.sleep
     delay_s = clamped_interval / 1000.0
-    last_idx = len(text) - 1
-    for char_idx, ch in enumerate(text):
+    last_idx = len(normalized_text) - 1
+    for char_idx, ch in enumerate(normalized_text):
         if guard is not None:
             guard.assert_ready(f"{step_label}_char_{char_idx}")
         _send_win32_inputs(u32, _encode_char_events(ch))
@@ -4694,7 +5211,9 @@ def gui_action(
     seconds: float = 1.0,
     interval_ms: int = 12,
     *,
+    app_name: str | None = None,
     user32: Any = None,
+    kernel32: Any = None,
     sleep_fn: Callable[[float], None] | None = None,
     focus_backend: FocusPreconditionBackend | None = None,
     expected_hwnd: int | None = None,
@@ -4844,12 +5363,34 @@ def gui_action(
         return _execute_gui_action(_guard)
 
     should_guard = focus_backend is not None or user32 is None
+    resolved_expected_hwnd = expected_hwnd
+    if resolved_expected_hwnd is None and isinstance(app_name, str) and app_name.strip():
+        target_app_query = app_name.strip()
+        try:
+            resolved_expected_hwnd = _resolve_target_hwnd_optional(
+                target_app_query,
+                user32=user32,
+                kernel32=kernel32,
+                focus_if_app_name=False,
+            )
+        except ValueError as exc:
+            if should_guard:
+                abort = PreconditionFailedError(
+                    reason="no_target_window",
+                    step_label=f"gui_action:{normalized_action}",
+                    expected_title=target_app_query,
+                    message=str(exc),
+                ).to_abort_payload()
+                abort["action"] = normalized_action
+                return abort
+            raise
+
     if should_guard:
         backend = focus_backend or Win32FocusPreconditionBackend()
         try:
             with PreconditionGuard(
                 backend,
-                expected_hwnd=expected_hwnd,
+                expected_hwnd=resolved_expected_hwnd,
                 require_foreground=require_foreground,
             ) as guard:
                 return _execute_gui_action(guard)
@@ -5373,3 +5914,377 @@ def ui_batch(
         "diff": diff,
         "snapshot": after_snapshot,
     }
+
+
+def register_windows_os_tools(
+    registry: ToolRegistry,
+    *,
+    risk_level: RiskLevel = RiskLevel.READ_ONLY,
+    focus_backend: FocusPreconditionBackend | None = None,
+    verifier: ActionVerifier | None = None,
+    user32: Any = None,
+    kernel32: Any = None,
+) -> None:
+    """Register interactive Windows OS desktop control and UI automation tools for Chat."""
+
+    def _open_or_focus_handler(
+        app_name: str,
+        target_path: str | None = None,
+    ) -> dict[str, Any]:
+        return open_or_focus_app(
+            app_name,
+            target_path,
+            user32=user32,
+            kernel32=kernel32,
+            focus_backend=focus_backend,
+            verifier=verifier,
+        )
+
+    def _ui_snapshot_handler(
+        app_name: str | None = None,
+        max_elements: int | None = 60,
+        interactive_only: bool | None = False,
+    ) -> dict[str, Any]:
+        return ui_snapshot(
+            app_name,
+            60 if max_elements is None else max_elements,
+            interactive_only=False if interactive_only is None else interactive_only,
+            user32=user32,
+            kernel32=kernel32,
+        )
+
+    def _ui_act_handler(
+        ref: str,
+        action: str | None = "click",
+        value: str | None = None,
+        interval_ms: int | None = 12,
+    ) -> dict[str, Any]:
+        return ui_act(
+            ref,
+            "click" if action is None else action,
+            value,
+            interval_ms=12 if interval_ms is None else interval_ms,
+            user32=user32,
+            focus_backend=focus_backend,
+        )
+
+    def _ui_batch_handler(
+        steps: list[dict[str, Any]],
+        stop_on_error: bool | None = True,
+        stop_on_window_change: bool | None = True,
+    ) -> dict[str, Any]:
+        return ui_batch(
+            steps,
+            stop_on_error=True if stop_on_error is None else stop_on_error,
+            stop_on_window_change=(
+                True if stop_on_window_change is None else stop_on_window_change
+            ),
+            user32=user32,
+            focus_backend=focus_backend,
+        )
+
+    def _click_ui_element_handler(
+        name: str,
+        control_type: str | None = None,
+        app_name: str | None = None,
+    ) -> dict[str, Any]:
+        return click_ui_element(
+            name,
+            control_type,
+            app_name,
+            user32=user32,
+            kernel32=kernel32,
+            focus_backend=focus_backend,
+        )
+
+    def _gui_action_handler(
+        action: str,
+        x: int | None = None,
+        y: int | None = None,
+        text: str | None = None,
+        keys: list[str] | None = None,
+        clicks: int | None = 1,
+        button: str | None = "left",
+        delta: int | None = 0,
+        seconds: float | None = 1.0,
+        interval_ms: int | None = 12,
+        app_name: str | None = None,
+        expected_hwnd: int | None = None,
+    ) -> dict[str, Any]:
+        return gui_action(
+            action,
+            x=x,
+            y=y,
+            text=text,
+            keys=keys,
+            clicks=1 if clicks is None else clicks,
+            button="left" if button is None else button,
+            delta=0 if delta is None else delta,
+            seconds=1.0 if seconds is None else seconds,
+            interval_ms=12 if interval_ms is None else interval_ms,
+            app_name=app_name,
+            expected_hwnd=expected_hwnd,
+            user32=user32,
+            kernel32=kernel32,
+            focus_backend=focus_backend,
+        )
+
+    def _inspect_ui_elements_handler(
+        app_name: str | None = None,
+        max_elements: int | None = 60,
+    ) -> dict[str, Any]:
+        return inspect_ui_elements(
+            app_name,
+            60 if max_elements is None else max_elements,
+            user32=user32,
+            kernel32=kernel32,
+        )
+
+    registry.register(
+        name="open_or_focus_app",
+        description=(
+            "Focus an already-open Windows application window if visible, or safely launch a "
+            "known developer or desktop application (e.g., vscode, terminal, chrome, edge, "
+            "explorer, notepad, calculator, settings, taskmgr)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Application name or alias (e.g., notepad, calculator, vscode).",
+                },
+                "target_path": {
+                    "type": "string",
+                    "description": "Optional existing local file or directory path to open.",
+                },
+            },
+            "required": ["app_name"],
+            "additionalProperties": False,
+        },
+        risk_level=risk_level,
+        handler=_open_or_focus_handler,
+    )
+
+    registry.register(
+        name="ui_snapshot",
+        description=(
+            "Capture visible UI elements and accessibility tree for the active window or "
+            "specified application with stable element reference IDs (e.g. 'e1', 'e2')."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Optional target application or window title.",
+                },
+                "max_elements": {
+                    "type": "integer",
+                    "description": "Maximum number of UI elements to capture (1..200).",
+                },
+                "interactive_only": {
+                    "type": "boolean",
+                    "description": "Whether to return only interactive controls.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        risk_level=risk_level,
+        handler=_ui_snapshot_handler,
+    )
+
+    registry.register(
+        name="ui_act",
+        description=(
+            "Perform a semantic action on a UI element identified by its snapshot reference ID "
+            "('ref', e.g. 'e1') with focus precondition checks and updated UI diff."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Element reference ID from ui_snapshot (e.g. 'e1').",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": list(VALID_UI_ACT_ACTIONS),
+                    "description": "Semantic action to execute on the element.",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Text value to set or type for 'set_value' or 'type'.",
+                },
+                "interval_ms": {
+                    "type": "integer",
+                    "description": "Inter-character typing interval in milliseconds (0..200).",
+                },
+            },
+            "required": ["ref", "action"],
+            "additionalProperties": False,
+        },
+        risk_level=risk_level,
+        handler=_ui_act_handler,
+    )
+
+    registry.register(
+        name="ui_batch",
+        description=(
+            "Execute a sequence of 1..20 GUI/UI steps in one call with focus precondition "
+            "checks and one final UI diff snapshot."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": sorted(VALID_UI_BATCH_OPS),
+                            },
+                            "ref": {"type": "string"},
+                            "action": {
+                                "type": "string",
+                                "enum": sorted(VALID_UI_ACT_ACTIONS),
+                            },
+                            "value": {"type": "string"},
+                            "keys": {"type": "array", "items": {"type": "string"}},
+                            "delta": {"type": "integer"},
+                            "seconds": {"type": "number"},
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                            "clicks": {"type": "integer"},
+                            "button": {
+                                "type": "string",
+                                "enum": sorted(VALID_CLICK_BUTTONS),
+                            },
+                        },
+                        "required": ["op"],
+                    },
+                    "description": "1 to 20 action steps to execute sequentially.",
+                },
+                "stop_on_error": {
+                    "type": "boolean",
+                    "description": "Abort remaining steps if any step errors (default true).",
+                },
+                "stop_on_window_change": {
+                    "type": "boolean",
+                    "description": "Stop early if foreground window title changes (default true).",
+                },
+            },
+            "required": ["steps"],
+            "additionalProperties": False,
+        },
+        risk_level=risk_level,
+        handler=_ui_batch_handler,
+    )
+
+    registry.register(
+        name="click_ui_element",
+        description=(
+            "Find and invoke or left-click a visible UI control by name in a Windows app "
+            "or the active foreground window."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Visible label or name of the UI control to click.",
+                },
+                "control_type": {
+                    "type": "string",
+                    "description": "Optional UI Automation control type filter (e.g. 'Button').",
+                },
+                "app_name": {
+                    "type": "string",
+                    "description": "Optional target application or window title.",
+                },
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+        risk_level=risk_level,
+        handler=_click_ui_element_handler,
+    )
+
+    registry.register(
+        name="gui_action",
+        description=(
+            "Perform a low-level desktop GUI input or wait step with focus precondition "
+            "checking: click_at, type_text, press_keys, scroll, or wait."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": sorted(VALID_GUI_ACTIONS),
+                    "description": "GUI input or wait action to execute.",
+                },
+                "x": {"type": "integer", "description": "Horizontal coordinate (>= 0)."},
+                "y": {"type": "integer", "description": "Vertical coordinate (>= 0)."},
+                "text": {"type": "string", "description": "Unicode text to type (1..2000 chars)."},
+                "keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Key names for 'press_keys' (e.g. ['ctrl', 's']).",
+                },
+                "clicks": {"type": "integer", "description": "Click count (1..3, default 1)."},
+                "button": {
+                    "type": "string",
+                    "enum": sorted(VALID_CLICK_BUTTONS),
+                    "description": "Mouse button for 'click_at'.",
+                },
+                "delta": {"type": "integer", "description": "Mouse wheel scroll delta."},
+                "seconds": {"type": "number", "description": "Wait duration in seconds."},
+                "interval_ms": {
+                    "type": "integer",
+                    "description": "Inter-character typing interval in milliseconds (0..200).",
+                },
+                "app_name": {
+                    "type": "string",
+                    "description": (
+                        "Optional target application name or window title; enforces that the "
+                        "named window is non-minimized and focused without un-minimizing it."
+                    ),
+                },
+                "expected_hwnd": {
+                    "type": "integer",
+                    "description": "Optional explicit target window HWND for precondition check.",
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        risk_level=risk_level,
+        handler=_gui_action_handler,
+    )
+
+    registry.register(
+        name="inspect_ui_elements",
+        description=(
+            "Inspect visible interactive UI Automation controls and coordinates in a "
+            "Windows application or the active foreground window."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Optional target application or window title.",
+                },
+                "max_elements": {
+                    "type": "integer",
+                    "description": "Maximum number of UI elements to return (1..150).",
+                },
+            },
+            "additionalProperties": False,
+        },
+        risk_level=risk_level,
+        handler=_inspect_ui_elements_handler,
+    )

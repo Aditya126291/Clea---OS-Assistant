@@ -93,6 +93,7 @@ from clea.tools import (
     ClipboardService,
     FocusPreconditionBackend,
     MediaVerificationBackend,
+    PreconditionFailedError,
     RiskLevel,
     ScreenVisionService,
     TimerManager,
@@ -107,6 +108,7 @@ from clea.tools import (
     register_system_control_tools,
     register_timer_tools,
     register_vision_tools,
+    register_windows_os_tools,
     requires_approval,
     set_default_clipboard_service,
     set_default_screen_vision_service,
@@ -892,7 +894,22 @@ class CleaDaemon:
                         )
                         continue
 
-                    await self._dispatch_request(conn, frame)
+                    try:
+                        await self._dispatch_request(conn, frame)
+                    except ConnectionClosed:
+                        raise
+                    except Exception as exc:
+                        logger.exception(
+                            "Unhandled error dispatching request %s: %s",
+                            getattr(frame, "method", "<unknown>"),
+                            exc,
+                        )
+                        with contextlib.suppress(Exception):
+                            await self._respond(
+                                ws,
+                                frame,
+                                error=str(exc).strip() or type(exc).__name__,
+                            )
         finally:
             self._connections.discard(conn)
             if conn.is_voice and self._call_state != "idle":
@@ -2686,8 +2703,15 @@ class CleaDaemon:
                 req.params.target_path,
                 **guard_kwargs,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         audit_details: dict[str, Any] = {
             "app": res.get("app"),
@@ -2714,8 +2738,15 @@ class CleaDaemon:
                 req.params.level,
                 **guard_kwargs,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         audit_details: dict[str, Any] = {
             "media_action": res.get("action"),
@@ -2743,8 +2774,15 @@ class CleaDaemon:
                 )
             except TypeError:
                 res = await asyncio.to_thread(read_clipboard, req.params.max_chars)
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_read_clipboard",
@@ -2792,8 +2830,15 @@ class CleaDaemon:
         ws = conn.ws
         try:
             res = await asyncio.to_thread(select_clipboard_item, req.params.index)
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_select_clipboard_item",
@@ -2816,8 +2861,15 @@ class CleaDaemon:
                 res = await asyncio.to_thread(open_url, req.params.url, req.params.browser)
             else:
                 res = await asyncio.to_thread(open_url, req.params.url)
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_open_url",
@@ -2841,7 +2893,11 @@ class CleaDaemon:
         if action in ("window", "window_action") and req.params.window_action:
             action = req.params.window_action
 
-        target_title = req.params.window_title or getattr(req.params, "title", None)
+        target_title = (
+            req.params.window_title
+            or getattr(req.params, "title", None)
+            or getattr(req.params, "title_query", None)
+        )
 
         try:
             sig = inspect.signature(control_system)
@@ -2884,6 +2940,10 @@ class CleaDaemon:
                 if target_title is not None and "title" not in fallback_kwargs:
                     fallback_kwargs["title"] = target_title
                 res = await asyncio.to_thread(control_system, action, **fallback_kwargs)
+        except PreconditionFailedError as exc:
+            res = exc.to_abort_payload()
+            res["success"] = False
+            res["action"] = action
         except (
             ValueError,
             OSError,
@@ -2892,7 +2952,7 @@ class CleaDaemon:
             TypeError,
             OverflowError,
         ) as exc:
-            await self._respond(ws, req, error=str(exc))
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         audit_sys: dict[str, Any] = {
             "system_action": action,
@@ -2904,6 +2964,8 @@ class CleaDaemon:
         model_cls = METHOD_RESULTS["os.control_system"]
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
+        if filtered.get("status") is None:
+            filtered.pop("status", None)
         if "ok" not in filtered:
             filtered["ok"] = res.get("success", True)
         if "action" not in filtered:
@@ -2916,8 +2978,15 @@ class CleaDaemon:
         ws = conn.ws
         try:
             res = await asyncio.to_thread(write_clipboard, req.params.text)
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log("os_write_clipboard", char_count=res.get("char_count"))
         await self._respond(ws, req, METHOD_RESULTS["os.write_clipboard"](**res))
@@ -2931,8 +3000,15 @@ class CleaDaemon:
                 req.params.update_clipboard,
                 clipboard_service=self.clipboard_service,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         if res.get("status") == "error":
             err = str(res.get("error") or "Clipboard transform failed")
@@ -2952,8 +3028,15 @@ class CleaDaemon:
                 req.params.filename,
                 req.params.directory,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         if res.get("status") == "error":
             await self._respond(ws, req, error=str(res.get("error") or "Clipboard save failed"))
@@ -2976,8 +3059,15 @@ class CleaDaemon:
                 req.params.target,
                 use_clipboard=req.params.use_clipboard,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_open_path_or_url",
@@ -3006,8 +3096,15 @@ class CleaDaemon:
                 question=p.question,
                 include_image=p.include_image,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_inspect_screen",
@@ -3052,8 +3149,15 @@ class CleaDaemon:
                 req.params.app_name,
                 req.params.max_elements,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_inspect_ui_elements",
@@ -3076,8 +3180,12 @@ class CleaDaemon:
                 req.params.app_name,
                 **guard_kwargs,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except PreconditionFailedError as exc:
+            res = exc.to_abort_payload()
+            res["name"] = req.params.name
+            res["control_type"] = req.params.control_type or ""
+        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_click_ui_element",
@@ -3095,6 +3203,26 @@ class CleaDaemon:
         ws = conn.ws
         p = req.params
         guard_kwargs = self._os_guard_kwargs(gui_action)
+        extra_gui_kwargs: dict[str, Any] = {}
+        app_name_val = getattr(p, "app_name", None)
+        expected_hwnd_val = getattr(p, "expected_hwnd", None)
+        if app_name_val is not None or expected_hwnd_val is not None:
+            try:
+                sig = inspect.signature(gui_action)
+                param_names = set(sig.parameters.keys())
+                accepts_kwargs = any(
+                    param.kind == inspect.Parameter.VAR_KEYWORD
+                    for param in sig.parameters.values()
+                )
+            except (ValueError, TypeError):
+                param_names = set()
+                accepts_kwargs = False
+            if app_name_val is not None and (accepts_kwargs or "app_name" in param_names):
+                extra_gui_kwargs["app_name"] = app_name_val
+            if expected_hwnd_val is not None and (
+                accepts_kwargs or "expected_hwnd" in param_names
+            ):
+                extra_gui_kwargs["expected_hwnd"] = expected_hwnd_val
         try:
             res = await asyncio.to_thread(
                 gui_action,
@@ -3107,10 +3235,14 @@ class CleaDaemon:
                 p.button,
                 p.delta,
                 p.seconds,
+                **extra_gui_kwargs,
                 **guard_kwargs,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except PreconditionFailedError as exc:
+            res = exc.to_abort_payload()
+            res["action"] = p.action
+        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_gui_action",
@@ -3138,8 +3270,8 @@ class CleaDaemon:
                     req.params.app_name,
                     req.params.max_elements,
                 )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_ui_snapshot",
@@ -3172,8 +3304,12 @@ class CleaDaemon:
                     p.action,
                     p.value,
                 )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except PreconditionFailedError as exc:
+            res = exc.to_abort_payload()
+            res["ref"] = p.ref
+            res["action"] = p.action
+        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_ui_act",
@@ -3202,8 +3338,12 @@ class CleaDaemon:
                 p.stop_on_window_change,
                 **guard_kwargs,
             )
-        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
-            await self._respond(ws, req, error=str(exc))
+        except PreconditionFailedError as exc:
+            res = exc.to_abort_payload()
+            res["steps_executed"] = 0
+            res["step_results"] = []
+        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
+            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
         self._audit_log(
             "os_ui_batch",
@@ -3580,16 +3720,17 @@ class CleaDaemon:
                 raise
             except Exception as exc:
                 logger.exception("Error while running agent turn")
-                await task_status("failed", str(exc))
+                err_msg = str(exc).strip() or f"{type(exc).__name__} while running agent turn"
+                await task_status("failed", err_msg)
                 await broadcast_session_event(
                     ErrorEvent(
                         request_id=request_id,
                         session_id=session.id,
-                        data=ErrorData(message=str(exc), code="turn_failed"),
+                        data=ErrorData(message=err_msg, code="turn_failed"),
                     ),
                 )
                 if ws is not None and req is not None:
-                    await self._respond(ws, req, error=str(exc), session_id=session.id)
+                    await self._respond(ws, req, error=err_msg, session_id=session.id)
                 return
 
             await task_status("succeeded")
@@ -3818,18 +3959,19 @@ class CleaDaemon:
                 raise
             except Exception as exc:
                 logger.exception("Error while running delegated voice task")
+                err_msg = str(exc).strip() or f"{type(exc).__name__} while running voice task"
                 task_finished = True
-                await task_status("failed", str(exc))
+                await task_status("failed", err_msg)
                 with contextlib.suppress(ConnectionClosed):
                     await self._send(
                         ws,
                         ErrorEvent(
                             request_id=req.id,
                             session_id=session.id,
-                            data=ErrorData(message=str(exc), code="turn_failed"),
+                            data=ErrorData(message=err_msg, code="turn_failed"),
                         ),
                     )
-                    await self._respond(ws, req, error=str(exc), session_id=session.id)
+                    await self._respond(ws, req, error=err_msg, session_id=session.id)
                 return
 
             task_finished = True
@@ -3909,6 +4051,14 @@ def build_daemon(
         resolved_registry.get("read_clipboard")
     except KeyError:
         register_clipboard_tools(resolved_registry, resolved_clipboard_service)
+    try:
+        resolved_registry.get("gui_action")
+    except KeyError:
+        register_windows_os_tools(
+            resolved_registry,
+            focus_backend=focus_backend,
+            verifier=action_verifier,
+        )
     resolved_provider = provider or GeminiProvider()
     agent = AgentLoop(
         provider=resolved_provider,

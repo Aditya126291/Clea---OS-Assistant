@@ -2346,7 +2346,11 @@ class VoiceRunner:
                         level=level,
                         step=step,
                         window_action=_req_str("window_action"),
-                        window_title=_req_str("window_title"),
+                        window_title=(
+                            _req_str("window_title")
+                            or _req_str("title")
+                            or _req_str("title_query")
+                        ),
                         hwnd=hwnd,
                         app_name=_req_str("app_name"),
                         page=_req_str("page"),
@@ -2430,6 +2434,7 @@ class VoiceRunner:
                 y_val = _opt_int("y")
                 clicks_val = _opt_int("clicks")
                 delta_val = _opt_int("delta")
+                expected_hwnd_val = _opt_int("expected_hwnd")
                 raw_sec = event.arguments.get("seconds", 1.0)
                 if isinstance(raw_sec, bool):
                     raise ValueError("seconds must be a number.")
@@ -2471,6 +2476,8 @@ class VoiceRunner:
                         button=btn_norm,  # type: ignore[arg-type]
                         delta=delta_val if delta_val is not None else 0,
                         seconds=seconds_val,
+                        app_name=_req_str("app_name"),
+                        expected_hwnd=expected_hwnd_val,
                     )
                 ),
                 error_prefix="Failed to execute GUI action",

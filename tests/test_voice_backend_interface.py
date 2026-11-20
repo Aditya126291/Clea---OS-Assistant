@@ -210,10 +210,15 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "maximize_window",
         "restore_window",
         "close_window",
+        "snap_left",
+        "snap_right",
         "lock_screen",
         "open_settings",
     ):
         assert expected_action in cs_actions
+    w_actions = by_name["control_system"].parameters_schema["properties"]["window_action"]["enum"]
+    assert "snap_left" in w_actions
+    assert "snap_right" in w_actions
     assert by_name["control_system"].parameters_schema["properties"]["level"]["minimum"] == 0
     assert by_name["control_system"].parameters_schema["properties"]["level"]["maximum"] == 100
 

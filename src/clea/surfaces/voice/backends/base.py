@@ -762,8 +762,9 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="control_system",
             description=(
-                "Control Windows display brightness, window state (minimize/maximize/restore/"
-                "close), screen lock, or open allowlisted Windows Settings pages."
+                "Control Windows display brightness, window placement/state (minimize/maximize/"
+                "restore/close/snap_left/snap_right to left or right half of screen), screen "
+                "lock, or open allowlisted Windows Settings pages."
             ),
             parameters_schema={
                 "type": "object",
@@ -780,6 +781,8 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                             "maximize_window",
                             "restore_window",
                             "close_window",
+                            "snap_left",
+                            "snap_right",
                             "lock_screen",
                             "open_settings",
                         ],
@@ -803,7 +806,14 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     },
                     "window_action": {
                         "type": "string",
-                        "enum": ["minimize", "maximize", "restore", "close"],
+                        "enum": [
+                            "minimize",
+                            "maximize",
+                            "restore",
+                            "close",
+                            "snap_left",
+                            "snap_right",
+                        ],
                         "description": "Optional window action when action is window-related.",
                     },
                     "window_title": {
@@ -973,6 +983,17 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                         "description": (
                             "Wait duration in seconds for 'wait' (clamped 0.1..10.0, default 1.0)."
                         ),
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": (
+                            "Optional target application name or window title; enforces that "
+                            "the window is non-minimized and focused without un-minimizing it."
+                        ),
+                    },
+                    "expected_hwnd": {
+                        "type": "integer",
+                        "description": "Optional explicit target HWND for precondition checks.",
                     },
                 },
                 "required": ["action"],

@@ -244,11 +244,15 @@ class OsControlSystemParams(_Model):
     )
     step: int | None = Field(default=None, description="Display brightness relative step")
     window_action: str | None = Field(
-        default=None, description="Window action: minimize, maximize, restore, close"
+        default=None,
+        description="Window action: minimize, maximize, restore, close, snap_left, snap_right",
     )
     window_title: str | None = Field(default=None, description="Window title or substring")
     title: str | None = Field(
         default=None, description="Window title or substring (alias for window_title)"
+    )
+    title_query: str | None = Field(
+        default=None, description="Window title or app substring alias"
     )
     hwnd: int | None = Field(default=None, description="Window handle (HWND)")
     app_name: str | None = Field(default=None, description="Application name for window action")
@@ -314,6 +318,16 @@ class OsGuiActionParams(_Model):
     button: GuiClickButton = "left"
     delta: int = 0
     seconds: float = 1.0
+    app_name: str | None = Field(
+        default=None,
+        description=(
+            "Optional target application or window title for focus precondition enforcement."
+        ),
+    )
+    expected_hwnd: int | None = Field(
+        default=None,
+        description="Optional explicit target HWND for focus precondition enforcement.",
+    )
 
 
 UiActAction = Literal["click", "set_value", "type", "clear", "double_click", "right_click"]
@@ -1278,6 +1292,7 @@ class ActivityCancelResult(_Model):
 class ActionVerificationInfo(_Model):
     verified: bool
     status: str = "verified"
+    outcome_kind: Literal["verified", "unavailable", "failed"] | None = None
     reason: str = ""
     actual: dict[str, Any] = Field(default_factory=dict)
     elapsed_ms: float = 0.0
@@ -1377,7 +1392,9 @@ class OsControlSystemResult(_Model):
     page: str | None = None
     uri: str | None = None
     message: str | None = None
+    rect: dict[str, int] | None = None
     verification: ActionVerificationInfo | None = None
+    aborted_precondition: PreconditionAbortInfo | None = None
 
 
 class OsWriteClipboardResult(_Model):

@@ -77,6 +77,7 @@ from clea.tools.vision import (
     register_vision_tools,
     set_default_screen_vision_service,
 )
+from clea.tools.windows_os import register_windows_os_tools
 
 __all__ = [
     "ActionVerifier",
@@ -130,6 +131,7 @@ __all__ = [
     "register_system_control_tools",
     "register_timer_tools",
     "register_vision_tools",
+    "register_windows_os_tools",
     "requires_approval",
     "save_clipboard_to_file",
     "search_files",

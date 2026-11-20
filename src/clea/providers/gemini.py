@@ -129,7 +129,7 @@ def _merge_token_usage(acc: TokenUsage | None, hop: TokenUsage) -> TokenUsage:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FIRST_EVENT_TIMEOUT = 7.0
+DEFAULT_FIRST_EVENT_TIMEOUT = 15.0
 
 
 class _NullAsyncContext:
@@ -283,6 +283,13 @@ class GeminiProvider(LLMProvider):
                         exc or "timeout",
                         now_iso,
                     )
+                    if isinstance(
+                        exc, TimeoutError | asyncio.TimeoutError
+                    ) and not str(exc).strip():
+                        raise TimeoutError(
+                            f"Gemini stream timed out waiting for first event after "
+                            f"{self.first_event_timeout_s:.1f}s."
+                        ) from exc
                     raise
 
         pending_calls: dict[int, dict[str, Any]] = {}
