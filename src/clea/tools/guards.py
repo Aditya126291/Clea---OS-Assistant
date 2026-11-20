@@ -981,12 +981,36 @@ class ActionVerifier:
         tolerance_px: int = _DEFAULT_BOUNDS_TOLERANCE_PX,
     ) -> VerificationOutcome:
         """Poll Win32 window state and DWM bounds until settled or timeout expires."""
+        valid_states = {"closed", "minimized", "maximized", "focused", "restored"}
+        valid_snaps = {"left", "snap_left", "right", "snap_right"}
+
+        norm_state: str | None = None
+        if expected_state is not None:
+            norm_state = expected_state.strip().lower()
+            if norm_state not in valid_states:
+                raise ValueError(
+                    f"Unsupported expected_state {expected_state!r}. "
+                    f"Must be one of {sorted(valid_states)}."
+                )
+
+        norm_snap: str | None = None
+        if expected_snap is not None:
+            norm_snap = expected_snap.strip().lower()
+            if norm_snap not in valid_snaps:
+                raise ValueError(
+                    f"Unsupported expected_snap {expected_snap!r}. "
+                    f"Must be one of {sorted(valid_snaps)}."
+                )
+
+        if expected_bounds is not None:
+            _bx, _by, bw, bh = expected_bounds
+            if bw <= 0 or bh <= 0:
+                raise ValueError("expected_bounds width and height must be positive.")
+
         backend = self._get_focus_backend()
         start = self._monotonic()
         deadline = start + max(0.0, float(timeout_s))
         interval = max(0.01, float(poll_interval_s))
-        norm_state = expected_state.strip().lower() if expected_state else None
-        norm_snap = expected_snap.strip().lower() if expected_snap else None
 
         last_reason = "window_state_mismatch"
         last_bounds: tuple[int, int, int, int] | None = None

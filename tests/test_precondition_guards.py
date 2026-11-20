@@ -31,6 +31,7 @@ from clea.core.sessions import Session
 from clea.memory.store import MemoryStore
 from clea.providers.base import LLMProvider, Message, StreamChunk, ToolCall
 from clea.surfaces.voice.memory_hooks import BASE_VOICE_SYSTEM_INSTRUCTION
+from clea.tools import system_controls, windows_os
 from clea.tools.guards import (
     ActionVerifier,
     MediaSessionState,
@@ -1145,3 +1146,219 @@ def test_prompts_require_honest_reporting_of_aborted_or_unverified_actions() -> 
     assert "verification.verified=false" in _BASE_SYSTEM_PROMPT
     assert "aborted_precondition" in BASE_VOICE_SYSTEM_INSTRUCTION
     assert "verification.verified=false" in BASE_VOICE_SYSTEM_INSTRUCTION
+
+
+def test_system_controls_and_windows_os_64bit_win32_signatures_and_high_hwnd() -> None:
+    if sys.platform == "win32":
+        u32 = system_controls._get_user32()
+        k32 = system_controls._get_kernel32()
+        assert u32 is not None
+        assert k32 is not None
+        assert u32 is not ctypes.windll.user32
+        assert k32 is not ctypes.windll.kernel32
+        assert u32.GetForegroundWindow.restype is ctypes.c_void_p
+        assert u32.GetDesktopWindow.restype is ctypes.c_void_p
+        assert u32.IsWindow.argtypes == [ctypes.c_void_p]
+        assert u32.IsWindowVisible.argtypes == [ctypes.c_void_p]
+        assert u32.GetWindowTextLengthW.argtypes == [ctypes.c_void_p]
+        assert u32.MonitorFromWindow.argtypes[0] is ctypes.c_void_p
+        assert u32.MonitorFromWindow.restype is ctypes.c_void_p
+        assert u32.GetMonitorInfoW.argtypes == [ctypes.c_void_p, ctypes.c_void_p]
+        assert u32.ShowWindow.argtypes[0] is ctypes.c_void_p
+        assert u32.SetForegroundWindow.argtypes == [ctypes.c_void_p]
+        assert u32.MoveWindow.argtypes[0] is ctypes.c_void_p
+        assert u32.PostMessageW.argtypes[0] is ctypes.c_void_p
+        assert u32.SendMessageW.argtypes[0] is ctypes.c_void_p
+        assert u32.DefWindowProcW.argtypes[0] is ctypes.c_void_p
+        assert k32.GetSystemPowerStatus.argtypes == [ctypes.c_void_p]
+        assert k32.GlobalMemoryStatusEx.argtypes == [ctypes.c_void_p]
+
+        wos_u32 = windows_os._get_win32_user32()
+        assert wos_u32.IsWindow.argtypes[0] is ctypes.c_void_p
+
+    high_hwnd = 0x1_0000_BEEF
+    win = _FakeWindowState(
+        hwnd=high_hwnd,
+        title="Code Editor",
+        process_name="Code.exe",
+        bounds=(200, 100, 1200, 800),
+        work_area=(0, 0, 1920, 1040),
+    )
+    backend = FakeFocusPreconditionBackend(windows={high_hwnd: win}, foreground_hwnd=high_hwnd)
+    fake_u32 = _FakeUser32ForControls(backend)
+    clock = _FakeClock()
+    verifier = ActionVerifier(
+        focus_backend=backend,
+        monotonic_fn=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    res = manage_window(
+        "snap_left",
+        title_query="Code",
+        user32=fake_u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res["ok"] is True
+    assert res["hwnd"] == high_hwnd
+    assert res["rect"] == {"x": 0, "y": 0, "width": 960, "height": 1040}
+    assert res["verification"]["verified"] is True
+
+
+def test_ui_batch_and_ui_act_forward_guard_to_real_gui_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_hwnd = 0x1_0000_1234
+    other_hwnd = 0x1_0000_5678
+    modal_hwnd = 0x1_0000_9999
+
+    target = _FakeWindowState(hwnd=target_hwnd, title="Editor", process_name="Code.exe")
+    other = _FakeWindowState(hwnd=other_hwnd, title="Browser", process_name="msedge.exe")
+    modal = _FakeWindowState(
+        hwnd=modal_hwnd, title="Windows Security", process_name="CredentialUIBroker.exe"
+    )
+    backend = FakeFocusPreconditionBackend(
+        windows={target_hwnd: target, other_hwnd: other, modal_hwnd: modal},
+        foreground_hwnd=other_hwnd,
+    )
+    fake_u32 = _FakeUser32ForControls(backend)
+
+    def _forbid_live_win32(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError(
+            "Must not construct Win32FocusPreconditionBackend when guard/backend injected"
+        )
+
+    monkeypatch.setattr(windows_os, "Win32FocusPreconditionBackend", _forbid_live_win32)
+
+    snap_payload = {
+        "ok": True,
+        "snapshot_id": "snap_guard_fwd",
+        "hwnd": target_hwnd,
+        "window_title": "Editor",
+        "count": 1,
+        "elements": [
+            {
+                "ref": "e1",
+                "name": "Input Box",
+                "role": "textbox",
+                "x": 20,
+                "y": 30,
+                "width": 120,
+                "height": 28,
+                "cx": 80,
+                "cy": 44,
+            }
+        ],
+    }
+    set_ui_snapshot_state(snap_payload)
+
+    # 1. require_foreground=False via ui_batch must flow all the way into real gui_action
+    #    both through ui_act (op="act") and directly (op="press_keys"), without falling back
+    #    to Win32FocusPreconditionBackend(require_foreground=True).
+    res_bg = ui_batch(
+        steps=[
+            {"op": "act", "ref": "e1", "action": "click", "label": "click_input"},
+            {"op": "press_keys", "keys": ["ctrl", "s"], "label": "save_file"},
+        ],
+        expected_hwnd=target_hwnd,
+        require_foreground=False,
+        focus_backend=backend,
+        gui_action_fn=None,
+        user32=fake_u32,
+        ui_snapshot_fn=lambda **_kw: snap_payload,
+        window_title_fn=lambda: "Editor",
+    )
+    assert res_bg["ok"] is True
+    assert res_bg["status"] == "completed"
+    assert res_bg["steps_executed"] == 2
+    assert len(fake_u32.sent_inputs) == 2
+
+    # 2. If focus is stolen during step 1's real gui_action SendInput inside ui_batch,
+    #    real gui_action on step 2 must fail the locked PreconditionGuard and abort cleanly.
+    backend.foreground_hwnd = target_hwnd
+    fake_u32.sent_inputs.clear()
+
+    class _FocusStealingUser32(_FakeUser32ForControls):
+        def SendInput(self, count: int, inputs: Any, size: int) -> int:
+            res = super().SendInput(count, inputs, size)
+            # Modal steals focus right after the first input (click) completes
+            self.backend.foreground_hwnd = modal_hwnd
+            return res
+
+    stealing_u32 = _FocusStealingUser32(backend)
+    res_abort = ui_batch(
+        steps=[
+            {"op": "act", "ref": "e1", "action": "click", "label": "step1_click"},
+            {"op": "press_keys", "keys": ["ctrl", "a"], "label": "step2_select_all"},
+        ],
+        expected_hwnd=target_hwnd,
+        require_foreground=True,
+        focus_backend=backend,
+        gui_action_fn=None,
+        user32=stealing_u32,
+        ui_snapshot_fn=lambda **_kw: snap_payload,
+        window_title_fn=lambda: "Editor",
+    )
+    assert res_abort["ok"] is False
+    assert res_abort["status"] == "aborted_precondition"
+    assert res_abort["aborted_precondition"]["reason"] == "focus_lost"
+    assert res_abort["aborted_precondition"]["actual_title"] == "Windows Security"
+    assert len(stealing_u32.sent_inputs) == 1
+
+
+def test_gui_action_type_text_aborts_mid_typing_when_focus_stolen() -> None:
+    target_hwnd = 0x1_0000_2000
+    modal_hwnd = 0x1_0000_9999
+    target = _FakeWindowState(hwnd=target_hwnd, title="Notepad", process_name="notepad.exe")
+    modal = _FakeWindowState(hwnd=modal_hwnd, title="UAC Prompt", process_name="consent.exe")
+    backend = FakeFocusPreconditionBackend(
+        windows={target_hwnd: target, modal_hwnd: modal},
+        foreground_hwnd=target_hwnd,
+    )
+    fake_u32 = _FakeUser32ForControls(backend)
+
+    sleeps = 0
+
+    def _steal_after_first_char(_sec: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        backend.foreground_hwnd = modal_hwnd
+
+    res = gui_action(
+        "type_text",
+        text="secret",
+        interval_ms=15,
+        user32=fake_u32,
+        sleep_fn=_steal_after_first_char,
+        focus_backend=backend,
+        expected_hwnd=target_hwnd,
+    )
+    assert res["ok"] is False
+    assert res["status"] == "aborted_precondition"
+    assert res["aborted_precondition"]["reason"] == "focus_lost"
+    assert res["aborted_precondition"]["actual_title"] == "UAC Prompt"
+    assert res["aborted_precondition"]["step_label"] == "gui_action_type_text_char_1"
+    # Only the first char ('s') was dispatched before focus theft stopped remaining chars
+    assert len(fake_u32.sent_inputs) == 1
+    assert sleeps == 1
+
+
+def test_verify_window_state_rejects_invalid_expectations() -> None:
+    win = _FakeWindowState(hwnd=901, title="Editor")
+    backend = FakeFocusPreconditionBackend(windows={901: win}, foreground_hwnd=901)
+    clock = _FakeClock()
+    verifier = ActionVerifier(
+        focus_backend=backend,
+        monotonic_fn=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    with pytest.raises(ValueError, match="expected_state"):
+        verifier.verify_window_state(901, expected_state="unknown")
+
+    with pytest.raises(ValueError, match="expected_snap"):
+        verifier.verify_window_state(901, expected_snap="top")
+
+    with pytest.raises(ValueError, match="expected_bounds"):
+        verifier.verify_window_state(901, expected_bounds=(0, 0, 0, 100))

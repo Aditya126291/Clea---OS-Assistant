@@ -12,6 +12,7 @@ import base64
 import contextlib
 import ctypes
 import difflib
+import inspect
 import json
 import logging
 import math
@@ -380,6 +381,10 @@ def _get_win32_user32(user32: Any = None) -> Any:
     wndenumproc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     u32.EnumWindows.argtypes = [wndenumproc, wintypes.LPARAM]
     u32.EnumWindows.restype = wintypes.BOOL
+
+    if hasattr(u32, "IsWindow"):
+        u32.IsWindow.argtypes = [wintypes.HWND]
+        u32.IsWindow.restype = wintypes.BOOL
 
     u32.IsWindowVisible.argtypes = [wintypes.HWND]
     u32.IsWindowVisible.restype = wintypes.BOOL
@@ -3596,6 +3601,8 @@ def _send_unicode_text(
     *,
     interval_ms: int = 12,
     sleep_fn: Callable[[float], None] | None = None,
+    guard: PreconditionGuard | None = None,
+    step_label: str = "type_text",
 ) -> int:
     """Send Unicode text via Win32 SendInput with clamped inter-character pacing."""
     if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
@@ -3632,6 +3639,8 @@ def _send_unicode_text(
         return chunk_events
 
     if clamped_interval == 0:
+        if guard is not None:
+            guard.assert_ready(step_label)
         _send_win32_inputs(u32, _encode_char_events(text))
         return clamped_interval
 
@@ -3639,6 +3648,8 @@ def _send_unicode_text(
     delay_s = clamped_interval / 1000.0
     last_idx = len(text) - 1
     for char_idx, ch in enumerate(text):
+        if guard is not None:
+            guard.assert_ready(f"{step_label}_char_{char_idx}")
         _send_win32_inputs(u32, _encode_char_events(ch))
         if char_idx < last_idx:
             sleeper(delay_s)
@@ -3836,6 +3847,17 @@ def ui_snapshot(
     return snap_result
 
 
+def _action_runner_accepts_guard(runner: Any) -> bool:
+    """Return True if a gui_action runner explicitly accepts the internal _guard kwarg."""
+    if runner is gui_action:
+        return True
+    try:
+        params = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return False
+    return "_guard" in params
+
+
 def ui_act(
     ref: str,
     action: str = "click",
@@ -3924,7 +3946,11 @@ def ui_act(
     method = ""
     should_guard = _guard is None and (
         focus_backend is not None
-        or (user32 is None and gui_action_fn is None and powershell_runner is None)
+        or (
+            user32 is None
+            and (gui_action_fn is None or gui_action_fn is gui_action)
+            and powershell_runner is None
+        )
     )
     target_guard_hwnd = (
         expected_hwnd
@@ -3932,110 +3958,203 @@ def ui_act(
         else (snapshot_hwnd if snapshot_hwnd > 0 else None)
     )
     active_guard: PreconditionGuard | None = _guard
+    aborted_result: dict[str, Any] | None = None
 
     def _assert_step(step_label: str) -> None:
         if active_guard is not None:
             active_guard.assert_ready(step_label)
 
     def _run_act_steps() -> None:
-        nonlocal method, target_cx, target_cy
+        nonlocal method, target_cx, target_cy, aborted_result
+        runner_guard_kw: dict[str, Any] = (
+            {"_guard": active_guard}
+            if (active_guard is not None and _action_runner_accepts_guard(action_runner))
+            else {}
+        )
+        sleep_kw: dict[str, Any] = (
+            {"sleep_fn": sleep_fn}
+            if (action_runner is gui_action and sleep_fn is not None)
+            else {}
+        )
+
+        def _check_abort(res: Any) -> bool:
+            nonlocal aborted_result
+            if isinstance(res, dict) and res.get("status") == "aborted_precondition":
+                aborted_result = res
+                return True
+            return False
+
         if gui_action_fn is not None:
             if norm_action == "click":
                 _assert_step("click")
-                action_runner(
-                    action="click_at",
-                    x=target_cx,
-                    y=target_cy,
-                    clicks=1,
-                    button="left",
-                    user32=user32,
-                )
+                if _check_abort(
+                    action_runner(
+                        action="click_at",
+                        x=target_cx,
+                        y=target_cy,
+                        clicks=1,
+                        button="left",
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 method = "click_at"
             elif norm_action == "double_click":
                 _assert_step("double_click")
-                action_runner(
-                    action="click_at",
-                    x=target_cx,
-                    y=target_cy,
-                    clicks=2,
-                    button="double",
-                    user32=user32,
-                )
+                if _check_abort(
+                    action_runner(
+                        action="click_at",
+                        x=target_cx,
+                        y=target_cy,
+                        clicks=2,
+                        button="double",
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 method = "double_click"
             elif norm_action == "right_click":
                 _assert_step("right_click")
-                action_runner(
-                    action="click_at",
-                    x=target_cx,
-                    y=target_cy,
-                    clicks=1,
-                    button="right",
-                    user32=user32,
-                )
+                if _check_abort(
+                    action_runner(
+                        action="click_at",
+                        x=target_cx,
+                        y=target_cy,
+                        clicks=1,
+                        button="right",
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 method = "right_click"
             elif norm_action == "clear":
                 _assert_step("clear_click")
-                action_runner(
-                    action="click_at",
-                    x=target_cx,
-                    y=target_cy,
-                    clicks=1,
-                    button="left",
-                    user32=user32,
-                )
+                if _check_abort(
+                    action_runner(
+                        action="click_at",
+                        x=target_cx,
+                        y=target_cy,
+                        clicks=1,
+                        button="left",
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 _assert_step("clear_select_all")
-                action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+                if _check_abort(
+                    action_runner(
+                        action="press_keys",
+                        keys=["ctrl", "a"],
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 _assert_step("clear_backspace")
-                action_runner(action="press_keys", keys=["backspace"], user32=user32)
+                if _check_abort(
+                    action_runner(
+                        action="press_keys",
+                        keys=["backspace"],
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 method = "clear"
             elif norm_action == "type":
                 assert value is not None
                 _assert_step("type_click")
-                action_runner(
-                    action="click_at",
-                    x=target_cx,
-                    y=target_cy,
-                    clicks=1,
-                    button="left",
-                    user32=user32,
-                )
+                if _check_abort(
+                    action_runner(
+                        action="click_at",
+                        x=target_cx,
+                        y=target_cy,
+                        clicks=1,
+                        button="left",
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 _assert_step("type_text")
                 try:
-                    action_runner(
+                    step_res = action_runner(
                         action="type_text",
                         text=value,
                         interval_ms=clamped_interval,
                         user32=user32,
+                        **sleep_kw,
+                        **runner_guard_kw,
                     )
                 except TypeError:
-                    action_runner(action="type_text", text=value, user32=user32)
+                    step_res = action_runner(
+                        action="type_text",
+                        text=value,
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                if _check_abort(step_res):
+                    return
                 method = "type"
             elif norm_action == "set_value":
                 val_str = str(value) if value is not None else ""
                 _assert_step("set_value_click")
-                action_runner(
-                    action="click_at",
-                    x=target_cx,
-                    y=target_cy,
-                    clicks=1,
-                    button="left",
-                    user32=user32,
-                )
+                if _check_abort(
+                    action_runner(
+                        action="click_at",
+                        x=target_cx,
+                        y=target_cy,
+                        clicks=1,
+                        button="left",
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 _assert_step("set_value_select_all")
-                action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+                if _check_abort(
+                    action_runner(
+                        action="press_keys",
+                        keys=["ctrl", "a"],
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 _assert_step("set_value_backspace")
-                action_runner(action="press_keys", keys=["backspace"], user32=user32)
+                if _check_abort(
+                    action_runner(
+                        action="press_keys",
+                        keys=["backspace"],
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
                 if val_str:
                     _assert_step("set_value_type_text")
                     try:
-                        action_runner(
+                        step_res = action_runner(
                             action="type_text",
                             text=val_str,
                             interval_ms=clamped_interval,
                             user32=user32,
+                            **sleep_kw,
+                            **runner_guard_kw,
                         )
                     except TypeError:
-                        action_runner(action="type_text", text=val_str, user32=user32)
+                        step_res = action_runner(
+                            action="type_text",
+                            text=val_str,
+                            user32=user32,
+                            **runner_guard_kw,
+                        )
+                    if _check_abort(step_res):
+                        return
                 method = "set_value"
         else:
             acted_via_uia = False
@@ -4124,7 +4243,12 @@ def ui_act(
                     if value:
                         _assert_step("set_value_type_text")
                         _send_unicode_text(
-                            u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn
+                            u32,
+                            value,
+                            interval_ms=clamped_interval,
+                            sleep_fn=sleep_fn,
+                            guard=active_guard,
+                            step_label="set_value_type_text",
                         )
                     method = "keyboard_fallback"
                 elif norm_action == "type":
@@ -4132,7 +4256,14 @@ def ui_act(
                     _assert_step("type_click")
                     _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
                     _assert_step("type_text")
-                    _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
+                    _send_unicode_text(
+                        u32,
+                        value,
+                        interval_ms=clamped_interval,
+                        sleep_fn=sleep_fn,
+                        guard=active_guard,
+                        step_label="type_text",
+                    )
                     method = "win32_type"
                 else:  # "clear"
                     _assert_step("clear_click")
@@ -4170,6 +4301,9 @@ def ui_act(
             return abort
     else:
         _run_act_steps()
+
+    if aborted_result is not None:
+        return aborted_result
 
     if not _capture_snapshot:
         res_no_snap: dict[str, Any] = {
@@ -4565,6 +4699,7 @@ def gui_action(
     focus_backend: FocusPreconditionBackend | None = None,
     expected_hwnd: int | None = None,
     require_foreground: bool = True,
+    _guard: PreconditionGuard | None = None,
 ) -> dict[str, Any]:
     """Perform a safety-bounded low-level GUI input action via Win32 ctypes."""
     if not isinstance(action, str):
@@ -4626,6 +4761,88 @@ def gui_action(
             if x < 0 or y < 0:
                 raise ValueError("x and y must be non-negative integers for 'scroll'.")
 
+    def _execute_gui_action(active_guard: PreconditionGuard | None) -> dict[str, Any]:
+        if active_guard is not None:
+            active_guard.assert_ready(f"gui_action:{normalized_action}")
+
+        u32 = _get_win32_user32(user32)
+
+        if normalized_action == "click_at":
+            assert x is not None and y is not None
+            _perform_mouse_click(x, y, clicks=clicks, button=btn, user32=u32)
+            actual_clicks = 2 if btn == "double" and clicks == 1 else clicks
+            return {
+                "ok": True,
+                "status": "completed",
+                "action": "click_at",
+                "x": x,
+                "y": y,
+                "clicks": actual_clicks,
+                "button": btn,
+            }
+
+        if normalized_action == "type_text":
+            assert text is not None
+            clamped_interval = _send_unicode_text(
+                u32,
+                text,
+                interval_ms=interval_ms,
+                sleep_fn=sleep_fn,
+                guard=active_guard,
+                step_label="gui_action_type_text",
+            )
+            return {
+                "ok": True,
+                "status": "completed",
+                "action": "type_text",
+                "char_count": len(text),
+                "interval_ms": clamped_interval,
+            }
+
+        if normalized_action == "press_keys":
+            normalized_keys = _send_key_chord(u32, keys or [])
+            return {
+                "ok": True,
+                "status": "completed",
+                "action": "press_keys",
+                "keys": normalized_keys,
+            }
+
+        # normalized_action == "scroll"
+        if x is not None and y is not None and hasattr(u32, "SetCursorPos"):
+            moved = u32.SetCursorPos(x, y)
+            if moved is not None and not moved:
+                raise RuntimeError(f"Win32 SetCursorPos({x}, {y}) failed.")
+
+        clamped_delta = max(-12000, min(12000, delta))
+        scroll_input = _INPUT(
+            type=INPUT_MOUSE,
+            union=_INPUT_UNION(
+                mi=_MOUSEINPUT(
+                    mouseData=clamped_delta & 0xFFFFFFFF,
+                    dwFlags=MOUSEEVENTF_WHEEL,
+                )
+            ),
+        )
+        if hasattr(u32, "SendInput"):
+            _send_win32_inputs(u32, [scroll_input])
+        elif hasattr(u32, "mouse_event"):
+            u32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, clamped_delta & 0xFFFFFFFF, 0)
+        else:
+            raise RuntimeError("Win32 SendInput/mouse_event is unavailable.")
+
+        return {
+            "ok": True,
+            "status": "completed",
+            "action": "scroll",
+            "delta": clamped_delta,
+            "x": x,
+            "y": y,
+        }
+
+    if _guard is not None:
+        return _execute_gui_action(_guard)
+
     should_guard = focus_backend is not None or user32 is None
     if should_guard:
         backend = focus_backend or Win32FocusPreconditionBackend()
@@ -4635,84 +4852,13 @@ def gui_action(
                 expected_hwnd=expected_hwnd,
                 require_foreground=require_foreground,
             ) as guard:
-                guard.assert_ready(f"gui_action:{normalized_action}")
+                return _execute_gui_action(guard)
         except PreconditionFailedError as exc:
             abort = exc.to_abort_payload()
             abort["action"] = normalized_action
             return abort
 
-    u32 = _get_win32_user32(user32)
-
-    if normalized_action == "click_at":
-        assert x is not None and y is not None
-        _perform_mouse_click(x, y, clicks=clicks, button=btn, user32=u32)
-        actual_clicks = 2 if btn == "double" and clicks == 1 else clicks
-        return {
-            "ok": True,
-            "status": "completed",
-            "action": "click_at",
-            "x": x,
-            "y": y,
-            "clicks": actual_clicks,
-            "button": btn,
-        }
-
-    if normalized_action == "type_text":
-        assert text is not None
-        clamped_interval = _send_unicode_text(
-            u32,
-            text,
-            interval_ms=interval_ms,
-            sleep_fn=sleep_fn,
-        )
-        return {
-            "ok": True,
-            "status": "completed",
-            "action": "type_text",
-            "char_count": len(text),
-            "interval_ms": clamped_interval,
-        }
-
-    if normalized_action == "press_keys":
-        normalized_keys = _send_key_chord(u32, keys or [])
-        return {
-            "ok": True,
-            "status": "completed",
-            "action": "press_keys",
-            "keys": normalized_keys,
-        }
-
-    # normalized_action == "scroll"
-    if x is not None and y is not None and hasattr(u32, "SetCursorPos"):
-        moved = u32.SetCursorPos(x, y)
-        if moved is not None and not moved:
-            raise RuntimeError(f"Win32 SetCursorPos({x}, {y}) failed.")
-
-    clamped_delta = max(-12000, min(12000, delta))
-    scroll_input = _INPUT(
-        type=INPUT_MOUSE,
-        union=_INPUT_UNION(
-            mi=_MOUSEINPUT(
-                mouseData=clamped_delta & 0xFFFFFFFF,
-                dwFlags=MOUSEEVENTF_WHEEL,
-            )
-        ),
-    )
-    if hasattr(u32, "SendInput"):
-        _send_win32_inputs(u32, [scroll_input])
-    elif hasattr(u32, "mouse_event"):
-        u32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, clamped_delta & 0xFFFFFFFF, 0)
-    else:
-        raise RuntimeError("Win32 SendInput/mouse_event is unavailable.")
-
-    return {
-        "ok": True,
-        "status": "completed",
-        "action": "scroll",
-        "delta": clamped_delta,
-        "x": x,
-        "y": y,
-    }
+    return _execute_gui_action(None)
 
 
 # ---------------------------------------------------------------------------
@@ -5008,7 +5154,9 @@ def ui_batch(
 
     step_results: list[dict[str, Any]] = []
     status = "completed"
-    should_guard = focus_backend is not None or (user32 is None and gui_action_fn is None)
+    should_guard = focus_backend is not None or (
+        user32 is None and (gui_action_fn is None or gui_action_fn is gui_action)
+    )
     target_guard_hwnd = (
         expected_hwnd
         if expected_hwnd is not None
@@ -5026,6 +5174,11 @@ def ui_batch(
 
     try:
         with guard_cm as guard:
+            runner_guard_kw: dict[str, Any] = (
+                {"_guard": guard}
+                if (guard is not None and _action_runner_accepts_guard(action_runner))
+                else {}
+            )
             for idx, s in enumerate(steps):
                 s_dict = (
                     s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else dict(s)
@@ -5053,12 +5206,20 @@ def ui_batch(
                         if step_interval is not None and not isinstance(step_interval, bool):
                             with contextlib.suppress(TypeError, ValueError):
                                 act_kwargs["interval_ms"] = int(step_interval)
-                        ui_act(
+                        act_res = ui_act(
                             ref,
                             action,
                             val,
                             **act_kwargs,
                         )
+                        if (
+                            isinstance(act_res, dict)
+                            and act_res.get("status") == "aborted_precondition"
+                        ):
+                            abort_res = dict(act_res)
+                            abort_res["steps_executed"] = len(step_results)
+                            abort_res["step_results"] = step_results
+                            return abort_res
                         step_results.append(
                             {
                                 "step": idx,
@@ -5073,7 +5234,17 @@ def ui_batch(
 
                     elif op == "press_keys":
                         keys = [str(k) for k in s_dict["keys"]]
-                        action_runner(action="press_keys", keys=keys, user32=user32)
+                        step_res = action_runner(
+                            action="press_keys", keys=keys, user32=user32, **runner_guard_kw
+                        )
+                        if (
+                            isinstance(step_res, dict)
+                            and step_res.get("status") == "aborted_precondition"
+                        ):
+                            abort_res = dict(step_res)
+                            abort_res["steps_executed"] = len(step_results)
+                            abort_res["step_results"] = step_results
+                            return abort_res
                         step_results.append(
                             {
                                 "step": idx,
@@ -5089,7 +5260,17 @@ def ui_batch(
                         delta = int(s_dict["delta"])
                         x = s_dict.get("x")
                         y = s_dict.get("y")
-                        action_runner(action="scroll", delta=delta, x=x, y=y, user32=user32)
+                        step_res = action_runner(
+                            action="scroll", delta=delta, x=x, y=y, user32=user32, **runner_guard_kw
+                        )
+                        if (
+                            isinstance(step_res, dict)
+                            and step_res.get("status") == "aborted_precondition"
+                        ):
+                            abort_res = dict(step_res)
+                            abort_res["steps_executed"] = len(step_results)
+                            abort_res["step_results"] = step_results
+                            return abort_res
                         step_results.append(
                             {
                                 "step": idx,
@@ -5100,7 +5281,7 @@ def ui_batch(
 
                     elif op == "wait":
                         sec = float(s_dict.get("seconds", 0.5))
-                        action_runner(action="wait", seconds=sec, user32=user32)
+                        action_runner(action="wait", seconds=sec, user32=user32, **runner_guard_kw)
                         step_results.append(
                             {
                                 "step": idx,
@@ -5114,14 +5295,23 @@ def ui_batch(
                         y = int(s_dict["y"])
                         clicks = int(s_dict.get("clicks", 1))
                         btn = str(s_dict.get("button", "left"))
-                        action_runner(
+                        step_res = action_runner(
                             action="click_at",
                             x=x,
                             y=y,
                             clicks=clicks,
                             button=btn,
                             user32=user32,
+                            **runner_guard_kw,
                         )
+                        if (
+                            isinstance(step_res, dict)
+                            and step_res.get("status") == "aborted_precondition"
+                        ):
+                            abort_res = dict(step_res)
+                            abort_res["steps_executed"] = len(step_results)
+                            abort_res["step_results"] = step_results
+                            return abort_res
                         step_results.append(
                             {
                                 "step": idx,

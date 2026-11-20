@@ -13,6 +13,7 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
+from clea.surfaces.voice.win32 import _MONITORINFOEXW, _RECT
 from clea.tools.guards import (
     ActionVerifier,
     FocusPreconditionBackend,
@@ -82,22 +83,8 @@ VALID_THEME_ACTIONS = ("dark", "light", "toggle")
 VALID_DIAGNOSTIC_CHECKS = ("overview", "battery", "network", "top_processes", "port")
 
 
-class RECT(ctypes.Structure):
-    _fields_ = [
-        ("left", ctypes.c_long),
-        ("top", ctypes.c_long),
-        ("right", ctypes.c_long),
-        ("bottom", ctypes.c_long),
-    ]
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.c_ulong),
-        ("rcMonitor", RECT),
-        ("rcWork", RECT),
-        ("dwFlags", ctypes.c_ulong),
-    ]
+RECT = _RECT
+MONITORINFO = _MONITORINFOEXW
 
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):
@@ -125,19 +112,145 @@ class MEMORYSTATUSEX(ctypes.Structure):
     ]
 
 
+_SYSTEM_CONTROLS_USER32: Any = None
+_SYSTEM_CONTROLS_KERNEL32: Any = None
+
+
+def _configure_system_controls_user32(u32: Any) -> Any:
+    """Attach explicit 64-bit Win32 ctypes signatures (c_void_p handles) to user32."""
+    if u32 is None or not hasattr(ctypes, "WINFUNCTYPE"):
+        return u32
+    wndenumproc = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.c_void_p, wintypes.LPARAM)
+    if hasattr(u32, "GetForegroundWindow"):
+        u32.GetForegroundWindow.argtypes = []
+        u32.GetForegroundWindow.restype = ctypes.c_void_p
+    if hasattr(u32, "GetDesktopWindow"):
+        u32.GetDesktopWindow.argtypes = []
+        u32.GetDesktopWindow.restype = ctypes.c_void_p
+    if hasattr(u32, "IsWindow"):
+        u32.IsWindow.argtypes = [ctypes.c_void_p]
+        u32.IsWindow.restype = wintypes.BOOL
+    if hasattr(u32, "IsWindowVisible"):
+        u32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        u32.IsWindowVisible.restype = wintypes.BOOL
+    if hasattr(u32, "GetWindowTextLengthW"):
+        u32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+        u32.GetWindowTextLengthW.restype = ctypes.c_int
+    if hasattr(u32, "GetWindowTextW"):
+        u32.GetWindowTextW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, ctypes.c_int]
+        u32.GetWindowTextW.restype = ctypes.c_int
+    if hasattr(u32, "EnumWindows"):
+        u32.EnumWindows.argtypes = [wndenumproc, wintypes.LPARAM]
+        u32.EnumWindows.restype = wintypes.BOOL
+    if hasattr(u32, "OpenDesktopW"):
+        u32.OpenDesktopW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        u32.OpenDesktopW.restype = ctypes.c_void_p
+    if hasattr(u32, "EnumDesktopWindows"):
+        u32.EnumDesktopWindows.argtypes = [ctypes.c_void_p, wndenumproc, wintypes.LPARAM]
+        u32.EnumDesktopWindows.restype = wintypes.BOOL
+    if hasattr(u32, "CloseDesktop"):
+        u32.CloseDesktop.argtypes = [ctypes.c_void_p]
+        u32.CloseDesktop.restype = wintypes.BOOL
+    if hasattr(u32, "MonitorFromWindow"):
+        u32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        u32.MonitorFromWindow.restype = ctypes.c_void_p
+    if hasattr(u32, "GetMonitorInfoW"):
+        u32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        u32.GetMonitorInfoW.restype = wintypes.BOOL
+    if hasattr(u32, "ShowWindow"):
+        u32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u32.ShowWindow.restype = wintypes.BOOL
+    if hasattr(u32, "SetForegroundWindow"):
+        u32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        u32.SetForegroundWindow.restype = wintypes.BOOL
+    if hasattr(u32, "MoveWindow"):
+        u32.MoveWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.BOOL,
+        ]
+        u32.MoveWindow.restype = wintypes.BOOL
+    if hasattr(u32, "PostMessageW"):
+        u32.PostMessageW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        u32.PostMessageW.restype = wintypes.BOOL
+    if hasattr(u32, "SendMessageW"):
+        u32.SendMessageW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        u32.SendMessageW.restype = wintypes.LPARAM
+    if hasattr(u32, "DefWindowProcW"):
+        u32.DefWindowProcW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        u32.DefWindowProcW.restype = wintypes.LPARAM
+    if hasattr(u32, "keybd_event"):
+        u32.keybd_event.argtypes = [
+            ctypes.c_ubyte,
+            ctypes.c_ubyte,
+            wintypes.DWORD,
+            ctypes.c_size_t,
+        ]
+        u32.keybd_event.restype = None
+    return u32
+
+
+def _configure_system_controls_kernel32(k32: Any) -> Any:
+    """Attach explicit Win32 ctypes signatures to kernel32."""
+    if k32 is None:
+        return None
+    if hasattr(k32, "GetSystemPowerStatus"):
+        k32.GetSystemPowerStatus.argtypes = [ctypes.c_void_p]
+        k32.GetSystemPowerStatus.restype = wintypes.BOOL
+    if hasattr(k32, "GlobalMemoryStatusEx"):
+        k32.GlobalMemoryStatusEx.argtypes = [ctypes.c_void_p]
+        k32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    return k32
+
+
 def _get_user32(user32: Any = None) -> Any:
+    global _SYSTEM_CONTROLS_USER32
     if user32 is not None:
         return user32
-    if sys.platform == "win32" and hasattr(ctypes, "windll"):
-        return ctypes.windll.user32
+    if _SYSTEM_CONTROLS_USER32 is not None:
+        return _SYSTEM_CONTROLS_USER32
+    if sys.platform == "win32" and hasattr(ctypes, "WinDLL"):
+        _SYSTEM_CONTROLS_USER32 = _configure_system_controls_user32(
+            ctypes.WinDLL("user32", use_last_error=True)
+        )
+        return _SYSTEM_CONTROLS_USER32
     return None
 
 
 def _get_kernel32(kernel32: Any = None) -> Any:
+    global _SYSTEM_CONTROLS_KERNEL32
     if kernel32 is not None:
         return kernel32
-    if sys.platform == "win32" and hasattr(ctypes, "windll"):
-        return ctypes.windll.kernel32
+    if _SYSTEM_CONTROLS_KERNEL32 is not None:
+        return _SYSTEM_CONTROLS_KERNEL32
+    if sys.platform == "win32" and hasattr(ctypes, "WinDLL"):
+        _SYSTEM_CONTROLS_KERNEL32 = _configure_system_controls_kernel32(
+            ctypes.WinDLL("kernel32", use_last_error=True)
+        )
+        return _SYSTEM_CONTROLS_KERNEL32
     return None
 
 
