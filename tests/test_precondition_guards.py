@@ -2212,3 +2212,691 @@ def test_control_system_snap_calculator_known_app_spec() -> None:
     assert res["verification"]["verified"] is True
 
 
+def test_send_unicode_text_emits_atomic_pairs_per_code_unit_and_guards_between_pairs() -> None:
+    timeline: list[tuple[Any, ...]] = []
+    notepad = _FakeWindowState(hwnd=0x1_0000_6100, title="Notepad", process_name="notepad.exe")
+    modal = _FakeWindowState(
+        hwnd=0x1_0000_6200, title="Windows Security", process_name="CredentialUIBroker.exe"
+    )
+
+    class _TimelineBackend(FakeFocusPreconditionBackend):
+        def is_window_valid(self, hwnd: int) -> bool:
+            timeline.append(("guard_valid", hwnd))
+            return super().is_window_valid(hwnd)
+
+    class _RecordingUser32:
+        def SendInput(self, count: int, ptr: Any, size: int) -> int:
+            assert size == ctypes.sizeof(windows_os._INPUT)
+            arr = ctypes.cast(ptr, ctypes.POINTER(windows_os._INPUT * count)).contents
+            items = [
+                (
+                    int(item.type),
+                    int(item.union.ki.wVk),
+                    int(item.union.ki.wScan),
+                    int(item.union.ki.dwFlags),
+                )
+                for item in arr
+            ]
+            timeline.append(("send_input", count, items))
+            return count
+
+    def _record_sleep(dt: float) -> None:
+        timeline.append(("sleep", dt))
+
+    backend = _TimelineBackend(
+        windows={notepad.hwnd: notepad, modal.hwnd: modal},
+        foreground_hwnd=notepad.hwnd,
+    )
+    u32 = _RecordingUser32()
+
+    # 1. Non-zero pacing with BMP Unicode, surrogate pair ('😀'), CRLF, and tab
+    sample = "Aé😀\r\n\tZ"
+    with PreconditionGuard(backend, expected_hwnd=notepad.hwnd) as guard:
+        clamped = windows_os._send_unicode_text(
+            u32,
+            sample,
+            interval_ms=12,
+            sleep_fn=_record_sleep,
+            guard=guard,
+            step_label="type_sample",
+        )
+    assert clamped == 12
+
+    send_calls = [evt for evt in timeline if evt[0] == "send_input"]
+    # 'A' (1 pair), 'é' (1 pair), '😀' (2 UTF-16 code units = 2 pairs), '\n' (1), '\t' (1), 'Z' (1)
+    assert len(send_calls) == 7
+    assert all(count == 2 for _, count, _ in send_calls)
+
+    assert send_calls[0][2] == [
+        (windows_os.INPUT_KEYBOARD, 0, ord("A"), windows_os.KEYEVENTF_UNICODE),
+        (
+            windows_os.INPUT_KEYBOARD,
+            0,
+            ord("A"),
+            windows_os.KEYEVENTF_UNICODE | windows_os.KEYEVENTF_KEYUP,
+        ),
+    ]
+    assert send_calls[1][2] == [
+        (windows_os.INPUT_KEYBOARD, 0, ord("é"), windows_os.KEYEVENTF_UNICODE),
+        (
+            windows_os.INPUT_KEYBOARD,
+            0,
+            ord("é"),
+            windows_os.KEYEVENTF_UNICODE | windows_os.KEYEVENTF_KEYUP,
+        ),
+    ]
+    # Surrogate pair code units for 😀 (U+1F600 -> 0xD83D, 0xDE00) each get atomic SendInput(2)
+    assert send_calls[2][2] == [
+        (windows_os.INPUT_KEYBOARD, 0, 0xD83D, windows_os.KEYEVENTF_UNICODE),
+        (
+            windows_os.INPUT_KEYBOARD,
+            0,
+            0xD83D,
+            windows_os.KEYEVENTF_UNICODE | windows_os.KEYEVENTF_KEYUP,
+        ),
+    ]
+    assert send_calls[3][2] == [
+        (windows_os.INPUT_KEYBOARD, 0, 0xDE00, windows_os.KEYEVENTF_UNICODE),
+        (
+            windows_os.INPUT_KEYBOARD,
+            0,
+            0xDE00,
+            windows_os.KEYEVENTF_UNICODE | windows_os.KEYEVENTF_KEYUP,
+        ),
+    ]
+    assert send_calls[4][2] == [
+        (windows_os.INPUT_KEYBOARD, windows_os.VK_RETURN_OS, 0, 0),
+        (windows_os.INPUT_KEYBOARD, windows_os.VK_RETURN_OS, 0, windows_os.KEYEVENTF_KEYUP),
+    ]
+    assert send_calls[5][2] == [
+        (windows_os.INPUT_KEYBOARD, windows_os.VK_TAB_OS, 0, 0),
+        (windows_os.INPUT_KEYBOARD, windows_os.VK_TAB_OS, 0, windows_os.KEYEVENTF_KEYUP),
+    ]
+    assert send_calls[6][2] == [
+        (windows_os.INPUT_KEYBOARD, 0, ord("Z"), windows_os.KEYEVENTF_UNICODE),
+        (
+            windows_os.INPUT_KEYBOARD,
+            0,
+            ord("Z"),
+            windows_os.KEYEVENTF_UNICODE | windows_os.KEYEVENTF_KEYUP,
+        ),
+    ]
+
+    # Verify ordering: guard -> send_input(s) -> sleep, never sleep/guard inside a pair
+    sleep_calls = [evt for evt in timeline if evt[0] == "sleep"]
+    assert len(sleep_calls) == 5  # 6 normalized chars -> 5 inter-char sleeps
+    assert [evt[0] for evt in timeline] == [
+        "guard_valid",
+        "send_input",
+        "sleep",
+        "guard_valid",
+        "send_input",
+        "sleep",
+        "guard_valid",
+        "send_input",
+        "send_input",
+        "sleep",
+        "guard_valid",
+        "send_input",
+        "sleep",
+        "guard_valid",
+        "send_input",
+        "sleep",
+        "guard_valid",
+        "send_input",
+    ]
+
+    # 2. interval_ms=0 still dispatches atomic SendInput(2) per code unit, zero sleeps, and
+    #    aborts cleanly between atomic character pairs if focus is stolen mid-stream
+    timeline.clear()
+    zero_calls = 0
+
+    class _StealOnSecondCharUser32(_RecordingUser32):
+        def SendInput(self, count: int, ptr: Any, size: int) -> int:
+            nonlocal zero_calls
+            res = super().SendInput(count, ptr, size)
+            zero_calls += 1
+            if zero_calls == 1:
+                backend.foreground_hwnd = modal.hwnd
+            return res
+
+    with pytest.raises(PreconditionFailedError) as exc_zero:
+        with PreconditionGuard(backend, expected_hwnd=notepad.hwnd) as guard_zero:
+            windows_os._send_unicode_text(
+                _StealOnSecondCharUser32(),
+                "abc",
+                interval_ms=0,
+                sleep_fn=_record_sleep,
+                guard=guard_zero,
+                step_label="fast_type",
+            )
+    assert exc_zero.value.reason == "focus_lost"
+    assert exc_zero.value.step_label == "fast_type_char_1"
+    assert [evt for evt in timeline if evt[0] == "sleep"] == []
+    assert len([evt for evt in timeline if evt[0] == "send_input"]) == 1
+
+
+def test_background_capable_actions_vs_foreground_raw_sendinput() -> None:
+    target = _FakeWindowState(
+        hwnd=0x1_0000_7100,
+        title="Calculator",
+        process_name="CalculatorApp.exe",
+        bounds=(100, 100, 500, 600),
+        work_area=(0, 0, 1920, 1040),
+    )
+    fg_other = _FakeWindowState(
+        hwnd=0x1_0000_7200,
+        title="Google Chrome",
+        process_name="chrome.exe",
+        bounds=(0, 0, 1920, 1040),
+        work_area=(0, 0, 1920, 1040),
+    )
+    backend = FakeFocusPreconditionBackend(
+        windows={target.hwnd: target, fg_other.hwnd: fg_other},
+        foreground_hwnd=fg_other.hwnd,
+    )
+    media_backend = FakeMediaVerificationBackend(
+        [
+            MediaSessionState("paused", title="Song A", source_app="Spotify"),
+            MediaSessionState("playing", title="Song A", source_app="Spotify"),
+            MediaSessionState("playing", title="Song A", source_app="Spotify"),
+            MediaSessionState("paused", title="Song A", source_app="Spotify"),
+        ]
+    )
+    clock = _FakeClock()
+    verifier = ActionVerifier(
+        focus_backend=backend,
+        media_backend=media_backend,
+        monotonic_fn=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    class _TrackingUser32(_FakeUser32ForControls):
+        def __init__(self) -> None:
+            super().__init__(backend, allow_resize=True)
+            self.foreground_calls: list[int] = []
+            self.show_calls: list[tuple[int, int]] = []
+            self.cursor_moves: list[tuple[int, int]] = []
+
+        def SetForegroundWindow(self, hwnd: int) -> bool:
+            self.foreground_calls.append(hwnd)
+            return super().SetForegroundWindow(hwnd)
+
+        def ShowWindow(self, hwnd: int, cmd: int) -> bool:
+            self.show_calls.append((hwnd, cmd))
+            return super().ShowWindow(hwnd, cmd)
+
+        def SetCursorPos(self, x: int, y: int) -> bool:
+            self.cursor_moves.append((x, y))
+            return True
+
+    u32 = _TrackingUser32()
+    enum_windows = [
+        EnumeratedWindow(
+            hwnd=target.hwnd,
+            title=target.title,
+            process_name=target.process_name,
+            is_visible=True,
+        ),
+        EnumeratedWindow(
+            hwnd=fg_other.hwnd,
+            title=fg_other.title,
+            process_name=fg_other.process_name,
+            is_visible=True,
+        ),
+    ]
+
+    # 1. UIA pattern-based click_ui_element succeeds on non-foreground target
+    #    without SetForegroundWindow
+    res_click_uia = click_ui_element(
+        "Equals",
+        control_type="Button",
+        app_name="Calculator",
+        powershell_runner=lambda cmd, **_kw: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "found": True,
+                    "invoked": True,
+                    "name": "Equals",
+                    "control_type": "Button",
+                    "x": 300,
+                    "y": 400,
+                }
+            ),
+            stderr="",
+        ),
+        user32=u32,
+        window_enumerator=lambda: enum_windows,
+        focus_backend=backend,
+    )
+    assert res_click_uia["ok"] is True
+    assert res_click_uia["method"] == "invoke"
+    assert backend.foreground_hwnd == fg_other.hwnd
+    assert u32.foreground_calls == []
+    assert u32.show_calls == []
+    assert u32.sent_inputs == []
+
+    # 2. UIA pattern-based ui_act (click + set_value) succeeds on non-foreground target
+    #    without SetFocus or focus_lost
+    assert "SetFocus" not in windows_os._POWERSHELL_UI_ACT_SCRIPT
+    set_ui_snapshot_state(
+        {
+            "ok": True,
+            "snapshot_id": "snap_bg_uia",
+            "window_title": "Calculator",
+            "hwnd": target.hwnd,
+            "count": 2,
+            "elements": [
+                {
+                    "ref": "e1",
+                    "role": "Button",
+                    "name": "Equals",
+                    "x": 300,
+                    "y": 400,
+                    "bounds": {"x": 280, "y": 380, "width": 40, "height": 40},
+                    "center": {"cx": 300, "cy": 400},
+                },
+                {
+                    "ref": "e2",
+                    "role": "Edit",
+                    "name": "Expression",
+                    "x": 250,
+                    "y": 150,
+                    "bounds": {"x": 150, "y": 135, "width": 200, "height": 30},
+                    "center": {"cx": 250, "cy": 150},
+                },
+            ],
+        }
+    )
+
+    res_act_click = ui_act(
+        "e1",
+        "click",
+        powershell_runner=lambda cmd, **_kw: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"found": True, "acted": True, "method": "invoke", "cx": 300, "cy": 400}
+            ),
+            stderr="",
+        ),
+        user32=u32,
+        focus_backend=backend,
+        _capture_snapshot=False,
+    )
+    assert res_act_click["ok"] is True
+    assert res_act_click["method"] == "invoke"
+
+    res_act_set = ui_act(
+        "e2",
+        "set_value",
+        "42",
+        powershell_runner=lambda cmd, **_kw: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"found": True, "acted": True, "method": "value_pattern", "cx": 250, "cy": 150}
+            ),
+            stderr="",
+        ),
+        user32=u32,
+        focus_backend=backend,
+        _capture_snapshot=False,
+    )
+    assert res_act_set["ok"] is True
+    assert res_act_set["method"] == "value_pattern"
+    assert backend.foreground_hwnd == fg_other.hwnd
+    assert u32.foreground_calls == []
+    assert u32.sent_inputs == []
+
+    # 3. Background-capable manage_window (minimize/restore/maximize/snap) & media controls
+    #    do NOT enforce require_foreground=True
+    res_min = manage_window(
+        "minimize",
+        title_query="Calculator",
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_min["ok"] is True
+    assert res_min["verification"]["verified"] is True
+    assert u32.foreground_calls == []
+
+    res_restore = manage_window(
+        "restore",
+        title_query="Calculator",
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_restore["ok"] is True
+    assert res_restore["verification"]["verified"] is True
+
+    backend.foreground_hwnd = fg_other.hwnd
+    u32.foreground_calls.clear()
+
+    res_max = manage_window(
+        "maximize",
+        title_query="Calculator",
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_max["ok"] is True
+    assert res_max["verification"]["verified"] is True
+
+    backend.foreground_hwnd = fg_other.hwnd
+    u32.foreground_calls.clear()
+
+    res_media = system_control("media", "play_pause", user32=u32, verifier=verifier)
+    assert res_media["ok"] is True
+    assert res_media["verification"]["verified"] is True
+    assert u32.foreground_calls == []
+
+    res_snap = manage_window(
+        "snap_left",
+        title_query="Calculator",
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_snap["ok"] is True
+    assert res_snap["verification"]["verified"] is True
+
+    # Reset foreground back to Chrome so target is non-foreground for fallback/raw input checks
+    backend.foreground_hwnd = fg_other.hwnd
+    u32.foreground_calls.clear()
+    u32.sent_inputs.clear()
+
+    # 4. Raw SendInput paths (click_ui_element/ui_act falling back to SendInput, and gui_action)
+    #    MUST still enforce require_foreground=True and abort with focus_lost
+    abort_click_fb = click_ui_element(
+        "History",
+        app_name="Calculator",
+        powershell_runner=lambda cmd, **_kw: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"found": True, "invoked": False, "name": "History", "x": 150, "y": 90}
+            ),
+            stderr="",
+        ),
+        user32=u32,
+        window_enumerator=lambda: enum_windows,
+        focus_backend=backend,
+    )
+    assert abort_click_fb["ok"] is False
+    assert abort_click_fb["status"] == "aborted_precondition"
+    assert abort_click_fb["reason"] == "focus_lost"
+    assert u32.sent_inputs == []
+
+    abort_act_click_fb = ui_act(
+        "e1",
+        "click",
+        powershell_runner=lambda cmd, **_kw: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"found": True, "acted": False, "method": "", "cx": 300, "cy": 400}),
+            stderr="",
+        ),
+        user32=u32,
+        focus_backend=backend,
+        _capture_snapshot=False,
+    )
+    assert abort_act_click_fb["ok"] is False
+    assert abort_act_click_fb["status"] == "aborted_precondition"
+    assert abort_act_click_fb["reason"] == "focus_lost"
+    assert u32.sent_inputs == []
+
+    abort_act_fb = ui_act(
+        "e2",
+        "set_value",
+        "42",
+        powershell_runner=lambda cmd, **_kw: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"found": True, "acted": False, "method": "", "cx": 250, "cy": 150}),
+            stderr="",
+        ),
+        user32=u32,
+        focus_backend=backend,
+        _capture_snapshot=False,
+    )
+    assert abort_act_fb["ok"] is False
+    assert abort_act_fb["status"] == "aborted_precondition"
+    assert abort_act_fb["reason"] == "focus_lost"
+    assert u32.sent_inputs == []
+
+    abort_act_type = ui_act(
+        "e2",
+        "type",
+        "42",
+        user32=u32,
+        focus_backend=backend,
+        _capture_snapshot=False,
+    )
+    assert abort_act_type["ok"] is False
+    assert abort_act_type["status"] == "aborted_precondition"
+    assert abort_act_type["reason"] == "focus_lost"
+    assert u32.sent_inputs == []
+
+    abort_gui = gui_action(
+        "type_text",
+        text="42",
+        user32=u32,
+        focus_backend=backend,
+        expected_hwnd=target.hwnd,
+    )
+    assert abort_gui["ok"] is False
+    assert abort_gui["status"] == "aborted_precondition"
+    assert abort_gui["reason"] == "focus_lost"
+    assert abort_gui["aborted_precondition"]["expected_hwnd"] == target.hwnd
+    assert abort_gui["aborted_precondition"]["actual_hwnd"] == fg_other.hwnd
+    assert u32.sent_inputs == []
+
+    # 5. windows_os background-capable control_system & control_media_volume also work
+    #    on non-foreground targets without require_foreground=True
+    res_cs_min = control_system(
+        "minimize_window",
+        hwnd=target.hwnd,
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_cs_min["ok"] is True
+    assert res_cs_min["verification"]["verified"] is True
+    assert u32.foreground_calls == []
+
+    res_cs_max = control_system(
+        "maximize_window",
+        hwnd=target.hwnd,
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_cs_max["ok"] is True
+    assert res_cs_max["verification"]["verified"] is True
+    assert u32.foreground_calls == []
+
+    res_cs_restore = control_system(
+        "restore_window",
+        hwnd=target.hwnd,
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_cs_restore["ok"] is True
+    assert res_cs_restore["verification"]["verified"] is True
+    assert u32.foreground_calls == []
+
+    res_cs_media = control_media_volume("play_pause", user32=u32, verifier=verifier)
+    assert res_cs_media["ok"] is True
+    assert res_cs_media["verification"]["verified"] is True
+    assert u32.foreground_calls == []
+
+    res_cs_snap = control_system(
+        "snap_left",
+        hwnd=target.hwnd,
+        user32=u32,
+        focus_backend=backend,
+        verifier=verifier,
+    )
+    assert res_cs_snap["ok"] is True
+    assert res_cs_snap["verification"]["verified"] is True
+
+    set_ui_snapshot_state({})
+
+
+def test_uia_expected_hwnd_after_snap_mid_ps_close_and_partial_sendinput(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _FakeWindowState(hwnd=0x1_0000_9100, title="Calculator", process_name="calc.exe")
+    fg_other = _FakeWindowState(hwnd=0x1_0000_9200, title="Chrome", process_name="chrome.exe")
+    backend = FakeFocusPreconditionBackend(
+        windows={target.hwnd: target, fg_other.hwnd: fg_other},
+        foreground_hwnd=fg_other.hwnd,
+    )
+
+    class _TrackingUser32(_FakeUser32ForControls):
+        def __init__(self) -> None:
+            super().__init__(backend)
+            self.foreground_calls: list[int] = []
+
+        def SetForegroundWindow(self, hwnd: int) -> bool:
+            self.foreground_calls.append(hwnd)
+            return super().SetForegroundWindow(hwnd)
+
+    u32 = _TrackingUser32()
+
+    # 1. click_ui_element with explicit expected_hwnd (and app_name=None) targets expected_hwnd,
+    #    NOT GetForegroundWindow()
+    captured_cmds: list[str] = []
+
+    def _ps_expected_hwnd(cmd: list[str], **_kw: Any) -> Any:
+        captured_cmds.append(cmd[4])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"found": True, "invoked": True, "name": "Equals", "x": 100, "y": 200}
+            ),
+            stderr="",
+        )
+
+    res_expected = click_ui_element(
+        "Equals",
+        expected_hwnd=target.hwnd,
+        powershell_runner=_ps_expected_hwnd,
+        user32=u32,
+        focus_backend=backend,
+    )
+    assert res_expected["ok"] is True
+    assert f"-TargetHwnd {target.hwnd}" in captured_cmds[0]
+    assert u32.foreground_calls == []
+
+    # 2. Target window closing mid-PowerShell preserves reason="window_closed" & expected_title
+    def _ps_close_during_click(cmd: list[str], **_kw: Any) -> Any:
+        target.valid = False
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"found": True, "invoked": False, "name": "Hist", "x": 10, "y": 10}),
+            stderr="",
+        )
+
+    closed_click = click_ui_element(
+        "Hist",
+        expected_hwnd=target.hwnd,
+        powershell_runner=_ps_close_during_click,
+        user32=u32,
+        focus_backend=backend,
+    )
+    assert closed_click["ok"] is False
+    assert closed_click["status"] == "aborted_precondition"
+    assert closed_click["reason"] == "window_closed"
+    assert closed_click["aborted_precondition"]["expected_title"] == "Calculator"
+    assert closed_click["aborted_precondition"]["step_label"] == "click_ui_mouse"
+    assert u32.sent_inputs == []
+
+    target.valid = True
+    set_ui_snapshot_state(
+        {
+            "ok": True,
+            "snapshot_id": "snap_close_act",
+            "window_title": "Calculator",
+            "hwnd": 0,
+            "count": 1,
+            "elements": [
+                {"ref": "e1", "role": "Button", "name": "Equals", "x": 100, "y": 200},
+            ],
+        }
+    )
+
+    def _ps_close_during_act(cmd: list[str], **_kw: Any) -> Any:
+        target.valid = False
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"found": True, "acted": False, "method": "", "cx": 100, "cy": 200}),
+            stderr="",
+        )
+
+    closed_act = ui_act(
+        "e1",
+        "click",
+        expected_hwnd=target.hwnd,
+        powershell_runner=_ps_close_during_act,
+        user32=u32,
+        focus_backend=backend,
+        _capture_snapshot=False,
+    )
+    assert closed_act["ok"] is False
+    assert closed_act["status"] == "aborted_precondition"
+    assert closed_act["reason"] == "window_closed"
+    assert closed_act["aborted_precondition"]["expected_title"] == "Calculator"
+    assert closed_act["aborted_precondition"]["step_label"] == "win32_click"
+    assert u32.sent_inputs == []
+
+    # 3. ui_act after_snap passes _target_hwnd=expected_hwnd even when snapshot_hwnd == 0
+    target.valid = True
+    snap_kwargs: list[dict[str, Any]] = []
+    act_ps_cmds: list[str] = []
+
+    def _fake_ui_snapshot(**kw: Any) -> dict[str, Any]:
+        snap_kwargs.append(kw)
+        return {
+            "ok": True,
+            "snapshot_id": "snap_after_bg",
+            "window_title": "Calculator",
+            "hwnd": target.hwnd,
+            "count": 1,
+            "elements": [
+                {"ref": "e1", "role": "Button", "name": "Equals", "x": 100, "y": 200},
+            ],
+        }
+
+    def _fake_uia_json(ps_cmd: str, **_kw: Any) -> dict[str, Any]:
+        act_ps_cmds.append(ps_cmd)
+        return {"found": True, "acted": True, "method": "invoke", "cx": 100, "cy": 200}
+
+    monkeypatch.setattr(windows_os.shutil, "which", lambda _exe: "powershell.exe")
+    monkeypatch.setattr(windows_os, "_run_powershell_uia_json", _fake_uia_json)
+    monkeypatch.setattr(windows_os, "ui_snapshot", _fake_ui_snapshot)
+
+    res_after = ui_act(
+        "e1",
+        "click",
+        expected_hwnd=target.hwnd,
+        focus_backend=backend,
+        _capture_snapshot=True,
+    )
+    assert res_after["ok"] is True
+    assert res_after["method"] == "invoke"
+    assert f"-TargetHwnd {target.hwnd}" in act_ps_cmds[0]
+    assert snap_kwargs == [{"user32": None, "_target_hwnd": target.hwnd}]
+
+    # 4. Partial SendInput (1 of 2 events) raises instead of leaving keydown stuck
+    class _PartialSendInputU32:
+        def SendInput(self, count: int, ptr: Any, size: int) -> int:
+            return 1 if count == 2 else count
+
+    with pytest.raises(RuntimeError, match="SendInput failed"):
+        windows_os._send_unicode_text(_PartialSendInputU32(), "a", interval_ms=0)
+
+    set_ui_snapshot_state({})
+
+
+

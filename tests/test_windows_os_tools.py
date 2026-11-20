@@ -1982,6 +1982,7 @@ def test_click_ui_element_invoke_fallback_matching_and_errors() -> None:
     assert res_inv["method"] == "invoke"
     assert u32_invoke.cursor_moves == []
     assert u32_invoke.sent_inputs == []
+    assert u32_invoke.foreground_calls == []
 
     # 2. InvokePattern unsupported -> SetCursorPos + SendInput left click fallback
     u32_click = _FakeInputUser32()
@@ -2804,9 +2805,17 @@ def test_gui_action_type_text_pacing_and_ref_store_thread_safety() -> None:
     assert sleeps == [0.012, 0.012]
     assert len(u32.sent_inputs) == 6
 
-    # Zero pacing sends in one batch with no sleeps
+    # Zero pacing sends atomic 2-event pairs per code unit with no sleeps
     sleeps.clear()
     u32.sent_inputs.clear()
+    batch_sizes: list[int] = []
+    orig_send_input = u32.SendInput
+
+    def _counting_send_input(count: int, ptr: Any, cb_size: int) -> int:
+        batch_sizes.append(count)
+        return orig_send_input(count, ptr, cb_size)
+
+    u32.SendInput = _counting_send_input  # type: ignore[method-assign]
     res_fast = gui_action(
         "type_text",
         text="abc",
@@ -2817,6 +2826,7 @@ def test_gui_action_type_text_pacing_and_ref_store_thread_safety() -> None:
     assert res_fast["interval_ms"] == 0
     assert sleeps == []
     assert len(u32.sent_inputs) == 6
+    assert batch_sizes == [2, 2, 2]
 
     # Concurrent update & resolve smoke check on _UI_REF_STORE
     errors: list[Exception] = []

@@ -3847,7 +3847,6 @@ _POWERSHELL_UI_ACT_SCRIPT = (
     "      } "
     "    } catch { $method = '' } "
     "  } elseif ($Action -eq 'set_value') { "
-    "    try { $chosen.SetFocus() } catch {} "
     "    $vp = $null; "
     "    try { "
     "      if ($chosen.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
@@ -3921,8 +3920,10 @@ def _send_win32_inputs(u32: Any, inputs: list[_INPUT]) -> int:
     arr = (_INPUT * len(inputs))(*inputs)
     if hasattr(u32, "SendInput"):
         sent = int(u32.SendInput(len(inputs), arr, ctypes.sizeof(_INPUT)))
-        if sent == 0:
-            raise RuntimeError("Win32 SendInput failed to inject input events.")
+        if sent != len(inputs):
+            raise RuntimeError(
+                f"Win32 SendInput failed to inject input events ({sent}/{len(inputs)})."
+            )
         return sent
     raise RuntimeError("Win32 SendInput API is unavailable.")
 
@@ -4074,7 +4075,7 @@ def _send_unicode_text(
     guard: PreconditionGuard | None = None,
     step_label: str = "type_text",
 ) -> int:
-    """Send Unicode text via Win32 SendInput with clamped inter-character pacing."""
+    """Send Unicode text via Win32 SendInput with atomic keydown/keyup pairs."""
     if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
         raise ValueError("interval_ms must be an integer.")
     clamped_interval = max(0, min(200, interval_ms))
@@ -4083,19 +4084,16 @@ def _send_unicode_text(
 
     normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    def _encode_char_events(chunk: str) -> list[_INPUT]:
-        chunk_events: list[_INPUT] = []
-        for ch in chunk:
-            if ch == "\n":
-                chunk_events.append(
+    def _encode_char_pairs(ch: str) -> list[list[_INPUT]]:
+        if ch == "\n":
+            return [
+                [
                     _INPUT(
                         type=INPUT_KEYBOARD,
                         union=_INPUT_UNION(
                             ki=_KEYBDINPUT(wVk=VK_RETURN_OS, wScan=0, dwFlags=0)
                         ),
-                    )
-                )
-                chunk_events.append(
+                    ),
                     _INPUT(
                         type=INPUT_KEYBOARD,
                         union=_INPUT_UNION(
@@ -4105,19 +4103,18 @@ def _send_unicode_text(
                                 dwFlags=KEYEVENTF_KEYUP,
                             )
                         ),
-                    )
-                )
-                continue
-            if ch == "\t":
-                chunk_events.append(
+                    ),
+                ]
+            ]
+        if ch == "\t":
+            return [
+                [
                     _INPUT(
                         type=INPUT_KEYBOARD,
                         union=_INPUT_UNION(
                             ki=_KEYBDINPUT(wVk=VK_TAB_OS, wScan=0, dwFlags=0)
                         ),
-                    )
-                )
-                chunk_events.append(
+                    ),
                     _INPUT(
                         type=INPUT_KEYBOARD,
                         union=_INPUT_UNION(
@@ -4127,21 +4124,21 @@ def _send_unicode_text(
                                 dwFlags=KEYEVENTF_KEYUP,
                             )
                         ),
-                    )
-                )
-                continue
-            utf16_bytes = ch.encode("utf-16-le")
-            for idx in range(0, len(utf16_bytes), 2):
-                code_unit = int.from_bytes(utf16_bytes[idx : idx + 2], "little")
-                chunk_events.append(
+                    ),
+                ]
+            ]
+        utf16_bytes = ch.encode("utf-16-le")
+        pairs: list[list[_INPUT]] = []
+        for idx in range(0, len(utf16_bytes), 2):
+            code_unit = int.from_bytes(utf16_bytes[idx : idx + 2], "little")
+            pairs.append(
+                [
                     _INPUT(
                         type=INPUT_KEYBOARD,
                         union=_INPUT_UNION(
                             ki=_KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)
                         ),
-                    )
-                )
-                chunk_events.append(
+                    ),
                     _INPUT(
                         type=INPUT_KEYBOARD,
                         union=_INPUT_UNION(
@@ -4151,24 +4148,20 @@ def _send_unicode_text(
                                 dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
                             )
                         ),
-                    )
-                )
-        return chunk_events
-
-    if clamped_interval == 0:
-        if guard is not None:
-            guard.assert_ready(step_label)
-        _send_win32_inputs(u32, _encode_char_events(normalized_text))
-        return clamped_interval
+                    ),
+                ]
+            )
+        return pairs
 
     sleeper = sleep_fn or time.sleep
     delay_s = clamped_interval / 1000.0
     last_idx = len(normalized_text) - 1
     for char_idx, ch in enumerate(normalized_text):
         if guard is not None:
-            guard.assert_ready(f"{step_label}_char_{char_idx}")
-        _send_win32_inputs(u32, _encode_char_events(ch))
-        if char_idx < last_idx:
+            guard.assert_ready(step_label=f"{step_label}_char_{char_idx}")
+        for pair in _encode_char_pairs(ch):
+            _send_win32_inputs(u32, pair)
+        if clamped_interval > 0 and char_idx < last_idx:
             sleeper(delay_s)
     return clamped_interval
 
@@ -4213,6 +4206,7 @@ def ui_snapshot(
     user32: Any = None,
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    _target_hwnd: int | None = None,
 ) -> dict[str, Any]:
     """Capture a semantic UI Automation snapshot and assign compact ref IDs ('e1'..'eN')."""
     if app_name is not None and not isinstance(app_name, str):
@@ -4227,14 +4221,17 @@ def ui_snapshot(
     if cleaned_app == "":
         raise ValueError("app_name must not be empty when provided.")
 
-    hwnd = _resolve_target_hwnd_optional(
-        cleaned_app,
-        powershell_runner=powershell_runner,
-        user32=user32,
-        kernel32=kernel32,
-        window_enumerator=window_enumerator,
-        focus_if_app_name=True,
-    )
+    if _target_hwnd is not None and _target_hwnd > 0:
+        hwnd = int(_target_hwnd)
+    else:
+        hwnd = _resolve_target_hwnd_optional(
+            cleaned_app,
+            powershell_runner=powershell_runner,
+            user32=user32,
+            kernel32=kernel32,
+            window_enumerator=window_enumerator,
+            focus_if_app_name=True,
+        )
 
     app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
     interactive_flag = 1 if interactive_only else 0
@@ -4474,6 +4471,7 @@ def ui_act(
         if expected_hwnd is not None
         else (snapshot_hwnd if snapshot_hwnd > 0 else None)
     )
+    resolved_guard_hwnd: int | None = target_guard_hwnd
     active_guard: PreconditionGuard | None = _guard
     aborted_result: dict[str, Any] | None = None
 
@@ -4481,8 +4479,136 @@ def ui_act(
         if active_guard is not None:
             active_guard.assert_ready(step_label)
 
+    can_try_uia = (
+        gui_action_fn is None
+        and norm_action in {"click", "set_value"}
+        and (powershell_runner is not None or shutil.which("powershell.exe") is not None)
+    )
+
+    def _run_uia_pattern_step() -> bool:
+        nonlocal method, target_cx, target_cy
+        _assert_step(f"uia_{norm_action}")
+        title_b64 = (
+            base64.b64encode(window_title.encode("utf-8")).decode("ascii")
+            if window_title
+            else ""
+        )
+        aid_b64 = (
+            base64.b64encode(entry.get("automation_id", "").encode("utf-8")).decode("ascii")
+            if entry.get("automation_id")
+            else ""
+        )
+        name_b64 = (
+            base64.b64encode(entry.get("name", "").encode("utf-8")).decode("ascii")
+            if entry.get("name")
+            else ""
+        )
+        val_b64 = (
+            base64.b64encode(value.encode("utf-8")).decode("ascii")
+            if norm_action == "set_value" and value
+            else ""
+        )
+        ct_arg = str(entry.get("control_type") or "")
+        if ct_arg and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", ct_arg):
+            ct_arg = ""
+        ps_target_hwnd = (
+            resolved_guard_hwnd
+            if (resolved_guard_hwnd is not None and resolved_guard_hwnd > 0)
+            else (snapshot_hwnd if snapshot_hwnd > 0 else (expected_hwnd or 0))
+        )
+        ps_command = (
+            f"& {{ {_POWERSHELL_UI_ACT_SCRIPT} }} "
+            f"-TargetHwnd {ps_target_hwnd} -WindowTitleBase64 '{title_b64}' "
+            f"-Action '{norm_action}' -AutomationIdBase64 '{aid_b64}' "
+            f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
+            f"-ExpectedX {int(bounds.get('x', target_cx))} "
+            f"-ExpectedY {int(bounds.get('y', target_cy))} "
+            f"-ExpectedW {int(bounds.get('width', 0))} "
+            f"-ExpectedH {int(bounds.get('height', 0))} "
+            f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
+        )
+        data = _run_powershell_uia_json(
+            ps_command,
+            operation=f"UI Automation {norm_action}",
+            powershell_runner=powershell_runner,
+        )
+        if data.get("found"):
+            if isinstance(data.get("cx"), int) and not isinstance(data.get("cx"), bool):
+                target_cx = int(data["cx"])
+            if isinstance(data.get("cy"), int) and not isinstance(data.get("cy"), bool):
+                target_cy = int(data["cy"])
+        if data.get("acted"):
+            method = str(
+                data.get("method")
+                or ("value_pattern" if norm_action == "set_value" else "invoke")
+            )
+            return True
+        return False
+
+    def _run_win32_fallback_steps() -> None:
+        nonlocal method
+        u32 = _get_win32_user32(user32)
+        if active_guard is None:
+            _ensure_window_foreground(snapshot_hwnd, u32)
+
+        if norm_action == "click":
+            _assert_step("win32_click")
+            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+            method = "win32_click"
+        elif norm_action == "double_click":
+            _assert_step("win32_double_click")
+            _perform_mouse_click(
+                target_cx, target_cy, clicks=1, button="double", user32=u32
+            )
+            method = "win32_double_click"
+        elif norm_action == "right_click":
+            _assert_step("win32_right_click")
+            _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
+            method = "win32_right_click"
+        elif norm_action == "set_value":
+            assert value is not None
+            _assert_step("set_value_click")
+            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+            _assert_step("set_value_select_all")
+            _send_key_chord(u32, ["ctrl", "a"])
+            _assert_step("set_value_backspace")
+            _send_key_chord(u32, ["backspace"])
+            if value:
+                _assert_step("set_value_type_text")
+                _send_unicode_text(
+                    u32,
+                    value,
+                    interval_ms=clamped_interval,
+                    sleep_fn=sleep_fn,
+                    guard=active_guard,
+                    step_label="set_value_type_text",
+                )
+            method = "keyboard_fallback"
+        elif norm_action == "type":
+            assert value is not None
+            _assert_step("type_click")
+            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+            _assert_step("type_text")
+            _send_unicode_text(
+                u32,
+                value,
+                interval_ms=clamped_interval,
+                sleep_fn=sleep_fn,
+                guard=active_guard,
+                step_label="type_text",
+            )
+            method = "win32_type"
+        else:  # "clear"
+            _assert_step("clear_click")
+            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+            _assert_step("clear_select_all")
+            _send_key_chord(u32, ["ctrl", "a"])
+            _assert_step("clear_backspace")
+            _send_key_chord(u32, ["backspace"])
+            method = "win32_clear"
+
     def _run_act_steps() -> None:
-        nonlocal method, target_cx, target_cy, aborted_result
+        nonlocal method, aborted_result
         runner_guard_kw: dict[str, Any] = (
             {"_guard": active_guard}
             if (active_guard is not None and _action_runner_accepts_guard(action_runner))
@@ -4674,133 +4800,46 @@ def ui_act(
                         return
                 method = "set_value"
         else:
-            acted_via_uia = False
-            if norm_action in {"click", "set_value"} and (
-                powershell_runner is not None or shutil.which("powershell.exe") is not None
-            ):
-                _assert_step(f"uia_{norm_action}")
-                title_b64 = (
-                    base64.b64encode(window_title.encode("utf-8")).decode("ascii")
-                    if window_title
-                    else ""
-                )
-                aid_b64 = (
-                    base64.b64encode(entry.get("automation_id", "").encode("utf-8")).decode("ascii")
-                    if entry.get("automation_id")
-                    else ""
-                )
-                name_b64 = (
-                    base64.b64encode(entry.get("name", "").encode("utf-8")).decode("ascii")
-                    if entry.get("name")
-                    else ""
-                )
-                val_b64 = (
-                    base64.b64encode(value.encode("utf-8")).decode("ascii")
-                    if norm_action == "set_value" and value
-                    else ""
-                )
-                ct_arg = str(entry.get("control_type") or "")
-                if ct_arg and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", ct_arg):
-                    ct_arg = ""
-                ps_command = (
-                    f"& {{ {_POWERSHELL_UI_ACT_SCRIPT} }} "
-                    f"-TargetHwnd {snapshot_hwnd} -WindowTitleBase64 '{title_b64}' "
-                    f"-Action '{norm_action}' -AutomationIdBase64 '{aid_b64}' "
-                    f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
-                    f"-ExpectedX {int(bounds.get('x', target_cx))} "
-                    f"-ExpectedY {int(bounds.get('y', target_cy))} "
-                    f"-ExpectedW {int(bounds.get('width', 0))} "
-                    f"-ExpectedH {int(bounds.get('height', 0))} "
-                    f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
-                )
-                data = _run_powershell_uia_json(
-                    ps_command,
-                    operation=f"UI Automation {norm_action}",
-                    powershell_runner=powershell_runner,
-                )
-                if data.get("found"):
-                    if isinstance(data.get("cx"), int) and not isinstance(data.get("cx"), bool):
-                        target_cx = int(data["cx"])
-                    if isinstance(data.get("cy"), int) and not isinstance(data.get("cy"), bool):
-                        target_cy = int(data["cy"])
-                if data.get("acted"):
-                    acted_via_uia = True
-                    method = str(
-                        data.get("method")
-                        or ("value_pattern" if norm_action == "set_value" else "invoke")
-                    )
-
+            acted_via_uia = _run_uia_pattern_step() if can_try_uia else False
             if not acted_via_uia:
-                u32 = _get_win32_user32(user32)
-                if active_guard is None:
-                    _ensure_window_foreground(snapshot_hwnd, u32)
-
-                if norm_action == "click":
-                    _assert_step("win32_click")
-                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                    method = "win32_click"
-                elif norm_action == "double_click":
-                    _assert_step("win32_double_click")
-                    _perform_mouse_click(
-                        target_cx, target_cy, clicks=1, button="double", user32=u32
-                    )
-                    method = "win32_double_click"
-                elif norm_action == "right_click":
-                    _assert_step("win32_right_click")
-                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
-                    method = "win32_right_click"
-                elif norm_action == "set_value":
-                    assert value is not None
-                    _assert_step("set_value_click")
-                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                    _assert_step("set_value_select_all")
-                    _send_key_chord(u32, ["ctrl", "a"])
-                    _assert_step("set_value_backspace")
-                    _send_key_chord(u32, ["backspace"])
-                    if value:
-                        _assert_step("set_value_type_text")
-                        _send_unicode_text(
-                            u32,
-                            value,
-                            interval_ms=clamped_interval,
-                            sleep_fn=sleep_fn,
-                            guard=active_guard,
-                            step_label="set_value_type_text",
-                        )
-                    method = "keyboard_fallback"
-                elif norm_action == "type":
-                    assert value is not None
-                    _assert_step("type_click")
-                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                    _assert_step("type_text")
-                    _send_unicode_text(
-                        u32,
-                        value,
-                        interval_ms=clamped_interval,
-                        sleep_fn=sleep_fn,
-                        guard=active_guard,
-                        step_label="type_text",
-                    )
-                    method = "win32_type"
-                else:  # "clear"
-                    _assert_step("clear_click")
-                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                    _assert_step("clear_select_all")
-                    _send_key_chord(u32, ["ctrl", "a"])
-                    _assert_step("clear_backspace")
-                    _send_key_chord(u32, ["backspace"])
-                    method = "win32_clear"
+                _run_win32_fallback_steps()
 
     if should_guard:
         backend = focus_backend or Win32FocusPreconditionBackend()
         try:
-            with PreconditionGuard(
-                backend,
-                expected_hwnd=target_guard_hwnd,
-                require_foreground=require_foreground,
-            ) as owned_guard:
-                active_guard = owned_guard
-                _run_act_steps()
+            if can_try_uia:
+                with PreconditionGuard(
+                    backend,
+                    expected_hwnd=target_guard_hwnd,
+                    require_foreground=False,
+                ) as bg_guard:
+                    active_guard = bg_guard
+                    if bg_guard.target is not None and bg_guard.target.hwnd > 0:
+                        resolved_guard_hwnd = bg_guard.target.hwnd
+                    acted_via_uia = _run_uia_pattern_step()
+                    if not acted_via_uia:
+                        bg_guard.assert_ready(
+                            "win32_click" if norm_action == "click" else "set_value_click"
+                        )
+                active_guard = None
+                if not acted_via_uia:
+                    with PreconditionGuard(
+                        backend,
+                        expected_hwnd=resolved_guard_hwnd,
+                        require_foreground=require_foreground,
+                    ) as fg_guard:
+                        active_guard = fg_guard
+                        _run_win32_fallback_steps()
+            else:
+                with PreconditionGuard(
+                    backend,
+                    expected_hwnd=target_guard_hwnd,
+                    require_foreground=require_foreground,
+                ) as owned_guard:
+                    active_guard = owned_guard
+                    if owned_guard.target is not None and owned_guard.target.hwnd > 0:
+                        resolved_guard_hwnd = owned_guard.target.hwnd
+                    _run_act_steps()
         except PreconditionFailedError as exc:
             abort = exc.to_abort_payload()
             abort.update(
@@ -4816,6 +4855,8 @@ def ui_act(
                 }
             )
             return abort
+        finally:
+            active_guard = None
     else:
         _run_act_steps()
 
@@ -4854,8 +4895,16 @@ def ui_act(
         and shutil.which("powershell.exe") is not None
         and not is_fake_user32
     ):
+        after_target_hwnd = (
+            resolved_guard_hwnd
+            if (resolved_guard_hwnd is not None and resolved_guard_hwnd > 0)
+            else (snapshot_hwnd if snapshot_hwnd > 0 else 0)
+        )
         with contextlib.suppress(Exception):
-            after_snap = snap_runner(user32=user32)
+            if ui_snapshot_fn is None and snap_runner is ui_snapshot and after_target_hwnd > 0:
+                after_snap = ui_snapshot(user32=user32, _target_hwnd=after_target_hwnd)
+            else:
+                after_snap = snap_runner(user32=user32)
             set_ui_snapshot_state(after_snap)
     else:
         after_snap = _LAST_UI_SNAPSHOT or {
@@ -5054,23 +5103,35 @@ def click_ui_element(
             raise ValueError("app_name must not be empty when provided.")
         cleaned_app = app_name.strip()
 
-    hwnd = _resolve_target_hwnd_optional(
-        cleaned_app,
-        powershell_runner=powershell_runner,
-        user32=user32,
-        kernel32=kernel32,
-        window_enumerator=window_enumerator,
-        focus_if_app_name=True,
-    )
+    if expected_hwnd is not None and cleaned_app is None:
+        hwnd = int(expected_hwnd)
+    else:
+        hwnd = _resolve_target_hwnd_optional(
+            cleaned_app,
+            powershell_runner=powershell_runner,
+            user32=user32,
+            kernel32=kernel32,
+            window_enumerator=window_enumerator,
+            focus_if_app_name=False,
+        )
 
     should_guard = focus_backend is not None or (
         user32 is None and powershell_runner is None and window_enumerator is None
     )
     guard_hwnd = expected_hwnd if expected_hwnd is not None else (hwnd if hwnd > 0 else None)
+    ps_target_hwnd = (
+        int(expected_hwnd)
+        if (expected_hwnd is not None and expected_hwnd > 0)
+        else (hwnd if hwnd > 0 else 0)
+    )
 
-    def _run_click(guard: PreconditionGuard | None) -> dict[str, Any]:
-        if guard is not None:
-            guard.assert_ready("click_ui_locate")
+    def _run_click(
+        locate_guard: PreconditionGuard | None,
+        mouse_guard_fn: Callable[[], None] | None,
+        target_hwnd: int = ps_target_hwnd,
+    ) -> dict[str, Any]:
+        if locate_guard is not None:
+            locate_guard.assert_ready("click_ui_locate")
 
         ps_exe = _resolve_powershell_exe(powershell_runner)
         runner = powershell_runner or subprocess.run
@@ -5086,7 +5147,7 @@ def click_ui_element(
             "-Command",
             (
                 f"& {{ {_POWERSHELL_CLICK_UI_SCRIPT} }} "
-                f"-TargetHwnd {hwnd} -TargetNameBase64 '{name_b64}' "
+                f"-TargetHwnd {target_hwnd} -TargetNameBase64 '{name_b64}' "
                 f"-ControlTypeFilter '{ct_arg}' -AppNameBase64 '{app_b64}'"
             ),
         ]
@@ -5127,8 +5188,8 @@ def click_ui_element(
             cy = int(chosen.get("y", 0))
             invoked = bool(chosen.get("supports_invoke", False))
             if not invoked:
-                if guard is not None:
-                    guard.assert_ready("click_ui_mouse")
+                if mouse_guard_fn is not None:
+                    mouse_guard_fn()
                 _perform_mouse_click(cx, cy, clicks=1, button="left", user32=user32)
             return {
                 "ok": True,
@@ -5156,8 +5217,8 @@ def click_ui_element(
         cy = int(data.get("y", 0))
         invoked = bool(data.get("invoked", False))
         if not invoked:
-            if guard is not None:
-                guard.assert_ready("click_ui_mouse")
+            if mouse_guard_fn is not None:
+                mouse_guard_fn()
             _perform_mouse_click(cx, cy, clicks=1, button="left", user32=user32)
 
         return {
@@ -5176,15 +5237,36 @@ def click_ui_element(
             with PreconditionGuard(
                 backend,
                 expected_hwnd=guard_hwnd,
-                require_foreground=require_foreground,
-            ) as guard:
-                return _run_click(guard)
+                require_foreground=False,
+            ) as locate_guard:
+                fallback_hwnd = (
+                    locate_guard.target.hwnd
+                    if locate_guard.target is not None
+                    else guard_hwnd
+                )
+                resolved_target_hwnd = (
+                    ps_target_hwnd
+                    if ps_target_hwnd > 0
+                    else (fallback_hwnd if fallback_hwnd is not None and fallback_hwnd > 0 else 0)
+                )
+
+                def _mouse_guard() -> None:
+                    locate_guard.assert_ready("click_ui_mouse")
+                    if require_foreground:
+                        with PreconditionGuard(
+                            backend,
+                            expected_hwnd=fallback_hwnd,
+                            require_foreground=True,
+                        ) as fg_guard:
+                            fg_guard.assert_ready("click_ui_mouse")
+
+                return _run_click(locate_guard, _mouse_guard, target_hwnd=resolved_target_hwnd)
         except PreconditionFailedError as exc:
             abort = exc.to_abort_payload()
             abort["name"] = target_name
             abort["control_type"] = cleaned_ct or ""
             return abort
-    return _run_click(None)
+    return _run_click(None, None)
 
 
 def _normalize_key_name(raw_key: str) -> str:
