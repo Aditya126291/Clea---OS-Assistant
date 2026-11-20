@@ -29,6 +29,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from clea.tools.guards import (
+    ActionVerifier,
+    FocusPreconditionBackend,
+    MediaVerificationBackend,
+    PreconditionFailedError,
+    PreconditionGuard,
+    Win32FocusPreconditionBackend,
+)
+
 logger = logging.getLogger(__name__)
 
 # Window show/focus constants
@@ -997,6 +1006,9 @@ def open_or_focus_app(
     app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
     startfile_fn: Callable[[str], Any] | None = None,
     desktop_name_fn: Callable[[], str | None] | None = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    verifier: ActionVerifier | None = None,
+    verify_timeout_s: float = 0.6,
 ) -> dict[str, Any]:
     """Focus a running application window or launch an allowed desktop application.
 
@@ -1069,7 +1081,7 @@ def open_or_focus_app(
                 if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
                     u32.ShowWindow(win.hwnd, SW_RESTORE)
                 u32.SetForegroundWindow(win.hwnd)
-                return {
+                res_focus: dict[str, Any] = {
                     "ok": True,
                     "status": "focused",
                     "app": spec.canonical_name,
@@ -1078,6 +1090,19 @@ def open_or_focus_app(
                     "executable": None,
                     "target_path": None,
                 }
+                if (
+                    verifier is not None
+                    or focus_backend is not None
+                    or (user32 is None and window_enumerator is None)
+                ):
+                    active_verifier = verifier or ActionVerifier(focus_backend=focus_backend)
+                    outcome = active_verifier.verify_window_state(
+                        int(win.hwnd),
+                        expected_state="focused",
+                        timeout_s=verify_timeout_s,
+                    )
+                    res_focus["verification"] = outcome.to_dict()
+                return res_focus
 
     if spec is not None:
         try:
@@ -1150,7 +1175,7 @@ def open_or_focus_app(
                     if hasattr(u32, "IsIconic") and bool(u32.IsIconic(win.hwnd)):
                         u32.ShowWindow(win.hwnd, SW_RESTORE)
                     u32.SetForegroundWindow(win.hwnd)
-                    return {
+                    res_matched_focus: dict[str, Any] = {
                         "ok": True,
                         "status": "focused",
                         "app": matched_name,
@@ -1159,6 +1184,19 @@ def open_or_focus_app(
                         "executable": None,
                         "target_path": None,
                     }
+                    if (
+                        verifier is not None
+                        or focus_backend is not None
+                        or (user32 is None and window_enumerator is None)
+                    ):
+                        active_verifier = verifier or ActionVerifier(focus_backend=focus_backend)
+                        outcome = active_verifier.verify_window_state(
+                            int(win.hwnd),
+                            expected_state="focused",
+                            timeout_s=verify_timeout_s,
+                        )
+                        res_matched_focus["verification"] = outcome.to_dict()
+                    return res_matched_focus
 
         non_default = _check_interactive_desktop(desktop_name_fn)
         if non_default is not None:
@@ -1293,6 +1331,9 @@ def control_media_volume(
     *,
     user32: Any = None,
     volume_setter: Callable[[int], None] | None = None,
+    media_backend: MediaVerificationBackend | None = None,
+    verifier: ActionVerifier | None = None,
+    verify_timeout_s: float = 1.5,
 ) -> dict[str, Any]:
     """Control system audio volume or media playback via Win32 virtual keys or CoreAudio."""
     if not isinstance(action, str):
@@ -1325,15 +1366,34 @@ def control_media_volume(
             "level": clamped_level,
         }
 
+    is_playback_action = normalized in {"play_pause", "next_track", "previous_track"}
+    should_verify = is_playback_action and (
+        verifier is not None or media_backend is not None or user32 is None
+    )
+    active_verifier = (
+        verifier
+        if verifier is not None
+        else (ActionVerifier(media_backend=media_backend) if should_verify else None)
+    )
+    baseline = active_verifier.probe_media_session() if active_verifier is not None else None
+
     vk = _MEDIA_VOLUME_VK_MAP[normalized]
     u32 = _get_win32_user32(user32)
     u32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
     u32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
-    return {
+
+    res: dict[str, Any] = {
         "ok": True,
         "action": normalized,
         "level": clamped_level,
     }
+    if active_verifier is not None:
+        outcome = active_verifier.verify_media_state(
+            baseline=baseline,
+            timeout_s=verify_timeout_s,
+        )
+        res["verification"] = outcome.to_dict()
+    return res
 
 
 # --------------------------------------------------------------------------- Clipboard
@@ -2257,6 +2317,9 @@ def control_system(
     startfile_fn: Callable[[str], Any] | None = None,
     popen_fn: Callable[..., Any] = subprocess.Popen,
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    verifier: ActionVerifier | None = None,
+    verify_timeout_s: float = 0.6,
     **_extra: Any,
 ) -> dict[str, Any]:
     """Control Windows display brightness, window state, screen lock, or settings navigation."""
@@ -2365,39 +2428,77 @@ def control_system(
             window_enumerator=window_enumerator,
         )
         u32 = _get_win32_user32(user32)
+        should_verify = (
+            verifier is not None
+            or focus_backend is not None
+            or (user32 is None and window_enumerator is None)
+        )
+        active_verifier = (
+            verifier
+            if verifier is not None
+            else (ActionVerifier(focus_backend=focus_backend) if should_verify else None)
+        )
 
         if normalized in ("minimize_window", "minimize"):
             u32.ShowWindow(target_hwnd, SW_MINIMIZE)
-            return {
+            res_win: dict[str, Any] = {
                 "ok": True,
                 "success": True,
                 "action": "minimize_window",
                 "hwnd": target_hwnd,
             }
+            if active_verifier is not None:
+                res_win["verification"] = active_verifier.verify_window_state(
+                    target_hwnd,
+                    expected_state="minimized",
+                    timeout_s=verify_timeout_s,
+                ).to_dict()
+            return res_win
         if normalized in ("maximize_window", "maximize"):
             u32.ShowWindow(target_hwnd, SW_MAXIMIZE)
-            return {
+            res_win = {
                 "ok": True,
                 "success": True,
                 "action": "maximize_window",
                 "hwnd": target_hwnd,
             }
+            if active_verifier is not None:
+                res_win["verification"] = active_verifier.verify_window_state(
+                    target_hwnd,
+                    expected_state="maximized",
+                    timeout_s=verify_timeout_s,
+                ).to_dict()
+            return res_win
         if normalized in ("restore_window", "restore"):
             u32.ShowWindow(target_hwnd, SW_RESTORE)
-            return {
+            res_win = {
                 "ok": True,
                 "success": True,
                 "action": "restore_window",
                 "hwnd": target_hwnd,
             }
+            if active_verifier is not None:
+                res_win["verification"] = active_verifier.verify_window_state(
+                    target_hwnd,
+                    expected_state="restored",
+                    timeout_s=verify_timeout_s,
+                ).to_dict()
+            return res_win
         if normalized in ("close_window", "close"):
             u32.PostMessageW(target_hwnd, WM_CLOSE, 0, 0)
-            return {
+            res_win = {
                 "ok": True,
                 "success": True,
                 "action": "close_window",
                 "hwnd": target_hwnd,
             }
+            if active_verifier is not None:
+                res_win["verification"] = active_verifier.verify_window_state(
+                    target_hwnd,
+                    expected_state="closed",
+                    timeout_s=verify_timeout_s,
+                ).to_dict()
+            return res_win
 
     # 3. Screen locking
     if normalized in ("lock_screen", "lock"):
@@ -3746,6 +3847,10 @@ def ui_act(
     sleep_fn: Callable[[float], None] | None = None,
     ui_snapshot_fn: Callable[..., dict[str, Any]] | None = None,
     gui_action_fn: Callable[..., dict[str, Any]] | None = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    expected_hwnd: int | None = None,
+    require_foreground: bool = True,
+    _guard: PreconditionGuard | None = None,
     _capture_snapshot: bool = True,
 ) -> dict[str, Any]:
     """Execute a semantic action on an indexed UI element and return verification diff."""
@@ -3817,179 +3922,254 @@ def ui_act(
     }
 
     method = ""
-    if gui_action_fn is not None:
-        if norm_action == "click":
-            action_runner(
-                action="click_at",
-                x=target_cx,
-                y=target_cy,
-                clicks=1,
-                button="left",
-                user32=user32,
-            )
-            method = "click_at"
-        elif norm_action == "double_click":
-            action_runner(
-                action="click_at",
-                x=target_cx,
-                y=target_cy,
-                clicks=2,
-                button="double",
-                user32=user32,
-            )
-            method = "double_click"
-        elif norm_action == "right_click":
-            action_runner(
-                action="click_at",
-                x=target_cx,
-                y=target_cy,
-                clicks=1,
-                button="right",
-                user32=user32,
-            )
-            method = "right_click"
-        elif norm_action == "clear":
-            action_runner(
-                action="click_at",
-                x=target_cx,
-                y=target_cy,
-                clicks=1,
-                button="left",
-                user32=user32,
-            )
-            action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
-            action_runner(action="press_keys", keys=["backspace"], user32=user32)
-            method = "clear"
-        elif norm_action == "type":
-            assert value is not None
-            action_runner(
-                action="click_at",
-                x=target_cx,
-                y=target_cy,
-                clicks=1,
-                button="left",
-                user32=user32,
-            )
-            try:
+    should_guard = _guard is None and (
+        focus_backend is not None
+        or (user32 is None and gui_action_fn is None and powershell_runner is None)
+    )
+    target_guard_hwnd = (
+        expected_hwnd
+        if expected_hwnd is not None
+        else (snapshot_hwnd if snapshot_hwnd > 0 else None)
+    )
+    active_guard: PreconditionGuard | None = _guard
+
+    def _assert_step(step_label: str) -> None:
+        if active_guard is not None:
+            active_guard.assert_ready(step_label)
+
+    def _run_act_steps() -> None:
+        nonlocal method, target_cx, target_cy
+        if gui_action_fn is not None:
+            if norm_action == "click":
+                _assert_step("click")
                 action_runner(
-                    action="type_text",
-                    text=value,
-                    interval_ms=clamped_interval,
+                    action="click_at",
+                    x=target_cx,
+                    y=target_cy,
+                    clicks=1,
+                    button="left",
                     user32=user32,
                 )
-            except TypeError:
-                action_runner(action="type_text", text=value, user32=user32)
-            method = "type"
-        elif norm_action == "set_value":
-            val_str = str(value) if value is not None else ""
-            action_runner(
-                action="click_at",
-                x=target_cx,
-                y=target_cy,
-                clicks=1,
-                button="left",
-                user32=user32,
-            )
-            action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
-            action_runner(action="press_keys", keys=["backspace"], user32=user32)
-            if val_str:
+                method = "click_at"
+            elif norm_action == "double_click":
+                _assert_step("double_click")
+                action_runner(
+                    action="click_at",
+                    x=target_cx,
+                    y=target_cy,
+                    clicks=2,
+                    button="double",
+                    user32=user32,
+                )
+                method = "double_click"
+            elif norm_action == "right_click":
+                _assert_step("right_click")
+                action_runner(
+                    action="click_at",
+                    x=target_cx,
+                    y=target_cy,
+                    clicks=1,
+                    button="right",
+                    user32=user32,
+                )
+                method = "right_click"
+            elif norm_action == "clear":
+                _assert_step("clear_click")
+                action_runner(
+                    action="click_at",
+                    x=target_cx,
+                    y=target_cy,
+                    clicks=1,
+                    button="left",
+                    user32=user32,
+                )
+                _assert_step("clear_select_all")
+                action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+                _assert_step("clear_backspace")
+                action_runner(action="press_keys", keys=["backspace"], user32=user32)
+                method = "clear"
+            elif norm_action == "type":
+                assert value is not None
+                _assert_step("type_click")
+                action_runner(
+                    action="click_at",
+                    x=target_cx,
+                    y=target_cy,
+                    clicks=1,
+                    button="left",
+                    user32=user32,
+                )
+                _assert_step("type_text")
                 try:
                     action_runner(
                         action="type_text",
-                        text=val_str,
+                        text=value,
                         interval_ms=clamped_interval,
                         user32=user32,
                     )
                 except TypeError:
-                    action_runner(action="type_text", text=val_str, user32=user32)
-            method = "set_value"
-    else:
-        acted_via_uia = False
-        if norm_action in {"click", "set_value"} and (
-            powershell_runner is not None or shutil.which("powershell.exe") is not None
-        ):
-            title_b64 = (
-                base64.b64encode(window_title.encode("utf-8")).decode("ascii")
-                if window_title
-                else ""
-            )
-            aid_b64 = (
-                base64.b64encode(entry.get("automation_id", "").encode("utf-8")).decode("ascii")
-                if entry.get("automation_id")
-                else ""
-            )
-            name_b64 = (
-                base64.b64encode(entry.get("name", "").encode("utf-8")).decode("ascii")
-                if entry.get("name")
-                else ""
-            )
-            val_b64 = (
-                base64.b64encode(value.encode("utf-8")).decode("ascii")
-                if norm_action == "set_value" and value
-                else ""
-            )
-            ct_arg = str(entry.get("control_type") or "")
-            if ct_arg and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", ct_arg):
-                ct_arg = ""
-            ps_command = (
-                f"& {{ {_POWERSHELL_UI_ACT_SCRIPT} }} "
-                f"-TargetHwnd {snapshot_hwnd} -WindowTitleBase64 '{title_b64}' "
-                f"-Action '{norm_action}' -AutomationIdBase64 '{aid_b64}' "
-                f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
-                f"-ExpectedX {int(bounds.get('x', target_cx))} "
-                f"-ExpectedY {int(bounds.get('y', target_cy))} "
-                f"-ExpectedW {int(bounds.get('width', 0))} "
-                f"-ExpectedH {int(bounds.get('height', 0))} "
-                f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
-            )
-            data = _run_powershell_uia_json(
-                ps_command,
-                operation=f"UI Automation {norm_action}",
-                powershell_runner=powershell_runner,
-            )
-            if data.get("found"):
-                if isinstance(data.get("cx"), int) and not isinstance(data.get("cx"), bool):
-                    target_cx = int(data["cx"])
-                if isinstance(data.get("cy"), int) and not isinstance(data.get("cy"), bool):
-                    target_cy = int(data["cy"])
-            if data.get("acted"):
-                acted_via_uia = True
-                method = str(
-                    data.get("method")
-                    or ("value_pattern" if norm_action == "set_value" else "invoke")
-                )
-
-        if not acted_via_uia:
-            u32 = _get_win32_user32(user32)
-            _ensure_window_foreground(snapshot_hwnd, u32)
-
-            if norm_action == "click":
-                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                method = "win32_click"
-            elif norm_action == "double_click":
-                _perform_mouse_click(target_cx, target_cy, clicks=1, button="double", user32=u32)
-                method = "win32_double_click"
-            elif norm_action == "right_click":
-                _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
-                method = "win32_right_click"
+                    action_runner(action="type_text", text=value, user32=user32)
+                method = "type"
             elif norm_action == "set_value":
-                assert value is not None
-                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                _send_key_chord(u32, ["ctrl", "a"])
-                _send_key_chord(u32, ["backspace"])
-                if value:
+                val_str = str(value) if value is not None else ""
+                _assert_step("set_value_click")
+                action_runner(
+                    action="click_at",
+                    x=target_cx,
+                    y=target_cy,
+                    clicks=1,
+                    button="left",
+                    user32=user32,
+                )
+                _assert_step("set_value_select_all")
+                action_runner(action="press_keys", keys=["ctrl", "a"], user32=user32)
+                _assert_step("set_value_backspace")
+                action_runner(action="press_keys", keys=["backspace"], user32=user32)
+                if val_str:
+                    _assert_step("set_value_type_text")
+                    try:
+                        action_runner(
+                            action="type_text",
+                            text=val_str,
+                            interval_ms=clamped_interval,
+                            user32=user32,
+                        )
+                    except TypeError:
+                        action_runner(action="type_text", text=val_str, user32=user32)
+                method = "set_value"
+        else:
+            acted_via_uia = False
+            if norm_action in {"click", "set_value"} and (
+                powershell_runner is not None or shutil.which("powershell.exe") is not None
+            ):
+                _assert_step(f"uia_{norm_action}")
+                title_b64 = (
+                    base64.b64encode(window_title.encode("utf-8")).decode("ascii")
+                    if window_title
+                    else ""
+                )
+                aid_b64 = (
+                    base64.b64encode(entry.get("automation_id", "").encode("utf-8")).decode("ascii")
+                    if entry.get("automation_id")
+                    else ""
+                )
+                name_b64 = (
+                    base64.b64encode(entry.get("name", "").encode("utf-8")).decode("ascii")
+                    if entry.get("name")
+                    else ""
+                )
+                val_b64 = (
+                    base64.b64encode(value.encode("utf-8")).decode("ascii")
+                    if norm_action == "set_value" and value
+                    else ""
+                )
+                ct_arg = str(entry.get("control_type") or "")
+                if ct_arg and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", ct_arg):
+                    ct_arg = ""
+                ps_command = (
+                    f"& {{ {_POWERSHELL_UI_ACT_SCRIPT} }} "
+                    f"-TargetHwnd {snapshot_hwnd} -WindowTitleBase64 '{title_b64}' "
+                    f"-Action '{norm_action}' -AutomationIdBase64 '{aid_b64}' "
+                    f"-NameBase64 '{name_b64}' -ControlType '{ct_arg}' "
+                    f"-ExpectedX {int(bounds.get('x', target_cx))} "
+                    f"-ExpectedY {int(bounds.get('y', target_cy))} "
+                    f"-ExpectedW {int(bounds.get('width', 0))} "
+                    f"-ExpectedH {int(bounds.get('height', 0))} "
+                    f"-CenterX {target_cx} -CenterY {target_cy} -ValueBase64 '{val_b64}'"
+                )
+                data = _run_powershell_uia_json(
+                    ps_command,
+                    operation=f"UI Automation {norm_action}",
+                    powershell_runner=powershell_runner,
+                )
+                if data.get("found"):
+                    if isinstance(data.get("cx"), int) and not isinstance(data.get("cx"), bool):
+                        target_cx = int(data["cx"])
+                    if isinstance(data.get("cy"), int) and not isinstance(data.get("cy"), bool):
+                        target_cy = int(data["cy"])
+                if data.get("acted"):
+                    acted_via_uia = True
+                    method = str(
+                        data.get("method")
+                        or ("value_pattern" if norm_action == "set_value" else "invoke")
+                    )
+
+            if not acted_via_uia:
+                u32 = _get_win32_user32(user32)
+                if active_guard is None:
+                    _ensure_window_foreground(snapshot_hwnd, u32)
+
+                if norm_action == "click":
+                    _assert_step("win32_click")
+                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                    method = "win32_click"
+                elif norm_action == "double_click":
+                    _assert_step("win32_double_click")
+                    _perform_mouse_click(
+                        target_cx, target_cy, clicks=1, button="double", user32=u32
+                    )
+                    method = "win32_double_click"
+                elif norm_action == "right_click":
+                    _assert_step("win32_right_click")
+                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
+                    method = "win32_right_click"
+                elif norm_action == "set_value":
+                    assert value is not None
+                    _assert_step("set_value_click")
+                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                    _assert_step("set_value_select_all")
+                    _send_key_chord(u32, ["ctrl", "a"])
+                    _assert_step("set_value_backspace")
+                    _send_key_chord(u32, ["backspace"])
+                    if value:
+                        _assert_step("set_value_type_text")
+                        _send_unicode_text(
+                            u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn
+                        )
+                    method = "keyboard_fallback"
+                elif norm_action == "type":
+                    assert value is not None
+                    _assert_step("type_click")
+                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                    _assert_step("type_text")
                     _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
-                method = "keyboard_fallback"
-            elif norm_action == "type":
-                assert value is not None
-                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                _send_unicode_text(u32, value, interval_ms=clamped_interval, sleep_fn=sleep_fn)
-                method = "win32_type"
-            else:  # "clear"
-                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-                _send_key_chord(u32, ["ctrl", "a"])
-                _send_key_chord(u32, ["backspace"])
-                method = "win32_clear"
+                    method = "win32_type"
+                else:  # "clear"
+                    _assert_step("clear_click")
+                    _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                    _assert_step("clear_select_all")
+                    _send_key_chord(u32, ["ctrl", "a"])
+                    _assert_step("clear_backspace")
+                    _send_key_chord(u32, ["backspace"])
+                    method = "win32_clear"
+
+    if should_guard:
+        backend = focus_backend or Win32FocusPreconditionBackend()
+        try:
+            with PreconditionGuard(
+                backend,
+                expected_hwnd=target_guard_hwnd,
+                require_foreground=require_foreground,
+            ) as owned_guard:
+                active_guard = owned_guard
+                _run_act_steps()
+        except PreconditionFailedError as exc:
+            abort = exc.to_abort_payload()
+            abort.update(
+                {
+                    "snapshot_id": snapshot_id,
+                    "ref": norm_ref,
+                    "action": norm_action,
+                    "role": entry.get("role", ""),
+                    "name": entry.get("name", ""),
+                    "method": method,
+                    "x": target_cx,
+                    "y": target_cy,
+                }
+            )
+            return abort
+    else:
+        _run_act_steps()
 
     if not _capture_snapshot:
         res_no_snap: dict[str, Any] = {
@@ -4200,6 +4380,9 @@ def click_ui_element(
     user32: Any = None,
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    expected_hwnd: int | None = None,
+    require_foreground: bool = True,
 ) -> dict[str, Any]:
     """Find and invoke or click a visible UI Automation control by name."""
     if not isinstance(name, str) or not name.strip():
@@ -4229,97 +4412,128 @@ def click_ui_element(
         focus_if_app_name=True,
     )
 
-    ps_exe = _resolve_powershell_exe(powershell_runner)
-    runner = powershell_runner or subprocess.run
-    name_b64 = base64.b64encode(target_name.encode("utf-8")).decode("ascii")
-    app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
-    ct_arg = cleaned_ct or ""
-    cmd = [
-        ps_exe,
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        (
-            f"& {{ {_POWERSHELL_CLICK_UI_SCRIPT} }} "
-            f"-TargetHwnd {hwnd} -TargetNameBase64 '{name_b64}' "
-            f"-ControlTypeFilter '{ct_arg}' -AppNameBase64 '{app_b64}'"
-        ),
-    ]
-    try:
-        proc = runner(
-            cmd,
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
-            check=False,
+    should_guard = focus_backend is not None or (
+        user32 is None and powershell_runner is None and window_enumerator is None
+    )
+    guard_hwnd = expected_hwnd if expected_hwnd is not None else (hwnd if hwnd > 0 else None)
+
+    def _run_click(guard: PreconditionGuard | None) -> dict[str, Any]:
+        if guard is not None:
+            guard.assert_ready("click_ui_locate")
+
+        ps_exe = _resolve_powershell_exe(powershell_runner)
+        runner = powershell_runner or subprocess.run
+        name_b64 = base64.b64encode(target_name.encode("utf-8")).decode("ascii")
+        app_b64 = (
+            base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
         )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(
-            f"UI Automation click timed out after {UI_AUTOMATION_TIMEOUT_SECONDS}s."
-        ) from exc
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(f"UI Automation click failed: {err}")
+        ct_arg = cleaned_ct or ""
+        cmd = [
+            ps_exe,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                f"& {{ {_POWERSHELL_CLICK_UI_SCRIPT} }} "
+                f"-TargetHwnd {hwnd} -TargetNameBase64 '{name_b64}' "
+                f"-ControlTypeFilter '{ct_arg}' -AppNameBase64 '{app_b64}'"
+            ),
+        ]
+        try:
+            proc = runner(
+                cmd,
+                shell=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"UI Automation click timed out after {UI_AUTOMATION_TIMEOUT_SECONDS}s."
+            ) from exc
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"UI Automation click failed: {err}")
 
-    raw = (proc.stdout or "").strip()
-    if not raw:
-        raise RuntimeError("UI Automation click returned empty output.")
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            raise RuntimeError("UI Automation click returned empty output.")
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"UI Automation click returned invalid JSON: {exc}") from exc
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"UI Automation click returned invalid JSON: {exc}") from exc
 
-    if "elements" in data and "found" not in data:
-        raw_elements = data.get("elements") or []
-        if isinstance(raw_elements, dict):
-            raw_elements = [raw_elements]
-        chosen = _select_matching_ui_element(raw_elements, target_name, cleaned_ct)
-        cx = int(chosen.get("x", 0))
-        cy = int(chosen.get("y", 0))
-        invoked = bool(chosen.get("supports_invoke", False))
+        if "elements" in data and "found" not in data:
+            raw_elements = data.get("elements") or []
+            if isinstance(raw_elements, dict):
+                raw_elements = [raw_elements]
+            chosen = _select_matching_ui_element(raw_elements, target_name, cleaned_ct)
+            cx = int(chosen.get("x", 0))
+            cy = int(chosen.get("y", 0))
+            invoked = bool(chosen.get("supports_invoke", False))
+            if not invoked:
+                if guard is not None:
+                    guard.assert_ready("click_ui_mouse")
+                _perform_mouse_click(cx, cy, clicks=1, button="left", user32=user32)
+            return {
+                "ok": True,
+                "status": "clicked",
+                "name": str(chosen.get("name") or target_name),
+                "control_type": str(chosen.get("control_type") or cleaned_ct or ""),
+                "x": cx,
+                "y": cy,
+                "method": "invoke" if invoked else "click",
+            }
+
+        if not data.get("found"):
+            avail_raw = data.get("available") or []
+            if isinstance(avail_raw, str):
+                avail = [avail_raw]
+            else:
+                avail = [str(item) for item in avail_raw if item]
+            ct_note = f" (control_type={cleaned_ct!r})" if cleaned_ct else ""
+            avail_str = ", ".join(avail) if avail else "none"
+            raise ValueError(
+                f"UI element {target_name!r}{ct_note} not found. Available elements: {avail_str}"
+            )
+
+        cx = int(data.get("x", 0))
+        cy = int(data.get("y", 0))
+        invoked = bool(data.get("invoked", False))
         if not invoked:
+            if guard is not None:
+                guard.assert_ready("click_ui_mouse")
             _perform_mouse_click(cx, cy, clicks=1, button="left", user32=user32)
+
         return {
             "ok": True,
             "status": "clicked",
-            "name": str(chosen.get("name") or target_name),
-            "control_type": str(chosen.get("control_type") or cleaned_ct or ""),
+            "name": str(data.get("name") or target_name),
+            "control_type": str(data.get("control_type") or cleaned_ct or ""),
             "x": cx,
             "y": cy,
             "method": "invoke" if invoked else "click",
         }
 
-    if not data.get("found"):
-        avail_raw = data.get("available") or []
-        if isinstance(avail_raw, str):
-            avail = [avail_raw]
-        else:
-            avail = [str(item) for item in avail_raw if item]
-        ct_note = f" (control_type={cleaned_ct!r})" if cleaned_ct else ""
-        avail_str = ", ".join(avail) if avail else "none"
-        raise ValueError(
-            f"UI element {target_name!r}{ct_note} not found. Available elements: {avail_str}"
-        )
-
-    cx = int(data.get("x", 0))
-    cy = int(data.get("y", 0))
-    invoked = bool(data.get("invoked", False))
-    if not invoked:
-        _perform_mouse_click(cx, cy, clicks=1, button="left", user32=user32)
-
-    return {
-        "ok": True,
-        "status": "clicked",
-        "name": str(data.get("name") or target_name),
-        "control_type": str(data.get("control_type") or cleaned_ct or ""),
-        "x": cx,
-        "y": cy,
-        "method": "invoke" if invoked else "click",
-    }
+    if should_guard:
+        backend = focus_backend or Win32FocusPreconditionBackend()
+        try:
+            with PreconditionGuard(
+                backend,
+                expected_hwnd=guard_hwnd,
+                require_foreground=require_foreground,
+            ) as guard:
+                return _run_click(guard)
+        except PreconditionFailedError as exc:
+            abort = exc.to_abort_payload()
+            abort["name"] = target_name
+            abort["control_type"] = cleaned_ct or ""
+            return abort
+    return _run_click(None)
 
 
 def _normalize_key_name(raw_key: str) -> str:
@@ -4348,6 +4562,9 @@ def gui_action(
     *,
     user32: Any = None,
     sleep_fn: Callable[[float], None] | None = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    expected_hwnd: int | None = None,
+    require_foreground: bool = True,
 ) -> dict[str, Any]:
     """Perform a safety-bounded low-level GUI input action via Win32 ctypes."""
     if not isinstance(action, str):
@@ -4373,8 +4590,8 @@ def gui_action(
             "seconds": clamped_seconds,
         }
 
-    u32 = _get_win32_user32(user32)
-
+    # Validate arguments before checking focus/window preconditions
+    btn = button.strip().lower() if isinstance(button, str) else ""
     if normalized_action == "click_at":
         if x is None or y is None or isinstance(x, bool) or isinstance(y, bool):
             raise ValueError("x and y integer coordinates are required for 'click_at'.")
@@ -4382,11 +4599,52 @@ def gui_action(
             raise ValueError("x and y must be non-negative integers for 'click_at'.")
         if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1 or clicks > 3:
             raise ValueError("clicks must be an integer between 1 and 3.")
-        btn = button.strip().lower() if isinstance(button, str) else ""
         if btn not in VALID_CLICK_BUTTONS:
             raise ValueError(
                 f"Unsupported button {button!r}. Must be one of {sorted(VALID_CLICK_BUTTONS)}."
             )
+    elif normalized_action == "type_text":
+        if not isinstance(text, str) or len(text) == 0:
+            raise ValueError("text must be a non-empty string for 'type_text'.")
+        if len(text) > MAX_GUI_TYPE_TEXT_LEN:
+            raise ValueError(
+                f"text length ({len(text)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
+            )
+    elif normalized_action == "scroll":
+        if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
+            raise ValueError("delta must be a non-zero integer for 'scroll' action.")
+        if (x is None) != (y is None):
+            raise ValueError("Both x and y must be provided together for 'scroll'.")
+        if x is not None and y is not None:
+            if (
+                isinstance(x, bool)
+                or isinstance(y, bool)
+                or not isinstance(x, int)
+                or not isinstance(y, int)
+            ):
+                raise ValueError("x and y must be integers for 'scroll'.")
+            if x < 0 or y < 0:
+                raise ValueError("x and y must be non-negative integers for 'scroll'.")
+
+    should_guard = focus_backend is not None or user32 is None
+    if should_guard:
+        backend = focus_backend or Win32FocusPreconditionBackend()
+        try:
+            with PreconditionGuard(
+                backend,
+                expected_hwnd=expected_hwnd,
+                require_foreground=require_foreground,
+            ) as guard:
+                guard.assert_ready(f"gui_action:{normalized_action}")
+        except PreconditionFailedError as exc:
+            abort = exc.to_abort_payload()
+            abort["action"] = normalized_action
+            return abort
+
+    u32 = _get_win32_user32(user32)
+
+    if normalized_action == "click_at":
+        assert x is not None and y is not None
         _perform_mouse_click(x, y, clicks=clicks, button=btn, user32=u32)
         actual_clicks = 2 if btn == "double" and clicks == 1 else clicks
         return {
@@ -4400,12 +4658,7 @@ def gui_action(
         }
 
     if normalized_action == "type_text":
-        if not isinstance(text, str) or len(text) == 0:
-            raise ValueError("text must be a non-empty string for 'type_text'.")
-        if len(text) > MAX_GUI_TYPE_TEXT_LEN:
-            raise ValueError(
-                f"text length ({len(text)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
-            )
+        assert text is not None
         clamped_interval = _send_unicode_text(
             u32,
             text,
@@ -4430,24 +4683,10 @@ def gui_action(
         }
 
     # normalized_action == "scroll"
-    if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
-        raise ValueError("delta must be a non-zero integer for 'scroll' action.")
-    if (x is None) != (y is None):
-        raise ValueError("Both x and y must be provided together for 'scroll'.")
-    if x is not None and y is not None:
-        if (
-            isinstance(x, bool)
-            or isinstance(y, bool)
-            or not isinstance(x, int)
-            or not isinstance(y, int)
-        ):
-            raise ValueError("x and y must be integers for 'scroll'.")
-        if x < 0 or y < 0:
-            raise ValueError("x and y must be non-negative integers for 'scroll'.")
-        if hasattr(u32, "SetCursorPos"):
-            moved = u32.SetCursorPos(x, y)
-            if moved is not None and not moved:
-                raise RuntimeError(f"Win32 SetCursorPos({x}, {y}) failed.")
+    if x is not None and y is not None and hasattr(u32, "SetCursorPos"):
+        moved = u32.SetCursorPos(x, y)
+        if moved is not None and not moved:
+            raise RuntimeError(f"Win32 SetCursorPos({x}, {y}) failed.")
 
     clamped_delta = max(-12000, min(12000, delta))
     scroll_input = _INPUT(
@@ -4666,6 +4905,9 @@ def ui_batch(
     gui_action_fn: Callable[..., dict[str, Any]] | None = None,
     window_title_fn: Callable[[], str] | None = None,
     user32: Any = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    expected_hwnd: int | None = None,
+    require_foreground: bool = True,
 ) -> dict[str, Any]:
     """Execute speculative multi-step GUI actions in a single round-trip with state diffing."""
     if not isinstance(steps, list) or len(steps) < 1 or len(steps) > 20:
@@ -4766,119 +5008,165 @@ def ui_batch(
 
     step_results: list[dict[str, Any]] = []
     status = "completed"
+    should_guard = focus_backend is not None or (user32 is None and gui_action_fn is None)
+    target_guard_hwnd = (
+        expected_hwnd
+        if expected_hwnd is not None
+        else (_UI_REF_STORE.hwnd if _UI_REF_STORE.hwnd > 0 else None)
+    )
+    guard_cm: Any = (
+        PreconditionGuard(
+            focus_backend or Win32FocusPreconditionBackend(),
+            expected_hwnd=target_guard_hwnd,
+            require_foreground=require_foreground,
+        )
+        if should_guard
+        else contextlib.nullcontext()
+    )
 
-    for idx, s in enumerate(steps):
-        s_dict = s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else dict(s)
-        op = str(s_dict.get("op") or "").strip().lower()
-        trigger_nav = False
-
-        try:
-            if op == "act":
-                ref = str(s_dict.get("ref") or "").strip()
-                action = str(s_dict.get("action") or "").strip().lower()
-                val = s_dict.get("value")
-                step_interval = s_dict.get("interval_ms")
-                act_kwargs: dict[str, Any] = {
-                    "ui_snapshot_fn": snap_runner,
-                    "gui_action_fn": action_runner,
-                    "user32": user32,
-                    "_capture_snapshot": False,
-                }
-                if step_interval is not None and not isinstance(step_interval, bool):
-                    with contextlib.suppress(TypeError, ValueError):
-                        act_kwargs["interval_ms"] = int(step_interval)
-                ui_act(
-                    ref,
-                    action,
-                    val,
-                    **act_kwargs,
+    try:
+        with guard_cm as guard:
+            for idx, s in enumerate(steps):
+                s_dict = (
+                    s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else dict(s)
                 )
-                step_results.append(
-                    {
-                        "step": idx,
-                        "op": "act",
-                        "ref": ref,
-                        "action": action,
-                        "status": "ok",
-                    }
-                )
-                if action in {"click", "double_click"}:
-                    trigger_nav = True
+                op = str(s_dict.get("op") or "").strip().lower()
+                trigger_nav = False
 
-            elif op == "press_keys":
-                keys = [str(k) for k in s_dict["keys"]]
-                action_runner(action="press_keys", keys=keys, user32=user32)
-                step_results.append(
-                    {
-                        "step": idx,
-                        "op": "press_keys",
-                        "status": "ok",
-                    }
-                )
-                norm_keys = [k.strip().lower() for k in keys]
-                if any(k in {"enter", "return", "tab", "escape", "esc"} for k in norm_keys):
-                    trigger_nav = True
+                if guard is not None:
+                    step_label = str(s_dict.get("label") or f"step_{idx + 1}")
+                    guard.assert_ready(step_label)
 
-            elif op == "scroll":
-                delta = int(s_dict["delta"])
-                x = s_dict.get("x")
-                y = s_dict.get("y")
-                action_runner(action="scroll", delta=delta, x=x, y=y, user32=user32)
-                step_results.append(
-                    {
-                        "step": idx,
-                        "op": "scroll",
-                        "status": "ok",
-                    }
-                )
+                try:
+                    if op == "act":
+                        ref = str(s_dict.get("ref") or "").strip()
+                        action = str(s_dict.get("action") or "").strip().lower()
+                        val = s_dict.get("value")
+                        step_interval = s_dict.get("interval_ms")
+                        act_kwargs: dict[str, Any] = {
+                            "ui_snapshot_fn": snap_runner,
+                            "gui_action_fn": action_runner,
+                            "user32": user32,
+                            "_guard": guard,
+                            "_capture_snapshot": False,
+                        }
+                        if step_interval is not None and not isinstance(step_interval, bool):
+                            with contextlib.suppress(TypeError, ValueError):
+                                act_kwargs["interval_ms"] = int(step_interval)
+                        ui_act(
+                            ref,
+                            action,
+                            val,
+                            **act_kwargs,
+                        )
+                        step_results.append(
+                            {
+                                "step": idx,
+                                "op": "act",
+                                "ref": ref,
+                                "action": action,
+                                "status": "ok",
+                            }
+                        )
+                        if action in {"click", "double_click"}:
+                            trigger_nav = True
 
-            elif op == "wait":
-                sec = float(s_dict.get("seconds", 0.5))
-                action_runner(action="wait", seconds=sec, user32=user32)
-                step_results.append(
-                    {
-                        "step": idx,
-                        "op": "wait",
-                        "status": "ok",
-                    }
-                )
+                    elif op == "press_keys":
+                        keys = [str(k) for k in s_dict["keys"]]
+                        action_runner(action="press_keys", keys=keys, user32=user32)
+                        step_results.append(
+                            {
+                                "step": idx,
+                                "op": "press_keys",
+                                "status": "ok",
+                            }
+                        )
+                        norm_keys = [k.strip().lower() for k in keys]
+                        if any(k in {"enter", "return", "tab", "escape", "esc"} for k in norm_keys):
+                            trigger_nav = True
 
-            elif op == "click_at":
-                x = int(s_dict["x"])
-                y = int(s_dict["y"])
-                clicks = int(s_dict.get("clicks", 1))
-                btn = str(s_dict.get("button", "left"))
-                action_runner(action="click_at", x=x, y=y, clicks=clicks, button=btn, user32=user32)
-                step_results.append(
-                    {
-                        "step": idx,
-                        "op": "click_at",
-                        "status": "ok",
-                    }
-                )
-                trigger_nav = True
+                    elif op == "scroll":
+                        delta = int(s_dict["delta"])
+                        x = s_dict.get("x")
+                        y = s_dict.get("y")
+                        action_runner(action="scroll", delta=delta, x=x, y=y, user32=user32)
+                        step_results.append(
+                            {
+                                "step": idx,
+                                "op": "scroll",
+                                "status": "ok",
+                            }
+                        )
 
-        except Exception as exc:
-            step_results.append(
-                {
-                    "step": idx,
-                    "op": op,
-                    "status": "error",
-                    "error": str(exc),
-                }
-            )
-            if stop_on_error:
-                status = "partial_error"
-                break
-            continue
+                    elif op == "wait":
+                        sec = float(s_dict.get("seconds", 0.5))
+                        action_runner(action="wait", seconds=sec, user32=user32)
+                        step_results.append(
+                            {
+                                "step": idx,
+                                "op": "wait",
+                                "status": "ok",
+                            }
+                        )
 
-        if stop_on_window_change and trigger_nav:
-            current_title = ""
-            with contextlib.suppress(Exception):
-                current_title = title_getter()
-            if current_title and current_title != initial_title:
-                status = "stopped_on_window_change"
-                break
+                    elif op == "click_at":
+                        x = int(s_dict["x"])
+                        y = int(s_dict["y"])
+                        clicks = int(s_dict.get("clicks", 1))
+                        btn = str(s_dict.get("button", "left"))
+                        action_runner(
+                            action="click_at",
+                            x=x,
+                            y=y,
+                            clicks=clicks,
+                            button=btn,
+                            user32=user32,
+                        )
+                        step_results.append(
+                            {
+                                "step": idx,
+                                "op": "click_at",
+                                "status": "ok",
+                            }
+                        )
+                        trigger_nav = True
+
+                except PreconditionFailedError:
+                    raise
+                except Exception as exc:
+                    step_results.append(
+                        {
+                            "step": idx,
+                            "op": op,
+                            "status": "error",
+                            "error": str(exc),
+                        }
+                    )
+                    if stop_on_error:
+                        status = "partial_error"
+                        break
+                    continue
+
+                if stop_on_window_change and trigger_nav:
+                    if guard is not None and (idx + 1 < len(steps)):
+                        next_step = steps[idx + 1]
+                        next_label = (
+                            str(next_step.get("label") or f"step_{idx + 2}")
+                            if isinstance(next_step, dict)
+                            else f"step_{idx + 2}"
+                        )
+                        guard.assert_ready(next_label)
+                    current_title = ""
+                    with contextlib.suppress(Exception):
+                        current_title = title_getter()
+                    if current_title and current_title != initial_title:
+                        status = "stopped_on_window_change"
+                        break
+    except PreconditionFailedError as exc:
+        abort = exc.to_abort_payload()
+        abort["steps_executed"] = len(step_results)
+        abort["step_results"] = step_results
+        return abort
 
     if status == "completed" and any(r.get("status") == "error" for r in step_results):
         status = "partial_error"

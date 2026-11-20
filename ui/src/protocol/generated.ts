@@ -970,6 +970,10 @@ export type Hwnd1 = number | null;
 export type Executable = string | null;
 export type TargetPath1 = string | null;
 export type Error4 = string | null;
+export type Verified = boolean;
+export type Status9 = string;
+export type Reason4 = string;
+export type ElapsedMs = number;
 export type Ok13 = boolean;
 export type Action7 =
   | "mute"
@@ -1014,20 +1018,20 @@ export type Image1 = {
 export type Items = ClipboardItem[];
 export type Ok15 = boolean;
 export type Success = boolean;
-export type Status9 = string;
+export type Status10 = string;
 export type Index2 = number;
 export type ItemId1 = string | null;
 export type Message7 = string | null;
 export type Ok16 = boolean;
 export type Success1 = boolean;
-export type Status10 = string;
+export type Status11 = string;
 export type Url1 = string;
 export type Browser1 = string | null;
 export type Message8 = string | null;
 export type Ok17 = boolean;
 export type Success2 = boolean;
 export type Action8 = string;
-export type Status11 = string;
+export type Status12 = string;
 export type Level3 = number | null;
 export type CurrentBrightness = number | null;
 export type WindowTitle2 = string | null;
@@ -1038,13 +1042,13 @@ export type Message9 = string | null;
 export type Ok18 = boolean;
 export type CharCount2 = number;
 export type Ok19 = boolean;
-export type Status12 = string;
+export type Status13 = string;
 export type Action9 = string;
 export type UpdatedClipboard = boolean;
 export type Preview = string;
 export type Error5 = string | null;
 export type Ok20 = boolean;
-export type Status13 = string;
+export type Status14 = string;
 export type SavedPath = string;
 export type Path = string;
 export type Filename2 = string;
@@ -1052,13 +1056,13 @@ export type SizeBytes1 = number;
 export type Kind4 = string;
 export type Error6 = string | null;
 export type Ok21 = boolean;
-export type Status14 = "opened" | "error" | "non_interactive_desktop";
+export type Status15 = "opened" | "error" | "non_interactive_desktop";
 export type Kind5 = ("file" | "url") | null;
 export type Target3 = string;
 export type Filename3 = string | null;
 export type Error7 = string | null;
 export type Ok22 = boolean;
-export type Status15 = "ok" | "minimized" | "not_found" | "empty" | "error" | "non_interactive_desktop";
+export type Status16 = "ok" | "minimized" | "not_found" | "empty" | "error" | "non_interactive_desktop";
 export type Source4 = string | null;
 export type WindowTitle3 = string | null;
 export type ProcessName = string | null;
@@ -1083,14 +1087,26 @@ export type X2 = number;
 export type Y2 = number;
 export type Elements = UiElementItem[];
 export type Ok24 = boolean;
-export type Status16 = string;
+export type Status17 = string;
 export type Name7 = string;
 export type ControlType2 = string;
 export type X3 = number;
 export type Y3 = number;
 export type Method65 = string;
+export type Reason5 = string | null;
+export type Error8 = string | null;
+export type Status18 = string;
+export type Reason6 = string;
+export type StepLabel = string;
+export type ExpectedHwnd = number | null;
+export type ExpectedTitle = string;
+export type ExpectedProcess = string;
+export type ActualHwnd = number | null;
+export type ActualTitle = string;
+export type ActualProcess = string;
+export type Message11 = string;
 export type Ok25 = boolean;
-export type Status17 = string;
+export type Status19 = string;
 export type Action10 = string;
 export type X4 = number | null;
 export type Y4 = number | null;
@@ -1100,6 +1116,8 @@ export type CharCount3 = number | null;
 export type Keys2 = string[] | null;
 export type Delta2 = number | null;
 export type Seconds2 = number | null;
+export type Reason7 = string | null;
+export type Error9 = string | null;
 export type Ok26 = boolean;
 export type SnapshotId = string;
 export type WindowTitle5 = string;
@@ -1117,7 +1135,7 @@ export type Enabled = boolean;
 export type Focused = boolean;
 export type Elements1 = UiSnapshotElement[];
 export type Ok27 = boolean;
-export type Status18 = string;
+export type Status20 = string;
 export type SnapshotId1 = string;
 export type Action11 = string;
 export type Ref3 = string;
@@ -1138,17 +1156,21 @@ export type NewValue = string | null;
 export type ChangedValues = UiDiffChangedValue[];
 export type AddedElements = UiSnapshotElement[];
 export type RemovedCount3 = number;
+export type Reason8 = string | null;
+export type Error10 = string | null;
 export type Ok28 = boolean;
-export type Status19 = "completed" | "stopped_on_window_change" | "partial_error";
+export type Status21 = "completed" | "stopped_on_window_change" | "partial_error" | "aborted_precondition";
 export type StepsExecuted = number;
 export type StepResults = {
   [k: string]: unknown | undefined;
 }[];
+export type Reason9 = string | null;
+export type Error11 = string | null;
 export type Ok29 = boolean;
 export type RepoPath1 = string;
 export type Branch = string;
 export type IsClean = boolean;
-export type Status20 = string;
+export type Status22 = string;
 export type Staged = string[];
 export type Unstaged = string[];
 export type Untracked = string[];
@@ -2759,11 +2781,23 @@ export interface OsOpenOrFocusAppResult {
   executable?: Executable;
   target_path?: TargetPath1;
   error?: Error4;
+  verification?: ActionVerificationInfo | null;
+}
+export interface ActionVerificationInfo {
+  verified: Verified;
+  status?: Status9;
+  reason?: Reason4;
+  actual?: Actual;
+  elapsed_ms?: ElapsedMs;
+}
+export interface Actual {
+  [k: string]: unknown | undefined;
 }
 export interface OsControlMediaVolumeResult {
   ok?: Ok13;
   action: Action7;
   level?: Level2;
+  verification?: ActionVerificationInfo | null;
 }
 export interface OsReadClipboardResult {
   ok?: Ok14;
@@ -2798,7 +2832,7 @@ export interface ClipboardItem {
 export interface OsSelectClipboardItemResult {
   ok?: Ok15;
   success?: Success;
-  status?: Status9;
+  status?: Status10;
   index?: Index2;
   item_id?: ItemId1;
   message?: Message7;
@@ -2806,7 +2840,7 @@ export interface OsSelectClipboardItemResult {
 export interface OsOpenUrlResult {
   ok?: Ok16;
   success?: Success1;
-  status?: Status10;
+  status?: Status11;
   url: Url1;
   browser?: Browser1;
   message?: Message8;
@@ -2815,7 +2849,7 @@ export interface OsControlSystemResult {
   ok?: Ok17;
   success?: Success2;
   action?: Action8;
-  status?: Status11;
+  status?: Status12;
   level?: Level3;
   current_brightness?: CurrentBrightness;
   window_title?: WindowTitle2;
@@ -2823,6 +2857,7 @@ export interface OsControlSystemResult {
   page?: Page1;
   uri?: Uri1;
   message?: Message9;
+  verification?: ActionVerificationInfo | null;
 }
 export interface OsWriteClipboardResult {
   ok?: Ok18;
@@ -2830,7 +2865,7 @@ export interface OsWriteClipboardResult {
 }
 export interface OsTransformClipboardResult {
   ok?: Ok19;
-  status?: Status12;
+  status?: Status13;
   action?: Action9;
   updated_clipboard?: UpdatedClipboard;
   preview?: Preview;
@@ -2838,7 +2873,7 @@ export interface OsTransformClipboardResult {
 }
 export interface OsSaveClipboardToFileResult {
   ok?: Ok20;
-  status?: Status13;
+  status?: Status14;
   saved_path?: SavedPath;
   path?: Path;
   filename?: Filename2;
@@ -2848,7 +2883,7 @@ export interface OsSaveClipboardToFileResult {
 }
 export interface OsOpenPathOrUrlResult {
   ok?: Ok21;
-  status?: Status14;
+  status?: Status15;
   kind?: Kind5;
   target?: Target3;
   filename?: Filename3;
@@ -2856,7 +2891,7 @@ export interface OsOpenPathOrUrlResult {
 }
 export interface OsInspectScreenResult {
   ok?: Ok22;
-  status?: Status15;
+  status?: Status16;
   source?: Source4;
   window_title?: WindowTitle3;
   process_name?: ProcessName;
@@ -2887,16 +2922,31 @@ export interface UiElementItem {
 }
 export interface OsClickUiElementResult {
   ok?: Ok24;
-  status?: Status16;
+  status?: Status17;
   name?: Name7;
   control_type?: ControlType2;
   x?: X3;
   y?: Y3;
   method?: Method65;
+  reason?: Reason5;
+  error?: Error8;
+  aborted_precondition?: PreconditionAbortInfo | null;
+}
+export interface PreconditionAbortInfo {
+  status?: Status18;
+  reason?: Reason6;
+  step_label?: StepLabel;
+  expected_hwnd?: ExpectedHwnd;
+  expected_title?: ExpectedTitle;
+  expected_process?: ExpectedProcess;
+  actual_hwnd?: ActualHwnd;
+  actual_title?: ActualTitle;
+  actual_process?: ActualProcess;
+  message?: Message11;
 }
 export interface OsGuiActionResult {
   ok?: Ok25;
-  status?: Status17;
+  status?: Status19;
   action?: Action10;
   x?: X4;
   y?: Y4;
@@ -2906,6 +2956,9 @@ export interface OsGuiActionResult {
   keys?: Keys2;
   delta?: Delta2;
   seconds?: Seconds2;
+  reason?: Reason7;
+  error?: Error9;
+  aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface OsUiSnapshotResult {
   ok?: Ok26;
@@ -2929,7 +2982,7 @@ export interface UiSnapshotElement {
 }
 export interface OsUiActResult {
   ok?: Ok27;
-  status?: Status18;
+  status?: Status20;
   snapshot_id?: SnapshotId1;
   action?: Action11;
   ref?: Ref3;
@@ -2942,6 +2995,9 @@ export interface OsUiActResult {
   interval_ms?: IntervalMs2;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
+  reason?: Reason8;
+  error?: Error10;
+  aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface UiDiff {
   window_changed?: WindowChanged;
@@ -2959,18 +3015,21 @@ export interface UiDiffChangedValue {
 }
 export interface OsUiBatchResult {
   ok?: Ok28;
-  status?: Status19;
+  status?: Status21;
   steps_executed?: StepsExecuted;
   step_results?: StepResults;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
+  reason?: Reason9;
+  error?: Error11;
+  aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface WorkspaceGitInspectResult {
   ok?: Ok29;
   repo_path: RepoPath1;
   branch: Branch;
   is_clean?: IsClean;
-  status?: Status20;
+  status?: Status22;
   staged?: Staged;
   unstaged?: Unstaged;
   untracked?: Untracked;

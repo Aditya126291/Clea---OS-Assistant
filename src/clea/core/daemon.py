@@ -88,8 +88,11 @@ from clea.memory.store import FIXED_SECTIONS, VOICE_COMPANION_SESSION_ID, Memory
 from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
+    ActionVerifier,
     ArtifactStore,
     ClipboardService,
+    FocusPreconditionBackend,
+    MediaVerificationBackend,
     RiskLevel,
     ScreenVisionService,
     TimerManager,
@@ -243,6 +246,9 @@ class CleaDaemon:
         timer_manager: TimerManager | None = None,
         clipboard_service: ClipboardService | None = None,
         screen_vision_service: ScreenVisionService | None = None,
+        focus_backend: FocusPreconditionBackend | None = None,
+        media_backend: MediaVerificationBackend | None = None,
+        action_verifier: ActionVerifier | None = None,
     ) -> None:
         self.host = _validate_localhost(host)
         self.port = port
@@ -258,6 +264,9 @@ class CleaDaemon:
             else auth.allowed_origins_from_env()
         )
         self.approval_timeout = approval_timeout
+        self._focus_backend = focus_backend
+        self._media_backend = media_backend
+        self._action_verifier = action_verifier
         self._server: Server | None = None
         self._busy_sessions: set[str] = set()
         self._connections: set[_Connection] = set()
@@ -2636,13 +2645,46 @@ class CleaDaemon:
             ),
         )
 
+    def _os_guard_kwargs(self, fn: Any) -> dict[str, Any]:
+        """Return injected guard/verifier kwargs supported by *fn* without breaking fakes."""
+        if (
+            self._focus_backend is None
+            and self._media_backend is None
+            and self._action_verifier is None
+        ):
+            return {}
+        try:
+            params = set(inspect.signature(fn).parameters.keys())
+        except (ValueError, TypeError):
+            return {}
+        extra: dict[str, Any] = {}
+        if self._focus_backend is not None and "focus_backend" in params:
+            extra["focus_backend"] = self._focus_backend
+        if self._media_backend is not None and "media_backend" in params:
+            extra["media_backend"] = self._media_backend
+        if self._action_verifier is not None and "verifier" in params:
+            extra["verifier"] = self._action_verifier
+        elif (
+            (self._focus_backend is not None or self._media_backend is not None)
+            and "verifier" in params
+            and "focus_backend" not in params
+            and "media_backend" not in params
+        ):
+            extra["verifier"] = ActionVerifier(
+                focus_backend=self._focus_backend,
+                media_backend=self._media_backend,
+            )
+        return extra
+
     async def _handle_os_open_or_focus_app(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
+        guard_kwargs = self._os_guard_kwargs(open_or_focus_app)
         try:
             res = await asyncio.to_thread(
                 open_or_focus_app,
                 req.params.app_name,
                 req.params.target_path,
+                **guard_kwargs,
             )
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
@@ -2654,26 +2696,39 @@ class CleaDaemon:
         logged_target = res.get("target_path") or req.params.target_path
         if logged_target:
             audit_details["target_path"] = logged_target
+        if isinstance(res.get("verification"), dict):
+            audit_details["verified"] = res["verification"].get("verified")
         self._audit_log("os_open_or_focus_app", **audit_details)
-        await self._respond(ws, req, METHOD_RESULTS["os.open_or_focus_app"](**res))
+        model_cls = METHOD_RESULTS["os.open_or_focus_app"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_os_control_media_volume(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
+        guard_kwargs = self._os_guard_kwargs(control_media_volume)
         try:
             res = await asyncio.to_thread(
                 control_media_volume,
                 req.params.action,
                 req.params.level,
+                **guard_kwargs,
             )
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
             return
-        self._audit_log(
-            "os_control_media_volume",
-            media_action=res.get("action"),
-            level=res.get("level"),
-        )
-        await self._respond(ws, req, METHOD_RESULTS["os.control_media_volume"](**res))
+        audit_details: dict[str, Any] = {
+            "media_action": res.get("action"),
+            "level": res.get("level"),
+        }
+        if isinstance(res.get("verification"), dict):
+            audit_details["verified"] = res["verification"].get("verified")
+            audit_details["verification_reason"] = res["verification"].get("reason")
+        self._audit_log("os_control_media_volume", **audit_details)
+        model_cls = METHOD_RESULTS["os.control_media_volume"]
+        valid_fields = set(model_cls.model_fields.keys())
+        filtered = {k: v for k, v in res.items() if k in valid_fields}
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_os_read_clipboard(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
@@ -2812,6 +2867,9 @@ class CleaDaemon:
             if "window_action" in param_names or accepts_kwargs:
                 kwargs["window_action"] = req.params.window_action
 
+        guard_kwargs = self._os_guard_kwargs(control_system)
+        kwargs.update(guard_kwargs)
+
         try:
             try:
                 res = await asyncio.to_thread(control_system, action, **kwargs)
@@ -2819,7 +2877,9 @@ class CleaDaemon:
                 # If control_system did not accept window_title or window_action,
                 # retry with title only
                 fallback_kwargs = {
-                    k: v for k, v in kwargs.items() if k not in ("window_title", "window_action")
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in ("window_title", "window_action", *guard_kwargs.keys())
                 }
                 if target_title is not None and "title" not in fallback_kwargs:
                     fallback_kwargs["title"] = target_title
@@ -2834,11 +2894,13 @@ class CleaDaemon:
         ) as exc:
             await self._respond(ws, req, error=str(exc))
             return
-        self._audit_log(
-            "os_control_system",
-            system_action=action,
-            status=res.get("status"),
-        )
+        audit_sys: dict[str, Any] = {
+            "system_action": action,
+            "status": res.get("status"),
+        }
+        if isinstance(res.get("verification"), dict):
+            audit_sys["verified"] = res["verification"].get("verified")
+        self._audit_log("os_control_system", **audit_sys)
         model_cls = METHOD_RESULTS["os.control_system"]
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
@@ -2848,7 +2910,7 @@ class CleaDaemon:
             filtered["action"] = action
         if "window_title" not in filtered and target_title:
             filtered["window_title"] = target_title
-        await self._respond(ws, req, model_cls(**filtered))
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_os_write_clipboard(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
@@ -3005,12 +3067,14 @@ class CleaDaemon:
 
     async def _handle_os_click_ui_element(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
+        guard_kwargs = self._os_guard_kwargs(click_ui_element)
         try:
             res = await asyncio.to_thread(
                 click_ui_element,
                 req.params.name,
                 req.params.control_type,
                 req.params.app_name,
+                **guard_kwargs,
             )
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
@@ -3020,15 +3084,17 @@ class CleaDaemon:
             name=res.get("name"),
             control_type=res.get("control_type"),
             method=res.get("method"),
+            status=res.get("status"),
         )
         model_cls = METHOD_RESULTS["os.click_ui_element"]
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
-        await self._respond(ws, req, model_cls(**filtered))
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_os_gui_action(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         p = req.params
+        guard_kwargs = self._os_guard_kwargs(gui_action)
         try:
             res = await asyncio.to_thread(
                 gui_action,
@@ -3041,6 +3107,7 @@ class CleaDaemon:
                 p.button,
                 p.delta,
                 p.seconds,
+                **guard_kwargs,
             )
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
@@ -3053,7 +3120,7 @@ class CleaDaemon:
         model_cls = METHOD_RESULTS["os.gui_action"]
         valid_fields = set(model_cls.model_fields.keys())
         filtered = {k: v for k, v in res.items() if k in valid_fields}
-        await self._respond(ws, req, model_cls(**filtered))
+        await self._respond(ws, req, model_cls.model_validate(filtered))
 
     async def _handle_os_ui_snapshot(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
@@ -3087,6 +3154,7 @@ class CleaDaemon:
     async def _handle_os_ui_act(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         p = req.params
+        guard_kwargs = self._os_guard_kwargs(ui_act)
         try:
             try:
                 res = await asyncio.to_thread(
@@ -3095,6 +3163,7 @@ class CleaDaemon:
                     p.action,
                     p.value,
                     interval_ms=p.interval_ms,
+                    **guard_kwargs,
                 )
             except TypeError:
                 res = await asyncio.to_thread(
@@ -3111,6 +3180,7 @@ class CleaDaemon:
             ref=p.ref,
             ui_action=p.action,
             status=res.get("status"),
+            reason=res.get("reason"),
         )
         model_cls = METHOD_RESULTS["os.ui_act"]
         valid_fields = set(model_cls.model_fields.keys())
@@ -3123,12 +3193,14 @@ class CleaDaemon:
         steps_raw = [
             s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else s for s in p.steps
         ]
+        guard_kwargs = self._os_guard_kwargs(ui_batch)
         try:
             res = await asyncio.to_thread(
                 ui_batch,
                 steps_raw,
                 p.stop_on_error,
                 p.stop_on_window_change,
+                **guard_kwargs,
             )
         except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
             await self._respond(ws, req, error=str(exc))
@@ -3137,6 +3209,7 @@ class CleaDaemon:
             "os_ui_batch",
             steps_executed=res.get("steps_executed"),
             status=res.get("status"),
+            reason=res.get("reason"),
         )
         model_cls = METHOD_RESULTS["os.ui_batch"]
         valid_fields = set(model_cls.model_fields.keys())
@@ -3792,6 +3865,9 @@ def build_daemon(
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     timer_manager: TimerManager | None = None,
     clipboard_service: ClipboardService | None = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    media_backend: MediaVerificationBackend | None = None,
+    action_verifier: ActionVerifier | None = None,
 ) -> CleaDaemon:
     """Assemble a CleaDaemon wired with default memory, tools, and Gemini provider."""
     resolved_memory = memory or MemoryStore()
@@ -3822,7 +3898,12 @@ def build_daemon(
     try:
         resolved_registry.get("manage_window")
     except KeyError:
-        register_system_control_tools(resolved_registry)
+        register_system_control_tools(
+            resolved_registry,
+            focus_backend=focus_backend,
+            media_backend=media_backend,
+            verifier=action_verifier,
+        )
     resolved_clipboard_service = clipboard_service or ClipboardService()
     try:
         resolved_registry.get("read_clipboard")
@@ -3845,6 +3926,9 @@ def build_daemon(
         approval_timeout=approval_timeout,
         timer_manager=resolved_timer_manager,
         clipboard_service=resolved_clipboard_service,
+        focus_backend=focus_backend,
+        media_backend=media_backend,
+        action_verifier=action_verifier,
     )
 
 

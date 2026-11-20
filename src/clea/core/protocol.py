@@ -1275,6 +1275,27 @@ class ActivityCancelResult(_Model):
     message: str = ""
 
 
+class ActionVerificationInfo(_Model):
+    verified: bool
+    status: str = "verified"
+    reason: str = ""
+    actual: dict[str, Any] = Field(default_factory=dict)
+    elapsed_ms: float = 0.0
+
+
+class PreconditionAbortInfo(_Model):
+    status: str = "aborted_precondition"
+    reason: str = ""
+    step_label: str = ""
+    expected_hwnd: int | None = None
+    expected_title: str = ""
+    expected_process: str = ""
+    actual_hwnd: int | None = None
+    actual_title: str = ""
+    actual_process: str = ""
+    message: str = ""
+
+
 class OsOpenOrFocusAppResult(_Model):
     ok: bool = True
     status: Literal["focused", "launched", "non_interactive_desktop"]
@@ -1284,12 +1305,14 @@ class OsOpenOrFocusAppResult(_Model):
     executable: str | None = None
     target_path: str | None = None
     error: str | None = None
+    verification: ActionVerificationInfo | None = None
 
 
 class OsControlMediaVolumeResult(_Model):
     ok: bool = True
     action: MediaVolumeAction
     level: int | None = None
+    verification: ActionVerificationInfo | None = None
 
 
 class ClipboardItem(_Model):
@@ -1354,6 +1377,7 @@ class OsControlSystemResult(_Model):
     page: str | None = None
     uri: str | None = None
     message: str | None = None
+    verification: ActionVerificationInfo | None = None
 
 
 class OsWriteClipboardResult(_Model):
@@ -1439,6 +1463,9 @@ class OsClickUiElementResult(_Model):
     x: int = 0
     y: int = 0
     method: str = "invoke"
+    reason: str | None = None
+    error: str | None = None
+    aborted_precondition: PreconditionAbortInfo | None = None
 
 
 class OsGuiActionResult(_Model):
@@ -1453,6 +1480,9 @@ class OsGuiActionResult(_Model):
     keys: list[str] | None = None
     delta: int | None = None
     seconds: float | None = None
+    reason: str | None = None
+    error: str | None = None
+    aborted_precondition: PreconditionAbortInfo | None = None
 
 
 class UiSnapshotElement(_Model):
@@ -1508,15 +1538,26 @@ class OsUiActResult(_Model):
     interval_ms: int | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
+    reason: str | None = None
+    error: str | None = None
+    aborted_precondition: PreconditionAbortInfo | None = None
 
 
 class OsUiBatchResult(_Model):
     ok: bool = True
-    status: Literal["completed", "stopped_on_window_change", "partial_error"] = "completed"
+    status: Literal[
+        "completed",
+        "stopped_on_window_change",
+        "partial_error",
+        "aborted_precondition",
+    ] = "completed"
     steps_executed: int = 0
     step_results: list[dict[str, Any]] = Field(default_factory=list)
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
+    reason: str | None = None
+    error: str | None = None
+    aborted_precondition: PreconditionAbortInfo | None = None
 
 
 class GitWorktreeItem(_Model):

@@ -13,6 +13,13 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
+from clea.tools.guards import (
+    ActionVerifier,
+    FocusPreconditionBackend,
+    MediaVerificationBackend,
+    PreconditionFailedError,
+    PreconditionGuard,
+)
 from clea.tools.registry import RiskLevel, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -311,6 +318,9 @@ def manage_window(
     title_query: str | None = None,
     *,
     user32: Any = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    verifier: ActionVerifier | None = None,
+    verify_timeout_s: float = 0.6,
 ) -> dict[str, Any]:
     """Manage application windows using Win32 ctypes."""
     if not isinstance(action, str):
@@ -334,18 +344,37 @@ def manage_window(
         }
 
     hwnd, title = _resolve_target_window(u32, title_query)
+    should_verify = verifier is not None or focus_backend is not None or user32 is None
+    active_verifier = (
+        verifier
+        if verifier is not None
+        else (ActionVerifier(focus_backend=focus_backend) if should_verify else None)
+    )
+    active_focus_backend = (
+        focus_backend
+        if focus_backend is not None
+        else (active_verifier._get_focus_backend() if active_verifier is not None else None)
+    )
 
     if norm_action == "focus":
         if hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_RESTORE)
         if hasattr(u32, "SetForegroundWindow"):
             u32.SetForegroundWindow(hwnd)
-        return {
+        result: dict[str, Any] = {
             "ok": True,
             "action": "focus",
             "hwnd": hwnd,
             "title": title,
         }
+        if active_verifier is not None:
+            outcome = active_verifier.verify_window_state(
+                hwnd,
+                expected_state="focused",
+                timeout_s=verify_timeout_s,
+            )
+            result["verification"] = outcome.to_dict()
+        return result
 
     if norm_action in ("snap_left", "snap_right"):
         left, top, right, bottom = _get_monitor_work_area(hwnd, u32)
@@ -358,52 +387,118 @@ def manage_window(
             y = top
             w = half_width
             h = work_height
+            snap_side = "left"
         else:
             x = left + half_width
             y = top
             w = work_width - half_width
             h = work_height
+            snap_side = "right"
 
-        if hasattr(u32, "ShowWindow"):
-            u32.ShowWindow(hwnd, SW_RESTORE)
-        if hasattr(u32, "MoveWindow"):
-            u32.MoveWindow(hwnd, x, y, w, h, True)
-        if hasattr(u32, "SetForegroundWindow"):
-            u32.SetForegroundWindow(hwnd)
+        if active_focus_backend is not None:
+            try:
+                with PreconditionGuard(
+                    active_focus_backend,
+                    expected_hwnd=hwnd,
+                    require_foreground=False,
+                    allow_minimized=True,
+                ) as guard:
+                    guard.assert_ready("snap_restore")
+                    if hasattr(u32, "ShowWindow"):
+                        u32.ShowWindow(hwnd, SW_RESTORE)
+                    guard.assert_ready("snap_move_window")
+                    if hasattr(u32, "MoveWindow"):
+                        u32.MoveWindow(hwnd, x, y, w, h, True)
+                    guard.assert_ready("snap_focus")
+                    if hasattr(u32, "SetForegroundWindow"):
+                        u32.SetForegroundWindow(hwnd)
+            except PreconditionFailedError as exc:
+                payload = exc.to_abort_payload()
+                payload["action"] = norm_action
+                payload["hwnd"] = hwnd
+                payload["title"] = title
+                return payload
+        else:
+            if hasattr(u32, "ShowWindow"):
+                u32.ShowWindow(hwnd, SW_RESTORE)
+            if hasattr(u32, "MoveWindow"):
+                u32.MoveWindow(hwnd, x, y, w, h, True)
+            if hasattr(u32, "SetForegroundWindow"):
+                u32.SetForegroundWindow(hwnd)
 
-        return {
+        result = {
             "ok": True,
             "action": norm_action,
             "hwnd": hwnd,
             "title": title,
             "rect": {"x": x, "y": y, "width": w, "height": h},
         }
+        if active_verifier is not None:
+            outcome = active_verifier.verify_window_state(
+                hwnd,
+                expected_snap=snap_side,
+                timeout_s=verify_timeout_s,
+            )
+            result["verification"] = outcome.to_dict()
+        return result
 
     if norm_action == "maximize":
         if hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_MAXIMIZE)
         if hasattr(u32, "SetForegroundWindow"):
             u32.SetForegroundWindow(hwnd)
-        return {"ok": True, "action": "maximize", "hwnd": hwnd, "title": title}
+        result = {"ok": True, "action": "maximize", "hwnd": hwnd, "title": title}
+        if active_verifier is not None:
+            outcome = active_verifier.verify_window_state(
+                hwnd,
+                expected_state="maximized",
+                timeout_s=verify_timeout_s,
+            )
+            result["verification"] = outcome.to_dict()
+        return result
 
     if norm_action == "minimize":
         if hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_MINIMIZE)
-        return {"ok": True, "action": "minimize", "hwnd": hwnd, "title": title}
+        result = {"ok": True, "action": "minimize", "hwnd": hwnd, "title": title}
+        if active_verifier is not None:
+            outcome = active_verifier.verify_window_state(
+                hwnd,
+                expected_state="minimized",
+                timeout_s=verify_timeout_s,
+            )
+            result["verification"] = outcome.to_dict()
+        return result
 
     if norm_action == "restore":
         if hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_RESTORE)
         if hasattr(u32, "SetForegroundWindow"):
             u32.SetForegroundWindow(hwnd)
-        return {"ok": True, "action": "restore", "hwnd": hwnd, "title": title}
+        result = {"ok": True, "action": "restore", "hwnd": hwnd, "title": title}
+        if active_verifier is not None:
+            outcome = active_verifier.verify_window_state(
+                hwnd,
+                expected_state="restored",
+                timeout_s=verify_timeout_s,
+            )
+            result["verification"] = outcome.to_dict()
+        return result
 
     if norm_action == "close":
         if hasattr(u32, "PostMessageW"):
             u32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
         elif hasattr(u32, "SendMessageW"):
             u32.SendMessageW(hwnd, WM_CLOSE, 0, 0)
-        return {"ok": True, "action": "close", "hwnd": hwnd, "title": title}
+        result = {"ok": True, "action": "close", "hwnd": hwnd, "title": title}
+        if active_verifier is not None:
+            outcome = active_verifier.verify_window_state(
+                hwnd,
+                expected_state="closed",
+                timeout_s=verify_timeout_s,
+            )
+            result["verification"] = outcome.to_dict()
+        return result
 
     raise ValueError(f"Unhandled window action {action!r}.")
 
@@ -856,6 +951,9 @@ def _handle_media_control(
     action: str,
     *,
     user32: Any = None,
+    media_backend: MediaVerificationBackend | None = None,
+    verifier: ActionVerifier | None = None,
+    verify_timeout_s: float = 1.5,
 ) -> dict[str, Any]:
     if not isinstance(action, str):
         raise ValueError("action must be a string.")
@@ -875,11 +973,36 @@ def _handle_media_control(
         "stop": VK_MEDIA_STOP,
     }
     vk = vk_map[norm_action]
+    should_verify = verifier is not None or media_backend is not None or user32 is None
+    active_verifier = (
+        verifier
+        if verifier is not None
+        else (ActionVerifier(media_backend=media_backend) if should_verify else None)
+    )
+    baseline = None
+    if active_verifier is not None and norm_action in {"play_pause", "next", "previous", "prev"}:
+        baseline = active_verifier.probe_media_session()
+
     u32 = _get_user32(user32)
     if u32 and hasattr(u32, "keybd_event"):
         u32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
         u32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
-    return {"ok": True, "control": "media", "action": norm_action}
+
+    result: dict[str, Any] = {"ok": True, "control": "media", "action": norm_action}
+    if active_verifier is not None:
+        expected_status_map = {
+            "play": "playing",
+            "pause": "paused",
+            "stop": "stopped",
+        }
+        use_baseline = norm_action in {"play_pause", "next", "previous", "prev"}
+        outcome = active_verifier.verify_media_state(
+            expected_status=expected_status_map.get(norm_action),
+            timeout_s=verify_timeout_s,
+            baseline=baseline if use_baseline else None,
+        )
+        result["verification"] = outcome.to_dict()
+    return result
 
 
 def _handle_theme_control(
@@ -946,6 +1069,8 @@ def system_control(
     user32: Any = None,
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     winreg_mod: Any = None,
+    media_backend: MediaVerificationBackend | None = None,
+    verifier: ActionVerifier | None = None,
 ) -> dict[str, Any]:
     """Control system hardware, media, or theme settings."""
     if not isinstance(control, str):
@@ -968,7 +1093,12 @@ def system_control(
     if norm_ctrl == "brightness":
         return _handle_brightness_control(action, value, powershell_runner=powershell_runner)
     if norm_ctrl == "media":
-        return _handle_media_control(action, user32=user32)
+        return _handle_media_control(
+            action,
+            user32=user32,
+            media_backend=media_backend,
+            verifier=verifier,
+        )
     if norm_ctrl == "theme":
         return _handle_theme_control(action, winreg_mod=winreg_mod)
 
@@ -1450,8 +1580,50 @@ def register_system_control_tools(
     manage_window_risk: RiskLevel = RiskLevel.READ_ONLY,
     system_control_risk: RiskLevel = RiskLevel.READ_ONLY,
     system_diagnostics_risk: RiskLevel = RiskLevel.READ_ONLY,
+    focus_backend: FocusPreconditionBackend | None = None,
+    media_backend: MediaVerificationBackend | None = None,
+    verifier: ActionVerifier | None = None,
+    user32: Any = None,
 ) -> None:
     """Register window management, hardware/system controls, and diagnostic tools."""
+    if focus_backend is not None or verifier is not None or user32 is not None:
+
+        def _manage_window_handler(
+            action: str,
+            title_query: str | None = None,
+        ) -> dict[str, Any]:
+            return manage_window(
+                action,
+                title_query,
+                user32=user32,
+                focus_backend=focus_backend,
+                verifier=verifier,
+            )
+
+        manage_window_fn: Callable[..., dict[str, Any]] = _manage_window_handler
+    else:
+        manage_window_fn = manage_window
+
+    if media_backend is not None or verifier is not None or user32 is not None:
+
+        def _system_control_handler(
+            control: str,
+            action: str,
+            value: int | None = None,
+        ) -> dict[str, Any]:
+            return system_control(
+                control,
+                action,
+                value,
+                user32=user32,
+                media_backend=media_backend,
+                verifier=verifier,
+            )
+
+        system_control_fn: Callable[..., dict[str, Any]] = _system_control_handler
+    else:
+        system_control_fn = system_control
+
     registry.register(
         name="manage_window",
         description=(
@@ -1477,7 +1649,7 @@ def register_system_control_tools(
             "additionalProperties": False,
         },
         risk_level=manage_window_risk,
-        handler=manage_window,
+        handler=manage_window_fn,
     )
 
     registry.register(
@@ -1516,7 +1688,7 @@ def register_system_control_tools(
             "additionalProperties": False,
         },
         risk_level=system_control_risk,
-        handler=system_control,
+        handler=system_control_fn,
     )
 
     registry.register(

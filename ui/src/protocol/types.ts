@@ -1,4 +1,5 @@
 import type {
+  ActionVerificationInfo,
   ActivityCancelParams,
   ActivityCancelResult,
   ActivityListParams,
@@ -129,6 +130,7 @@ import type {
   VoiceStatusResult,
   VoiceTrigger,
   MediaVolumeAction,
+  PreconditionAbortInfo,
   ClipboardItem,
   OsOpenOrFocusAppParams,
   OsOpenOrFocusAppResult,
@@ -176,6 +178,7 @@ import type {
 } from "./generated";
 
 export type {
+  ActionVerificationInfo,
   ActivityCancelParams,
   ActivityCancelResult,
   ActivityListParams,
@@ -306,6 +309,7 @@ export type {
   VoiceStatusResult,
   VoiceTrigger,
   MediaVolumeAction,
+  PreconditionAbortInfo,
   ClipboardItem,
   OsOpenOrFocusAppParams,
   OsOpenOrFocusAppResult,

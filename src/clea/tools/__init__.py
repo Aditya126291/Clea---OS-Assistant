@@ -20,6 +20,18 @@ from clea.tools.file_intel import (
     register_file_tools,
     search_files,
 )
+from clea.tools.guards import (
+    ActionVerifier,
+    FocusPreconditionBackend,
+    MediaSessionState,
+    MediaVerificationBackend,
+    PreconditionFailedError,
+    PreconditionGuard,
+    VerificationOutcome,
+    Win32FocusPreconditionBackend,
+    WindowContext,
+    WinRTMediaVerificationBackend,
+)
 from clea.tools.memory_tools import register_memory_tools
 from clea.tools.registry import (
     AuditLogger,
@@ -67,6 +79,7 @@ from clea.tools.vision import (
 )
 
 __all__ = [
+    "ActionVerifier",
     "ArtifactStore",
     "AuditLogger",
     "ClipboardBackend",
@@ -74,7 +87,12 @@ __all__ = [
     "ClipboardService",
     "ClipboardSnapshot",
     "ConfirmationCallback",
+    "FocusPreconditionBackend",
+    "MediaSessionState",
+    "MediaVerificationBackend",
     "PermissionDeniedError",
+    "PreconditionFailedError",
+    "PreconditionGuard",
     "RiskLevel",
     "ScreenInspectionResult",
     "ScreenVisionBackend",
@@ -84,9 +102,13 @@ __all__ = [
     "ToolDefinition",
     "ToolNotFoundError",
     "ToolRegistry",
+    "VerificationOutcome",
     "Win32ClipboardBackend",
+    "Win32FocusPreconditionBackend",
     "Win32ScreenVisionBackend",
+    "WinRTMediaVerificationBackend",
     "WindowCapture",
+    "WindowContext",
     "WindowInfo",
     "cancel_timer_or_reminder",
     "get_default_clipboard_service",
