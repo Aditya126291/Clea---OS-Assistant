@@ -3185,6 +3185,50 @@ class CleaDaemon:
         ) as exc:
             await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
+
+        # Ensure window snap/layout actions wait for ActionVerifier.verify_window_state
+        # to settle before returning their tool result if verification wasn't already run.
+        if (
+            isinstance(res, dict)
+            and "verification" not in res
+            and isinstance(res.get("hwnd"), int)
+            and not isinstance(res.get("hwnd"), bool)
+            and (self._action_verifier is not None or self._focus_backend is not None)
+        ):
+            norm_act = (action or "").strip().lower()
+            snap_map = {
+                "snap_left": (None, "left"),
+                "snap_left_window": (None, "left"),
+                "snap_right": (None, "right"),
+                "snap_right_window": (None, "right"),
+                "maximize": ("maximized", None),
+                "maximize_window": ("maximized", None),
+                "minimize": ("minimized", None),
+                "minimize_window": ("minimized", None),
+                "restore": ("restored", None),
+                "restore_window": ("restored", None),
+                "close": ("closed", None),
+                "close_window": ("closed", None),
+            }
+            if norm_act in snap_map:
+                expected_state, expected_snap = snap_map[norm_act]
+                active_verifier = self._action_verifier or ActionVerifier(
+                    focus_backend=self._focus_backend,
+                    media_backend=self._media_backend,
+                )
+                verify_res = await asyncio.to_thread(
+                    active_verifier.verify_window_state,
+                    int(res["hwnd"]),
+                    expected_state=expected_state,
+                    expected_snap=expected_snap,
+                )
+                res = dict(res)
+                res["verification"] = verify_res.to_dict()
+                if not verify_res.verified and verify_res.status != "unavailable":
+                    res["ok"] = False
+                    res["success"] = False
+                    res["status"] = "verification_failed"
+
         audit_sys: dict[str, Any] = {
             "system_action": action,
             "status": res.get("status"),
@@ -3824,6 +3868,8 @@ class CleaDaemon:
             )
 
         async def on_text_delta(delta: str) -> None:
+            if not delta:
+                return
             await broadcast_session_event(
                 AssistantTokenEvent(
                     request_id=request_id,
@@ -3971,6 +4017,7 @@ class CleaDaemon:
                         await self._send(
                             c.ws,
                             ConversationUpdatedEvent(
+                                request_id=request_id,
                                 session_id=session.id,
                                 data=ConversationUpdatedData(
                                     session_id=session.id,

@@ -17,6 +17,7 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from PIL import Image
 
@@ -27,11 +28,13 @@ from clea.surfaces.voice.win32 import (
     WindowInfo,
     enable_per_monitor_dpi_awareness,
     enumerate_monitors,
+    format_window_geometry_z_order,
     get_monitor_for_window,
     get_target_monitor,
     get_window_bounds,
     get_window_process_name,
     get_window_title,
+    inspect_window_layout_win32,
     resolve_app_display_name,
 )
 
@@ -59,6 +62,8 @@ class ScreenCaptureResult:
     monitor_bounds: tuple[int, int, int, int] | None = None
     captured_at: str | None = None
     capture_seq: int = 0
+    window_layout: list[dict[str, Any]] | None = None
+    window_geometry_summary: str | None = None
 
 
 def is_window_blocked(
@@ -354,6 +359,8 @@ class ScreenCaptureService:
         target_mon: MonitorInfo | None = None
         monitors: list[MonitorInfo] = []
         virtual_origin = (0, 0)
+        window_layout: list[dict[str, Any]] | None = None
+        window_geometry_summary: str | None = None
         if self._has_injected_api or (sys.platform == "win32" and self._grabber is None):
             with contextlib.suppress(Exception):
                 api = self._get_api()
@@ -370,6 +377,10 @@ class ScreenCaptureService:
                 )
                 if not monitors and target_mon is not None:
                     virtual_origin = (min(0, target_mon.left), min(0, target_mon.top))
+                layout_items = inspect_window_layout_win32(api)
+                if layout_items:
+                    window_layout = layout_items
+                    window_geometry_summary = format_window_geometry_z_order(layout_items)
 
         effective_monitor_index = (
             target_mon.index
@@ -429,6 +440,8 @@ class ScreenCaptureService:
                 monitor_bounds=effective_monitor_bounds,
                 captured_at=captured_at,
                 capture_seq=seq,
+                window_layout=window_layout,
+                window_geometry_summary=window_geometry_summary,
             )
         except Exception as exc:
             logger.warning("Screen capture failed: %s", exc)
@@ -447,4 +460,6 @@ class ScreenCaptureService:
                 monitor_bounds=effective_monitor_bounds,
                 captured_at=captured_at,
                 capture_seq=seq,
+                window_layout=window_layout,
+                window_geometry_summary=window_geometry_summary,
             )

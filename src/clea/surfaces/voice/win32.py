@@ -855,6 +855,127 @@ def get_window_bounds(
     return (left, top, right, bottom)
 
 
+def classify_window_slot(
+    bounds: tuple[int, int, int, int],
+    work_bounds: tuple[int, int, int, int],
+    *,
+    is_maximized: bool = False,
+    tolerance_px: int = 28,
+) -> tuple[str, float]:
+    """Classify a window's horizontal slot relative to its monitor work area (rcWork)."""
+    wl, wt, wr, wb = bounds
+    ml, _mt, mr, _mb = work_bounds
+    win_w = max(0, wr - wl)
+    mon_w = max(1, mr - ml)
+    width_ratio = round(win_w / float(mon_w), 3)
+    if is_maximized:
+        return "maximized", width_ratio
+    half_w = mon_w // 2
+    mid_x = ml + half_w
+    if abs(wl - ml) <= tolerance_px and abs(wr - mid_x) <= tolerance_px:
+        return "left_half", width_ratio
+    if abs(wl - mid_x) <= tolerance_px and abs(wr - mr) <= tolerance_px:
+        return "right_half", width_ratio
+    if width_ratio >= 0.85 or (abs(wl - ml) <= tolerance_px and abs(wr - mr) <= tolerance_px):
+        return "full_width", width_ratio
+    return "custom", width_ratio
+
+
+def inspect_window_layout_win32(api: Win32API | None = None) -> list[dict[str, Any]]:
+    """Enumerate visible top-level windows in Z-order (front-to-back) with slot & occlusion info."""
+    if api is None:
+        api = Win32API()
+    if not hasattr(api.user32, "EnumWindows"):
+        return []
+
+    monitors = enumerate_monitors(api)
+    raw_windows = enumerate_visible_windows(api)
+    entries: list[dict[str, Any]] = []
+    prior_bounds: list[tuple[int, int, int, int]] = []
+
+    for win in raw_windows:
+        title = (win.title or "").strip()
+        if not title or title.lower() in {"program manager", "windows input experience"}:
+            continue
+        bounds = get_window_bounds(win.hwnd, api)
+        if bounds is None:
+            continue
+        left, top, right, bottom = bounds
+        width = right - left
+        height = bottom - top
+        if width <= 0 or height <= 0:
+            continue
+        mon = get_monitor_for_window(win.hwnd, api, monitors=monitors)
+        work_bounds = (
+            mon.work_bounds
+            if mon is not None
+            else (0, 0, max(1920, right), max(1080, bottom))
+        )
+        is_max = False
+        if hasattr(api.user32, "IsZoomed"):
+            with contextlib.suppress(Exception):
+                zoomed = api.user32.IsZoomed(win.hwnd)
+                is_max = bool(zoomed is True or (isinstance(zoomed, int) and zoomed != 0))
+        slot, width_ratio = classify_window_slot(bounds, work_bounds, is_maximized=is_max)
+        extends_behind = False
+        for fg_l, fg_t, fg_r, fg_b in prior_bounds:
+            overlap_w = min(right, fg_r) - max(left, fg_l)
+            overlap_h = min(bottom, fg_b) - max(top, fg_t)
+            if overlap_w > 16 and overlap_h > 16:
+                extends_behind = True
+                break
+        z_idx = len(entries)
+        app_name = resolve_app_display_name(win.process_name, title)
+        entries.append(
+            {
+                "z_index": z_idx,
+                "hwnd": int(win.hwnd),
+                "title": title,
+                "app_name": app_name,
+                "process_name": win.process_name,
+                "bounds": {
+                    "left": left,
+                    "top": top,
+                    "right": right,
+                    "bottom": bottom,
+                    "width": width,
+                    "height": height,
+                },
+                "work_area": {
+                    "left": work_bounds[0],
+                    "top": work_bounds[1],
+                    "right": work_bounds[2],
+                    "bottom": work_bounds[3],
+                    "width": max(0, work_bounds[2] - work_bounds[0]),
+                    "height": max(0, work_bounds[3] - work_bounds[1]),
+                },
+                "is_maximized": is_max,
+                "width_ratio": width_ratio,
+                "detected_slot": slot,
+                "extends_behind_foreground": extends_behind,
+            }
+        )
+        prior_bounds.append(bounds)
+    return entries
+
+
+def format_window_geometry_z_order(windows: list[dict[str, Any]]) -> str:
+    """Render a concise `[OS Window Geometry (Z-order)]` summary string."""
+    if not windows:
+        return "[OS Window Geometry (Z-order)]\n(no visible top-level windows)"
+    lines = ["[OS Window Geometry (Z-order)]"]
+    for w in windows[:10]:
+        b = w.get("bounds") or {}
+        lines.append(
+            f"- z={w.get('z_index')} app={w.get('app_name')!r} title={w.get('title')!r} "
+            f"slot={w.get('detected_slot')} width_ratio={w.get('width_ratio')} "
+            f"maximized={w.get('is_maximized')} "
+            f"extends_behind_foreground={w.get('extends_behind_foreground')} "
+            f"bounds=({b.get('left')},{b.get('top')},{b.get('right')},{b.get('bottom')})"
+        )
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- Global HotKey Manager
 
 

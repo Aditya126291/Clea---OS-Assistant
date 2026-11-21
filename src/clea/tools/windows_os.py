@@ -39,6 +39,7 @@ from clea.tools.guards import (
     Win32FocusPreconditionBackend,
 )
 from clea.tools.registry import RiskLevel, ToolRegistry
+from clea.tools.system_controls import inspect_window_layout
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,12 @@ _SITE_SHORTCUTS: dict[str, str] = {
     "google": "https://www.google.com",
     "github": "https://github.com",
     "youtube": "https://www.youtube.com",
+    "spotify": "https://open.spotify.com",
+    "whatsapp": "https://web.whatsapp.com",
+    "netflix": "https://www.netflix.com",
+    "discord": "https://discord.com/app",
+    "slack": "https://app.slack.com",
+    "notion": "https://www.notion.so",
     "reddit": "https://www.reddit.com",
     "twitter": "https://x.com",
     "x": "https://x.com",
@@ -172,6 +179,9 @@ VALID_SYSTEM_ACTIONS: tuple[str, ...] = (
     "settings",
     "window",
     "window_action",
+    "inspect_window_layout",
+    "inspect_layout",
+    "layout",
 )
 
 VALID_MEDIA_VOLUME_ACTIONS: tuple[str, ...] = (
@@ -1239,6 +1249,260 @@ def find_matching_start_app(
     return best_match
 
 
+_EXPLICIT_BROWSER_REQUEST_RE = re.compile(
+    r"\b(?:in|using|via|with|on)\s+(?:the\s+)?(?:google\s+chrome|chrome|microsoft\s+edge|"
+    r"edge|msedge|firefox|mozilla\s+firefox|brave|arc|web\s+browser|default\s+browser|"
+    r"browser|a\s+browser(?:\s+tab)?)\b"
+    r"|\b(?:web|browser)\s+version\b"
+    r"|\b(?:in|as)\s+a\s+(?:browser\s+)?tab\b"
+    r"|\bon\s+the\s+web\b",
+    re.IGNORECASE,
+)
+
+_BROWSER_DIRECTIVE_SUFFIX_RE = re.compile(
+    r"\s+(?:(?:in|using|via|with|on)\s+(?:the\s+)?(?:google\s+chrome|chrome|microsoft\s+edge|"
+    r"edge|msedge|firefox|mozilla\s+firefox|brave|arc|web\s+browser|default\s+browser|"
+    r"browser|a\s+browser(?:\s+tab)?)|(?:web|browser)\s+version|on\s+the\s+web)\s*$",
+    re.IGNORECASE,
+)
+
+_LEADING_OPEN_VERB_RE = re.compile(r"^(?:open|launch|start|focus|run)\s+", re.IGNORECASE)
+
+_LOCAL_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".exe",
+        ".txt",
+        ".md",
+        ".json",
+        ".py",
+        ".log",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".bmp",
+        ".pdf",
+        ".csv",
+        ".yaml",
+        ".yml",
+    }
+)
+
+_SERVICE_CANONICAL_APP_NAMES: dict[str, tuple[str, ...]] = {
+    "youtube": ("youtube",),
+    "spotify": ("spotify", "spotify music"),
+    "whatsapp": ("whatsapp", "whatsapp desktop"),
+    "netflix": ("netflix",),
+    "discord": ("discord",),
+    "slack": ("slack",),
+    "notion": ("notion",),
+    "chatgpt": ("chatgpt",),
+    "gmail": ("gmail",),
+    "docs": ("google docs",),
+    "github": ("github",),
+    "reddit": ("reddit",),
+    "twitter": ("twitter", "x"),
+}
+
+
+def is_explicit_browser_request(
+    text: str | None = None,
+    *,
+    browser: str | None = None,
+) -> bool:
+    """Return True when the caller/user explicitly requests opening in a web browser."""
+    if isinstance(browser, str) and browser.strip():
+        return True
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_EXPLICIT_BROWSER_REQUEST_RE.search(text))
+
+
+def extract_explicit_browser(
+    text: str | None = None,
+    *,
+    browser: str | None = None,
+) -> str | None:
+    """Return a specific browser name ('chrome', 'edge', 'firefox', 'brave') or None for default."""
+    if isinstance(browser, str) and browser.strip():
+        b_low = " ".join(browser.strip().lower().split())
+        if b_low in {"default", "browser", "web", "web browser", "default browser"}:
+            return None
+        if b_low in {"google chrome", "chrome", "chrome.exe"}:
+            return "chrome"
+        if b_low in {"microsoft edge", "edge", "msedge", "msedge.exe"}:
+            return "edge"
+        if b_low in {"mozilla firefox", "firefox", "firefox.exe"}:
+            return "firefox"
+        if b_low in {"brave", "brave.exe"}:
+            return "brave"
+        return b_low
+    if not isinstance(text, str) or not text.strip():
+        return None
+    low = text.lower()
+    if re.search(r"\b(?:google\s+)?chrome\b", low):
+        return "chrome"
+    if re.search(r"\b(?:microsoft\s+edge|msedge|edge)\b", low):
+        return "edge"
+    if re.search(r"\b(?:mozilla\s+)?firefox\b", low):
+        return "firefox"
+    if re.search(r"\bbrave\b", low):
+        return "brave"
+    return None
+
+
+def _strip_browser_directive(text: str) -> str:
+    cleaned = text.strip().strip("'\"")
+    cleaned = _BROWSER_DIRECTIVE_SUFFIX_RE.sub("", cleaned).strip()
+    cleaned = _LEADING_OPEN_VERB_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def normalize_launch_target(target: str | None) -> str:
+    """Normalize app names, aliases, domains, and URLs to a canonical lowercase target token.
+
+    Examples:
+        "YouTube", "https://www.youtube.com", "youtube.com", "https://youtu.be/abc" -> "youtube"
+        "Spotify", "https://open.spotify.com" -> "spotify"
+        "WhatsApp", "https://web.whatsapp.com" -> "whatsapp"
+        "Visual Studio Code", "code.exe" -> "vscode"
+    """
+    if not isinstance(target, str):
+        return ""
+    stripped = _strip_browser_directive(target)
+    if not stripped:
+        return ""
+
+    low = " ".join(stripped.lower().split())
+    if low in _APP_ALIASES:
+        return _APP_ALIASES[low]
+    if low in {"x", "twitter"}:
+        return "twitter"
+    if low in {"mail", "gmail"}:
+        return "gmail"
+
+    looks_like_url = low.startswith(("http://", "https://")) or (
+        "." in low
+        and " " not in low
+        and "\\" not in low
+        and not any(low.endswith(ext) for ext in _LOCAL_FILE_EXTENSIONS)
+    )
+    if looks_like_url:
+        try:
+            parsed = urllib.parse.urlsplit(stripped if "://" in stripped else f"https://{stripped}")
+            host = (parsed.hostname or "").lower().strip(".")
+        except Exception:
+            host = ""
+        if host:
+            if host == "mail.google.com":
+                return "gmail"
+            if host == "docs.google.com":
+                return "docs"
+            if host in {
+                "youtu.be",
+                "youtube.com",
+                "www.youtube.com",
+                "m.youtube.com",
+                "music.youtube.com",
+            }:
+                return "youtube"
+            if host in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
+                return "twitter"
+            for prefix in ("www.", "m.", "open.", "web.", "app."):
+                if host.startswith(prefix):
+                    host = host[len(prefix) :]
+                    break
+            parts = [p for p in host.split(".") if p]
+            if len(parts) >= 3 and parts[-2] in {"co", "com", "org", "net"} and len(parts[-1]) == 2:
+                stem = parts[-3]
+            elif len(parts) >= 2:
+                stem = parts[-2]
+            elif parts:
+                stem = parts[0]
+            else:
+                stem = low
+            return _APP_ALIASES.get(stem, stem)
+
+    if low.endswith(".exe"):
+        low = low[:-4].strip()
+    for suffix in (" app", " pwa", " desktop", " music"):
+        if low.endswith(suffix) and low != "github desktop":
+            base = low[: -len(suffix)].strip()
+            if base:
+                low = base
+                break
+    return _APP_ALIASES.get(low, low)
+
+
+normalize_app_or_url_target = normalize_launch_target
+
+
+def find_installed_service_app(
+    target: str,
+    catalog: list[dict[str, str]],
+) -> dict[str, str] | None:
+    """Strictly match a service/URL target against installed Start Menu / Store / PWA apps."""
+    norm = normalize_launch_target(target)
+    if not norm:
+        return None
+    expected_names = _SERVICE_CANONICAL_APP_NAMES.get(norm, (norm,))
+    for entry in catalog:
+        entry_name = entry.get("Name", "").strip().lower()
+        if entry_name in expected_names:
+            return entry
+    for entry in catalog:
+        entry_name = entry.get("Name", "").strip().lower()
+        if entry_name == "github desktop" and norm == "github":
+            continue
+        if normalize_launch_target(entry_name) == norm and any(
+            entry_name.startswith(exp) for exp in expected_names
+        ):
+            return entry
+    return None
+
+
+def has_installed_app(
+    target: str,
+    *,
+    which_fn: Callable[[str], str | None] = shutil.which,
+    env: dict[str, str] | None = None,
+    app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
+) -> bool:
+    """Return True if *target* resolves to an installed native, Store, or PWA app."""
+    norm = normalize_launch_target(target)
+    if not norm:
+        return False
+    try:
+        _resolve_spec_and_command(norm, which_fn=which_fn, env=env, require_executable=True)
+        return True
+    except ValueError:
+        pass
+    catalog = get_installed_apps(app_catalog_fetcher=app_catalog_fetcher)
+    return find_installed_service_app(norm, catalog) is not None
+
+
+def _resolve_service_fallback_url(raw_target: str, norm_target: str) -> str | None:
+    cleaned = _strip_browser_directive(raw_target)
+    low = cleaned.lower()
+    if low.startswith(("http://", "https://")):
+        return cleaned
+    if norm_target in _SITE_SHORTCUTS:
+        return _SITE_SHORTCUTS[norm_target]
+    if low in _SITE_SHORTCUTS:
+        return _SITE_SHORTCUTS[low]
+    if (
+        "." in cleaned
+        and " " not in cleaned
+        and "\\" not in cleaned
+        and not any(low.endswith(ext) for ext in _LOCAL_FILE_EXTENSIONS)
+    ):
+        return f"https://{cleaned}"
+    return None
+
+
+_ORIG_GET_INSTALLED_APPS = get_installed_apps
+
+
 def open_or_focus_app(
     app_name: str,
     target_path: str | None = None,
@@ -1255,14 +1519,73 @@ def open_or_focus_app(
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
     verify_timeout_s: float = 1.2,
+    prefer_browser: bool = False,
+    browser: str | None = None,
+    user_request: str | None = None,
 ) -> dict[str, Any]:
-    """Focus a running application window or launch an allowed desktop application.
+    """Focus a running application window or launch an installed desktop/Store/PWA app.
 
-    If a matching visible window is already open and no ``target_path`` is supplied,
-    restores the window if minimized and brings it to the foreground. Otherwise
-    launches the validated executable or Start Menu / UWP app with ``shell=False``.
+    Installed-App-First Policy:
+    Resolves and launches the installed native/Store/PWA application first. Only falls
+    back to opening a browser URL if (a) the caller/user explicitly requests the browser
+    or web version (e.g. ``prefer_browser=True``, ``browser='chrome'``, or
+    ``'open YouTube in Chrome'``), or (b) no installed app match exists on the machine
+    and the target corresponds to a known web service or URL.
     """
     resolved_target = _validate_target_path(target_path, env=env)
+    if not isinstance(app_name, str):
+        raise ValueError("app_name must be a non-empty string.")
+
+    raw_app_name = app_name
+    explicit_browser = bool(prefer_browser) or is_explicit_browser_request(
+        user_request or raw_app_name,
+        browser=browser,
+    )
+    chosen_browser = extract_explicit_browser(user_request or raw_app_name, browser=browser)
+
+    if explicit_browser and resolved_target is None:
+        clean_target = _strip_browser_directive(raw_app_name)
+        norm_target = normalize_launch_target(clean_target)
+        fallback_url = _resolve_service_fallback_url(clean_target, norm_target)
+        if fallback_url is not None:
+            url_res = open_url(
+                fallback_url,
+                browser=chosen_browser,
+                startfile_fn=startfile_fn,
+                popen_fn=popen_fn,
+                which_fn=which_fn,
+                env=env,
+                desktop_name_fn=desktop_name_fn,
+                prefer_browser=True,
+            )
+            return {
+                "ok": bool(url_res.get("ok", True)),
+                "status": "launched"
+                if url_res.get("ok", True)
+                else str(url_res.get("status") or "error"),
+                "app": norm_target or clean_target,
+                "window_title": None,
+                "hwnd": None,
+                "executable": url_res.get("browser") or "default",
+                "target_path": url_res.get("url", fallback_url),
+                "url": url_res.get("url", fallback_url),
+                "browser": url_res.get("browser") or "default",
+                "launched_app": False,
+                "normalized_target": norm_target,
+            }
+
+    original_url_candidate: str | None = None
+    stripped_raw = raw_app_name.strip()
+    if resolved_target is None and stripped_raw.lower().startswith(("http://", "https://")):
+        original_url_candidate = stripped_raw
+        norm_from_url = normalize_launch_target(stripped_raw)
+        if norm_from_url:
+            app_name = norm_from_url
+    elif resolved_target is None and _LEADING_OPEN_VERB_RE.match(stripped_raw):
+        cleaned_verb = _strip_browser_directive(stripped_raw)
+        if cleaned_verb:
+            app_name = cleaned_verb
+
     if resolved_target is None and isinstance(app_name, str):
         app_stripped = app_name.strip()
         app_norm = " ".join(app_stripped.lower().split())
@@ -1335,6 +1658,8 @@ def open_or_focus_app(
                 "hwnd": target_hwnd,
                 "executable": None,
                 "target_path": None,
+                "launched_app": True,
+                "normalized_target": normalize_launch_target(spec.canonical_name),
             }
             if (
                 verifier is not None
@@ -1377,6 +1702,8 @@ def open_or_focus_app(
                 "hwnd": None,
                 "executable": cmd[0],
                 "target_path": str(resolved_target) if resolved_target is not None else None,
+                "launched_app": True,
+                "normalized_target": normalize_launch_target(launched_spec.canonical_name),
             }
         except ValueError as exc:
             resolve_err = exc
@@ -1433,6 +1760,8 @@ def open_or_focus_app(
                     "hwnd": target_hwnd,
                     "executable": None,
                     "target_path": None,
+                    "launched_app": True,
+                    "normalized_target": normalize_launch_target(matched_name),
                 }
                 if (
                     verifier is not None
@@ -1464,7 +1793,42 @@ def open_or_focus_app(
             "hwnd": None,
             "executable": launch_cmd[0],
             "target_path": str(resolved_target) if resolved_target is not None else None,
+            "launched_app": True,
+            "normalized_target": normalize_launch_target(matched_name),
         }
+
+    # Browser URL fallback ONLY when no installed app exists on the machine
+    if resolved_target is None:
+        norm_fallback = normalize_launch_target(raw_app_name)
+        fallback_url = original_url_candidate or _resolve_service_fallback_url(
+            stripped, norm_fallback
+        )
+        if fallback_url is not None:
+            url_res = open_url(
+                fallback_url,
+                browser=chosen_browser,
+                startfile_fn=startfile_fn,
+                popen_fn=popen_fn,
+                which_fn=which_fn,
+                env=env,
+                desktop_name_fn=desktop_name_fn,
+                prefer_browser=True,
+            )
+            return {
+                "ok": bool(url_res.get("ok", True)),
+                "status": "launched"
+                if url_res.get("ok", True)
+                else str(url_res.get("status") or "error"),
+                "app": norm_fallback or stripped,
+                "window_title": None,
+                "hwnd": None,
+                "executable": url_res.get("browser") or "default",
+                "target_path": url_res.get("url", fallback_url),
+                "url": url_res.get("url", fallback_url),
+                "browser": url_res.get("browser") or "default",
+                "launched_app": False,
+                "normalized_target": norm_fallback,
+            }
 
     if resolve_err is not None:
         raise resolve_err
@@ -2290,12 +2654,19 @@ def open_url(
     browser: str | None = None,
     *,
     startfile_fn: Callable[[str], Any] | None = None,
-    popen_fn: Callable[..., Any] = subprocess.Popen,
+    popen_fn: Callable[..., Any] | None = None,
     which_fn: Callable[[str], str | None] = shutil.which,
     env: dict[str, str] | None = None,
     desktop_name_fn: Callable[[], str | None] | None = None,
+    app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
+    user32: Any = None,
+    kernel32: Any = None,
+    window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    prefer_browser: bool = False,
+    user_request: str | None = None,
 ) -> dict[str, Any]:
-    """Validate and open an http/https URL in the default or specified browser."""
+    """Validate and open an http/https URL, preferring installed apps unless browser requested."""
+    effective_popen = popen_fn if popen_fn is not None else subprocess.Popen
     if not isinstance(url, str):
         raise ValueError("url must be a string.")
     stripped = url.strip()
@@ -2347,6 +2718,59 @@ def open_url(
     if not parsed.netloc or any(ch.isspace() for ch in parsed.netloc):
         raise ValueError(f"Invalid URL: host/domain is required in {url!r}")
 
+    explicit_browser = bool(prefer_browser) or is_explicit_browser_request(
+        user_request, browser=browser
+    )
+    if explicit_browser and browser is None and user_request:
+        browser = extract_explicit_browser(user_request)
+
+    norm_target = normalize_launch_target(target_url)
+    is_root_service_url = (
+        (parsed.path or "").strip() in {"", "/", "/app"}
+        and not parsed.query
+        and not parsed.fragment
+    )
+    if (
+        not explicit_browser
+        and browser is None
+        and is_root_service_url
+        and norm_target
+        and norm_target not in {"chrome", "edge", "firefox", "brave"}
+    ):
+        catalog = get_installed_apps(app_catalog_fetcher=app_catalog_fetcher)
+        matched_app = find_installed_service_app(norm_target, catalog)
+        if matched_app is not None:
+            app_res = open_or_focus_app(
+                matched_app["Name"],
+                user32=user32,
+                kernel32=kernel32,
+                window_enumerator=window_enumerator,
+                which_fn=which_fn,
+                popen_fn=effective_popen,
+                env=env,
+                app_catalog_fetcher=lambda: catalog,
+                startfile_fn=startfile_fn,
+                desktop_name_fn=desktop_name_fn,
+            )
+            return {
+                "ok": bool(app_res.get("ok", True)),
+                "success": bool(app_res.get("ok", True)),
+                "status": str(app_res.get("status") or "launched"),
+                "app": app_res.get("app"),
+                "window_title": app_res.get("window_title"),
+                "hwnd": app_res.get("hwnd"),
+                "executable": app_res.get("executable"),
+                "target_path": app_res.get("target_path"),
+                "url": target_url,
+                "browser": None,
+                "launched_app": True,
+                "normalized_target": norm_target,
+                "message": (
+                    f"Opened installed app '{app_res.get('app')}' for '{norm_target}' "
+                    "(app-first policy)."
+                ),
+            }
+
     if browser is None:
         non_default = _check_interactive_desktop(desktop_name_fn)
         if non_default is not None:
@@ -2361,13 +2785,15 @@ def open_url(
                     f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
                 ),
             }
-        _open_via_shell(target_url, startfile_fn=startfile_fn, popen_fn=popen_fn)
+        _open_via_shell(target_url, startfile_fn=startfile_fn, popen_fn=effective_popen)
         return {
             "ok": True,
             "success": True,
             "url": target_url,
             "browser": "default",
             "status": "opened",
+            "launched_app": False,
+            "normalized_target": norm_target,
         }
 
     b_clean = browser.strip().lower()
@@ -2409,13 +2835,15 @@ def open_url(
             ),
         }
 
-    popen_fn([browser_exe, target_url], **_build_gui_popen_kwargs())
+    effective_popen([browser_exe, target_url], **_build_gui_popen_kwargs())
     return {
         "ok": True,
         "success": True,
         "url": target_url,
         "browser": b_clean,
         "status": "opened",
+        "launched_app": False,
+        "normalized_target": norm_target,
     }
 
 
@@ -2666,6 +3094,7 @@ def _move_window_snap_os(
     h: int,
     *,
     guard: PreconditionGuard | None = None,
+    work_area: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Restore/unmaximize target window and MoveWindow with DWM invisible-border compensation."""
     if isinstance(u32, ctypes.CDLL):
@@ -2682,6 +3111,26 @@ def _move_window_snap_os(
     if hasattr(u32, "MoveWindow"):
         il, it, ir, ib = _get_dwm_frame_insets_os(hwnd, u32)
         u32.MoveWindow(hwnd, x - il, y - it, w + il + ir, h + it + ib, True)
+        if not isinstance(u32, ctypes.CDLL):
+            try:
+                moved = getattr(u32, "_clea_last_moved_rects", None)
+                if not isinstance(moved, dict):
+                    moved = {}
+                    u32._clea_last_moved_rects = moved
+                moved[int(hwnd)] = (x, y, x + w, y + h)
+                if work_area is not None:
+                    wa_map = getattr(u32, "_clea_last_work_areas", None)
+                    if not isinstance(wa_map, dict):
+                        wa_map = {}
+                        u32._clea_last_work_areas = wa_map
+                    wa_map[int(hwnd)] = (
+                        int(work_area[0]),
+                        int(work_area[1]),
+                        int(work_area[2]),
+                        int(work_area[3]),
+                    )
+            except Exception:
+                pass
 
 
 def control_system(
@@ -2804,7 +3253,20 @@ def control_system(
             "step": st,
         }
 
-    # 2. Window actions
+    # 2. Deterministic Win32 window layout inspection
+    if normalized in ("inspect_window_layout", "inspect_layout", "layout"):
+        layout = inspect_window_layout(
+            user32=user32,
+            kernel32=kernel32,
+            focus_backend=focus_backend,
+        )
+        return {
+            "success": True,
+            "action": normalized,
+            **layout,
+        }
+
+    # 3. Window actions
     if normalized in (
         "minimize_window",
         "minimize",
@@ -2833,24 +3295,39 @@ def control_system(
             window_enumerator=window_enumerator,
         )
         u32 = _get_win32_user32(user32)
+        is_snap_action = normalized in (
+            "snap_left",
+            "snap_left_window",
+            "snap_right",
+            "snap_right_window",
+        )
+        inferred_focus_backend = focus_backend
+        if inferred_focus_backend is None and verifier is None:
+            candidate_backend = getattr(u32, "backend", None)
+            if isinstance(candidate_backend, FocusPreconditionBackend):
+                inferred_focus_backend = candidate_backend
+            elif is_snap_action and user32 is not None:
+                inferred_focus_backend = Win32FocusPreconditionBackend(user32=u32)
+
         should_verify = (
-            verifier is not None
-            or focus_backend is not None
+            is_snap_action
+            or verifier is not None
+            or inferred_focus_backend is not None
             or (user32 is None and window_enumerator is None)
         )
         active_verifier = (
             verifier
             if verifier is not None
-            else (ActionVerifier(focus_backend=focus_backend) if should_verify else None)
+            else (ActionVerifier(focus_backend=inferred_focus_backend) if should_verify else None)
         )
         active_focus_backend = (
-            focus_backend
-            if focus_backend is not None
+            inferred_focus_backend
+            if inferred_focus_backend is not None
             else (active_verifier._get_focus_backend() if active_verifier is not None else None)
         )
         resolved_title = _read_window_title_os(target_hwnd, u32, active_focus_backend)
 
-        if normalized in ("snap_left", "snap_left_window", "snap_right", "snap_right_window"):
+        if is_snap_action:
             is_left = normalized in ("snap_left", "snap_left_window")
             canon_snap = "snap_left" if is_left else "snap_right"
             snap_side = "left" if is_left else "right"
@@ -2880,7 +3357,16 @@ def control_system(
                         allow_minimized=True,
                     ) as guard:
                         guard.assert_ready("snap_restore")
-                        _move_window_snap_os(u32, target_hwnd, x, y, w, h, guard=guard)
+                        _move_window_snap_os(
+                            u32,
+                            target_hwnd,
+                            x,
+                            y,
+                            w,
+                            h,
+                            guard=guard,
+                            work_area=(left, top, right, bottom),
+                        )
                         guard.assert_ready("snap_focus")
                         if hasattr(u32, "SetForegroundWindow"):
                             _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
@@ -2893,7 +3379,9 @@ def control_system(
                         payload["window_title"] = resolved_title
                     return payload
             else:
-                _move_window_snap_os(u32, target_hwnd, x, y, w, h)
+                _move_window_snap_os(
+                    u32, target_hwnd, x, y, w, h, work_area=(left, top, right, bottom)
+                )
                 if hasattr(u32, "SetForegroundWindow"):
                     _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
 
@@ -2907,11 +3395,22 @@ def control_system(
             if resolved_title:
                 res_snap["window_title"] = resolved_title
             if active_verifier is not None:
-                res_snap["verification"] = active_verifier.verify_window_state(
+                outcome = active_verifier.verify_window_state(
                     target_hwnd,
                     expected_snap=snap_side,
                     timeout_s=verify_timeout_s,
-                ).to_dict()
+                )
+                if not outcome.verified and isinstance(u32, ctypes.CDLL):
+                    _move_window_snap_os(u32, target_hwnd, x, y, w, h)
+                    if hasattr(u32, "SetForegroundWindow"):
+                        _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
+                    outcome = active_verifier.verify_window_state(
+                        target_hwnd,
+                        expected_snap=snap_side,
+                        timeout_s=verify_timeout_s,
+                    )
+                res_snap["verification"] = outcome.to_dict()
+                res_snap["verified"] = outcome.verified
             return res_snap
 
         if normalized in ("minimize_window", "minimize"):
@@ -6125,16 +6624,24 @@ def register_windows_os_tools(
     registry.register(
         name="open_or_focus_app",
         description=(
-            "Focus an already-open Windows application window if visible, or safely launch a "
-            "known developer or desktop application (e.g., vscode, terminal, chrome, edge, "
-            "explorer, notepad, calculator, settings, taskmgr)."
+            "Focus an already-open Windows application window if visible, or launch the "
+            "installed native, Microsoft Store, or PWA app first (e.g., YouTube, Spotify, "
+            "WhatsApp, vscode, terminal, chrome, edge, explorer, notepad, calculator, "
+            "settings, taskmgr). Always prefer this tool over browser URLs for services "
+            "that may be installed as desktop/Store/PWA apps; only falls back to the "
+            "browser if no installed app exists or the user explicitly requests the browser "
+            "(e.g. 'open YouTube in Chrome')."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "app_name": {
                     "type": "string",
-                    "description": "Application name or alias (e.g., notepad, calculator, vscode).",
+                    "description": (
+                        "Application or service name/alias (e.g., youtube, spotify, whatsapp, "
+                        "notepad, calculator, vscode). Resolves installed native/Store/PWA apps "
+                        "first unless a browser/web request is explicitly stated."
+                    ),
                 },
                 "target_path": {
                     "type": "string",

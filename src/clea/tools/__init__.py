@@ -44,6 +44,8 @@ from clea.tools.registry import (
     requires_approval,
 )
 from clea.tools.system_controls import (
+    format_window_layout_summary,
+    inspect_window_layout,
     manage_window,
     register_system_control_tools,
     system_control,
@@ -77,7 +79,13 @@ from clea.tools.vision import (
     register_vision_tools,
     set_default_screen_vision_service,
 )
-from clea.tools.windows_os import register_windows_os_tools
+from clea.tools.windows_os import (
+    extract_explicit_browser,
+    has_installed_app,
+    is_explicit_browser_request,
+    normalize_launch_target,
+    register_windows_os_tools,
+)
 
 __all__ = [
     "ActionVerifier",
@@ -112,13 +120,19 @@ __all__ = [
     "WindowContext",
     "WindowInfo",
     "cancel_timer_or_reminder",
+    "extract_explicit_browser",
+    "format_window_layout_summary",
     "get_default_clipboard_service",
     "get_default_screen_vision_service",
     "get_default_timer_manager",
+    "has_installed_app",
     "inspect_screen",
+    "inspect_window_layout",
+    "is_explicit_browser_request",
     "list_timers_and_reminders",
     "manage_file",
     "manage_window",
+    "normalize_launch_target",
     "open_path_or_url",
     "parse_duration",
     "parse_when",

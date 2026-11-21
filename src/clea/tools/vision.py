@@ -40,6 +40,9 @@ from clea.tools.clipboard import (
     get_default_clipboard_service,
 )
 from clea.tools.registry import RiskLevel, ToolRegistry
+from clea.tools.system_controls import format_window_layout_summary, inspect_window_layout
+
+_ORIG_INSPECT_WINDOW_LAYOUT = inspect_window_layout
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +116,8 @@ class ScreenInspectionResult(BaseModel):
     uia_text: str | None = None
     text: str | None = None
     message: str | None = None
+    os_window_geometry: str | None = None
+    window_layout: dict[str, Any] | None = None
     attachment: dict[str, Any] | None = Field(default=None, exclude=True)
 
     def to_dict(self, include_attachment: bool = True) -> dict[str, Any]:
@@ -131,6 +136,10 @@ class ScreenInspectionResult(BaseModel):
             "text": self.text,
             "message": self.message,
         }
+        if self.os_window_geometry is not None:
+            res["os_window_geometry"] = self.os_window_geometry
+        if self.window_layout is not None:
+            res["window_layout"] = self.window_layout
         if include_attachment and self.attachment is not None:
             res["attachment"] = self.attachment
         return res
@@ -988,11 +997,81 @@ class ScreenVisionService:
         clipboard_service: ClipboardService | None = None,
         artifact_store: ArtifactStore | None = None,
         desktop_name_fn: Callable[[], str | None] | None = None,
+        layout_inspector: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._backend = backend or Win32ScreenVisionBackend()
         self._clipboard = clipboard_service
         self._artifact_store = artifact_store or ArtifactStore()
         self._desktop_name_fn = desktop_name_fn
+        self._layout_inspector = layout_inspector
+
+    def _collect_window_layout(
+        self,
+        target_window: WindowInfo | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Collect deterministic Win32 Z-order window geometry and concise summary."""
+        try:
+            layout: dict[str, Any] | None = None
+            if self._layout_inspector is not None:
+                layout = self._layout_inspector()
+            elif inspect_window_layout is not _ORIG_INSPECT_WINDOW_LAYOUT:
+                layout = inspect_window_layout()
+            elif isinstance(self._backend, Win32ScreenVisionBackend):
+                layout = inspect_window_layout(
+                    user32=self._backend._user32,
+                    dwmapi=self._backend._dwmapi,
+                    kernel32=self._backend._kernel32,
+                )
+            elif hasattr(self._backend, "inspect_window_layout") and callable(
+                self._backend.inspect_window_layout
+            ):
+                layout = self._backend.inspect_window_layout()
+            else:
+                raw_windows: list[dict[str, Any]] = []
+                seen_hwnds: set[int] = set()
+                ordered_candidates: list[WindowInfo] = []
+                fg = None
+                with contextlib.suppress(Exception):
+                    fg = self._backend.get_foreground_window()
+                if fg is not None:
+                    ordered_candidates.append(fg)
+                backend_windows = getattr(self._backend, "windows", None)
+                if isinstance(backend_windows, list):
+                    for candidate in backend_windows:
+                        if isinstance(candidate, WindowInfo):
+                            ordered_candidates.append(candidate)
+                if target_window is not None:
+                    ordered_candidates.append(target_window)
+                for item in ordered_candidates:
+                    if item.hwnd in seen_hwnds:
+                        continue
+                    with contextlib.suppress(Exception):
+                        if self._backend.is_minimized(item.hwnd):
+                            continue
+                    seen_hwnds.add(item.hwnd)
+                    bounds = item.bounds or (0, 0, 1280, 720)
+                    raw_windows.append(
+                        {
+                            "hwnd": item.hwnd,
+                            "title": item.title,
+                            "app_name": item.app_name or item.process_name,
+                            "process_name": item.process_name,
+                            "bounds": bounds,
+                            "is_maximized": False,
+                        }
+                    )
+                if raw_windows:
+                    layout = inspect_window_layout(windows=raw_windows)
+
+            if not isinstance(layout, dict):
+                return None, None
+            summary = layout.get("summary")
+            if not isinstance(summary, str) or not summary.strip():
+                summary = format_window_layout_summary(layout)
+            return layout, summary
+        except Exception as exc:
+            logger.debug("Collecting OS window geometry failed: %s", exc)
+            return None, None
 
     @property
     def backend(self) -> ScreenVisionBackend:
@@ -1094,6 +1173,7 @@ class ScreenVisionService:
             )
 
         uia_text = self._backend.probe_uia_text(win.hwnd)
+        window_layout, os_window_geometry = self._collect_window_layout(target_window=win)
 
         if include_image:
             try:
@@ -1114,6 +1194,8 @@ class ScreenVisionService:
                         f"for question: '{q_norm}'."
                     )
                 )
+                if os_window_geometry:
+                    msg = f"{msg}\n{os_window_geometry}"
                 return ScreenInspectionResult(
                     status="ok",
                     source=source,
@@ -1126,6 +1208,8 @@ class ScreenVisionService:
                     artifact_path=str(saved_path),
                     uia_text=uia_text or None,
                     message=msg,
+                    os_window_geometry=os_window_geometry,
+                    window_layout=window_layout,
                     attachment=attachment,
                 )
             except Exception as exc:
@@ -1138,6 +1222,8 @@ class ScreenVisionService:
                     question=q_norm,
                     uia_text=uia_text or None,
                     message=f"Failed capturing window pixels: {exc}",
+                    os_window_geometry=os_window_geometry,
+                    window_layout=window_layout,
                 )
 
         # include_image is False: text probe only
@@ -1146,6 +1232,8 @@ class ScreenVisionService:
             if not q_norm
             else f"Probed window '{win.title}' ({win.process_name}) text for question: '{q_norm}'."
         )
+        if os_window_geometry:
+            msg = f"{msg}\n{os_window_geometry}"
         return ScreenInspectionResult(
             status="ok",
             source=source,
@@ -1154,6 +1242,8 @@ class ScreenVisionService:
             question=q_norm,
             uia_text=uia_text or None,
             message=msg,
+            os_window_geometry=os_window_geometry,
+            window_layout=window_layout,
         )
 
     def _inspect_clipboard(
@@ -1352,7 +1442,10 @@ def register_vision_tools(
         description=(
             "Inspect the active screen or a specific background window, or inspect recently copied "
             "clipboard images/text. Automatically routes to clipboard if an image was copied "
-            "in the last 10 seconds, or targets the active foreground or named application window."
+            "in the last 10 seconds, or targets the active foreground or named application window. "
+            "Window inspections automatically attach deterministic [OS Window Geometry (Z-order)] "
+            "metadata (bounds, detected_slot, width_ratio, extends_behind_foreground) as ground "
+            "truth for window layout and split-screen verification."
         ),
         input_schema={
             "type": "object",

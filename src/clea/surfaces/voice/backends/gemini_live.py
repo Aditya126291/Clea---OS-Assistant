@@ -68,6 +68,8 @@ class GeminiLiveBackend(VoiceBackend):
         self._receive_task: asyncio.Task[None] | None = None
         self._closed = True
         self._reconnect_count = 0
+        self._last_assistant_transcript: tuple[str, bool] | None = None
+        self._turn_completed: bool = False
 
     @property
     def model_name(self) -> str:
@@ -234,6 +236,8 @@ class GeminiLiveBackend(VoiceBackend):
             return
         self._session_ctx = session_ctx
         self._session = session
+        self._last_assistant_transcript = None
+        self._turn_completed = False
         self._receive_task = asyncio.create_task(
             self._receive_loop(),
             name="GeminiLiveBackendReceiveLoop",
@@ -333,24 +337,38 @@ class GeminiLiveBackend(VoiceBackend):
         await self._open_session(self._config)
 
     async def _handle_server_message(self, msg: types.LiveServerMessage) -> None:
+        has_tool_call = bool(msg.tool_call is not None and msg.tool_call.function_calls)
+
         # 1. Content and audio
         if msg.server_content is not None:
             sc = msg.server_content
             if sc.interrupted:
+                self._last_assistant_transcript = None
+                self._turn_completed = False
                 await self._events_queue.put(InterruptedEvent())
 
-            if sc.model_turn is not None and sc.model_turn.parts:
+            emitted_part_texts: set[str] = set()
+            if not has_tool_call and sc.model_turn is not None and sc.model_turn.parts:
                 for part in sc.model_turn.parts:
                     if part.inline_data is not None and part.inline_data.data:
+                        self._turn_completed = False
                         await self._events_queue.put(
                             AudioOutputEvent(pcm_bytes=part.inline_data.data, sample_rate_hz=24000)
                         )
                     if part.text:
-                        await self._events_queue.put(
-                            TranscriptOutputEvent(role="assistant", text=part.text, final=False)
-                        )
+                        self._turn_completed = False
+                        norm_part_text = part.text.strip()
+                        key = (norm_part_text, False)
+                        if norm_part_text and key != self._last_assistant_transcript:
+                            self._last_assistant_transcript = key
+                            emitted_part_texts.add(norm_part_text)
+                            await self._events_queue.put(
+                                TranscriptOutputEvent(role="assistant", text=part.text, final=False)
+                            )
 
             if sc.input_transcription is not None and sc.input_transcription.text:
+                self._turn_completed = False
+                self._last_assistant_transcript = None
                 await self._events_queue.put(
                     TranscriptOutputEvent(
                         role="user",
@@ -359,20 +377,44 @@ class GeminiLiveBackend(VoiceBackend):
                     )
                 )
 
-            if sc.output_transcription is not None and sc.output_transcription.text:
-                await self._events_queue.put(
-                    TranscriptOutputEvent(
-                        role="assistant",
-                        text=sc.output_transcription.text,
-                        final=bool(sc.output_transcription.finished),
+            if (
+                not has_tool_call
+                and sc.output_transcription is not None
+                and sc.output_transcription.text
+            ):
+                self._turn_completed = False
+                out_text = sc.output_transcription.text
+                norm_out_text = out_text.strip()
+                out_final = bool(sc.output_transcription.finished)
+                out_key = (norm_out_text, out_final)
+                # Suppress duplicate assistant transcript when identical to model_turn part.text
+                # or an identical consecutive output_transcription frame in the same turn.
+                if (
+                    norm_out_text
+                    and out_key != self._last_assistant_transcript
+                    and not (not out_final and norm_out_text in emitted_part_texts)
+                ):
+                    self._last_assistant_transcript = out_key
+                    await self._events_queue.put(
+                        TranscriptOutputEvent(
+                            role="assistant",
+                            text=out_text,
+                            final=out_final,
+                        )
                     )
-                )
 
-            if sc.turn_complete or sc.interaction_status == types.InteractionStatus.IDLE:
-                await self._events_queue.put(TurnCompleteEvent())
+            if not has_tool_call and (
+                sc.turn_complete or sc.interaction_status == types.InteractionStatus.IDLE
+            ):
+                if not self._turn_completed:
+                    self._turn_completed = True
+                    self._last_assistant_transcript = None
+                    await self._events_queue.put(TurnCompleteEvent())
 
         # 2. Tool calls
-        if msg.tool_call is not None and msg.tool_call.function_calls:
+        if has_tool_call and msg.tool_call is not None:
+            self._turn_completed = False
+            self._last_assistant_transcript = None
             for fc in msg.tool_call.function_calls:
                 call_id = fc.id or ""
                 name = fc.name or ""

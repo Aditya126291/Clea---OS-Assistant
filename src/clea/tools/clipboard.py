@@ -1383,8 +1383,10 @@ def register_clipboard_tools(
         name="open_path_or_url",
         description=(
             "Open a saved local file (e.g., on Desktop or Documents, or the most recently saved "
-            "clipboard file) or an http/https URL (explicitly provided or extracted from the "
-            "clipboard) using Windows default application / browser."
+            "clipboard file) or an explicit http/https URL (provided or extracted from the "
+            "clipboard) using Windows default application / browser. For opening services that "
+            "may be installed as native/Store/PWA apps (e.g. YouTube, Spotify, WhatsApp), prefer "
+            "open_or_focus_app first unless the user explicitly asked for the browser/web URL."
         ),
         input_schema={
             "type": "object",

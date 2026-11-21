@@ -560,7 +560,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
             ? {
                 ...m,
                 streaming: false,
-                content: m.content || res.text || "",
+                content: res.text || m.content || "",
               }
             : m,
         ),
@@ -1167,18 +1167,37 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       case "transcript": {
         const entry = event.data;
         set((state) => {
-          const nextVoiceTranscripts = [...state.voiceTranscripts, entry].slice(-200);
+          const trimmedText = entry.text.trim();
+          const lastTranscript = state.voiceTranscripts[state.voiceTranscripts.length - 1];
+          const isDuplicateTranscript =
+            Boolean(lastTranscript) &&
+            lastTranscript.role === entry.role &&
+            lastTranscript.text.trim() === trimmedText &&
+            Boolean(lastTranscript.final) === Boolean(entry.final);
+          const nextVoiceTranscripts = isDuplicateTranscript
+            ? state.voiceTranscripts
+            : [...state.voiceTranscripts, entry].slice(-200);
           let nextHistory = state.voiceHistoryMessages;
-          if (entry.final && entry.text.trim()) {
-            nextHistory = [
-              ...state.voiceHistoryMessages,
-              {
-                role: entry.role,
-                text: entry.text,
-                timestamp: entry.timestamp || new Date().toISOString(),
-                call_id: state.activeCallId || undefined,
-              },
-            ];
+          if (entry.final && trimmedText) {
+            const currentCallId = state.activeCallId || undefined;
+            const lastHistory =
+              state.voiceHistoryMessages[state.voiceHistoryMessages.length - 1];
+            const isDuplicateHistory =
+              Boolean(lastHistory) &&
+              lastHistory.role === entry.role &&
+              lastHistory.text.trim() === trimmedText &&
+              lastHistory.call_id === currentCallId;
+            if (!isDuplicateHistory) {
+              nextHistory = [
+                ...state.voiceHistoryMessages,
+                {
+                  role: entry.role,
+                  text: entry.text,
+                  timestamp: entry.timestamp || new Date().toISOString(),
+                  call_id: currentCallId,
+                },
+              ];
+            }
           }
           return {
             voiceTranscripts: nextVoiceTranscripts,
@@ -1231,23 +1250,40 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
               }
             }
             if (d.assistant_message) {
-              const matched = d.request_id
-                ? nextMessages.some((m) => m.id === d.request_id)
+              const reqId = d.request_id || event.request_id || undefined;
+              const matched = reqId
+                ? nextMessages.some((m) => m.id === reqId)
                 : false;
               const hasStreaming = nextMessages.some(
                 (m) => m.role === "assistant" && m.streaming,
               );
+              const lastMsg = nextMessages[nextMessages.length - 1];
+              const isDuplicateLastAssistant =
+                Boolean(lastMsg) &&
+                lastMsg.role === "assistant" &&
+                (lastMsg.content.trim() === d.assistant_message.trim() ||
+                  (Boolean(reqId) && lastMsg.id === reqId));
               if (matched || hasStreaming) {
-                nextMessages = updateAssistantByRequest(nextMessages, d.request_id, (m) => ({
+                nextMessages = updateAssistantByRequest(nextMessages, reqId, (m) => ({
                   ...m,
                   content: d.assistant_message || m.content,
                   streaming: false,
                 }));
+              } else if (isDuplicateLastAssistant) {
+                nextMessages = nextMessages.map((m, idx) =>
+                  idx === nextMessages.length - 1
+                    ? {
+                        ...m,
+                        content: d.assistant_message || m.content,
+                        streaming: false,
+                      }
+                    : m,
+                );
               } else {
                 nextMessages = [
                   ...nextMessages,
                   {
-                    id: d.request_id || nextRequestId(),
+                    id: reqId || nextRequestId(),
                     role: "assistant",
                     content: d.assistant_message,
                     streaming: false,

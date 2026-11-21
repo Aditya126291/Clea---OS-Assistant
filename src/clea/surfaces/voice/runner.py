@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import importlib
 import inspect
 import json
 import logging
 import logging.handlers
 import math
+import re
 import sys
 import time
+import urllib.parse
 from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
@@ -198,6 +201,213 @@ def voice_log_path(data_dir: Path | None = None) -> Path:
     return (data_dir or default_data_dir()) / "logs" / "voice.log"
 
 
+_LAUNCH_APP_ALIASES: dict[str, str] = {
+    "vscode": "vscode",
+    "code": "vscode",
+    "vs code": "vscode",
+    "visual studio code": "vscode",
+    "terminal": "terminal",
+    "wt": "terminal",
+    "windows terminal": "terminal",
+    "windowsterminal": "terminal",
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "edge": "edge",
+    "msedge": "edge",
+    "microsoft edge": "edge",
+    "explorer": "explorer",
+    "file explorer": "explorer",
+    "cursor": "cursor",
+    "antigravity": "antigravity",
+    "google antigravity": "antigravity",
+    "notepad": "notepad",
+    "calculator": "calculator",
+    "calc": "calculator",
+    "settings": "settings",
+    "windows settings": "settings",
+    "ms-settings": "settings",
+    "taskmgr": "taskmgr",
+    "task manager": "taskmgr",
+    "youtu.be": "youtube",
+    "youtube": "youtube",
+    "spotify": "spotify",
+    "whatsapp": "whatsapp",
+    "github": "github",
+    "mail": "gmail",
+    "gmail": "gmail",
+    "mail.google.com": "gmail",
+    "docs": "docs",
+    "docs.google.com": "docs",
+    "twitter": "x",
+    "x": "x",
+    "x.com": "x",
+    "twitter.com": "x",
+    "chatgpt": "chatgpt",
+    "reddit": "reddit",
+    "wikipedia": "wikipedia",
+}
+
+_LOCAL_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".txt",
+        ".md",
+        ".json",
+        ".py",
+        ".log",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".bmp",
+        ".pdf",
+        ".csv",
+        ".html",
+        ".htm",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+    }
+)
+
+_HOST_PREFIX_LABELS: frozenset[str] = frozenset(
+    {"www", "m", "open", "web", "app", "play", "mobile", "desktop"}
+)
+
+_TLD_LABELS: frozenset[str] = frozenset(
+    {
+        "com",
+        "org",
+        "net",
+        "io",
+        "co",
+        "uk",
+        "in",
+        "edu",
+        "gov",
+        "ai",
+        "app",
+        "dev",
+        "tv",
+        "gg",
+        "me",
+        "us",
+        "de",
+        "fr",
+        "jp",
+    }
+)
+
+_BROWSER_EXPLICIT_RE = re.compile(
+    r"\b(?:in\s+(?:the\s+)?(?:browser|chrome|edge|firefox|brave|web)|"
+    r"web\s+version|browser\s+tab|website)\b",
+    re.IGNORECASE,
+)
+
+_WINDOW_LAYOUT_ACTIONS: frozenset[str] = frozenset(
+    {
+        "snap_left",
+        "snap_right",
+        "snap_left_window",
+        "snap_right_window",
+        "maximize_window",
+        "minimize_window",
+        "restore_window",
+        "close_window",
+        "maximize",
+        "minimize",
+        "restore",
+        "close",
+    }
+)
+
+
+def _is_local_file_target(raw: str | None) -> bool:
+    """Return True if *raw* refers to a local file/directory path rather than an app or URL."""
+    if not raw or not isinstance(raw, str):
+        return False
+    stripped = raw.strip().strip("'\"")
+    if not stripped or "://" in stripped:
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", stripped) or "\\" in stripped:
+        return True
+    suffix = Path(stripped).suffix.lower()
+    return suffix in _LOCAL_FILE_EXTENSIONS
+
+
+def normalize_launch_target(target: str | None) -> str:
+    """Normalize an app name, service shorthand, or URL to a canonical target key."""
+    if not target or not isinstance(target, str):
+        return ""
+    cleaned = " ".join(target.strip().strip("'\"").lower().split())
+    if not cleaned or _is_local_file_target(cleaned):
+        return ""
+
+    if cleaned.endswith(".exe"):
+        cleaned = cleaned[:-4].strip()
+
+    for suffix in (" desktop app", " web app", " pwa", " app"):
+        if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+
+    if cleaned in _LAUNCH_APP_ALIASES:
+        return _LAUNCH_APP_ALIASES[cleaned]
+
+    # Check if input is a URL or domain name
+    looks_like_url = "://" in cleaned or (
+        "." in cleaned and not any(ch.isspace() for ch in cleaned)
+    )
+    if looks_like_url:
+        candidate = cleaned if "://" in cleaned else f"https://{cleaned}"
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+            host = (parsed.hostname or "").lower().strip(".")
+        except Exception:
+            host = ""
+        if host:
+            if host in _LAUNCH_APP_ALIASES:
+                return _LAUNCH_APP_ALIASES[host]
+            labels = [lbl for lbl in host.split(".") if lbl]
+            while len(labels) > 1 and labels[0] in _HOST_PREFIX_LABELS:
+                labels.pop(0)
+            while len(labels) > 1 and labels[-1] in _TLD_LABELS:
+                labels.pop()
+            if labels:
+                brand = labels[-1]
+                return _LAUNCH_APP_ALIASES.get(brand, brand)
+
+    return _LAUNCH_APP_ALIASES.get(cleaned, cleaned)
+
+
+def _is_app_candidate_url(url: str, norm_target: str) -> bool:
+    """Return True if *url* is a shorthand or root URL eligible for app-first launch."""
+    if not norm_target:
+        return False
+    stripped = url.strip()
+    if "://" not in stripped and "/" not in stripped and "?" not in stripped:
+        return True
+    candidate = stripped if "://" in stripped else f"https://{stripped}"
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except Exception:
+        return False
+    path = (parsed.path or "").strip("/")
+    return not path and not parsed.query and not parsed.fragment
+
+
+def _is_browser_explicitly_requested(
+    context_text: str | None = None,
+    browser: str | None = None,
+) -> bool:
+    """Return True when the caller or user explicitly requested opening in a web browser."""
+    if browser and browser.strip():
+        return True
+    if context_text and _BROWSER_EXPLICIT_RE.search(context_text):
+        return True
+    return False
+
+
 class VoiceRunner:
     """Manages the full lifecycle of the voice surface."""
 
@@ -216,6 +426,7 @@ class VoiceRunner:
         on_event: Callable[[BaseEvent], None] | None = None,
         screen_service: ScreenCaptureService | None = None,
         screen_indicator: ScreenIndicator | None = None,
+        action_verifier: Any = None,
         debug_audio: bool = False,
         audio_init_retries: int = 8,
         audio_init_retry_delay: float = 1.5,
@@ -226,6 +437,8 @@ class VoiceRunner:
         self.daemon_url = daemon_url
         self.token = token
         self.debug_audio = debug_audio
+        self._action_verifier = action_verifier
+        self._turn_launched_targets: dict[str, dict[str, Any]] = {}
         self._audio_init_retries = max(1, audio_init_retries)
         self._audio_init_retry_delay = max(0.0, audio_init_retry_delay)
         self._daemon_retry_delay = max(0.05, daemon_retry_delay)
@@ -687,6 +900,7 @@ class VoiceRunner:
         self._call_state = "connecting"
         self._set_voice_state("thinking")
         self._transcript_history.clear()
+        self._turn_launched_targets.clear()
         self._first_audio_latency_ms = None
         logger.info("Starting call (call_id=%s, trigger=%s)...", self._call_id, trigger)
 
@@ -906,6 +1120,7 @@ class VoiceRunner:
             self._set_voice_state("idle")
         self._call_id = None
         self._transcript_history.clear()
+        self._turn_launched_targets.clear()
         if self._wake_word is not None:
             self._wake_word.reset()
 
@@ -1120,25 +1335,43 @@ class VoiceRunner:
                 elif isinstance(event, InterruptedEvent):
                     # Barge-in: flush output audio immediately
                     logger.debug("Barge-in: flushing audio buffer.")
+                    self._turn_launched_targets.clear()
                     if self._audio_manager is not None:
                         self._audio_manager.stop_output()
                     self._set_voice_state("listening")
                 elif isinstance(event, TurnCompleteEvent):
+                    self._turn_launched_targets.clear()
                     if self._transcript_history:
                         self._transcript_history[-1]["final"] = True
                     self._set_voice_state("listening")
                 elif isinstance(event, TranscriptOutputEvent):
                     if event.role == "user":
                         self._last_user_speech_time = time.monotonic()
+                        self._turn_launched_targets.clear()
                     ts_iso = datetime.now().astimezone().isoformat()
-                    self._transcript_history.append(
-                        {
-                            "role": event.role,
-                            "text": event.text,
-                            "final": event.final,
-                            "timestamp": ts_iso,
-                        }
-                    )
+                    norm_evt_text = event.text.strip()
+                    if (
+                        event.role == "assistant"
+                        and norm_evt_text
+                        and self._transcript_history
+                        and self._transcript_history[-1].get("role") == "assistant"
+                        and str(self._transcript_history[-1].get("text", "")).strip()
+                        == norm_evt_text
+                    ):
+                        prev_entry = self._transcript_history[-1]
+                        if bool(prev_entry.get("final")) == bool(event.final):
+                            continue
+                        prev_entry["final"] = bool(event.final)
+                        prev_entry["timestamp"] = ts_iso
+                    else:
+                        self._transcript_history.append(
+                            {
+                                "role": event.role,
+                                "text": event.text,
+                                "final": event.final,
+                                "timestamp": ts_iso,
+                            }
+                        )
                     self._emit_event(
                         TranscriptEvent(
                             data=TranscriptData(
@@ -1152,8 +1385,22 @@ class VoiceRunner:
                     )
                     logger.debug("[%s]: %s", event.role, event.text)
                 elif isinstance(event, ToolCallEvent):
+                    # Flush any speculative pre-tool speech audio and unfinalized pre-tool
+                    # assistant transcript so Clea never speaks an early confirmation before
+                    # tool execution completes and a second confirmation afterwards.
+                    if self._audio_manager is not None and (
+                        self._state == "speaking" or self._audio_manager.is_speaking
+                    ):
+                        self._audio_manager.stop_output()
+                    while (
+                        self._transcript_history
+                        and self._transcript_history[-1].get("role") == "assistant"
+                        and not self._transcript_history[-1].get("final")
+                    ):
+                        self._transcript_history.pop()
                     self._set_voice_state("thinking")
-                    await self._handle_tool_call(event, backend)
+                    tool_batch = self._drain_contiguous_tool_calls(backend, event)
+                    await self._execute_tool_call_batch(tool_batch, backend)
                 elif isinstance(event, ToolCallCancellationEvent):
                     for cid in event.call_ids:
                         fut = self._pending_tasks.pop(cid, None)
@@ -1207,6 +1454,194 @@ class VoiceRunner:
             await self.end_call(
                 reason=f"consumer_error: {exc}", error=f"Voice stream failed: {exc}"
             )
+
+    def reset_turn_state(self) -> None:
+        """Reset per-turn launch deduplication state."""
+        self._turn_launched_targets.clear()
+
+    def _drain_contiguous_tool_calls(
+        self,
+        backend: VoiceBackend,
+        first_event: ToolCallEvent,
+    ) -> list[ToolCallEvent]:
+        """Drain any immediately queued contiguous ToolCallEvents from the backend queue."""
+        batch: list[ToolCallEvent] = [first_event]
+        q: asyncio.Queue[Any] | None = getattr(backend, "_events_queue", None) or getattr(
+            backend, "event_queue", None
+        )
+        if q is None:
+            return batch
+        internal_deque = getattr(q, "_queue", None)
+        while internal_deque and isinstance(internal_deque[0], ToolCallEvent):
+            try:
+                nxt = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(nxt, ToolCallEvent):
+                batch.append(nxt)
+        if len(batch) > 1:
+            # If the same batch has both open_or_focus_app and open_url for the same target,
+            # prioritize open_or_focus_app first so the installed app launches and open_url dedupes.
+            app_targets = {
+                normalize_launch_target(str(ev.arguments.get("app_name") or ""))
+                for ev in batch
+                if ev.name == "open_or_focus_app"
+            } - {""}
+            if app_targets:
+                prioritized: list[ToolCallEvent] = []
+                deferred_urls: list[ToolCallEvent] = []
+                for ev in batch:
+                    if ev.name == "open_url":
+                        u_norm = normalize_launch_target(str(ev.arguments.get("url") or ""))
+                        if u_norm in app_targets and not _is_browser_explicitly_requested(
+                            str(ev.arguments.get("reason") or ""),
+                            str(ev.arguments.get("browser") or "") or None,
+                        ):
+                            deferred_urls.append(ev)
+                            continue
+                    prioritized.append(ev)
+                batch = prioritized + deferred_urls
+        return batch
+
+    async def _execute_tool_call_batch(
+        self,
+        batch: list[ToolCallEvent],
+        backend: VoiceBackend,
+    ) -> None:
+        """Execute a batch of tool calls and send all responses in a single backend call."""
+        if len(batch) <= 1:
+            for ev in batch:
+                await self._handle_tool_call(ev, backend)
+            return
+
+        collected: list[VoiceToolResponse] = []
+
+        class _BatchProxy(VoiceBackend):
+            backend_name = backend.backend_name
+
+            @property
+            def model_name(self) -> str:
+                return backend.model_name
+
+            async def connect(self, config: VoiceSessionConfig) -> None:
+                await backend.connect(config)
+
+            async def close(self) -> None:
+                await backend.close()
+
+            async def send_audio(self, pcm_bytes: bytes) -> None:
+                await backend.send_audio(pcm_bytes)
+
+            async def send_video_frame(
+                self, image_bytes: bytes, *, mime_type: str = "image/jpeg"
+            ) -> None:
+                await backend.send_video_frame(image_bytes, mime_type=mime_type)
+
+            async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
+                await backend.send_text(text, end_of_turn=end_of_turn)
+
+            async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
+                collected.extend(responses)
+
+            def events(self) -> AsyncIterator[Any]:
+                return backend.events()
+
+        proxy = _BatchProxy()
+        for ev in batch:
+            if ev.name == "end_call":
+                if collected:
+                    await backend.send_tool_responses(list(collected))
+                    collected.clear()
+                await self._handle_tool_call(ev, backend)
+                return
+            await self._handle_tool_call(ev, proxy)
+
+        if collected:
+            await backend.send_tool_responses(collected)
+
+    async def _verify_control_system_window_state(
+        self,
+        eff_action: str,
+        res: dict[str, Any],
+        fallback_hwnd: int | None,
+    ) -> None:
+        """Wait for ActionVerifier.verify_window_state to settle on window layout actions."""
+        if eff_action not in _WINDOW_LAYOUT_ACTIONS:
+            return
+        if isinstance(res.get("verification"), dict):
+            ver = res["verification"]
+            if ver.get("verified") is False and ver.get("outcome_kind") == "failed":
+                res["ok"] = False
+                res["success"] = False
+            return
+
+        verifier = self._action_verifier
+        if verifier is None:
+            try:
+                guards_mod = importlib.import_module("clea.tools.guards")
+                av_cls = getattr(guards_mod, "ActionVerifier", None)
+                if av_cls is not None:
+                    v_fn = getattr(av_cls, "verify_window_state", None)
+                    is_patched = (
+                        hasattr(av_cls, "_mock_name")
+                        or hasattr(v_fn, "_mock_name")
+                        or getattr(v_fn, "__qualname__", "") != "ActionVerifier.verify_window_state"
+                    )
+                    if is_patched:
+                        verifier = av_cls()
+            except Exception:
+                verifier = None
+
+        if verifier is None:
+            return
+
+        raw_hwnd = res.get("hwnd")
+        target_hwnd = (
+            int(raw_hwnd)
+            if isinstance(raw_hwnd, int) and not isinstance(raw_hwnd, bool)
+            else (int(fallback_hwnd) if fallback_hwnd is not None else 0)
+        )
+        expected_snap: str | None = None
+        expected_state: str | None = None
+        if eff_action in ("snap_left", "snap_left_window"):
+            expected_snap = "left"
+        elif eff_action in ("snap_right", "snap_right_window"):
+            expected_snap = "right"
+        elif eff_action in ("maximize", "maximize_window"):
+            expected_state = "maximized"
+        elif eff_action in ("minimize", "minimize_window"):
+            expected_state = "minimized"
+        elif eff_action in ("restore", "restore_window"):
+            expected_state = "restored"
+        elif eff_action in ("close", "close_window"):
+            expected_state = "closed"
+
+        verify_fn = getattr(verifier, "verify_window_state", None)
+        if not callable(verify_fn):
+            return
+
+        try:
+            call_res = verify_fn(
+                target_hwnd,
+                expected_state=expected_state,
+                expected_snap=expected_snap,
+            )
+            outcome = await call_res if inspect.isawaitable(call_res) else call_res
+            if hasattr(outcome, "to_dict"):
+                ver_dict = outcome.to_dict()
+            elif isinstance(outcome, dict):
+                ver_dict = dict(outcome)
+            else:
+                ver_dict = {"verified": bool(getattr(outcome, "verified", True))}
+            res["verification"] = ver_dict
+            if ver_dict.get("verified") is False and (
+                ver_dict.get("outcome_kind") == "failed"
+                or ver_dict.get("status") in ("failed", "timeout")
+            ):
+                res["ok"] = False
+                res["success"] = False
+        except Exception as exc:
+            logger.debug("Window state verification failed during control_system: %s", exc)
 
     async def _handle_tool_call(self, event: ToolCallEvent, backend: VoiceBackend) -> None:
         """Execute or delegate live voice tool call."""
@@ -1430,6 +1865,10 @@ class VoiceRunner:
                     payload["active_window_mime_type"] = active_res.mime_type
                     payload["active_window_width"] = active_res.width
                     payload["active_window_height"] = active_res.height
+                if getattr(res, "window_layout", None) is not None:
+                    payload["window_layout"] = res.window_layout
+                if getattr(res, "window_geometry_summary", None):
+                    payload["window_geometry_summary"] = res.window_geometry_summary
 
                 resp = VoiceToolResponse(
                     call_id=event.call_id,
@@ -2045,15 +2484,75 @@ class VoiceRunner:
             if not app_name:
                 await _send_error("app_name must not be empty.")
                 return
-            await _execute_rpc_tool(
-                OsOpenOrFocusAppRequest(
-                    params=OsOpenOrFocusAppParams(
-                        app_name=app_name,
-                        target_path=_req_str("target_path"),
-                    )
-                ),
-                error_prefix="Failed to open or focus app",
+            target_path = _req_str("target_path")
+            norm_target = normalize_launch_target(app_name) if target_path is None else ""
+            if norm_target and norm_target in self._turn_launched_targets:
+                prev = self._turn_launched_targets[norm_target]
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={
+                                "ok": True,
+                                "status": "deduplicated",
+                                "deduplicated": True,
+                                "app": prev.get("app") or norm_target,
+                                "target": norm_target,
+                                "message": (
+                                    f"Target '{norm_target}' was already launched or focused "
+                                    "in this turn; skipped duplicate launch."
+                                ),
+                            },
+                            is_error=False,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+
+            effective_app_name = (
+                norm_target
+                if (
+                    target_path is None
+                    and norm_target
+                    and ("://" in app_name or "." in app_name)
+                    and not app_name.lower().endswith(".exe")
+                )
+                else app_name
             )
+            try:
+                res = await self._rpc(
+                    OsOpenOrFocusAppRequest(
+                        params=OsOpenOrFocusAppParams(
+                            app_name=effective_app_name,
+                            target_path=target_path,
+                        )
+                    ),
+                    timeout=10.0,
+                )
+                if norm_target and res.get("ok", True) is not False and res.get("status") not in (
+                    "error",
+                    "not_found",
+                    "aborted_precondition",
+                ):
+                    self._turn_launched_targets[norm_target] = dict(res)
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to open or focus app: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
             return
 
         if event.name == "control_media_volume":
@@ -2197,15 +2696,70 @@ class VoiceRunner:
             return
 
         if event.name == "open_path_or_url":
-            await _execute_rpc_tool(
-                OsOpenPathOrUrlRequest(
-                    params=OsOpenPathOrUrlParams(
-                        target=_req_str("target"),
-                        use_clipboard=_parse_bool("use_clipboard", default=False),
-                    )
-                ),
-                error_prefix="Failed to open path or URL",
+            raw_target = _req_str("target")
+            use_clip = _parse_bool("use_clipboard", default=False)
+            norm_target = (
+                normalize_launch_target(raw_target)
+                if (raw_target and not use_clip and not _is_local_file_target(raw_target))
+                else ""
             )
+            if norm_target and norm_target in self._turn_launched_targets:
+                prev = self._turn_launched_targets[norm_target]
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={
+                                "ok": True,
+                                "status": "deduplicated",
+                                "deduplicated": True,
+                                "target": raw_target,
+                                "normalized_target": norm_target,
+                                "app": prev.get("app") or norm_target,
+                                "message": (
+                                    f"Target '{norm_target}' was already launched or focused "
+                                    "in this turn; skipped duplicate launch."
+                                ),
+                            },
+                            is_error=False,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+            try:
+                res = await self._rpc(
+                    OsOpenPathOrUrlRequest(
+                        params=OsOpenPathOrUrlParams(
+                            target=raw_target,
+                            use_clipboard=use_clip,
+                        )
+                    ),
+                    timeout=10.0,
+                )
+                if norm_target and res.get("ok", True) is not False and res.get("status") not in (
+                    "error",
+                    "not_found",
+                    "non_interactive_desktop",
+                ):
+                    self._turn_launched_targets[norm_target] = dict(res)
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to open path or URL: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
             return
 
         if event.name == "inspect_screen":
@@ -2383,15 +2937,107 @@ class VoiceRunner:
                 await _send_error("url must not be empty.")
                 return
             browser = _req_str("browser")
-            await _execute_rpc_tool(
-                OsOpenUrlRequest(
-                    params=OsOpenUrlParams(
-                        url=url,
-                        browser=browser,
+            norm_target = normalize_launch_target(url)
+            if norm_target and norm_target in self._turn_launched_targets:
+                prev = self._turn_launched_targets[norm_target]
+                await backend.send_tool_responses(
+                    [
+                        VoiceToolResponse(
+                            call_id=event.call_id,
+                            name=event.name,
+                            response={
+                                "ok": True,
+                                "status": "deduplicated",
+                                "deduplicated": True,
+                                "url": url,
+                                "target": norm_target,
+                                "app": prev.get("app") or norm_target,
+                                "message": (
+                                    f"Target '{norm_target}' was already launched or focused "
+                                    "in this turn; skipped duplicate URL launch."
+                                ),
+                            },
+                            is_error=False,
+                            scheduling="when_idle",
+                        )
+                    ]
+                )
+                return
+
+            browser_explicit = _is_browser_explicitly_requested(
+                _req_str("reason") or _req_str("context"),
+                browser,
+            ) or _parse_bool("prefer_browser", default=False)
+
+            # Installed-App-First Policy: when no browser is explicitly requested and the URL
+            # is a service/app target, resolve and launch the installed app first, falling back
+            # to the browser URL only if no installed app match exists.
+            if not browser_explicit and _is_app_candidate_url(url, norm_target):
+                try:
+                    app_res = await self._rpc(
+                        OsOpenOrFocusAppRequest(
+                            params=OsOpenOrFocusAppParams(
+                                app_name=norm_target,
+                                target_path=None,
+                            )
+                        ),
+                        timeout=10.0,
                     )
-                ),
-                error_prefix="Failed to open URL",
-            )
+                    if (
+                        isinstance(app_res, dict)
+                        and app_res.get("ok", True) is not False
+                        and app_res.get("status") in ("launched", "focused", "opened")
+                    ):
+                        enriched = dict(app_res)
+                        enriched.setdefault("url", url)
+                        enriched.setdefault("resolved_via", "installed_app")
+                        self._turn_launched_targets[norm_target] = enriched
+                        await backend.send_tool_responses(
+                            [
+                                VoiceToolResponse(
+                                    call_id=event.call_id,
+                                    name=event.name,
+                                    response=enriched,
+                                    is_error=False,
+                                    scheduling="when_idle",
+                                )
+                            ]
+                        )
+                        return
+                except Exception:
+                    pass
+
+            try:
+                res = await self._rpc(
+                    OsOpenUrlRequest(
+                        params=OsOpenUrlParams(
+                            url=url,
+                            browser=browser,
+                        )
+                    ),
+                    timeout=10.0,
+                )
+                if norm_target and res.get("ok", True) is not False and res.get("status") not in (
+                    "error",
+                    "non_interactive_desktop",
+                ):
+                    self._turn_launched_targets[norm_target] = dict(res)
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to open URL: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
             return
 
         if event.name == "control_system":
@@ -2436,26 +3082,52 @@ class VoiceRunner:
                     await _send_error("hwnd must be an integer.")
                     return
 
-            await _execute_rpc_tool(
-                OsControlSystemRequest(
-                    params=OsControlSystemParams(
-                        action=action,
-                        level=level,
-                        step=step,
-                        window_action=_req_str("window_action"),
-                        window_title=(
-                            _req_str("window_title")
-                            or _req_str("title")
-                            or _req_str("title_query")
-                        ),
-                        hwnd=hwnd,
-                        app_name=_req_str("app_name"),
-                        page=_req_str("page"),
-                        uri=_req_str("uri"),
-                    )
-                ),
-                error_prefix="Failed to control system",
+            window_action = _req_str("window_action")
+            eff_action = (
+                window_action.lower()
+                if action in ("window", "window_action") and window_action
+                else action
             )
+            try:
+                res = await self._rpc(
+                    OsControlSystemRequest(
+                        params=OsControlSystemParams(
+                            action=action,
+                            level=level,
+                            step=step,
+                            window_action=window_action,
+                            window_title=(
+                                _req_str("window_title")
+                                or _req_str("title")
+                                or _req_str("title_query")
+                            ),
+                            hwnd=hwnd,
+                            app_name=_req_str("app_name"),
+                            page=_req_str("page"),
+                            uri=_req_str("uri"),
+                        )
+                    ),
+                    timeout=15.0,
+                )
+                if isinstance(res, dict):
+                    res = dict(res)
+                    await self._verify_control_system_window_state(eff_action, res, hwnd)
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response=res,
+                    is_error=False,
+                    scheduling="when_idle",
+                )
+            except Exception as exc:
+                tool_resp = VoiceToolResponse(
+                    call_id=event.call_id,
+                    name=event.name,
+                    response={"error": f"Failed to control system: {exc}"},
+                    is_error=True,
+                    scheduling="when_idle",
+                )
+            await backend.send_tool_responses([tool_resp])
             return
 
         if event.name == "write_clipboard":

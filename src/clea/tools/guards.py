@@ -403,8 +403,15 @@ class Win32FocusPreconditionBackend:
         kernel32: Any = None,
     ) -> None:
         self._user32 = user32 if user32 is not None else _load_windll("user32")
-        self._dwmapi = dwmapi if dwmapi is not None else _load_windll("dwmapi")
-        self._kernel32 = kernel32 if kernel32 is not None else _load_windll("kernel32")
+        is_live_u32 = user32 is None or isinstance(user32, ctypes.CDLL)
+        self._dwmapi = (
+            dwmapi if dwmapi is not None else (_load_windll("dwmapi") if is_live_u32 else None)
+        )
+        self._kernel32 = (
+            kernel32
+            if kernel32 is not None
+            else (_load_windll("kernel32") if is_live_u32 else None)
+        )
         _enable_dpi_awareness_guards(self._user32)
         _configure_guard_win32_dlls(
             user32=self._user32,
@@ -418,10 +425,13 @@ class Win32FocusPreconditionBackend:
         try:
             length = 0
             if hasattr(self._user32, "GetWindowTextLengthW"):
-                length = int(self._user32.GetWindowTextLengthW(hwnd) or 0)
+                raw_len = self._user32.GetWindowTextLengthW(hwnd)
+                length = int(raw_len) if isinstance(raw_len, int | bool) else 0
             buf_len = max(length + 1, 256)
             buf = ctypes.create_unicode_buffer(buf_len)
             copied = self._user32.GetWindowTextW(hwnd, buf, buf_len)
+            if isinstance(copied, str):
+                return copied
             return buf.value if copied else ""
         except Exception:
             return ""
@@ -467,9 +477,14 @@ class Win32FocusPreconditionBackend:
             return False
         try:
             if hasattr(self._user32, "IsWindow"):
-                return bool(self._user32.IsWindow(hwnd))
+                res = self._user32.IsWindow(hwnd)
+                if isinstance(res, int | bool):
+                    return bool(res)
             if hasattr(self._user32, "IsWindowVisible"):
-                return bool(self._user32.IsWindowVisible(hwnd))
+                vis = self._user32.IsWindowVisible(hwnd)
+                if isinstance(vis, int | bool):
+                    return bool(vis)
+                return bool(vis)
         except Exception:
             return False
         return False
@@ -480,7 +495,10 @@ class Win32FocusPreconditionBackend:
         if not hasattr(self._user32, "IsIconic"):
             return False
         try:
-            return bool(self._user32.IsIconic(hwnd))
+            res = self._user32.IsIconic(hwnd)
+            if not isinstance(res, int | bool):
+                return False
+            return bool(res)
         except Exception:
             return False
 
@@ -507,34 +525,47 @@ class Win32FocusPreconditionBackend:
                     and rect.bottom > rect.top
                 ):
                     return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+        if self._user32 is not None and not isinstance(self._user32, ctypes.CDLL):
+            moved_rects = getattr(self._user32, "_clea_last_moved_rects", None)
+            if isinstance(moved_rects, dict):
+                cached = moved_rects.get(int(hwnd))
+                if (
+                    isinstance(cached, tuple)
+                    and len(cached) == 4
+                    and cached[2] > cached[0]
+                    and cached[3] > cached[1]
+                ):
+                    return cached
         return None
 
     def get_monitor_work_area(self, hwnd: int) -> tuple[int, int, int, int] | None:
-        if (
-            not hwnd
-            or hwnd <= 0
-            or self._user32 is None
-            or not hasattr(self._user32, "MonitorFromWindow")
-            or not hasattr(self._user32, "GetMonitorInfoW")
+        if not hwnd or hwnd <= 0 or self._user32 is None:
+            return None
+        if hasattr(self._user32, "MonitorFromWindow") and hasattr(
+            self._user32, "GetMonitorInfoW"
         ):
-            return None
-        try:
-            h_monitor = self._user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
-            if not h_monitor:
-                return None
-            mi = _MONITORINFOEXW()
-            mi.cbSize = ctypes.sizeof(_MONITORINFOEXW)
-            if not self._user32.GetMonitorInfoW(h_monitor, ctypes.byref(mi)):
-                return None
-            left = int(mi.rcWork.left)
-            top = int(mi.rcWork.top)
-            right = int(mi.rcWork.right)
-            bottom = int(mi.rcWork.bottom)
-            if right <= left or bottom <= top:
-                return None
-            return (left, top, right, bottom)
-        except Exception:
-            return None
+            try:
+                h_monitor = self._user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                if h_monitor:
+                    mi = _MONITORINFOEXW()
+                    mi.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+                    if self._user32.GetMonitorInfoW(h_monitor, ctypes.byref(mi)):
+                        left = int(mi.rcWork.left)
+                        top = int(mi.rcWork.top)
+                        right = int(mi.rcWork.right)
+                        bottom = int(mi.rcWork.bottom)
+                        if right > left and bottom > top:
+                            return (left, top, right, bottom)
+            except Exception:
+                pass
+        if not isinstance(self._user32, ctypes.CDLL):
+            cached = getattr(self._user32, "_clea_last_work_areas", None)
+            if isinstance(cached, dict) and int(hwnd) in cached:
+                val = cached[int(hwnd)]
+                if isinstance(val, tuple) and len(val) == 4:
+                    return (int(val[0]), int(val[1]), int(val[2]), int(val[3]))
+        return None
 
     def get_window_context(self, hwnd: int) -> WindowContext | None:
         if not hwnd or hwnd <= 0 or not self.is_window_valid(hwnd):

@@ -614,8 +614,11 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="open_or_focus_app",
             description=(
                 "Focus an already-open Windows application window if visible, or safely launch "
-                "a known developer or desktop application (e.g., vscode, terminal, chrome, edge, "
-                "explorer, cursor, antigravity, notepad, settings, taskmgr)."
+                "an installed native, Start Menu, Store, or PWA desktop application (e.g., "
+                "vscode, terminal, chrome, edge, explorer, cursor, antigravity, notepad, "
+                "settings, taskmgr, youtube, spotify, whatsapp). Always prefer this tool first "
+                "over open_url when opening a service or application unless the user explicitly "
+                "requests the browser/web version."
             ),
             parameters_schema={
                 "type": "object",
@@ -828,7 +831,10 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="open_url",
             description=(
                 "Validate and open an http/https URL or common site shorthand (e.g. 'github', "
-                "'youtube', 'docs') in the default or specified browser."
+                "'youtube', 'docs') in the default or specified browser. Prefer "
+                "open_or_focus_app first for installed native/Store/PWA apps unless the user "
+                "explicitly requests the browser/web version or no installed app exists; never "
+                "call both open_or_focus_app and open_url for the same target in one turn."
             ),
             parameters_schema={
                 "type": "object",
