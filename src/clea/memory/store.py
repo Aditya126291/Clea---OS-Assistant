@@ -28,6 +28,7 @@ from clea.memory.database import (
     MemoryDatabase,
     MemoryFactRecord,
     is_secret_or_sensitive,
+    is_synthetic_episodic_session,
 )
 from clea.memory.retrieval import (
     WEIGHT_EPISODE,
@@ -301,8 +302,10 @@ class MemoryStore:
         summary: str = "",
         topics: str = "",
         updated_at: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Index or update an episodic session summary in the SQLite FTS5 store."""
+        if is_synthetic_episodic_session(session_id):
+            return None
         self.ensure_initialized()
         return self.memory_db.upsert_episodic_session(
             session_id=session_id,
@@ -747,6 +750,8 @@ class MemoryStore:
         dt: datetime,
     ) -> None:
         """Mirror an episode summary into the SQLite FTS5 episodic_sessions table."""
+        if is_synthetic_episodic_session(session_id):
+            return
         try:
             surface: Literal["chat", "voice"] = (
                 "voice" if session_id == VOICE_COMPANION_SESSION_ID else "chat"

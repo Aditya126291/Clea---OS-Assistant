@@ -13,6 +13,7 @@ from clea.memory.database import (
     MemoryDatabase,
     MemoryFactRecord,
     SurfaceType,
+    is_synthetic_episodic_session,
 )
 from clea.memory.facts import FactBankReconciler, ReconciliationResult
 from clea.memory.retrieval import STOPWORDS
@@ -20,6 +21,15 @@ from clea.memory.working import WORKING_SUMMARY_PREFIX, WorkingMemoryManager
 
 if TYPE_CHECKING:
     from clea.providers.base import LLMProvider, Message
+
+EPISODIC_SUMMARY_SYSTEM_PROMPT = (
+    "You are Clea's episodic session summarizer. Summarize the completed session concisely for "
+    "future recall. STRICT GROUNDING: Summarize ONLY facts, actions, and topics literally "
+    "stated in the transcript. NEVER infer, speculate, or invent unmentioned topics, entities, "
+    "or details to fill gaps. If the session is trivial or too short, write a single literal "
+    "sentence describing only what was actually said (or return empty if no meaningful exchange "
+    "occurred)."
+)
 
 
 def _extract_message_fields(msg: Message | dict[str, Any]) -> tuple[str, str, list[str]]:
@@ -179,7 +189,7 @@ class ThreeTierMemoryBank:
         summary: str = "",
         topics: str | Sequence[str] = "",
         updated_at: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         return self.db.upsert_episodic_session(
             session_id=session_id,
             surface=surface,
@@ -200,7 +210,9 @@ class ThreeTierMemoryBank:
         started_at: str = "",
         ended_at: str = "",
         fallback_title: str = "",
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        if is_synthetic_episodic_session(session_id):
+            return None
         title, summary, topics = build_extractive_session_summary(
             messages, fallback_title=fallback_title
         )

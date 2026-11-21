@@ -39,6 +39,13 @@ FactStatus = Literal["active", "superseded", "deleted"]
 FactOperation = Literal["add", "update", "delete", "noop"]
 SurfaceType = Literal["chat", "voice"]
 
+SYNTHETIC_EPISODIC_SESSION_IDS: frozenset[str] = frozenset({"voice_companion"})
+
+
+def is_synthetic_episodic_session(session_id: str | None) -> bool:
+    """Return True if session_id is a synthetic UI container that must not be indexed."""
+    return (session_id or "").strip().lower() in SYNTHETIC_EPISODIC_SESSION_IDS
+
 _CATEGORY_ALIASES: dict[str, FactCategory] = {
     "preference": "preference",
     "preferences": "preference",
@@ -337,11 +344,14 @@ class MemoryDatabase:
         summary: str = "",
         topics: str | Sequence[str] = "",
         updated_at: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Insert or update an episodic session summary using ON CONFLICT DO UPDATE."""
         sid = (session_id or "").strip()
         if not sid:
             raise ValueError("session_id cannot be empty.")
+        if is_synthetic_episodic_session(sid):
+            logger.debug("Skipping episodic indexing for synthetic session '%s'", sid)
+            return None
 
         self._ensure_ready()
         resolved_surface = _normalize_surface(surface)

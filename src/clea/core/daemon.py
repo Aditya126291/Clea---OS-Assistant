@@ -86,7 +86,7 @@ from clea.core.protocol import (
 )
 from clea.core.sessions import Session, SessionManager
 from clea.memory.consolidation import ConsolidationManager
-from clea.memory.database import normalize_fact_category
+from clea.memory.database import is_synthetic_episodic_session, normalize_fact_category
 from clea.memory.facts import FactBankReconciler
 from clea.memory.store import FIXED_SECTIONS, VOICE_COMPANION_SESSION_ID, MemoryStore
 from clea.memory.three_tier import build_extractive_session_summary
@@ -519,12 +519,12 @@ class CleaDaemon:
             await self._server.wait_closed()
             self._server = None
         for sid, sess in list(self.sessions._sessions.items()):
-            if sess.messages:
+            if sess.messages and not is_synthetic_episodic_session(sid):
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(
                         self._index_session_episodic,
                         sid,
-                        surface="voice" if sid == VOICE_COMPANION_SESSION_ID else "chat",
+                        surface="chat",
                     )
         self._idle_tasks.clear()
         self._consolidation_tasks.clear()
@@ -1043,7 +1043,7 @@ class CleaDaemon:
             call_id=call_id,
             entries=cleaned,
         )
-        if persisted:
+        if persisted and not is_synthetic_episodic_session(call_id):
             with contextlib.suppress(Exception):
                 voice_msgs = [
                     {"role": role, "text": text, "timestamp": dt.isoformat()}
@@ -1071,7 +1071,7 @@ class CleaDaemon:
     ) -> dict[str, Any] | None:
         """Index or update a session summary in Tier 2 episodic FTS5."""
         sid = (session_id or "").strip()
-        if not sid:
+        if not sid or sid == VOICE_COMPANION_SESSION_ID or is_synthetic_episodic_session(sid):
             return None
 
         resolved_messages: Sequence[Any] | None = messages

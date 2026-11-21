@@ -930,7 +930,11 @@ def index_voice_call_episode(
 ) -> dict[str, Any] | None:
     """Index a completed voice call transcript into Tier 2 episodic SQLite FTS5 storage."""
     clean_call_id = (call_id or "").strip()
-    if not clean_call_id or db_or_store is None:
+    if (
+        not clean_call_id
+        or clean_call_id.lower() == _VOICE_COMPANION_SESSION_ID
+        or db_or_store is None
+    ):
         return None
 
     normalized = normalize_voice_transcript(entries)

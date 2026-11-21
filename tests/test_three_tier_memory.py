@@ -7,6 +7,7 @@ import contextlib
 import json
 import sqlite3
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -33,15 +34,19 @@ from clea.core.protocol import (
 )
 from clea.core.sessions import Session
 from clea.memory import (
+    EPISODIC_SUMMARY_SYSTEM_PROMPT,
     FactBankReconciler,
     MemoryDatabase,
     MemoryStore,
     ThreeTierMemoryBank,
     WorkingMemoryManager,
+    is_synthetic_episodic_session,
     sanitize_fts5_query,
 )
+from clea.memory.consolidation import CONSOLIDATION_SYSTEM_PROMPT
 from clea.memory.database import is_secret_or_sensitive
 from clea.memory.facts import parse_explicit_fact_commands
+from clea.memory.store import VOICE_COMPANION_SESSION_ID
 from clea.memory.working import WORKING_SUMMARY_PREFIX, WORKING_SUMMARY_SYSTEM_PROMPT
 from clea.providers.base import LLMProvider, Message, StreamChunk, ToolCall
 from clea.surfaces.voice.audio import AudioManager
@@ -1530,3 +1535,191 @@ async def test_chat_and_voice_fact_bank_parity(tmp_path: Path) -> None:
     finally:
         await daemon.stop()
         store.close()
+
+
+def test_skip_indexing_synthetic_voice_companion_session(tmp_path: Path) -> None:
+    """Synthetic voice_companion container must never be indexed into episodic_sessions / FTS5."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.ensure_initialized()
+    bank = ThreeTierMemoryBank(db=store.memory_db)
+
+    assert is_synthetic_episodic_session(VOICE_COMPANION_SESSION_ID) is True
+    assert is_synthetic_episodic_session("  Voice_Companion ") is True
+    assert is_synthetic_episodic_session("call-voice-101") is False
+
+    sample_entries = [
+        {
+            "role": "user",
+            "text": "Let us review the quarterly roadmap over voice.",
+            "timestamp": "2026-11-21T10:00:00+00:00",
+        },
+        {
+            "role": "assistant",
+            "text": "Sure, we can go over the quarterly roadmap milestones.",
+            "timestamp": "2026-11-21T10:00:05+00:00",
+        },
+    ]
+
+    try:
+        # 1. Direct DB upsert, facade upsert/index, store index/append_episode, voice hook & daemon
+        assert (
+            store.memory_db.upsert_episodic_session(
+                session_id=VOICE_COMPANION_SESSION_ID,
+                surface="voice",
+                title="Voice Companion",
+                summary="Smushed unrelated calls about quarterly roadmap.",
+                topics="quarterly roadmap",
+            )
+            is None
+        )
+        assert (
+            bank.upsert_episodic_session(
+                session_id="VOICE_COMPANION",
+                surface="voice",
+                title="Voice Companion",
+                summary="Another attempt to index voice companion.",
+                topics="roadmap",
+            )
+            is None
+        )
+        assert (
+            bank.index_session_messages(
+                session_id=VOICE_COMPANION_SESSION_ID,
+                messages=sample_entries,
+                surface="voice",
+            )
+            is None
+        )
+        assert (
+            store.index_episodic_session(
+                session_id=VOICE_COMPANION_SESSION_ID,
+                surface="voice",
+                title="Voice Companion",
+                summary="Store attempt to index voice companion.",
+                topics="roadmap",
+            )
+            is None
+        )
+        # Markdown episode still persists for legacy compatibility, but SQLite stays empty
+        ep_path = store.append_episode(
+            session_id=VOICE_COMPANION_SESSION_ID,
+            summary="Companion summary that must not enter SQLite episodic index.",
+        )
+        assert ep_path.exists()
+
+        assert (
+            index_voice_call_episode(
+                db_or_store=store,
+                call_id=VOICE_COMPANION_SESSION_ID,
+                entries=sample_entries,
+            )
+            is None
+        )
+
+        # Daemon _index_session_episodic also skips voice_companion cleanly
+        registry = ToolRegistry(audit_logger=AuditLogger(tmp_path / "logs" / "audit.jsonl"))
+        daemon = build_daemon(
+            host="127.0.0.1",
+            port=0,
+            provider=_FakeAgentProvider(),
+            memory=store,
+            registry=registry,
+        )
+        assert (
+            daemon._index_session_episodic(
+                VOICE_COMPANION_SESSION_ID,
+                surface="voice",
+                messages=sample_entries,
+            )
+            is None
+        )
+
+        # Verify ZERO rows in both episodic_sessions and episodic_sessions_fts
+        with sqlite3.connect(str(store.db_path)) as conn:
+            base_count = conn.execute("SELECT COUNT(*) FROM episodic_sessions").fetchone()[0]
+            fts_count = conn.execute("SELECT COUNT(*) FROM episodic_sessions_fts").fetchone()[0]
+        assert base_count == 0
+        assert fts_count == 0
+
+        # 2. Companion UI log stays completely intact
+        now_dt = datetime(2026, 11, 21, 10, 5, 0, tzinfo=UTC)
+        assert store.append_voice_companion_call(
+            call_id="call-voice-101",
+            entries=[
+                ("user", "Check Docker Compose healthchecks", now_dt),
+                ("assistant", "I checked the Docker Compose healthchecks.", now_dt),
+            ],
+        )
+        tail = store.get_voice_companion_tail(max_turns=10)
+        assert len(tail) == 2
+        assert tail[0]["call_id"] == "call-voice-101"
+
+        # 3. Normal per-call voice session and chat session still index & search cleanly
+        voice_indexed = index_voice_call_episode(
+            db_or_store=store,
+            call_id="call-voice-101",
+            entries=[
+                {
+                    "role": "user",
+                    "text": "Check Docker Compose healthchecks for the API container.",
+                    "timestamp": "2026-11-21T10:05:00+00:00",
+                },
+                {
+                    "role": "assistant",
+                    "text": "Verified Docker Compose healthchecks for the API container.",
+                    "timestamp": "2026-11-21T10:05:05+00:00",
+                },
+            ],
+        )
+        assert voice_indexed is not None
+        assert voice_indexed["session_id"] == "call-voice-101"
+        assert voice_indexed["surface"] == "voice"
+
+        chat_indexed = store.index_episodic_session(
+            session_id="chat-session-202",
+            surface="chat",
+            title="SQLite WAL Tuning",
+            summary="Configured SQLite WAL mode and busy_timeout for local memory bank.",
+            topics="sqlite, wal, memory",
+        )
+        assert chat_indexed is not None
+        assert chat_indexed["session_id"] == "chat-session-202"
+
+        voice_hits = store.search_episodic_memory("Docker Compose healthchecks", limit=5)
+        assert len(voice_hits) == 1
+        assert voice_hits[0]["session_id"] == "call-voice-101"
+        assert voice_hits[0]["surface"] == "voice"
+
+        chat_hits = store.search_episodic_memory("SQLite WAL busy_timeout", limit=5)
+        assert len(chat_hits) == 1
+        assert chat_hits[0]["session_id"] == "chat-session-202"
+        assert chat_hits[0]["surface"] == "chat"
+
+        with sqlite3.connect(str(store.db_path)) as conn:
+            indexed_ids = {
+                row[0] for row in conn.execute("SELECT session_id FROM episodic_sessions")
+            }
+        assert indexed_ids == {"call-voice-101", "chat-session-202"}
+        assert VOICE_COMPANION_SESSION_ID not in indexed_ids
+    finally:
+        store.close()
+
+
+def test_summarizer_prompts_enforce_literal_grounding() -> None:
+    """Working, episodic, and consolidation prompts must require strict literal-only grounding."""
+    prompts = {
+        "working": WORKING_SUMMARY_SYSTEM_PROMPT,
+        "episodic": EPISODIC_SUMMARY_SYSTEM_PROMPT,
+        "consolidation": CONSOLIDATION_SYSTEM_PROMPT,
+    }
+    for name, prompt in prompts.items():
+        lowered = " ".join(prompt.lower().split())
+        assert "literally stated" in lowered, f"{name} prompt missing literal-only requirement"
+        assert "never infer" in lowered, f"{name} prompt missing anti-inference constraint"
+        assert "invent" in lowered and "unmentioned topics" in lowered, (
+            f"{name} prompt missing anti-hallucination constraint"
+        )
+        assert "single literal sentence" in lowered, (
+            f"{name} prompt missing short/trivial session rule"
+        )
+        assert "empty" in lowered, f"{name} prompt missing empty-output guidance for trivial turns"

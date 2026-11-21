@@ -17,7 +17,12 @@ WORKING_SUMMARY_PREFIX = "[Session Working Summary]"
 WORKING_SUMMARY_SYSTEM_PROMPT = (
     "You are Clea's working-memory compactor. Summarize the older conversation turns "
     "into a concise, factual working summary preserving key user goals, decisions, file paths, "
-    "tool outcomes, and unresolved items. Output plain bullet points only (no preamble)."
+    "tool outcomes, and unresolved items. Output plain bullet points only (no preamble). "
+    "STRICT GROUNDING: Summarize ONLY facts, actions, and topics literally stated in the "
+    "provided transcript or prior summary. NEVER infer, speculate, extrapolate, or invent "
+    "unmentioned topics or details to fill gaps. If the turns are trivial or too short with "
+    "no meaningful exchange, write a single literal sentence describing only what was actually "
+    "said (or return an empty response)."
 )
 
 
@@ -178,8 +183,9 @@ class WorkingMemoryManager:
         if transcript_block:
             prompt_parts.append(f"Older Turns to Merge & Summarize:\n{transcript_block}")
         prompt_parts.append(
-            "Produce an updated, concise bullet-point working summary capturing "
-            "all durable context needed for continuing this session."
+            "Produce an updated, concise bullet-point working summary grounded strictly "
+            "in facts, actions, and topics literally stated in the provided turns (do not "
+            "infer or invent unmentioned topics)."
         )
         prompt = "\n\n".join(prompt_parts)
 
