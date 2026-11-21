@@ -25,6 +25,16 @@ TranscriptRole = Literal["user", "assistant"]
 ScreenCaptureTarget = Literal["active_window", "full_screen"]
 VoiceTrigger = Literal["manual", "wake_word", "hotkey", "ui"]
 UiView = Literal["chat", "voice", "activity", "memory", "settings"]
+FactCategory = Literal[
+    "preference",
+    "environment",
+    "project",
+    "workflow",
+    "identity",
+    "constraint",
+]
+FactStatus = Literal["active", "superseded", "deleted"]
+FactOperation = Literal["add", "update", "delete", "noop"]
 MediaVolumeAction = Literal[
     "mute",
     "unmute",
@@ -199,6 +209,30 @@ class MemoryAddFactParams(_Model):
 
 class MemoryDeleteFactParams(_Model):
     query_or_id: str
+
+
+class MemorySearchEpisodicParams(_Model):
+    query: str
+    limit: int = Field(default=5, ge=1, le=50)
+    surface: Literal["chat", "voice"] | None = None
+
+
+class MemoryManageFactParams(_Model):
+    action: Literal["add", "update", "delete"]
+    fact_text: str | None = None
+    category: str | None = None
+    fact_key: str | None = None
+    fact_id: str | None = None
+    query: str | None = None
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0)
+    source_surface: Literal["chat", "voice"] = "chat"
+    source_session_id: str = ""
+
+
+class MemoryListFactsParams(_Model):
+    status: FactStatus | None = "active"
+    category: str | None = None
+    limit: int = Field(default=25, ge=1, le=200)
 
 
 class ActivityListParams(_Model):
@@ -640,6 +674,21 @@ class MemoryDeleteFactRequest(_Request):
     params: MemoryDeleteFactParams
 
 
+class MemorySearchEpisodicRequest(_Request):
+    method: Literal["memory.search_episodic"] = "memory.search_episodic"
+    params: MemorySearchEpisodicParams
+
+
+class MemoryManageFactRequest(_Request):
+    method: Literal["memory.manage_fact"] = "memory.manage_fact"
+    params: MemoryManageFactParams
+
+
+class MemoryListFactsRequest(_Request):
+    method: Literal["memory.list_facts"] = "memory.list_facts"
+    params: MemoryListFactsParams = Field(default_factory=MemoryListFactsParams)
+
+
 class ActivityListRequest(_Request):
     method: Literal["activity.list"] = "activity.list"
     params: ActivityListParams = Field(default_factory=ActivityListParams)
@@ -786,6 +835,9 @@ RequestFrame = Annotated[
     | ChatDeleteRequest
     | MemoryAddFactRequest
     | MemoryDeleteFactRequest
+    | MemorySearchEpisodicRequest
+    | MemoryManageFactRequest
+    | MemoryListFactsRequest
     | ActivityListRequest
     | ActivityCancelRequest
     | OsOpenOrFocusAppRequest
@@ -1278,6 +1330,48 @@ class MemoryDeleteFactResult(_Model):
     removed_ids: list[str] = Field(default_factory=list)
 
 
+class EpisodicSessionHit(_Model):
+    session_id: str
+    surface: Literal["chat", "voice"] = "chat"
+    timestamp: str = ""
+    title: str = ""
+    summary: str = ""
+    topics: str = ""
+    snippet: str = ""
+    score: float = 0.0
+
+
+class MemorySearchEpisodicResult(_Model):
+    results: list[EpisodicSessionHit] = Field(default_factory=list)
+
+
+class MemoryBankFactItem(_Model):
+    id: str
+    category: FactCategory
+    fact_key: str
+    fact_text: str
+    confidence: float = 0.9
+    source_surface: Literal["chat", "voice"] = "chat"
+    source_session_id: str = ""
+    status: FactStatus = "active"
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class MemoryManageFactResult(_Model):
+    ok: bool = True
+    operation: FactOperation
+    fact: MemoryBankFactItem | None = None
+    superseded_id: str | None = None
+    affected_ids: list[str] = Field(default_factory=list)
+    message: str = ""
+
+
+class MemoryListFactsResult(_Model):
+    facts: list[MemoryBankFactItem] = Field(default_factory=list)
+    total: int = 0
+
+
 class ActivityListResult(_Model):
     tasks: list[TaskStatusData] = Field(default_factory=list)
 
@@ -1650,6 +1744,9 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "chat.delete": ChatDeleteResult,
     "memory.add_fact": MemoryAddFactResult,
     "memory.delete_fact": MemoryDeleteFactResult,
+    "memory.search_episodic": MemorySearchEpisodicResult,
+    "memory.manage_fact": MemoryManageFactResult,
+    "memory.list_facts": MemoryListFactsResult,
     "activity.list": ActivityListResult,
     "activity.cancel": ActivityCancelResult,
     "os.open_or_focus_app": OsOpenOrFocusAppResult,

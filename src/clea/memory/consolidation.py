@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from clea.memory.database import normalize_fact_category
 from clea.memory.store import (
     FIXED_SECTIONS,
     VOICE_COMPANION_SESSION_ID,
@@ -27,6 +28,7 @@ from clea.memory.store import (
     _atomic_replace_file,
     is_secret_or_sensitive,
 )
+from clea.memory.three_tier import build_extractive_session_summary
 from clea.providers.base import LLMProvider, Message
 
 logger = logging.getLogger(__name__)
@@ -933,6 +935,28 @@ class ConsolidationManager:
                 summary=parsed_output.summary,
                 trivial=False,
             )
+            try:
+                ep_title, _, ep_topics = build_extractive_session_summary(
+                    target_messages,
+                    fallback_title=str(transcript.get("title") or ""),
+                )
+                ep_surface = "voice" if (is_vc or transcript.get("is_voice_call")) else "chat"
+                self.memory.memory_db.upsert_episodic_session(
+                    session_id=session_id,
+                    surface=ep_surface,
+                    started_at=str(transcript.get("started_at") or ""),
+                    ended_at=str(transcript.get("updated_at") or ""),
+                    title=ep_title,
+                    summary=parsed_output.summary,
+                    topics=ep_topics,
+                )
+            except Exception as db_ep_err:
+                logger.debug("Skipping SQLite episodic sync for %s: %s", session_id, db_ep_err)
+
+            id_to_text: dict[str, str] = {}
+            for entries in self.memory.parse_sections().values():
+                for entry in entries:
+                    id_to_text[entry.id] = entry.text
 
             # 2. Apply operations with safety rules
             for op in parsed_output.operations:
@@ -963,6 +987,38 @@ class ConsolidationManager:
                         )
                 except Exception as op_err:
                     logger.warning("Could not apply memory operation (%s): %s", op, op_err)
+                    continue
+
+                try:
+                    fact_surface = (
+                        "voice" if (is_vc or transcript.get("is_voice_call")) else "chat"
+                    )
+                    fact_cat = normalize_fact_category(op.target_section)
+                    target_id = op.entry_id.strip("[]") if op.entry_id else None
+                    if op.op in ("remove", "delete"):
+                        self.memory.memory_db.manage_fact(
+                            "delete",
+                            fact_id=target_id,
+                            query=op.text,
+                            source_surface=fact_surface,
+                            source_session_id=session_id,
+                        )
+                    else:
+                        old_text = id_to_text.get(target_id) if target_id else None
+                        db_action: Literal["add", "update"] = (
+                            "update" if op.op == "update" else "add"
+                        )
+                        self.memory.memory_db.manage_fact(
+                            db_action,
+                            fact_text=op.text,
+                            category=fact_cat,
+                            fact_id=target_id,
+                            query=old_text or op.text,
+                            source_surface=fact_surface,
+                            source_session_id=session_id,
+                        )
+                except Exception as db_op_err:
+                    logger.debug("Skipping SQLite fact sync (%s): %s", op, db_op_err)
 
             # 2b. Backfill Layer 3 semantic embeddings for newly consolidated episodes & facts
             try:

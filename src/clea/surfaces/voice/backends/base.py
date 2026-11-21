@@ -277,6 +277,40 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             behavior="non_blocking",
         ),
         VoiceToolDeclaration(
+            name="search_episodic_memory",
+            description=(
+                "Search past chat and voice session summaries and topics via SQLite FTS5 BM25 "
+                "retrieval. Use this to recall earlier conversations, decisions, or topics across "
+                "chat and voice history."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Keywords or topic phrase to search across past session summaries."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": (
+                            "Maximum number of matching session summaries to return (default 5)."
+                        ),
+                    },
+                    "surface": {
+                        "type": "string",
+                        "enum": ["chat", "voice"],
+                        "description": "Optional surface filter ('chat' or 'voice').",
+                    },
+                },
+                "required": ["query"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
             name="post_to_active_chat",
             description=(
                 "Write a clean assistant message (such as code, shell commands, or a structured "
@@ -472,6 +506,62 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     }
                 },
                 "required": ["query_or_id"],
+            },
+            behavior="non_blocking",
+        ),
+        VoiceToolDeclaration(
+            name="manage_memory",
+            description=(
+                "Add, update (supersede), delete, or list durable stateful facts in Clea's "
+                "3-tier memory bank (preferences, environment, projects, workflows, identity, "
+                "and constraints)."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "update", "delete", "list"],
+                        "description": "Operation to perform on the structured memory bank.",
+                    },
+                    "fact_text": {
+                        "type": "string",
+                        "description": "Concise durable fact text for 'add' or 'update'.",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "preference",
+                            "environment",
+                            "project",
+                            "workflow",
+                            "identity",
+                            "constraint",
+                        ],
+                        "description": "Optional canonical fact category.",
+                    },
+                    "fact_key": {
+                        "type": "string",
+                        "description": "Optional stable snake_case key slug for the fact.",
+                    },
+                    "fact_id": {
+                        "type": "string",
+                        "description": "Target fact ID for 'update' or 'delete'.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Search phrase to match existing fact(s) for 'update' or 'delete'."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum number of facts to return when action is 'list'.",
+                    },
+                },
+                "required": ["action"],
             },
             behavior="non_blocking",
         ),

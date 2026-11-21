@@ -16,7 +16,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from clea.core.protocol import (
+_SRC_DIR = str(Path(__file__).resolve().parents[1] / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+from clea.core.protocol import (  # noqa: E402
     METHOD_RESULTS,
     ActivityCancelRequest,
     ActivityListRequest,
@@ -59,21 +63,29 @@ from clea.core.protocol import (
     ConversationUpdatedData,
     ConversationUpdatedEvent,
     DevEmitSampleTaskRequest,
+    EpisodicSessionHit,
     ErrorEvent,
     EventFrame,
+    FactCategory,
+    FactOperation,
+    FactStatus,
     GitCommitItem,
     GitWorktreeItem,
     HealthPingRequest,
     MediaVolumeAction,
     MemoryAddFactRequest,
     MemoryArchiveRequest,
+    MemoryBankFactItem,
     MemoryDeleteFactRequest,
     MemoryEpisodesRequest,
     MemoryFactsRequest,
     MemoryForgetRequest,
     MemoryGetDailyRequest,
     MemoryGetRequest,
+    MemoryListFactsRequest,
+    MemoryManageFactRequest,
     MemoryReconsolidateRequest,
+    MemorySearchEpisodicRequest,
     MemorySearchHit,
     MemoryStatusRequest,
     MemoryUpdatedData,
@@ -181,6 +193,9 @@ def build_json_schema() -> dict[str, Any]:
         voice_trigger: VoiceTrigger
         ui_view: UiView
         media_volume_action: MediaVolumeAction
+        fact_category: FactCategory
+        fact_status: FactStatus
+        fact_operation: FactOperation
         # Keep individual members explicit so json2ts always emits named interfaces
         health_ping_request: HealthPingRequest
         session_new_request: SessionNewRequest
@@ -232,6 +247,11 @@ def build_json_schema() -> dict[str, Any]:
         chat_delete_request: ChatDeleteRequest
         memory_add_fact_request: MemoryAddFactRequest
         memory_delete_fact_request: MemoryDeleteFactRequest
+        memory_search_episodic_request: MemorySearchEpisodicRequest
+        memory_manage_fact_request: MemoryManageFactRequest
+        memory_list_facts_request: MemoryListFactsRequest
+        episodic_session_hit: EpisodicSessionHit
+        memory_bank_fact_item: MemoryBankFactItem
         activity_list_request: ActivityListRequest
         activity_cancel_request: ActivityCancelRequest
         os_open_or_focus_app_request: OsOpenOrFocusAppRequest

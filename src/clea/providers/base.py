@@ -31,6 +31,9 @@ class Message(BaseModel):
     thought_signature: str | None = None
     image_bytes: bytes | None = Field(default=None, exclude=True)
     image_mime_type: str | None = Field(default=None, exclude=True)
+    turn_index: int | None = Field(default=None, exclude=True)
+    artifact_ttl_turns: int | None = Field(default=None, exclude=True)
+    artifact_expired: bool = Field(default=False, exclude=True)
 
 
 class TokenUsage(BaseModel):

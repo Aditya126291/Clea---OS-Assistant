@@ -13,6 +13,7 @@ never delayed or crashed.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Sequence
@@ -27,6 +28,8 @@ from clea.core.protocol import (
     BaseRequest,
     MemoryEpisodesRequest,
     MemoryGetRequest,
+    MemoryListFactsParams,
+    MemoryListFactsRequest,
     ResponseFrame,
     TranscriptsGetParams,
     TranscriptsGetRequest,
@@ -72,24 +75,28 @@ BASE_VOICE_SYSTEM_INSTRUCTION = (
     "of guessing the application name visually from dark-mode pixels. Only state visual details "
     "you can actually read in the latest screenshot.\n"
     "  2. Memory / Past Conversation Recall Intent (`list_conversations`, `search_conversations`, "
-    "`read_conversation`, `search_memory`, & Memory Context):\n"
+    "`read_conversation`, `search_memory`, `search_episodic_memory`, & Memory Context):\n"
     "     * Trigger whenever the user asks about past conversations, earlier decisions, "
     "previous chats, stored facts, or project history—even if they describe the topic vaguely "
-    "without exact keywords. Check your injected Memory Context (long-term memory, Recent "
-    "Episodes, Recent Voice Companion History) and use the 3-layer hybrid recall tools:\n"
+    "without exact keywords. Check your injected Memory Context (long-term memory, Active "
+    "Memory Facts, Recent Episodes, Recent Voice Companion History) and use the recall tools:\n"
     "       - `list_conversations` for recency questions (e.g., 'what was the chat before "
     "this?').\n"
+    "       - `search_episodic_memory(query, limit?, surface?)` for fast SQLite FTS5 search "
+    "across past `chat` and `voice` session summaries and topics when recalling earlier "
+    "conversations, decisions, or surface-specific history.\n"
     "       - `search_conversations` immediately with concise topic keywords (retrying with "
     "broader/alternate keywords if needed) to find past threads lexically or semantically.\n"
     "       - `read_conversation` to inspect full chronological turns from a matching thread.\n"
-    "       - `search_memory` to recall Durable Facts and Episode summaries on demand.\n"
+    "       - `search_memory` to recall Durable Facts and Episode summaries on demand, or "
+    "`manage_memory(action='list', category?)` to list active stateful facts.\n"
     "     * HARD NEGATIVE RULE: NEVER call `look_at_screen` or `watch_screen` for memory or "
     "past-chat questions, and NEVER tell the user to open or focus a chat on screen in order "
     "to read its history.\n"
     "  3. Clea App, Chat Output & Task Action Intent (`post_to_active_chat`, `navigate_ui`, "
-    "`create_chat`, `send_chat_message`, `rename_chat`, `delete_chat`, `save_memory_fact`, "
-    "`delete_memory_fact`, `inspect_activity`, `cancel_task`, `open_command_palette`, "
-    "`delegate_task`, `end_call`):\n"
+    "`create_chat`, `send_chat_message`, `rename_chat`, `delete_chat`, `manage_memory`, "
+    "`save_memory_fact`, `delete_memory_fact`, `inspect_activity`, `cancel_task`, "
+    "`open_command_palette`, `delegate_task`, `end_call`):\n"
     "     * When the user explicitly asks to send, drop, paste, write, save, or summarize "
     "output into their open Clea chat, route directly to `post_to_active_chat` rather than "
     "checking the screen first. Never call `post_to_active_chat` unprompted.\n"
@@ -112,6 +119,11 @@ BASE_VOICE_SYSTEM_INSTRUCTION = (
     "`delete_chat(conversation_id, confirmed)`: rename or delete a saved chat "
     "(`voice_companion` is protected and cannot be deleted). CRITICAL: ALWAYS ask the user for "
     "explicit verbal confirmation before calling `delete_chat(..., confirmed=True)`.\n"
+    "       - `manage_memory(action, fact_text?, category?, fact_key?, fact_id?, query?, "
+    "limit?)`: store, update (supersede), delete, or list durable stateful user facts, "
+    "preferences, constraints, or environment/setup details in the 3-tier memory bank "
+    "(categories: `preference`, `environment`, `project`, `workflow`, `identity`, "
+    "`constraint`).\n"
     "       - `save_memory_fact(fact, category?)` and `delete_memory_fact(query_or_id)`: save "
     "or remove Durable Facts in long-term Memory.\n"
     "       - `inspect_activity(limit?)`, `cancel_task(task_id)`, and "
@@ -611,6 +623,29 @@ async def load_voice_memory_context(
     except Exception as exc:  # noqa: BLE001
         logger.debug("Skipping optional Voice Companion tail for voice context: %s", exc)
 
+    if "## Active Memory Facts" not in content:
+        try:
+            facts_result = await _run_request(
+                MemoryListFactsRequest(params=MemoryListFactsParams(limit=25, status="active")),
+                request_fn=request_fn,
+                daemon_url=daemon_url,
+                token=token,
+                data_dir=data_dir,
+            )
+            facts = facts_result.get("facts") or []
+            if isinstance(facts, list) and facts:
+                fact_lines: list[str] = ["## Active Memory Facts"]
+                for fact in facts:
+                    if isinstance(fact, dict):
+                        category = str(fact.get("category") or "preference").strip()
+                        fact_text = str(fact.get("fact_text") or "").strip()
+                        if fact_text:
+                            fact_lines.append(f"- [{category}] {fact_text}")
+                if len(fact_lines) > 1:
+                    parts.append("\n".join(fact_lines))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skipping optional active memory facts for voice context: %s", exc)
+
     target_chat_id = active_conversation_id
     if target_chat_id and target_chat_id != _VOICE_COMPANION_SESSION_ID:
         try:
@@ -882,3 +917,54 @@ async def safe_consolidate_voice_call(
             exc,
         )
         return False
+
+
+def index_voice_call_episode(
+    *,
+    db_or_store: Any,
+    call_id: str,
+    entries: Sequence[dict[str, Any]],
+    title: str | None = None,
+    summary: str | None = None,
+    topics: str | None = None,
+) -> dict[str, Any] | None:
+    """Index a completed voice call transcript into Tier 2 episodic SQLite FTS5 storage."""
+    clean_call_id = (call_id or "").strip()
+    if not clean_call_id or db_or_store is None:
+        return None
+
+    normalized = normalize_voice_transcript(entries)
+    if not normalized:
+        return None
+
+    resolved_title = (title or "").strip()
+    resolved_summary = (summary or "").strip()
+    resolved_topics = (topics or "").strip()
+    if not (resolved_title and resolved_summary and resolved_topics):
+        three_tier = importlib.import_module("clea.memory.three_tier")
+        default_title, default_summary, default_topics = (
+            three_tier.build_extractive_session_summary(
+                normalized,
+                fallback_title=resolved_title,
+            )
+        )
+        resolved_title = resolved_title or default_title
+        resolved_summary = resolved_summary or default_summary
+        resolved_topics = resolved_topics or default_topics
+
+    kwargs = {
+        "session_id": clean_call_id,
+        "surface": "voice",
+        "started_at": normalized[0]["timestamp"],
+        "ended_at": normalized[-1]["timestamp"],
+        "title": resolved_title,
+        "summary": resolved_summary,
+        "topics": resolved_topics,
+    }
+    upsert_fn = getattr(db_or_store, "upsert_episodic_session", None)
+    if callable(upsert_fn):
+        return upsert_fn(**kwargs)  # type: ignore[no-any-return]
+    index_fn = getattr(db_or_store, "index_episodic_session", None)
+    if callable(index_fn):
+        return index_fn(**kwargs)  # type: ignore[no-any-return]
+    raise TypeError("db_or_store must expose upsert_episodic_session or index_episodic_session.")

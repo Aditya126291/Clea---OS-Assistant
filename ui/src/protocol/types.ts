@@ -59,6 +59,7 @@ import type {
   MemoryAddFactResult,
   MemoryArchiveItem,
   MemoryArchiveResult,
+  MemoryBankFactItem,
   MemoryDeleteFactParams,
   MemoryDeleteFactResult,
   MemoryEpisodesParams,
@@ -70,11 +71,21 @@ import type {
   MemoryForgetResult,
   MemoryGetDailyResult,
   MemoryGetResult,
+  MemoryListFactsParams,
+  MemoryListFactsResult,
+  MemoryManageFactParams,
+  MemoryManageFactResult,
   MemoryReconsolidateParams,
   MemoryReconsolidateResult,
+  MemorySearchEpisodicParams,
+  MemorySearchEpisodicResult,
   MemorySectionItem,
   MemoryStatusResult,
   MemoryUpdatedData,
+  EpisodicSessionHit,
+  FactCategory,
+  FactOperation,
+  FactStatus,
   PermissionTierInfo,
   Request,
   ResponseFrame,
@@ -238,6 +249,7 @@ export type {
   MemoryAddFactResult,
   MemoryArchiveItem,
   MemoryArchiveResult,
+  MemoryBankFactItem,
   MemoryDeleteFactParams,
   MemoryDeleteFactResult,
   MemoryEpisodesParams,
@@ -249,11 +261,21 @@ export type {
   MemoryForgetResult,
   MemoryGetDailyResult,
   MemoryGetResult,
+  MemoryListFactsParams,
+  MemoryListFactsResult,
+  MemoryManageFactParams,
+  MemoryManageFactResult,
   MemoryReconsolidateParams,
   MemoryReconsolidateResult,
+  MemorySearchEpisodicParams,
+  MemorySearchEpisodicResult,
   MemorySectionItem,
   MemoryStatusResult,
   MemoryUpdatedData,
+  EpisodicSessionHit,
+  FactCategory,
+  FactOperation,
+  FactStatus,
   PermissionTierInfo,
   Request as CleaRequest,
   ResponseFrame,
@@ -404,6 +426,9 @@ export interface MethodParamsMap {
   "chat.delete": ChatDeleteParams;
   "memory.add_fact": MemoryAddFactParams;
   "memory.delete_fact": MemoryDeleteFactParams;
+  "memory.search_episodic": MemorySearchEpisodicParams;
+  "memory.manage_fact": MemoryManageFactParams;
+  "memory.list_facts": MemoryListFactsParams;
   "activity.list": ActivityListParams;
   "activity.cancel": ActivityCancelParams;
   "os.open_or_focus_app": OsOpenOrFocusAppParams;
@@ -472,6 +497,9 @@ export interface MethodResultMap {
   "chat.delete": ChatDeleteResult;
   "memory.add_fact": MemoryAddFactResult;
   "memory.delete_fact": MemoryDeleteFactResult;
+  "memory.search_episodic": MemorySearchEpisodicResult;
+  "memory.manage_fact": MemoryManageFactResult;
+  "memory.list_facts": MemoryListFactsResult;
   "activity.list": ActivityListResult;
   "activity.cancel": ActivityCancelResult;
   "os.open_or_focus_app": OsOpenOrFocusAppResult;

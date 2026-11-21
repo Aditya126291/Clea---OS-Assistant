@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import sounddevice as sd
@@ -48,6 +48,12 @@ from clea.core.protocol import (
     MemoryAddFactRequest,
     MemoryDeleteFactParams,
     MemoryDeleteFactRequest,
+    MemoryListFactsParams,
+    MemoryListFactsRequest,
+    MemoryManageFactParams,
+    MemoryManageFactRequest,
+    MemorySearchEpisodicParams,
+    MemorySearchEpisodicRequest,
     OsClickUiElementParams,
     OsClickUiElementRequest,
     OsControlMediaVolumeParams,
@@ -1907,6 +1913,97 @@ class VoiceRunner:
             await _execute_rpc_tool(
                 MemoryDeleteFactRequest(params=MemoryDeleteFactParams(query_or_id=query_or_id)),
                 error_prefix="Failed to delete memory fact",
+            )
+            return
+
+        if event.name == "search_episodic_memory":
+            raw_query = event.arguments.get("query")
+            query = "" if raw_query is None else str(raw_query).strip()
+            if not query:
+                await _send_error("Search query must not be empty.")
+                return
+            raw_limit = event.arguments.get("limit")
+            limit = 5
+            if raw_limit is not None and not isinstance(raw_limit, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    limit = max(1, min(int(raw_limit), 50))
+            raw_surface = event.arguments.get("surface")
+            surface: Literal["chat", "voice"] | None = None
+            if raw_surface is not None:
+                if not isinstance(raw_surface, str):
+                    await _send_error("surface must be 'chat' or 'voice'.")
+                    return
+                cleaned_surface = raw_surface.strip().lower()
+                if cleaned_surface:
+                    if cleaned_surface not in ("chat", "voice"):
+                        await _send_error("surface must be 'chat' or 'voice'.")
+                        return
+                    surface = cleaned_surface  # type: ignore[assignment]
+            await _execute_rpc_tool(
+                MemorySearchEpisodicRequest(
+                    params=MemorySearchEpisodicParams(
+                        query=query,
+                        limit=limit,
+                        surface=surface,
+                    )
+                ),
+                error_prefix="Failed to search episodic memory",
+            )
+            return
+
+        if event.name == "manage_memory":
+            action = (_req_str("action") or "").lower()
+            if action not in ("add", "update", "delete", "list"):
+                await _send_error("action must be one of: add, update, delete, list.")
+                return
+            if action == "list":
+                raw_limit = event.arguments.get("limit")
+                limit = 25
+                if raw_limit is not None and not isinstance(raw_limit, bool):
+                    with contextlib.suppress(TypeError, ValueError):
+                        limit = max(1, min(int(raw_limit), 50))
+                await _execute_rpc_tool(
+                    MemoryListFactsRequest(
+                        params=MemoryListFactsParams(
+                            category=_req_str("category"),
+                            limit=limit,
+                        )
+                    ),
+                    error_prefix="Failed to list memory facts",
+                )
+                return
+
+            fact_text = _req_str("fact_text")
+            fact_key = _req_str("fact_key")
+            fact_id = _req_str("fact_id")
+            query = _req_str("query")
+            if action == "add" and not fact_text:
+                await _send_error("fact_text is required when action is 'add'.")
+                return
+            if action == "update" and not fact_text and not fact_id and not query:
+                await _send_error(
+                    "fact_text (or target fact_id/query) is required when action is 'update'."
+                )
+                return
+            if action == "delete" and not any((fact_id, fact_key, query, fact_text)):
+                await _send_error(
+                    "fact_id, fact_key, query, or fact_text is required when action is 'delete'."
+                )
+                return
+            await _execute_rpc_tool(
+                MemoryManageFactRequest(
+                    params=MemoryManageFactParams(
+                        action=action,  # type: ignore[arg-type]
+                        fact_text=fact_text,
+                        category=_req_str("category"),
+                        fact_key=fact_key,
+                        fact_id=fact_id,
+                        query=query,
+                        source_surface="voice",
+                        source_session_id=self._call_id or "",
+                    )
+                ),
+                error_prefix="Failed to manage memory",
             )
             return
 

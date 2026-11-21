@@ -35,6 +35,7 @@ from clea.surfaces.voice.memory_hooks import (
     BASE_VOICE_SYSTEM_INSTRUCTION,
     build_voice_system_instruction,
     consolidate_voice_call,
+    index_voice_call_episode,
     load_voice_memory_context,
     resolve_voice_system_instruction,
     safe_consolidate_voice_call,
@@ -70,6 +71,7 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "search_conversations",
         "read_conversation",
         "search_memory",
+        "search_episodic_memory",
         "post_to_active_chat",
         "navigate_ui",
         "create_chat",
@@ -78,6 +80,7 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "delete_chat",
         "save_memory_fact",
         "delete_memory_fact",
+        "manage_memory",
         "inspect_activity",
         "cancel_task",
         "open_command_palette",
@@ -125,6 +128,25 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert by_name["search_conversations"].parameters_schema["required"] == ["query"]
     assert by_name["read_conversation"].parameters_schema["required"] == ["conversation_id"]
     assert by_name["search_memory"].parameters_schema["required"] == ["query"]
+    ep_props = by_name["search_episodic_memory"].parameters_schema["properties"]
+    assert by_name["search_episodic_memory"].parameters_schema["required"] == ["query"]
+    assert ep_props["limit"]["minimum"] == 1
+    assert ep_props["limit"]["maximum"] == 50
+    assert ep_props["surface"]["enum"] == ["chat", "voice"]
+
+    mm_props = by_name["manage_memory"].parameters_schema["properties"]
+    assert by_name["manage_memory"].parameters_schema["required"] == ["action"]
+    assert mm_props["action"]["enum"] == ["add", "update", "delete", "list"]
+    assert mm_props["category"]["enum"] == [
+        "preference",
+        "environment",
+        "project",
+        "workflow",
+        "identity",
+        "constraint",
+    ]
+    assert mm_props["limit"]["minimum"] == 1
+    assert mm_props["limit"]["maximum"] == 50
     assert by_name["post_to_active_chat"].parameters_schema["required"] == ["content"]
     assert by_name["navigate_ui"].parameters_schema["properties"]["view"]["enum"] == [
         "chat",
@@ -440,7 +462,7 @@ async def test_memory_hooks_skip_empty_and_use_request_fn() -> None:
     assert "User lives in Pune." in ctx
     assert "Tested voice" in ctx
     assert "Recent ambient voice note" in ctx
-    assert calls == ["memory.get", "memory.episodes", "voice.history"]
+    assert calls == ["memory.get", "memory.episodes", "voice.history", "memory.list_facts"]
 
     # Empty calls are skipped without making any daemon RPCs
     calls.clear()
@@ -589,3 +611,253 @@ def test_voice_surface_respects_architecture_and_vendor_isolation_boundaries() -
                 assert not node.module.startswith(forbidden_prefixes), (
                     f"Forbidden import from {node.module!r} in {py_file}"
                 )
+
+
+async def test_load_voice_memory_context_injects_active_facts_and_avoids_duplication() -> None:
+    async def _request_with_facts(req):  # type: ignore[no-untyped-def]
+        if req.method == "memory.get":
+            return {"long_term": "## Profile\n- Lives in Pune."}
+        if req.method == "memory.list_facts":
+            return {
+                "facts": [
+                    {"category": "preference", "fact_text": "Uses uv for Python."},
+                    {"category": "environment", "fact_text": "Runs Windows 11."},
+                ],
+                "total": 2,
+            }
+        return {}
+
+    ctx = await load_voice_memory_context(request_fn=_request_with_facts)
+    assert "## Active Memory Facts" in ctx
+    assert "- [preference] Uses uv for Python." in ctx
+    assert "- [environment] Runs Windows 11." in ctx
+
+    async def _request_already_injected(req):  # type: ignore[no-untyped-def]
+        if req.method == "memory.get":
+            return {
+                "long_term": (
+                    "## Profile\n- Lives in Pune.\n\n"
+                    "## Active Memory Facts\n- [preference] Uses uv for Python."
+                )
+            }
+        if req.method == "memory.list_facts":
+            raise AssertionError("Should not re-fetch active facts when already in content")
+        return {}
+
+    ctx_dedup = await load_voice_memory_context(request_fn=_request_already_injected)
+    assert ctx_dedup.count("## Active Memory Facts") == 1
+
+    async def _request_facts_error(req):  # type: ignore[no-untyped-def]
+        if req.method == "memory.get":
+            return {"long_term": "Base memory."}
+        if req.method == "memory.list_facts":
+            raise RuntimeError("method not supported")
+        return {}
+
+    ctx_fallback = await load_voice_memory_context(request_fn=_request_facts_error)
+    assert "Base memory." in ctx_fallback
+    assert "## Active Memory Facts" not in ctx_fallback
+
+
+def test_index_voice_call_episode_indexes_with_db_and_store(tmp_path: Path) -> None:
+    from clea.memory.database import MemoryDatabase
+    from clea.memory.store import MemoryStore
+
+    db = MemoryDatabase(tmp_path / "direct.db")
+    db.ensure_schema()
+    entries = [
+        {"role": "user", "text": "Configure SQLite WAL ", "final": False},
+        {"role": "user", "text": "with FTS5 search.", "final": True},
+        {"role": "assistant", "text": "Done, enabled WAL and FTS5 triggers.", "final": True},
+    ]
+    assert index_voice_call_episode(db_or_store=db, call_id="call-db-1", entries=[]) is None
+    rec = index_voice_call_episode(db_or_store=db, call_id="call-db-1", entries=entries)
+    assert rec is not None
+    assert rec["session_id"] == "call-db-1"
+    assert rec["surface"] == "voice"
+    hits = db.search_episodic("SQLite FTS5", surface="voice")
+    assert len(hits) == 1
+    assert hits[0]["session_id"] == "call-db-1"
+    db.close()
+
+    store = MemoryStore(base_dir=tmp_path / "store")
+    store.ensure_initialized()
+    rec2 = index_voice_call_episode(
+        db_or_store=store,
+        call_id="call-store-1",
+        entries=entries,
+        title="Voice WAL Setup",
+        summary="Enabled SQLite WAL and FTS5 search.",
+        topics="sqlite, fts5",
+    )
+    assert rec2 is not None
+    assert rec2["title"] == "Voice WAL Setup"
+    hits2 = store.search_episodic_memory("Voice WAL", surface="voice")
+    assert len(hits2) == 1
+    assert hits2[0]["session_id"] == "call-store-1"
+    store.close()
+
+
+async def test_voice_runner_handles_search_episodic_memory_and_manage_memory(
+    tmp_path: Path,
+) -> None:
+    from clea.core.protocol import (
+        MemoryListFactsRequest,
+        MemoryManageFactRequest,
+        MemorySearchEpisodicRequest,
+    )
+    from clea.surfaces.voice.audio import AudioManager
+    from clea.surfaces.voice.config import VoiceConfig
+    from clea.surfaces.voice.runner import VoiceRunner
+    from clea.surfaces.voice.wake_word import WakeWordDetector
+
+    class _RecordingBackend(VoiceBackend):
+        backend_name = "fake"
+
+        def __init__(self) -> None:
+            self.sent_tool_responses: list[VoiceToolResponse] = []
+
+        @property
+        def model_name(self) -> str:
+            return "fake-model"
+
+        async def connect(self, config: VoiceSessionConfig) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def send_audio(self, pcm_bytes: bytes) -> None:
+            pass
+
+        async def send_video_frame(
+            self, image_bytes: bytes, *, mime_type: str = "image/jpeg"
+        ) -> None:
+            pass
+
+        async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
+            pass
+
+        async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
+            self.sent_tool_responses.extend(responses)
+
+        async def events(self) -> AsyncIterator[VoiceBackendEvent]:
+            if False:
+                yield TurnCompleteEvent()
+
+    audio = AudioManager()
+    wake = WakeWordDetector(model_instance=type("M", (), {"predict": lambda *_a: {"x": 0.0}})())
+    runner = VoiceRunner(
+        config=VoiceConfig(),
+        data_dir=tmp_path,
+        audio_manager=audio,
+        wake_word_detector=wake,
+        enable_hotkey=False,
+    )
+    runner._call_id = "voice-call-99"
+
+    sent_reqs: list[object] = []
+
+    async def _fake_rpc(req, *, timeout: float = 10.0):  # type: ignore[no-untyped-def]
+        sent_reqs.append(req)
+        if isinstance(req, MemorySearchEpisodicRequest):
+            return {"results": [{"session_id": "s1", "surface": "chat", "title": "T1"}]}
+        if isinstance(req, MemoryListFactsRequest):
+            return {
+                "facts": [{"id": "f1", "category": "preference", "fact_text": "Uses uv"}],
+                "total": 1,
+            }
+        if isinstance(req, MemoryManageFactRequest):
+            return {"ok": True, "operation": req.params.action, "affected_ids": ["f1"]}
+        return {}
+
+    runner._rpc = _fake_rpc  # type: ignore[method-assign]
+    backend = _RecordingBackend()
+
+    # Invalid search_episodic_memory calls
+    await runner._handle_tool_call(
+        ToolCallEvent(call_id="c1", name="search_episodic_memory", arguments={"query": "  "}),
+        backend,
+    )
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="c2",
+            name="search_episodic_memory",
+            arguments={"query": "sqlite", "surface": "email"},
+        ),
+        backend,
+    )
+    # Valid search_episodic_memory with clamped limit
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="c3",
+            name="search_episodic_memory",
+            arguments={"query": "sqlite", "limit": 999, "surface": "voice"},
+        ),
+        backend,
+    )
+
+    # Invalid manage_memory calls
+    await runner._handle_tool_call(
+        ToolCallEvent(call_id="c4", name="manage_memory", arguments={"action": "bogus"}),
+        backend,
+    )
+    await runner._handle_tool_call(
+        ToolCallEvent(call_id="c5", name="manage_memory", arguments={"action": "add"}),
+        backend,
+    )
+    await runner._handle_tool_call(
+        ToolCallEvent(call_id="c6", name="manage_memory", arguments={"action": "delete"}),
+        backend,
+    )
+
+    # Valid manage_memory: list and add
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="c7",
+            name="manage_memory",
+            arguments={"action": "list", "category": "preference", "limit": 100},
+        ),
+        backend,
+    )
+    await runner._handle_tool_call(
+        ToolCallEvent(
+            call_id="c8",
+            name="manage_memory",
+            arguments={
+                "action": "add",
+                "fact_text": "Uses uv for Python.",
+                "category": "preference",
+                "fact_key": "python_pkg_mgr",
+            },
+        ),
+        backend,
+    )
+
+    by_id = {r.call_id: r for r in backend.sent_tool_responses}
+    assert by_id["c1"].is_error is True
+    assert by_id["c2"].is_error is True
+    assert by_id["c3"].is_error is False
+    assert by_id["c4"].is_error is True
+    assert by_id["c5"].is_error is True
+    assert by_id["c6"].is_error is True
+    assert by_id["c7"].is_error is False
+    assert by_id["c8"].is_error is False
+
+    assert len(sent_reqs) == 3
+    ep_req = sent_reqs[0]
+    assert isinstance(ep_req, MemorySearchEpisodicRequest)
+    assert ep_req.params.limit == 50
+    assert ep_req.params.surface == "voice"
+
+    list_req = sent_reqs[1]
+    assert isinstance(list_req, MemoryListFactsRequest)
+    assert list_req.params.category == "preference"
+    assert list_req.params.limit == 50
+
+    add_req = sent_reqs[2]
+    assert isinstance(add_req, MemoryManageFactRequest)
+    assert add_req.params.action == "add"
+    assert add_req.params.fact_text == "Uses uv for Python."
+    assert add_req.params.source_surface == "voice"
+    assert add_req.params.source_session_id == "voice-call-99"

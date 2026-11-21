@@ -23,6 +23,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from clea.memory.database import (
+    FactStatus,
+    MemoryDatabase,
+    MemoryFactRecord,
+    is_secret_or_sensitive,
+)
 from clea.memory.retrieval import (
     WEIGHT_EPISODE,
     WEIGHT_FACT,
@@ -37,6 +43,7 @@ from clea.memory.retrieval import (
     score_memory_lexical,
     tokenize_query,
 )
+from clea.memory.three_tier import build_extractive_session_summary
 from clea.paths import default_data_dir
 
 logger = logging.getLogger(__name__)
@@ -67,28 +74,6 @@ class MemoryEntry(BaseModel):
 
     def format_line(self) -> str:
         return f"- [{self.id}] ({self.date}, {self.source}) {self.text.strip()}"
-
-
-# Secret patterns: API keys, tokens, passwords, credit cards, national ID numbers
-_SECRET_PATTERNS = [
-    re.compile(
-        r"(?i)\b(?:api[_-]?key|secret|password|passwd|bearer|token|access[_-]?token|auth[_-]?token|credential)[\s:=]+[\'\"]?[A-Za-z0-9_\-\.]{8,}[\'\"]?"
-    ),
-    re.compile(r"(?i)\bsk-[a-zA-Z0-9_-]{20,}\b"),
-    re.compile(r"(?i)\bAIza[0-9A-Za-z-_]{35}\b"),
-    re.compile(r"\b(?:\d[ -]*?){13,19}\b"),  # Credit/debit card numbers
-    re.compile(r"\b\d{4}[ -]?\d{4}[ -]?\d{4}\b"),  # 12-digit ID numbers (e.g. Aadhaar)
-    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # US SSN
-    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
-]
-
-
-def is_secret_or_sensitive(text: str) -> bool:
-    """Return True if text appears to contain secrets or credentials."""
-    for pattern in _SECRET_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
 
 
 def estimate_tokens(text: str) -> int:
@@ -173,6 +158,8 @@ class MemoryStore:
         self.embeddings_path = self.memory_dir / "embeddings.json"
         self.embedding_store = EmbeddingStore(self.embeddings_path)
         self.embedding_provider = embedding_provider or EmbeddingProvider(embed_fn=embed_fn)
+        self.db_path = self.base_dir / "memory.db"
+        self.memory_db = MemoryDatabase(self.db_path)
         self.token_cap = token_cap
     @property
     def _prune_lock(self) -> threading.Lock:
@@ -296,6 +283,86 @@ class MemoryStore:
             self.migrate_legacy_daily_logs()
         except Exception as exc:
             logger.warning("Legacy daily log migration notice: %s", exc)
+
+        self.memory_db.ensure_schema()
+
+    def close(self) -> None:
+        """Close/checkpoint the underlying SQLite memory database."""
+        self.memory_db.close()
+
+    def index_episodic_session(
+        self,
+        *,
+        session_id: str,
+        surface: Literal["chat", "voice"] = "chat",
+        started_at: str = "",
+        ended_at: str = "",
+        title: str = "",
+        summary: str = "",
+        topics: str = "",
+        updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Index or update an episodic session summary in the SQLite FTS5 store."""
+        self.ensure_initialized()
+        return self.memory_db.upsert_episodic_session(
+            session_id=session_id,
+            surface=surface,
+            started_at=started_at,
+            ended_at=ended_at,
+            title=title,
+            summary=summary,
+            topics=topics,
+            updated_at=updated_at,
+        )
+
+    def search_episodic_memory(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        surface: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search Tier 2 episodic session summaries using FTS5 BM25."""
+        self.ensure_initialized()
+        return self.memory_db.search_episodic(query, limit=limit, surface=surface)
+
+    def list_active_facts(
+        self,
+        *,
+        category: str | None = None,
+        limit: int = 25,
+        status: FactStatus | None = "active",
+    ) -> list[MemoryFactRecord]:
+        """List structured Tier 3 facts from SQLite."""
+        self.ensure_initialized()
+        return self.memory_db.list_facts(status=status, category=category, limit=limit)
+
+    def manage_fact(
+        self,
+        action: Literal["add", "update", "delete"],
+        *,
+        fact_text: str | None = None,
+        category: str | None = None,
+        fact_key: str | None = None,
+        fact_id: str | None = None,
+        query: str | None = None,
+        confidence: float = 0.9,
+        source_surface: str = "chat",
+        source_session_id: str = "",
+    ) -> dict[str, Any]:
+        """Add, update, or delete a structured Tier 3 fact in SQLite."""
+        self.ensure_initialized()
+        return self.memory_db.manage_fact(
+            action,
+            fact_text=fact_text,
+            category=category,
+            fact_key=fact_key,
+            fact_id=fact_id,
+            query=query,
+            confidence=confidence,
+            source_surface=source_surface,
+            source_session_id=source_session_id,
+        )
 
     def _build_empty_long_term_markdown(self) -> str:
         lines = [
@@ -672,6 +739,67 @@ class MemoryStore:
 
     # --- Episodes ---
 
+    def _sync_episodic_session_db(
+        self,
+        *,
+        session_id: str,
+        summary: str,
+        dt: datetime,
+    ) -> None:
+        """Mirror an episode summary into the SQLite FTS5 episodic_sessions table."""
+        try:
+            surface: Literal["chat", "voice"] = (
+                "voice" if session_id == VOICE_COMPANION_SESSION_ID else "chat"
+            )
+            title = ""
+            started_at = ""
+            ended_at = dt.isoformat()
+            topics = ""
+
+            tr: dict[str, Any] | None = None
+            try:
+                tr = self.get_transcript(session_id)
+            except Exception:
+                tr = None
+
+            if tr:
+                if tr.get("is_voice_call") or tr.get("session_id") == VOICE_COMPANION_SESSION_ID:
+                    surface = "voice"
+                title = str(tr.get("title") or "").strip()
+                started_at = str(tr.get("started_at") or "").strip()
+                ended_at = str(tr.get("updated_at") or dt.isoformat()).strip()
+                msgs = list(tr.get("messages", []))
+                if msgs:
+                    derived_title, _, topics = build_extractive_session_summary(
+                        msgs, fallback_title=title
+                    )
+                    if not title:
+                        title = derived_title
+
+            if not title:
+                title = (
+                    VOICE_COMPANION_TITLE
+                    if surface == "voice" and session_id == VOICE_COMPANION_SESSION_ID
+                    else _truncate(summary)
+                )
+            if not topics:
+                _, _, topics = build_extractive_session_summary(
+                    [{"role": "assistant", "text": summary}], fallback_title=title
+                )
+
+            self.memory_db.upsert_episodic_session(
+                session_id=session_id,
+                surface=surface,
+                started_at=started_at,
+                ended_at=ended_at,
+                title=title,
+                summary=summary.strip(),
+                topics=topics,
+                updated_at=dt.isoformat(),
+            )
+        except Exception as exc:
+            logger.debug("Skipping SQLite episodic upsert for %s: %s", session_id, exc)
+
     def append_episode(
         self,
         *,
@@ -706,6 +834,7 @@ class MemoryStore:
                         updated_content = pattern.sub(lambda _, b=new_block: b, content, count=1)
                         ep_file.write_text(updated_content, encoding="utf-8")
                         self._embed_item_if_needed(f"episode:{s}", summary.strip())
+                        self._sync_episodic_session_db(session_id=s, summary=summary, dt=dt)
                         return ep_file
 
         path = self.episodes_dir / f"{date_str}.md"
@@ -721,6 +850,7 @@ class MemoryStore:
             handle.write("".join(chunks))
 
         self._embed_item_if_needed(f"episode:{session_id}", summary.strip())
+        self._sync_episodic_session_db(session_id=session_id, summary=summary, dt=dt)
         return path
 
     def get_recent_episodes(self, limit: int = 5) -> list[dict[str, Any]]:
@@ -824,6 +954,46 @@ class MemoryStore:
                         f"- **{ep['date']} {ep['time']} ({ep['session_id'][:8]}):** {ep['summary']}"
                     )
                 combined = long_term + ("\n\n" + "\n".join(ep_lines) if episodes else "")
+
+        active_facts_ctx = ""
+        if self.db_path.exists():
+            try:
+                active_facts_ctx = self.memory_db.format_active_facts_context(limit=25).strip()
+            except Exception as exc:
+                logger.debug("Skipping SQLite active facts injection: %s", exc)
+
+        if active_facts_ctx:
+            candidate = (
+                f"{combined}\n\n{active_facts_ctx}".strip() if combined else active_facts_ctx
+            )
+            while episodes and estimate_tokens(candidate) > token_cap:
+                episodes.pop()
+                ep_lines = ["\n## Recent Episodes"]
+                for ep in episodes:
+                    ep_lines.append(
+                        f"- **{ep['date']} {ep['time']} ({ep['session_id'][:8]}):** {ep['summary']}"
+                    )
+                combined = long_term + ("\n\n" + "\n".join(ep_lines) if episodes else "")
+                candidate = (
+                    f"{combined}\n\n{active_facts_ctx}".strip() if combined else active_facts_ctx
+                )
+
+            if estimate_tokens(candidate) <= token_cap:
+                combined = candidate
+            else:
+                fact_lines = active_facts_ctx.splitlines()
+                while len(fact_lines) > 2:
+                    fact_lines.pop()
+                    trimmed_facts = "\n".join(fact_lines)
+                    candidate = (
+                        f"{combined}\n\n{trimmed_facts}".strip() if combined else trimmed_facts
+                    )
+                    if estimate_tokens(candidate) <= token_cap:
+                        combined = candidate
+                        break
+                else:
+                    if not combined and estimate_tokens(candidate) <= token_cap:
+                        combined = candidate
 
         extra_sections: list[str] = []
         if include_voice_tail and voice_tail_turns > 0:
@@ -1543,6 +1713,11 @@ class MemoryStore:
         if modified:
             if self.embedding_store.remove_key(f"episode:{session_id}"):
                 self.embedding_store.save()
+        if self.db_path.exists():
+            try:
+                self.memory_db.delete_episodic_session(session_id)
+            except Exception as exc:
+                logger.debug("SQLite episode delete skipped for %s: %s", session_id, exc)
         return modified
 
     def _restore_episode_from_trash(self, session_id: str) -> bool:

@@ -27,8 +27,19 @@ from clea.core.protocol import (
     ChatSendRequest,
     ClipboardItem,
     DevEmitSampleTaskRequest,
+    EpisodicSessionHit,
+    MemoryBankFactItem,
     MemoryEpisodesRequest,
     MemoryForgetRequest,
+    MemoryListFactsParams,
+    MemoryListFactsRequest,
+    MemoryListFactsResult,
+    MemoryManageFactParams,
+    MemoryManageFactRequest,
+    MemoryManageFactResult,
+    MemorySearchEpisodicParams,
+    MemorySearchEpisodicRequest,
+    MemorySearchEpisodicResult,
     OsClickUiElementParams,
     OsClickUiElementRequest,
     OsControlMediaVolumeParams,
@@ -242,6 +253,9 @@ def test_every_method_has_a_result_model() -> None:
             ("chat.delete", {"conversation_id": "s1", "confirmed": False}),
             ("memory.add_fact", {"fact": "User likes Python"}),
             ("memory.delete_fact", {"query_or_id": "fact-1"}),
+            ("memory.search_episodic", {"query": "test"}),
+            ("memory.manage_fact", {"action": "add", "fact_text": "prefers uv"}),
+            ("memory.list_facts", {}),
             ("activity.list", {}),
             ("activity.cancel", {"task_id": "task-1"}),
             ("os.open_or_focus_app", {"app_name": "vscode"}),
@@ -1162,3 +1176,101 @@ async def test_daemon_windows_os_control_system_window_actions(tmp_path: Path) -
         assert payload["id"] == req.id
         assert payload["ok"] is True
         assert payload["result"]["window_title"] == "Notepad"
+
+
+def test_three_tier_memory_protocol_roundtrip() -> None:
+    search_req = MemorySearchEpisodicRequest(
+        params=MemorySearchEpisodicParams(query="three-tier memory", limit=10, surface="voice")
+    )
+    parsed_search = parse_frame(search_req.model_dump_json())
+    assert isinstance(parsed_search, MemorySearchEpisodicRequest)
+    assert parsed_search.method == "memory.search_episodic"
+    assert parsed_search.params.query == "three-tier memory"
+    assert parsed_search.params.limit == 10
+    assert parsed_search.params.surface == "voice"
+
+    manage_req = MemoryManageFactRequest(
+        params=MemoryManageFactParams(
+            action="update",
+            fact_text="Prefers uv over pip",
+            category="workflow",
+            fact_key="package_manager",
+            fact_id="fact-1",
+            confidence=0.95,
+            source_surface="chat",
+            source_session_id="sess-1",
+        )
+    )
+    parsed_manage = parse_frame(manage_req.model_dump_json())
+    assert isinstance(parsed_manage, MemoryManageFactRequest)
+    assert parsed_manage.method == "memory.manage_fact"
+    assert parsed_manage.params.action == "update"
+    assert parsed_manage.params.confidence == 0.95
+
+    list_default_req = parse_frame('{"frame_type": "request", "method": "memory.list_facts"}')
+    assert isinstance(list_default_req, MemoryListFactsRequest)
+    assert list_default_req.params.status == "active"
+    assert list_default_req.params.limit == 25
+
+    list_req = MemoryListFactsRequest(
+        params=MemoryListFactsParams(status="superseded", category="workflow", limit=50)
+    )
+    parsed_list = parse_frame(list_req.model_dump_json())
+    assert isinstance(parsed_list, MemoryListFactsRequest)
+    assert parsed_list.params.status == "superseded"
+    assert parsed_list.params.category == "workflow"
+    assert parsed_list.params.limit == 50
+
+    with pytest.raises(ValidationError):
+        MemorySearchEpisodicParams(query="q", limit=0)
+    with pytest.raises(ValidationError):
+        MemorySearchEpisodicParams(query="q", limit=51)
+    with pytest.raises(ValidationError):
+        MemoryManageFactParams(action="replace")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        MemoryManageFactParams(action="add", confidence=1.5)
+    with pytest.raises(ValidationError):
+        MemoryListFactsParams(limit=201)
+
+    hit = EpisodicSessionHit(
+        session_id="sess-1",
+        surface="chat",
+        timestamp="2026-11-21T09:00:00Z",
+        title="Memory design",
+        summary="Designed three-tier memory",
+        topics="memory,sqlite",
+        snippet="...three-tier memory...",
+        score=4.2,
+    )
+    search_res = METHOD_RESULTS["memory.search_episodic"](results=[hit])
+    assert isinstance(search_res, MemorySearchEpisodicResult)
+    assert search_res.results[0].session_id == "sess-1"
+
+    fact = MemoryBankFactItem(
+        id="fact-2",
+        category="workflow",
+        fact_key="package_manager",
+        fact_text="Prefers uv over pip",
+        confidence=0.95,
+        source_surface="chat",
+        source_session_id="sess-1",
+        status="active",
+        created_at="2026-11-21T09:00:00Z",
+        updated_at="2026-11-21T09:00:00Z",
+    )
+    manage_res = METHOD_RESULTS["memory.manage_fact"](
+        ok=True,
+        operation="update",
+        fact=fact,
+        superseded_id="fact-1",
+        affected_ids=["fact-1", "fact-2"],
+        message="Updated fact",
+    )
+    assert isinstance(manage_res, MemoryManageFactResult)
+    assert manage_res.operation == "update"
+    assert manage_res.superseded_id == "fact-1"
+
+    list_res = METHOD_RESULTS["memory.list_facts"](facts=[fact], total=1)
+    assert isinstance(list_res, MemoryListFactsResult)
+    assert list_res.total == 1
+    assert list_res.facts[0].category == "workflow"

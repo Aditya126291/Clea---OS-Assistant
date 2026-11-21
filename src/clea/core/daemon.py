@@ -11,11 +11,11 @@ import logging.handlers
 import os
 import subprocess
 import time
-from collections.abc import Awaitable, Coroutine, Iterable
+from collections.abc import Awaitable, Coroutine, Iterable, Sequence
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 from websockets.asyncio.server import Server, ServerConnection, serve
@@ -50,9 +50,11 @@ from clea.core.protocol import (
     ConversationUpdatedData,
     ConversationUpdatedEvent,
     EpisodeItem,
+    EpisodicSessionHit,
     ErrorData,
     ErrorEvent,
     MemoryArchiveItem,
+    MemoryBankFactItem,
     MemoryFactItem,
     MemorySearchHit,
     MemorySectionItem,
@@ -84,7 +86,11 @@ from clea.core.protocol import (
 )
 from clea.core.sessions import Session, SessionManager
 from clea.memory.consolidation import ConsolidationManager
+from clea.memory.database import normalize_fact_category
+from clea.memory.facts import FactBankReconciler
 from clea.memory.store import FIXED_SECTIONS, VOICE_COMPANION_SESSION_ID, MemoryStore
+from clea.memory.three_tier import build_extractive_session_summary
+from clea.memory.working import WorkingMemoryManager
 from clea.providers.base import LLMProvider, Message, ToolCall
 from clea.providers.gemini import GeminiProvider
 from clea.tools import (
@@ -512,6 +518,14 @@ class CleaDaemon:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        for sid, sess in list(self.sessions._sessions.items()):
+            if sess.messages:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self._index_session_episodic,
+                        sid,
+                        surface="voice" if sid == VOICE_COMPANION_SESSION_ID else "chat",
+                    )
         self._idle_tasks.clear()
         self._consolidation_tasks.clear()
         self._consolidation_in_flight.clear()
@@ -525,6 +539,8 @@ class CleaDaemon:
             )
         with contextlib.suppress(Exception):
             self.consolidation.reconcile_orphaned_running(reason="Interrupted by daemon shutdown")
+        with contextlib.suppress(Exception):
+            self.agent.memory.close()
         auth.remove_token(self.token_file, self.token)
         self._instance_lock.release()
 
@@ -942,9 +958,16 @@ class CleaDaemon:
                 )
             for approval_id in list(conn.approvals):
                 self._shared_approvals.pop(approval_id, None)
-            if conn.current_session_id:
-                self._schedule_consolidation_now(conn.current_session_id)
+            prev_sid = conn.current_session_id
             await conn.close()
+            if prev_sid:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self._index_session_episodic,
+                        prev_sid,
+                        surface="chat",
+                    )
+                self._schedule_consolidation_now(prev_sid)
 
     def _schedule_trash_purge(self, delay_seconds: float = 15.0) -> None:
         async def _purge_after_delay() -> None:
@@ -1016,9 +1039,88 @@ class CleaDaemon:
             if curr_dt < prev_dt:
                 cleaned[i] = (curr_role, curr_text, prev_dt)
 
-        return self.agent.memory.append_voice_companion_call(
+        persisted = self.agent.memory.append_voice_companion_call(
             call_id=call_id,
             entries=cleaned,
+        )
+        if persisted:
+            with contextlib.suppress(Exception):
+                voice_msgs = [
+                    {"role": role, "text": text, "timestamp": dt.isoformat()}
+                    for role, text, dt in cleaned
+                ]
+                title, summary, topics = build_extractive_session_summary(voice_msgs)
+                self.agent.memory.index_episodic_session(
+                    session_id=call_id,
+                    surface="voice",
+                    started_at=cleaned[0][2].isoformat(),
+                    ended_at=cleaned[-1][2].isoformat(),
+                    title=title,
+                    summary=summary,
+                    topics=topics,
+                )
+        return persisted
+
+    def _index_session_episodic(
+        self,
+        session_id: str,
+        *,
+        surface: Literal["chat", "voice"] = "chat",
+        messages: Sequence[Any] | None = None,
+        title: str = "",
+    ) -> dict[str, Any] | None:
+        """Index or update a session summary in Tier 2 episodic FTS5."""
+        sid = (session_id or "").strip()
+        if not sid:
+            return None
+
+        resolved_messages: Sequence[Any] | None = messages
+        resolved_title = (title or "").strip()
+        started_at = ""
+        ended_at = ""
+
+        sess = self.sessions.get(sid)
+        if sess is not None:
+            started_at = sess.created_at.isoformat()
+
+        tr: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            tr = self.agent.memory.get_transcript(sid)
+        if tr:
+            if not resolved_title:
+                resolved_title = str(tr.get("title") or "").strip()
+            if not started_at:
+                started_at = str(tr.get("started_at") or "").strip()
+            ended_at = str(tr.get("updated_at") or "").strip()
+
+        if resolved_messages is None:
+            tr_msgs = list(tr.get("messages", [])) if tr else []
+            sess_msgs = list(sess.messages) if sess is not None and sess.messages else []
+            if tr_msgs and len(tr_msgs) >= len(sess_msgs):
+                resolved_messages = tr_msgs
+            elif sess_msgs:
+                resolved_messages = sess_msgs
+            elif tr_msgs:
+                resolved_messages = tr_msgs
+
+        if not resolved_messages:
+            return None
+
+        derived_title, summary, topics = build_extractive_session_summary(
+            resolved_messages,
+            fallback_title=resolved_title,
+        )
+        if sess is not None and sess.working_summary and summary == derived_title:
+            summary = sess.working_summary
+
+        return self.agent.memory.index_episodic_session(
+            session_id=sid,
+            surface=surface,
+            started_at=started_at,
+            ended_at=ended_at,
+            title=derived_title,
+            summary=summary,
+            topics=topics,
         )
 
     def _audit_log(self, action: str, **details: Any) -> None:
@@ -1086,7 +1188,14 @@ class CleaDaemon:
             await self._respond(ws, req, METHOD_RESULTS[method]())
         elif method == "session.new":
             if conn.current_session_id:
-                self._schedule_consolidation_now(conn.current_session_id)
+                prev_sid = conn.current_session_id
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self._index_session_episodic,
+                        prev_sid,
+                        surface="chat",
+                    )
+                self._schedule_consolidation_now(prev_sid)
             session = self.sessions.create()
             conn.current_session_id = session.id
             await self._respond(
@@ -1989,6 +2098,12 @@ class CleaDaemon:
             await self._handle_memory_add_fact(conn, req)
         elif method == "memory.delete_fact":
             await self._handle_memory_delete_fact(conn, req)
+        elif method == "memory.search_episodic":
+            await self._handle_memory_search_episodic(conn, req)
+        elif method == "memory.manage_fact":
+            await self._handle_memory_manage_fact(conn, req)
+        elif method == "memory.list_facts":
+            await self._handle_memory_list_facts(conn, req)
         elif method == "activity.list":
             await self._handle_activity_list(conn, req)
         elif method == "activity.cancel":
@@ -2445,6 +2560,15 @@ class CleaDaemon:
             await self._respond(ws, req, error=str(exc))
             return
 
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                self.agent.memory.memory_db.manage_fact,
+                "add",
+                fact_text=entry.text,
+                category=normalize_fact_category(req.params.category or entry.section),
+                source_surface="chat",
+            )
+
         await self._broadcast(
             MemoryUpdatedEvent(
                 data=MemoryUpdatedData(
@@ -2479,13 +2603,31 @@ class CleaDaemon:
 
         removed = self.agent.memory.remove_entries(query_or_id)
         removed_ids = [e.id for e in removed]
-        if removed:
+        db_deleted: list[str] = []
+        with contextlib.suppress(Exception):
+            if self.agent.memory.db_path.exists():
+
+                def _mirror_delete() -> list[str]:
+                    deleted: list[str] = []
+                    for entry in removed:
+                        deleted.extend(
+                            self.agent.memory.memory_db.delete_fact(query=entry.text)
+                        )
+                    deleted.extend(
+                        self.agent.memory.memory_db.delete_fact(query=query_or_id)
+                    )
+                    return list(dict.fromkeys(deleted))
+
+                db_deleted = await asyncio.to_thread(_mirror_delete)
+
+        effective_removed_ids = removed_ids if removed_ids else db_deleted
+        if effective_removed_ids:
             await self._broadcast(
                 MemoryUpdatedEvent(
                     data=MemoryUpdatedData(
                         action="deleted",
-                        removed_count=len(removed),
-                        removed_ids=removed_ids,
+                        removed_count=len(effective_removed_ids),
+                        removed_ids=effective_removed_ids,
                     )
                 )
             )
@@ -2494,9 +2636,98 @@ class CleaDaemon:
             req,
             METHOD_RESULTS["memory.delete_fact"](
                 ok=True,
-                removed_count=len(removed),
-                removed_ids=removed_ids,
+                removed_count=len(effective_removed_ids),
+                removed_ids=effective_removed_ids,
             ),
+        )
+
+    async def _handle_memory_search_episodic(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        hits_raw = await asyncio.to_thread(
+            self.agent.memory.search_episodic_memory,
+            req.params.query,
+            limit=req.params.limit,
+            surface=req.params.surface,
+        )
+        hits = [EpisodicSessionHit(**h) for h in hits_raw]
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["memory.search_episodic"](results=hits),
+        )
+
+    async def _handle_memory_manage_fact(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        p = req.params
+        try:
+            res = await asyncio.to_thread(
+                self.agent.memory.manage_fact,
+                p.action,
+                fact_text=p.fact_text,
+                category=p.category,
+                fact_key=p.fact_key,
+                fact_id=p.fact_id,
+                query=p.query,
+                confidence=p.confidence,
+                source_surface=p.source_surface,
+                source_session_id=p.source_session_id,
+            )
+        except ValueError as exc:
+            await self._respond(ws, req, error=str(exc))
+            return
+
+        op = str(res.get("operation") or "noop")
+        fact_dict = res.get("fact")
+        fact_item = MemoryBankFactItem(**fact_dict) if isinstance(fact_dict, dict) else None
+        affected_ids = [str(x) for x in (res.get("affected_ids") or [])]
+
+        if op in ("add", "update", "delete"):
+            event_action: Literal["added", "deleted", "updated"]
+            if op == "add":
+                event_action = "added"
+            elif op == "delete":
+                event_action = "deleted"
+            else:
+                event_action = "updated"
+            await self._broadcast(
+                MemoryUpdatedEvent(
+                    data=MemoryUpdatedData(
+                        action=event_action,
+                        fact_id=fact_item.id if fact_item is not None else None,
+                        section=fact_item.category if fact_item is not None else None,
+                        text=fact_item.fact_text if fact_item is not None else None,
+                        removed_count=len(affected_ids) if op == "delete" else 0,
+                        removed_ids=affected_ids if op == "delete" else [],
+                    )
+                )
+            )
+
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["memory.manage_fact"](
+                ok=bool(res.get("ok", True)),
+                operation=op,  # type: ignore[arg-type]
+                fact=fact_item,
+                superseded_id=res.get("superseded_id"),
+                affected_ids=affected_ids,
+                message=str(res.get("message") or ""),
+            ),
+        )
+
+    async def _handle_memory_list_facts(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        facts = await asyncio.to_thread(
+            self.agent.memory.list_active_facts,
+            limit=req.params.limit,
+            category=req.params.category,
+            status=req.params.status,
+        )
+        items = [MemoryBankFactItem(**f.model_dump()) for f in facts]
+        await self._respond(
+            ws,
+            req,
+            METHOD_RESULTS["memory.list_facts"](facts=items, total=len(items)),
         )
 
     async def _handle_activity_list(self, conn: _Connection, req: Any) -> None:
@@ -4060,10 +4291,17 @@ def build_daemon(
             verifier=action_verifier,
         )
     resolved_provider = provider or GeminiProvider()
+    working_memory = WorkingMemoryManager(provider=resolved_provider)
+    fact_reconciler = FactBankReconciler(
+        db=resolved_memory.memory_db,
+        provider=resolved_provider,
+    )
     agent = AgentLoop(
         provider=resolved_provider,
         registry=resolved_registry,
         memory=resolved_memory,
+        working_memory=working_memory,
+        fact_reconciler=fact_reconciler,
     )
     return CleaDaemon(
         agent=agent,

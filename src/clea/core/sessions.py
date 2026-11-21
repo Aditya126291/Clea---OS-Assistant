@@ -16,6 +16,8 @@ class Session(BaseModel):
     id: str = Field(default_factory=new_id)
     messages: list[Message] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    turn_count: int = 0
+    working_summary: str = ""
 
 
 class SessionManager:
