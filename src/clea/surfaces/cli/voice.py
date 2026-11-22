@@ -584,14 +584,22 @@ def run_voice_diagnose_mic(
     )
 
     selected: dict[str, Any] | None = None
+    selected_output: dict[str, Any] | None = None
     try:
         audio.start()
         selected = dict(audio.resolved_input_device) if audio.resolved_input_device else None
+        raw_out = getattr(audio, "resolved_output_device", None)
+        selected_output = dict(raw_out) if raw_out else None
         if selected:
             print_fn(
                 f"Active selected input: #{selected['index']} '{selected['name']}' "
                 f"(host API: {selected.get('hostapi_name', 'Unknown')}, "
                 f"negotiated: {audio.input_sample_rate} Hz, {audio.input_channels}ch)"
+            )
+        if selected_output:
+            print_fn(
+                f"Active selected output: #{selected_output['index']} '{selected_output['name']}' "
+                f"(host API: {selected_output.get('hostapi_name', 'Unknown')})"
             )
         print_fn(
             f"Sampling live mic audio for {sample_duration:.1f}s "
@@ -615,16 +623,22 @@ def run_voice_diagnose_mic(
     else:
         print_fn(f"Wake word ({config.wake_word_model}): skipped ({detector_note})")
 
-    if len(rms_values) == 0 or peak_rms < 3.0:
+    if len(rms_values) == 0 or peak_rms == 0.0:
         print_fn(
-            "[!] Warning: Captured audio is silent/dead (peak_rms < 3.0). "
-            "Check mic mute, Bluetooth HFP/A2DP conflict, or Windows privacy permissions."
+            "[!] Warning: Captured audio is all-zero / stalled (peak_rms == 0.0). "
+            "Check mic mute, Windows microphone privacy permissions, or headset connection."
+        )
+    elif peak_rms < 10.0:
+        print_fn(
+            "[i] Note: Room audio was very quiet (peak_rms < 10.0). "
+            f"Speak '{config.wake_word_model}' during sampling to verify live RMS and wake score."
         )
     print_fn("=============================================")
     return {
         "ok": True,
         "candidates": candidates,
         "selected_device": selected,
+        "selected_output_device": selected_output,
         "sample_rate": audio.input_sample_rate,
         "channels": audio.input_channels,
         "frames": len(rms_values),

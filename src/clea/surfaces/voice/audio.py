@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import math
 import queue
+import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -190,27 +193,6 @@ _BUILTIN_MIC_PATTERNS: tuple[str, ...] = (
     "intel smart sound",
 )
 
-_SUSPECT_SILENT_MIC_PATTERNS: tuple[str, ...] = (
-    "headset",
-    "hands-free",
-    "hands free",
-    "hfp",
-    "ag audio",
-    "bluetooth",
-    "earphone",
-    "airpods",
-    "buds",
-    "tws",
-    "virtual",
-    "voicemeeter",
-    "nvidia broadcast",
-    "cable",
-    "stereo mix",
-    "pc speaker",
-    "microsoft sound mapper",
-    "primary sound capture",
-)
-
 
 def _is_virtual_loopback_input(name: str) -> bool:
     low = name.strip().lower()
@@ -227,60 +209,152 @@ def _is_builtin_mic_input(name: str) -> bool:
     return any(pat in low for pat in _BUILTIN_MIC_PATTERNS)
 
 
-def _is_suspect_silent_input_device(
-    dev: dict[str, Any] | None,
-    *,
-    opened_via_fallback: bool = False,
-) -> bool:
-    """Return True for fallback, Bluetooth HFP, or virtual devices prone to near-zero RMS hangs.
+def get_os_default_audio_endpoint_ids() -> tuple[str | None, str | None]:
+    """Return ``(default_capture_id, default_render_id)`` from Windows Core Audio (read-only).
 
-    Built-in WASAPI hardware microphones (e.g. Realtek Microphone Array) are exempt from
-    near-zero RMS failover even when opened via fallback, because hardware noise suppression
-    in a quiet room legitimately drops idle RMS below 1.0 (bit-exact all-zero streams are
-    still caught separately by ``max_zero_callbacks``).
+    Queries ``IMMDeviceEnumerator::GetDefaultAudioEndpoint`` for ``eConsole`` without
+    reinitializing PortAudio or disrupting active audio streams. Returns ``(None, None)``
+    on non-Windows platforms or if Core Audio is unavailable.
     """
-    if dev:
-        name_low = str(dev.get("name", "")).strip().lower()
-        host_upper = str(dev.get("hostapi_name", "")).upper()
-        if (
-            _is_builtin_mic_input(name_low)
-            and "WASAPI" in host_upper
-            and not _is_virtual_loopback_input(name_low)
-            and not _is_os_default_alias_input(name_low)
-        ):
-            return False
-        if opened_via_fallback:
-            return True
-        return any(pat in name_low for pat in _SUSPECT_SILENT_MIC_PATTERNS)
-    return bool(opened_via_fallback)
+    if sys.platform != "win32":
+        return None, None
+
+    try:
+        from ctypes import POINTER, byref, c_int, c_long, c_void_p, wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+            @classmethod
+            def from_str(cls, text: str) -> _GUID:
+                parsed = uuid.UUID(text)
+                guid = cls()
+                guid.Data1 = parsed.fields[0]
+                guid.Data2 = parsed.fields[1]
+                guid.Data3 = parsed.fields[2]
+                for i, byte_val in enumerate(parsed.bytes[8:]):
+                    guid.Data4[i] = byte_val
+                return guid
+
+        clsid_enumerator = _GUID.from_str("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+        iid_enumerator = _GUID.from_str("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx.argtypes = [c_void_p, wintypes.DWORD]
+        ole32.CoInitializeEx.restype = c_long
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+        ole32.CoCreateInstance.argtypes = [
+            POINTER(_GUID),
+            c_void_p,
+            wintypes.DWORD,
+            POINTER(_GUID),
+            POINTER(c_void_p),
+        ]
+        ole32.CoCreateInstance.restype = c_long
+        ole32.CoTaskMemFree.argtypes = [c_void_p]
+        ole32.CoTaskMemFree.restype = None
+
+        hr_init = int(ole32.CoInitializeEx(None, 0))  # COINIT_MULTITHREADED
+        rpc_e_changed_mode = -2147417850  # 0x80010106
+        should_uninit = hr_init in (0, 1)
+        if not should_uninit and hr_init != rpc_e_changed_mode:
+            return None, None
+
+        enum_ptr = c_void_p()
+        try:
+            hr_create = int(
+                ole32.CoCreateInstance(
+                    byref(clsid_enumerator),
+                    None,
+                    23,  # CLSCTX_ALL
+                    byref(iid_enumerator),
+                    byref(enum_ptr),
+                )
+            )
+            if hr_create != 0 or not enum_ptr.value:
+                return None, None
+
+            def _vtable_fn(ptr: c_void_p, index: int, restype: Any, *argtypes: Any) -> Any:
+                vtbl = ctypes.cast(ptr, POINTER(POINTER(c_void_p)))[0]
+                return ctypes.WINFUNCTYPE(restype, c_void_p, *argtypes)(vtbl[index])
+
+            def _release(ptr: c_void_p) -> None:
+                if ptr.value:
+                    _vtable_fn(ptr, 2, wintypes.ULONG)(ptr)
+
+            def _default_id(data_flow: int) -> str | None:
+                dev_ptr = c_void_p()
+                hr_dev = int(
+                    _vtable_fn(
+                        enum_ptr,
+                        4,  # IMMDeviceEnumerator::GetDefaultAudioEndpoint
+                        c_long,
+                        c_int,
+                        c_int,
+                        POINTER(c_void_p),
+                    )(enum_ptr, data_flow, 0, byref(dev_ptr))  # eConsole = 0
+                )
+                if hr_dev != 0 or not dev_ptr.value:
+                    return None
+                id_ptr = wintypes.LPWSTR()
+                try:
+                    hr_id = int(
+                        _vtable_fn(
+                            dev_ptr,
+                            5,  # IMMDevice::GetId
+                            c_long,
+                            POINTER(wintypes.LPWSTR),
+                        )(dev_ptr, byref(id_ptr))
+                    )
+                    if hr_id != 0 or not id_ptr.value:
+                        return None
+                    return str(id_ptr.value)
+                finally:
+                    if id_ptr.value:
+                        ole32.CoTaskMemFree(id_ptr)
+                    _release(dev_ptr)
+
+            try:
+                capture_id = _default_id(1)  # eCapture = 1
+                render_id = _default_id(0)  # eRender = 0
+                return capture_id, render_id
+            finally:
+                _release(enum_ptr)
+        finally:
+            if should_uninit:
+                ole32.CoUninitialize()
+    except Exception as exc:
+        logger.debug("Could not query Windows default audio endpoints: %s", exc)
+        return None, None
 
 
 def list_candidate_audio_devices(
     spec: str | int | None,
     kind: str = "input",
     preferred_hostapi: str | None = "WASAPI",
-    *,
-    demoted_device_names: set[str] | frozenset[str] | None = None,
-    demoted_device_indices: set[int] | frozenset[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Return an ordered list of candidate audio devices to try opening.
 
     Always starts with the primary device chosen by :func:`resolve_audio_device`
-    (preserving ``AudioDeviceNotFoundError`` / ``AmbiguousAudioDeviceError``),
-    unless that device is currently demoted due to sustained silent/dead audio.
+    (preserving ``AudioDeviceNotFoundError`` / ``AmbiguousAudioDeviceError``).
     When *spec* is ``None`` (system default), appends same-name devices on other
     host APIs (e.g. DirectSound / MME when a Bluetooth WASAPI endpoint fails
-    with PaErrorCode -9996), followed by active built-in microphones and
-    remaining valid devices ordered by host API preference, placing virtual/loopback
-    capture endpoints and demoted silent devices last.
+    with PaErrorCode -9996 / -9999), followed by remaining valid devices ordered
+    by host API preference, placing virtual/loopback capture endpoints last.
     """
     primary = resolve_audio_device(spec, kind=kind, preferred_hostapi=preferred_hostapi)
-    candidates: list[dict[str, Any]] = []
-    seen_indices: set[int] = set()
+    candidates: list[dict[str, Any]] = [primary]
+    seen_indices: set[int] = {int(primary["index"])}
 
     # Explicit integer index -> honor the user's exact index without silent redirection
     if isinstance(spec, int) or (isinstance(spec, str) and spec.strip().isdigit()):
-        return [primary]
+        return candidates
 
     devices = list_audio_devices()
     valid_devices = [
@@ -288,37 +362,6 @@ def list_candidate_audio_devices(
         for d in devices
         if (d["max_input_channels"] > 0 if kind == "input" else d["max_output_channels"] > 0)
     ]
-
-    demoted_names_low = {n.strip().lower() for n in (demoted_device_names or ()) if n}
-    demoted_idxs = {int(i) for i in (demoted_device_indices or ())}
-
-    def _is_demoted_name(name_low: str) -> bool:
-        if not name_low:
-            return False
-        if name_low in demoted_names_low:
-            return True
-        # Windows MME truncates device names at 31 chars (MAXPNAMELEN - 1); match long prefixes
-        # so demoting a WASAPI/DirectSound Bluetooth device also demotes its truncated MME entry.
-        if len(name_low) >= 20:
-            for d_name in demoted_names_low:
-                if len(d_name) >= 20 and (
-                    d_name.startswith(name_low) or name_low.startswith(d_name)
-                ):
-                    return True
-        return False
-
-    def _is_demoted(dev: dict[str, Any], *, primary_was_demoted: bool = False) -> bool:
-        if int(dev["index"]) in demoted_idxs:
-            return True
-        name_low = str(dev.get("name", "")).strip().lower()
-        if _is_demoted_name(name_low):
-            return True
-        # When the OS default input device is demoted as silent, OS-default alias drivers
-        # ('Microsoft Sound Mapper - Input', 'Primary Sound Capture Driver') point to that
-        # exact same dead default device and must also be demoted.
-        if primary_was_demoted and _is_os_default_alias_input(name_low):
-            return True
-        return False
 
     def _host_rank(dev: dict[str, Any]) -> tuple[int, int, int]:
         api = str(dev.get("hostapi_name", "")).upper()
@@ -348,22 +391,29 @@ def list_candidate_audio_devices(
             candidates.append(dev)
 
     primary_name_lower = str(primary.get("name", "")).strip().lower()
-    primary_demoted = kind == "input" and spec is None and _is_demoted(primary)
 
-    if not primary_demoted:
-        _add(primary)
-
-        # 1. Same device name across alternate host APIs (e.g. DirectSound / MME fallback)
-        same_name = sorted(
-            [
-                d
-                for d in valid_devices
-                if str(d.get("name", "")).strip().lower() == primary_name_lower
-            ],
-            key=_host_rank,
+    def _is_same_device_name(name_low: str) -> bool:
+        if name_low == primary_name_lower:
+            return True
+        # Windows MME truncates device names at 31 chars (MAXPNAMELEN - 1); match long prefixes
+        # so alternate host-API fallback stays on the exact same physical headset/mic.
+        return (
+            len(name_low) >= 20
+            and len(primary_name_lower) >= 20
+            and (primary_name_lower.startswith(name_low) or name_low.startswith(primary_name_lower))
         )
-        for dev in same_name:
-            _add(dev)
+
+    # 1. Same device name across alternate host APIs (e.g. DirectSound / MME fallback)
+    same_name = sorted(
+        [
+            d
+            for d in valid_devices
+            if _is_same_device_name(str(d.get("name", "")).strip().lower())
+        ],
+        key=_host_rank,
+    )
+    for dev in same_name:
+        _add(dev)
 
     # Explicit string query -> also include other host-API matches for that substring
     if isinstance(spec, str) and spec.strip():
@@ -376,34 +426,18 @@ def list_candidate_audio_devices(
             _add(dev)
         return candidates
 
-    # 2. System default device from PortAudio (often MME/DirectSound), if not demoted
+    # 2. System default device from PortAudio (often MME/DirectSound)
     try:
         def_idx = sd.default.device[0 if kind == "input" else 1]
         if def_idx is not None and def_idx >= 0:
             match = next((d for d in valid_devices if d["index"] == def_idx), None)
-            if match is not None and not (
-                kind == "input" and _is_demoted(match, primary_was_demoted=primary_demoted)
-            ):
+            if match is not None:
                 _add(match)
     except Exception:
         pass
 
-    # 3. Remaining non-demoted valid devices ordered by quality & host API preference
-    non_demoted = [
-        d
-        for d in valid_devices
-        if not (kind == "input" and _is_demoted(d, primary_was_demoted=primary_demoted))
-    ]
-    for dev in sorted(non_demoted, key=_host_rank):
-        _add(dev)
-
-    # 4. Demoted devices last as a final fallback so we never crash if all others fail
-    demoted_remaining = [
-        d
-        for d in valid_devices
-        if kind == "input" and _is_demoted(d, primary_was_demoted=primary_demoted)
-    ]
-    for dev in sorted(demoted_remaining, key=_host_rank):
+    # 3. Remaining valid devices ordered by host API preference, virtual/loopback last
+    for dev in sorted(valid_devices, key=_host_rank):
         _add(dev)
 
     return candidates
@@ -592,15 +626,13 @@ class AudioManager:
         self._last_input_callback_time: float = 0.0
         self._input_callback_count: int = 0
         self._consecutive_zero_callbacks: int = 0
-        self._consecutive_silent_callbacks: int = 0
-        self._silent_rms_threshold: float = 3.0
+        self._consecutive_zero_samples: int = 0
         self._last_input_rms: float = 0.0
         self._peak_input_rms: float = 0.0
         self._input_status_error_count: int = 0
         self._health_monitored: bool = False
-        self._opened_via_fallback: bool = False
-        self._demoted_input_names: dict[str, float] = {}
-        self._demoted_input_indices: dict[int, float] = {}
+        self._wasapi_retry_delay: float = 0.35
+        self._default_endpoint_ids: tuple[str | None, str | None] = (None, None)
 
     @property
     def is_speaking(self) -> bool:
@@ -619,32 +651,44 @@ class AudioManager:
                 "peak_rms": round(self._peak_input_rms, 2),
                 "callback_count": self._input_callback_count,
                 "consecutive_zero_callbacks": self._consecutive_zero_callbacks,
-                "consecutive_silent_callbacks": self._consecutive_silent_callbacks,
             }
 
-    def _active_demoted_devices(self) -> tuple[set[str], set[int]]:
-        """Prune expired demotions and return currently demoted device names and indices."""
-        now = time.monotonic()
-        self._demoted_input_names = {
-            k: exp for k, exp in self._demoted_input_names.items() if exp > now
-        }
-        self._demoted_input_indices = {
-            k: exp for k, exp in self._demoted_input_indices.items() if exp > now
-        }
-        return set(self._demoted_input_names), set(self._demoted_input_indices)
+    def has_default_audio_device_changed(self) -> tuple[bool, str]:
+        """Check whether the OS default capture/render endpoint changed since streams opened.
 
-    def demote_current_input_device(self, *, ttl_seconds: float = 120.0) -> None:
-        """Temporarily demote the currently opened silent/dead input device for failover."""
+        Only monitors unpinned directions (``self.input_device is None`` /
+        ``self.output_device is None``). Never reinitializes PortAudio during the check.
+        """
+        if self.input_device is not None and self.output_device is not None:
+            return False, "pinned"
         with self._lock:
-            dev = self.resolved_input_device
-            if not dev:
-                return
-            expiry = time.monotonic() + max(1.0, float(ttl_seconds))
-            name_low = str(dev.get("name", "")).strip().lower()
-            if name_low:
-                self._demoted_input_names[name_low] = expiry
-            if "index" in dev:
-                self._demoted_input_indices[int(dev["index"])] = expiry
+            if not self._running:
+                return False, "not_running"
+            prev_in, prev_out = self._default_endpoint_ids
+
+        if prev_in is None and prev_out is None:
+            return False, "unavailable"
+
+        cur_in, cur_out = get_os_default_audio_endpoint_ids()
+        in_changed = (
+            self.input_device is None
+            and prev_in is not None
+            and cur_in is not None
+            and cur_in != prev_in
+        )
+        out_changed = (
+            self.output_device is None
+            and prev_out is not None
+            and cur_out is not None
+            and cur_out != prev_out
+        )
+        if in_changed and out_changed:
+            return True, "os_default_audio_changed"
+        if in_changed:
+            return True, "os_default_input_changed"
+        if out_changed:
+            return True, "os_default_output_changed"
+        return False, "ok"
 
     def set_input_callback(self, callback: Callable[[bytes], None] | None) -> None:
         """Set or update the microphone PCM data callback."""
@@ -663,14 +707,12 @@ class AudioManager:
         *,
         max_callback_gap_seconds: float = 5.0,
         max_zero_callbacks: int = 125,
-        max_silent_callbacks: int = 75,
     ) -> tuple[bool, str]:
         """Check whether the microphone InputStream is alive and delivering real frames.
 
         Returns ``(True, "ok")`` when healthy, or ``(False, reason)`` if the stream
-        stopped, callbacks stalled (WASAPI/Bluetooth hang), sustained bit-exact
-        all-zero buffers occur, or sustained near-zero RMS frames indicate a silent
-        or inactive endpoint (e.g., idle Bluetooth HFP over DirectSound).
+        stopped, callbacks stalled (WASAPI/Bluetooth hang), or sustained bit-exact
+        all-zero buffers indicate a dead endpoint.
         """
         with self._lock:
             if not self._running or self._input_stream is None:
@@ -678,10 +720,6 @@ class AudioManager:
             inp = self._input_stream
             last_cb = self._last_input_callback_time
             zero_streak = self._consecutive_zero_callbacks
-            silent_streak = self._consecutive_silent_callbacks
-            last_rms = self._last_input_rms
-            active_dev = self.resolved_input_device
-            via_fallback = self._opened_via_fallback
 
         try:
             if getattr(inp, "stopped", False) is True or getattr(inp, "active", True) is False:
@@ -697,11 +735,6 @@ class AudioManager:
         if zero_streak >= max_zero_callbacks:
             return False, f"sustained_zero_audio_{zero_streak}_blocks"
 
-        if silent_streak >= max_silent_callbacks and _is_suspect_silent_input_device(
-            active_dev, opened_via_fallback=via_fallback
-        ):
-            return False, f"sustained_silent_audio_{silent_streak}_blocks_rms_{last_rms:.2f}"
-
         return True, "ok"
 
     def restart_streams(
@@ -709,29 +742,9 @@ class AudioManager:
         *,
         max_attempts: int = 3,
         retry_delay: float = 0.5,
-        demote_current: bool = False,
-        demote_ttl_seconds: float = 120.0,
     ) -> bool:
-        """Stop streams, refresh PortAudio endpoints, and reopen audio I/O safely.
-
-        When *demote_current* is True and no explicit input device is pinned, the
-        previously opened silent/dead input device (and same-name host-API copies)
-        is demoted so failover switches to an active built-in/default microphone.
-        """
+        """Stop streams, refresh PortAudio endpoints, and reopen audio I/O safely."""
         try:
-            if demote_current and self.input_device is None and self.resolved_input_device:
-                prev = self.resolved_input_device
-                logger.warning(
-                    "Demoting silent/unhealthy audio input device #%s '%s' (%s, last_rms=%.2f, "
-                    "peak_rms=%.2f) for %.0fs to fail over to an active microphone.",
-                    prev.get("index", "?"),
-                    prev.get("name", "unknown"),
-                    prev.get("hostapi_name", "Unknown"),
-                    self._last_input_rms,
-                    self._peak_input_rms,
-                    demote_ttl_seconds,
-                )
-                self.demote_current_input_device(ttl_seconds=demote_ttl_seconds)
             self.stop()
             refresh_audio_devices()
             self.start(max_attempts=max_attempts, retry_delay=retry_delay)
@@ -781,21 +794,50 @@ class AudioManager:
                 native_rate,
                 dev.get("max_input_channels", 1),
             )
-            sample_rate, channels = negotiate_input_sample_rate(
-                device_idx=inp_idx,
-                default_samplerate=native_rate,
-                candidate_rates=(16000, 48000, 44100),
-                preferred_channels=1,
-            )
-            blocksize = int(sample_rate * 0.08)
             inp_wasapi = "WASAPI" in host_name.upper()
+            if inp_wasapi:
+                sample_rate, channels = negotiate_input_sample_rate(
+                    device_idx=inp_idx,
+                    default_samplerate=native_rate,
+                    candidate_rates=(16000, 48000, 44100),
+                    preferred_channels=1,
+                )
+            else:
+                # DirectSound / MME report 44100 Hz for all endpoints regardless of hardware rate;
+                # prefer 16000 Hz natively to avoid 16 kHz -> 44.1 kHz -> 16 kHz double-resampling.
+                sample_rate, channels = negotiate_input_sample_rate(
+                    device_idx=inp_idx,
+                    default_samplerate=INPUT_AUDIO_SAMPLE_RATE_HZ,
+                    candidate_rates=(INPUT_AUDIO_SAMPLE_RATE_HZ, native_rate, 48000, 44100),
+                    preferred_channels=1,
+                )
+            # On Windows WASAPI, pass blocksize=0 so PortAudio uses the native WASAPI engine
+            # period (~10 ms) instead of forcing an 80 ms ring-buffer adapter that causes
+            # 1.5-3.0s startup stalls and PaErrorCode -9999 on Bluetooth HFP SCO headsets;
+            # AudioChunkBuffer(1280) assembles exact 80 ms chunks downstream.
+            blocksize = 0 if inp_wasapi else int(sample_rate * 0.08)
             extra_options: list[Any] = (
                 [sd.WasapiSettings(auto_convert=True), None]
                 if (inp_wasapi and hasattr(sd, "WasapiSettings"))
                 else [None]
             )
+            # Bluetooth HFP SCO endpoints often need ~300-400 ms to wake from A2DP idle;
+            # retry primary WASAPI once after a brief settle pause before falling back.
+            attempt_specs: list[tuple[Any, int, float]] = [
+                (extra, blocksize, 0.0) for extra in extra_options
+            ]
+            if idx_pos == 0 and inp_wasapi and self._wasapi_retry_delay >= 0.0:
+                attempt_specs.append((extra_options[0], blocksize, self._wasapi_retry_delay))
 
-            for extra in extra_options:
+            for attempt_idx, (extra, try_blocksize, delay_before) in enumerate(attempt_specs):
+                if delay_before > 0.0:
+                    logger.debug(
+                        "Retrying primary WASAPI input #%d '%s' after %.2fs settle pause...",
+                        inp_idx,
+                        dev["name"],
+                        delay_before,
+                    )
+                    time.sleep(delay_before)
                 stream: sd.InputStream | None = None
                 try:
                     # Set negotiated sample rate & channels BEFORE stream.start() so the very
@@ -807,12 +849,11 @@ class AudioManager:
                         channels=channels,
                         dtype="int16",
                         device=inp_idx,
-                        blocksize=blocksize,
+                        blocksize=try_blocksize,
                         extra_settings=extra,
                         callback=self._input_stream_callback,
                     )
                     stream.start()
-                    self._opened_via_fallback = idx_pos > 0
                     if idx_pos > 0:
                         logger.warning(
                             "Audio input fell back to #%d '%s' (host API: %s, %d Hz, %dch).",
@@ -831,12 +872,13 @@ class AudioManager:
                             stream.close()
                         except Exception:
                             pass
-                    if extra is not None:
+                    if attempt_idx + 1 < len(attempt_specs):
                         logger.debug(
-                            "Input device #%d '%s' failed with WASAPI auto_convert (%s); "
-                            "retrying without extra_settings.",
+                            "Input device #%d '%s' attempt %d/%d failed (%s); retrying...",
                             inp_idx,
                             dev["name"],
+                            attempt_idx + 1,
+                            len(attempt_specs),
                             exc,
                         )
                         continue
@@ -930,21 +972,21 @@ class AudioManager:
             self._drain_output_queue()
             self._is_speaking.clear()
             self._consecutive_zero_callbacks = 0
-            self._consecutive_silent_callbacks = 0
+            self._consecutive_zero_samples = 0
             self._last_input_rms = 0.0
             self._peak_input_rms = 0.0
             self._input_callback_count = 0
             self._input_status_error_count = 0
 
-            demoted_names, demoted_indices = self._active_demoted_devices()
+            # Capture current OS default endpoint IDs BEFORE resolving candidates so any
+            # hot-swap occurring mid-startup is caught on the very next watchdog poll.
+            captured_defaults = get_os_default_audio_endpoint_ids()
 
             # Resolve ordered candidate input & output devices (raises on invalid/ambiguous spec)
             input_candidates = list_candidate_audio_devices(
                 self.input_device,
                 kind="input",
                 preferred_hostapi=self.preferred_hostapi,
-                demoted_device_names=demoted_names,
-                demoted_device_indices=demoted_indices,
             )
             output_candidates = list_candidate_audio_devices(
                 self.output_device,
@@ -970,6 +1012,7 @@ class AudioManager:
                 self._output_stream = out_stream
                 self.resolved_output_device = chosen_out
 
+                self._default_endpoint_ids = captured_defaults
                 self._last_input_callback_time = time.monotonic()
                 self._running = True
                 self._health_monitored = True
@@ -1065,19 +1108,31 @@ class AudioManager:
         if self.mic_mute_while_speaking and self._is_speaking.is_set():
             # Mute microphone while speaking; clear buffer to prevent stale stitching
             self._consecutive_zero_callbacks = 0
-            self._consecutive_silent_callbacks = 0
+            self._consecutive_zero_samples = 0
             if self._chunk_buffer is not None:
                 self._chunk_buffer.clear()
             return
 
+        orig_sr = getattr(self, "input_sample_rate", INPUT_AUDIO_SAMPLE_RATE_HZ)
         if indata.size > 0 and not np.any(indata):
-            self._consecutive_zero_callbacks += 1
+            block_80ms = max(1, int(orig_sr * 0.08))
+            chunk_frames = int(indata.shape[0])
+            if chunk_frames >= block_80ms:
+                self._consecutive_zero_callbacks += 1
+                self._consecutive_zero_samples = 0
+            else:
+                self._consecutive_zero_samples += chunk_frames
+                if self._consecutive_zero_samples >= block_80ms:
+                    step = self._consecutive_zero_samples // block_80ms
+                    self._consecutive_zero_callbacks += step
+                    self._consecutive_zero_samples %= block_80ms
         else:
             self._consecutive_zero_callbacks = 0
+            self._consecutive_zero_samples = 0
 
         resampled_16k = resample_to_16k_mono(
             indata,
-            orig_sr=getattr(self, "input_sample_rate", INPUT_AUDIO_SAMPLE_RATE_HZ),
+            orig_sr=orig_sr,
             target_sr=INPUT_AUDIO_SAMPLE_RATE_HZ,
         )
 
@@ -1085,10 +1140,6 @@ class AudioManager:
         self._last_input_rms = rms
         if rms > self._peak_input_rms:
             self._peak_input_rms = rms
-        if resampled_16k.size > 0 and rms < self._silent_rms_threshold:
-            self._consecutive_silent_callbacks += 1
-        else:
-            self._consecutive_silent_callbacks = 0
 
         cb = self._on_audio_input
         if cb is None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -167,6 +168,7 @@ class WakeWordDetector:
         self.data_dir = data_dir
         self._target_dir = wake_word_models_dir(data_dir)
         self._pending_samples: np.ndarray = np.empty(0, dtype=np.int16)
+        self._lock = threading.RLock()
 
         if model_instance is not None:
             self._model = model_instance
@@ -222,6 +224,14 @@ class WakeWordDetector:
             )
             return True, best_score, best_key
 
+        if best_score >= 0.05:
+            logger.debug(
+                "Wake word near-miss: model=%s, score=%.3f (threshold=%.2f)",
+                best_key,
+                best_score,
+                self.threshold,
+            )
+
         return False, best_score, best_key
 
     def process_audio(
@@ -268,42 +278,44 @@ class WakeWordDetector:
         if len(audio_arr) == 0:
             return False, 0.0, ""
 
-        if self._pending_samples.size > 0:
-            audio_arr = np.concatenate((self._pending_samples, audio_arr))
-            self._pending_samples = np.empty(0, dtype=np.int16)
+        with self._lock:
+            if self._pending_samples.size > 0:
+                audio_arr = np.concatenate((self._pending_samples, audio_arr))
+                self._pending_samples = np.empty(0, dtype=np.int16)
 
-        if len(audio_arr) <= WAKE_WORD_CHUNK_SAMPLES:
-            return self._predict_single_chunk(audio_arr)
+            if len(audio_arr) <= WAKE_WORD_CHUNK_SAMPLES:
+                return self._predict_single_chunk(audio_arr)
 
-        # Step multi-frame buffers through openwakeword in exact 1280-sample (80 ms) chunks.
-        best_score = 0.0
-        best_key = self.model_key
-        detected_any = False
-        offset = 0
-        total = len(audio_arr)
-        while offset + WAKE_WORD_CHUNK_SAMPLES <= total:
-            chunk = audio_arr[offset : offset + WAKE_WORD_CHUNK_SAMPLES]
-            offset += WAKE_WORD_CHUNK_SAMPLES
-            det, score, key = self._predict_single_chunk(chunk)
-            if score >= best_score:
-                best_score = score
-                best_key = key
-            if det:
-                detected_any = True
+            # Step multi-frame buffers through openwakeword in exact 1280-sample (80 ms) chunks.
+            best_score = 0.0
+            best_key = self.model_key
+            detected_any = False
+            offset = 0
+            total = len(audio_arr)
+            while offset + WAKE_WORD_CHUNK_SAMPLES <= total:
+                chunk = audio_arr[offset : offset + WAKE_WORD_CHUNK_SAMPLES]
+                offset += WAKE_WORD_CHUNK_SAMPLES
+                det, score, key = self._predict_single_chunk(chunk)
+                if score >= best_score:
+                    best_score = score
+                    best_key = key
+                if det:
+                    detected_any = True
 
-        if offset < total:
-            self._pending_samples = np.ascontiguousarray(audio_arr[offset:], dtype=np.int16)
+            if offset < total:
+                self._pending_samples = np.ascontiguousarray(audio_arr[offset:], dtype=np.int16)
 
-        return detected_any, best_score, best_key
+            return detected_any, best_score, best_key
 
     def reset(self) -> None:
         """Reset internal prediction buffers and preprocessor state."""
-        self._pending_samples = np.empty(0, dtype=np.int16)
-        if hasattr(self._model, "reset"):
-            try:
-                self._model.reset()
-                return
-            except Exception as exc:
-                logger.debug("Failed calling model.reset(): %s", exc)
-        if hasattr(self._model, "prediction_buffer"):
-            self._model.prediction_buffer.clear()
+        with self._lock:
+            self._pending_samples = np.empty(0, dtype=np.int16)
+            if hasattr(self._model, "reset"):
+                try:
+                    self._model.reset()
+                    return
+                except Exception as exc:
+                    logger.debug("Failed calling model.reset(): %s", exc)
+            if hasattr(self._model, "prediction_buffer"):
+                self._model.prediction_buffer.clear()

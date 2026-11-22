@@ -493,6 +493,7 @@ class VoiceRunner:
         self._wake_word_thread: threading.Thread | None = None
         self._wake_word_stop = threading.Event()
         self._wake_word_pending_trigger: bool = False
+        self._peak_wake_score_window: float = 0.0
 
     def _setup_voice_file_logging(self) -> None:
         """Ensure voice log file exists and receives log records."""
@@ -687,11 +688,14 @@ class VoiceRunner:
             if self._audio_manager.resolved_input_device:
                 inp = self._audio_manager.resolved_input_device
                 logger.info(
-                    "Input device: #%d '%s' (host API: %s, native rate: %d Hz)",
+                    "Input device: #%d '%s' (host API: %s, native rate: %d Hz, "
+                    "negotiated: %d Hz, %dch)",
                     inp["index"],
                     inp["name"],
                     inp.get("hostapi_name", "Unknown"),
                     int(inp.get("default_samplerate", 16000)),
+                    int(getattr(self._audio_manager, "input_sample_rate", 16000)),
+                    int(getattr(self._audio_manager, "input_channels", 1)),
                 )
             if self._audio_manager.resolved_output_device:
                 out = self._audio_manager.resolved_output_device
@@ -703,10 +707,14 @@ class VoiceRunner:
                     int(out.get("default_samplerate", 24000)),
                 )
 
-            # 2. Initialize wake word detector off the event loop (ONNX load can take 5-15s)
-            if self._wake_word is None:
+            # 2. Initialize wake word detector off the event loop (ONNX load can take 5-15s).
+            # Keep self._wake_word unpublished until the worker thread is started and stale
+            # audio buffered during model load has been flushed, eliminating startup races.
+            detector = self._wake_word
+            self._wake_word = None
+            if detector is None:
                 try:
-                    self._wake_word = await asyncio.to_thread(
+                    detector = await asyncio.to_thread(
                         WakeWordDetector,
                         model_name=self.config.wake_word_model,
                         threshold=self.config.wake_threshold,
@@ -716,23 +724,27 @@ class VoiceRunner:
                     logger.error(str(exc))
                     raise
 
-            # Guarantee wake-word starts armed immediately in IDLE and discard audio queued
-            # during ONNX model load so the detector begins on fresh live 16 kHz frames.
-            self._call_state = "idle"
-            self._wake_word_pending_trigger = False
-            flush_fn = getattr(self._audio_manager, "flush_input_buffer", None)
-            if callable(flush_fn):
-                with contextlib.suppress(Exception):
-                    flush_fn()
-            self._drain_wake_word_queue()
-            if self._wake_word is not None:
-                with contextlib.suppress(Exception):
-                    self._wake_word.reset()
+            with contextlib.suppress(Exception):
+                detector.reset()
 
             # Start dedicated wake-word worker thread & audio health watchdog for live streams
             # (mocked audio managers in direct unit tests retain synchronous _on_audio_chunk).
             if getattr(self._audio_manager, "_health_monitored", False):
                 self._start_wake_word_worker()
+
+            # Discard audio queued during ONNX model load so the detector begins on fresh
+            # live 16 kHz frames, then publish detector and arm IDLE atomically.
+            flush_fn = getattr(self._audio_manager, "flush_input_buffer", None)
+            if callable(flush_fn):
+                with contextlib.suppress(Exception):
+                    flush_fn()
+            self._drain_wake_word_queue()
+            self._call_state = "idle"
+            self._wake_word_pending_trigger = False
+            self._peak_wake_score_window = 0.0
+            self._wake_word = detector
+
+            if getattr(self._audio_manager, "_health_monitored", False):
                 self._audio_health_task = asyncio.create_task(
                     self._audio_health_watchdog(),
                     name="VoiceRunnerAudioHealthWatchdog",
@@ -928,6 +940,8 @@ class VoiceRunner:
             return
         try:
             detected, score, _key = self._wake_word.process_audio(pcm_bytes)
+            if score > self._peak_wake_score_window:
+                self._peak_wake_score_window = score
             if detected:
                 self._wake_word_pending_trigger = True
                 self._wake_word.reset()
@@ -947,13 +961,15 @@ class VoiceRunner:
                         if exc is not None:
                             self._wake_word_pending_trigger = False
                             logger.warning("Wake-word start_call failed: %s", exc)
+                        elif self._call_state == "idle":
+                            self._wake_word_pending_trigger = False
 
                 fut.add_done_callback(_on_trigger_done)
         except Exception:
             logger.exception("Error during wake word processing.")
 
     async def _audio_health_watchdog(self) -> None:
-        """Periodically verify AudioManager InputStream health and recover on stalls/hot-swaps."""
+        """Periodically verify AudioManager InputStream health and follow OS default hot-swaps."""
         poll = max(0.05, float(self._audio_health_poll_interval))
         while not self._stop_event.is_set():
             with contextlib.suppress(TimeoutError):
@@ -969,54 +985,67 @@ class VoiceRunner:
                 continue
             healthy, reason = health_fn()
             if healthy:
+                default_changed_fn = getattr(am, "has_default_audio_device_changed", None)
+                if callable(default_changed_fn):
+                    try:
+                        raw_change = await asyncio.to_thread(default_changed_fn)
+                        if isinstance(raw_change, tuple) and len(raw_change) == 2:
+                            changed, change_reason = bool(raw_change[0]), str(raw_change[1])
+                        else:
+                            changed, change_reason = False, "ignored"
+                    except Exception as exc:
+                        logger.debug("Default audio device check failed: %s", exc)
+                        changed, change_reason = False, "error"
+                    if changed:
+                        healthy = False
+                        reason = change_reason
+            if healthy:
                 continue
-            demote_silent = reason.startswith(
-                ("sustained_zero_audio_", "sustained_silent_audio_")
-            )
+
             telemetry_fn = getattr(am, "input_rms_telemetry", None)
             telemetry = telemetry_fn() if callable(telemetry_fn) else {}
-            logger.warning(
-                "Audio input stream unhealthy (%s, last_rms=%s, peak_rms=%s); "
-                "attempting automatic recovery (demote_current=%s)...",
-                reason,
-                telemetry.get("last_rms", "?"),
-                telemetry.get("peak_rms", "?"),
-                demote_silent,
-            )
+            if reason.startswith("os_default_"):
+                logger.info(
+                    "OS default audio endpoint changed (%s); rebinding audio streams to "
+                    "the active OS default device...",
+                    reason,
+                )
+            else:
+                logger.warning(
+                    "Audio input stream unhealthy (%s, last_rms=%s, peak_rms=%s); "
+                    "attempting automatic recovery...",
+                    reason,
+                    telemetry.get("last_rms", "?"),
+                    telemetry.get("peak_rms", "?"),
+                )
 
-            def _invoke_restart(
-                fn: Callable[..., Any] = restart_fn,
-                demote: bool = demote_silent,
-            ) -> bool:
-                try:
-                    sig = inspect.signature(fn)
-                    if any(
-                        p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "demote_current"
-                        for p in sig.parameters.values()
-                    ):
-                        return bool(fn(demote_current=demote))
-                except (TypeError, ValueError):
-                    pass
-                return bool(fn())
-
-            recovered = await asyncio.to_thread(_invoke_restart)
+            recovered = await asyncio.to_thread(restart_fn)
             if recovered:
+                flush_fn = getattr(am, "flush_input_buffer", None)
+                if callable(flush_fn):
+                    with contextlib.suppress(Exception):
+                        flush_fn()
                 self._drain_wake_word_queue()
                 if self._wake_word is not None:
-                    self._wake_word.reset()
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(self._wake_word.reset)
                 if self._wake_word_thread is None or not self._wake_word_thread.is_alive():
                     self._start_wake_word_worker()
                 inp = getattr(am, "resolved_input_device", None) or {}
+                out = getattr(am, "resolved_output_device", None) or {}
                 post_telemetry = telemetry_fn() if callable(telemetry_fn) else {}
                 logger.info(
-                    "Audio input stream recovered on #%s '%s' (host API: %s, rate: %s Hz, "
-                    "channels: %s, last_rms: %s).",
+                    "Audio streams rebound to input=#%s '%s' (%s, %s Hz, %sch, last_rms=%s) "
+                    "and output=#%s '%s' (%s).",
                     inp.get("index", "?"),
                     inp.get("name", "unknown"),
                     inp.get("hostapi_name", "Unknown"),
                     getattr(am, "input_sample_rate", "?"),
                     getattr(am, "input_channels", "?"),
                     post_telemetry.get("last_rms", "?"),
+                    out.get("index", "?"),
+                    out.get("name", "unknown"),
+                    out.get("hostapi_name", "Unknown"),
                 )
 
     def _enqueue_outbound_audio(self, pcm_bytes: bytes) -> None:
@@ -1062,7 +1091,12 @@ class VoiceRunner:
                 elapsed = now - self._last_fps_report_time
                 fps = self._frames_sent_window / elapsed
                 rms = compute_audio_rms(pcm_bytes)
-                msg = f"[AUDIO-DEBUG] Wake listen: {fps:4.1f} fps | 16 kHz RMS: {rms:6.1f}"
+                peak_sc = self._peak_wake_score_window
+                self._peak_wake_score_window = 0.0
+                msg = (
+                    f"[AUDIO-DEBUG] Wake listen: {fps:4.1f} fps | "
+                    f"16 kHz RMS: {rms:6.1f} | Wake peak: {peak_sc:.3f}"
+                )
                 print(msg, flush=True)
                 self._frames_sent_window = 0
                 self._last_fps_report_time = now
@@ -1459,19 +1493,20 @@ class VoiceRunner:
                 with contextlib.suppress(asyncio.CancelledError):
                     await consume_task
 
-        # Reset call and voice state immediately so hooks cannot block or corrupt IDLE/new calls
-        self._call_state = "idle"
-        self._wake_word_pending_trigger = False
-        self._stall_timer_armed = False
-        self._stall_accumulated_seconds = 0.0
-        self._audio_sent_start_time = None
-        if error is not None:
-            self._set_voice_state("error", error=error)
-        else:
-            self._set_voice_state("idle")
+        # While still in "ending" state, clear call state and reset wake-word buffers BEFORE
+        # re-arming IDLE so the wake-word worker cannot race with reset() or reuse stale call_id.
         self._call_id = None
         self._transcript_history.clear()
         self._turn_launched_targets.clear()
+        self._stall_timer_armed = False
+        self._stall_accumulated_seconds = 0.0
+        self._audio_sent_start_time = None
+        self._peak_wake_score_window = 0.0
+        if self._audio_manager is not None:
+            flush_fn = getattr(self._audio_manager, "flush_input_buffer", None)
+            if callable(flush_fn):
+                with contextlib.suppress(Exception):
+                    flush_fn()
         self._drain_wake_word_queue()
         if self._wake_word is not None:
             self._wake_word.reset()
@@ -1482,6 +1517,14 @@ class VoiceRunner:
             and (self._wake_word_thread is None or not self._wake_word_thread.is_alive())
         ):
             self._start_wake_word_worker()
+
+        # Re-arm IDLE now that all wake-word and call state has been cleanly reset
+        self._wake_word_pending_trigger = False
+        self._call_state = "idle"
+        if error is not None:
+            self._set_voice_state("error", error=error)
+        else:
+            self._set_voice_state("idle")
 
         # Write usage & metrics record off the event loop
         await asyncio.to_thread(

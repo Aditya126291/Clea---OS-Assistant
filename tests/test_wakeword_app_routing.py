@@ -3,9 +3,12 @@
 Covers:
 1. Guaranteed 16 kHz mono int16 1280-sample pipeline into openWakeWord (including float32
    [-1, 1] scaling, stereo downmix, 48 kHz & 44.1 kHz resampling, and multi-chunk stepping).
-2. Silent-device failover (near-zero RMS detection, device demotion across same-name host APIs,
-   virtual/loopback deprioritization, and VoiceRunner health-watchdog recovery).
-3. Wake-word armed state on startup, post-call, and post-error + read-only ``--diagnose-mic``.
+2. Bluetooth/earphone retention & resilience (never demoting quiet-room Bluetooth headsets to
+   the laptop mic, primary WASAPI settle retry & native blocksize=0 fallback, DirectSound
+   16 kHz negotiation, MME 31-char truncated headset matching, and OS default hot-swap
+   tracking in VoiceRunner's health watchdog).
+3. Wake-word armed state on startup, post-call, post-error, thread-safe reset/predict +
+   read-only ``--diagnose-mic``.
 4. Dynamic 3-layer OS URL-to-App resolver with zero hardcoded domain dictionaries:
    - Layer 1: Windows AppUriHandlers (Store / MSIX)
    - Layer 2: Windows Registry custom URL Protocol via winreg (install -> native; uninstall -> web)
@@ -148,14 +151,14 @@ def test_audio_manager_streams_exact_1280_int16_chunks_from_48k_float32_and_int1
 
 
 # ===========================================================================
-# 2. Smart Active-Mic Selection & Silent-Device Failover
+# 2. Bluetooth Earphone Retention, WASAPI Retry, 16 kHz DS & OS Default Hot-Swap
 # ===========================================================================
 
 
-def test_silent_bluetooth_hfp_device_demotes_and_fails_over_to_builtin_mic(
+def test_bluetooth_headset_never_demoted_in_quiet_room_and_prefers_16k_directsound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Sustained near-zero RMS on Bluetooth HFP fails over to active built-in Microphone Array."""
+    """Quiet-room Bluetooth HFP stays on Headset (never hijacks to laptop mic) at native 16 kHz."""
     fake_hostapis = [
         {"name": "Windows DirectSound", "default_input_device": 1, "default_output_device": 4},
         {"name": "Windows WASAPI", "default_input_device": 0, "default_output_device": 4},
@@ -190,7 +193,7 @@ def test_silent_bluetooth_hfp_device_demotes_and_fails_over_to_builtin_mic(
             "default_samplerate": 48000.0,
         },
         {
-            "name": "Speakers (Realtek(R) Audio)",
+            "name": "Headphones (Earphone)",
             "hostapi": 1,
             "max_input_channels": 0,
             "max_output_channels": 2,
@@ -198,14 +201,25 @@ def test_silent_bluetooth_hfp_device_demotes_and_fails_over_to_builtin_mic(
         },
     ]
 
+    opened_specs: list[tuple[int, int, int]] = []
+
     class _FakeStream:
-        def __init__(self, device: int, **_kw: Any) -> None:
+        def __init__(
+            self,
+            device: int,
+            samplerate: int = 16000,
+            blocksize: int = 0,
+            **_kw: Any,
+        ) -> None:
             self.device = device
+            self.samplerate = samplerate
+            self.blocksize = blocksize
             self.active = True
             self.stopped = False
 
         def start(self) -> None:
-            # Simulate Bluetooth HFP WASAPI failure (like PaErrorCode -9999 in voice.log)
+            opened_specs.append((self.device, self.samplerate, self.blocksize))
+            # Simulate Bluetooth HFP WASAPI failure (PaErrorCode -9999) on all WASAPI attempts
             if self.device == 0:
                 raise sd.PortAudioError("WdmSyncIoctl GLE=0x490 [PaErrorCode -9999]")
 
@@ -222,53 +236,132 @@ def test_silent_bluetooth_hfp_device_demotes_and_fails_over_to_builtin_mic(
     monkeypatch.setattr(sd, "InputStream", _FakeStream)
     monkeypatch.setattr(sd, "OutputStream", _FakeStream)
     monkeypatch.setattr(
-        "clea.surfaces.voice.audio.refresh_audio_devices",
-        lambda: None,
+        "clea.surfaces.voice.audio.get_os_default_audio_endpoint_ids",
+        lambda: ("cap-earphone", "ren-earphone"),
     )
+    monkeypatch.setattr("clea.surfaces.voice.audio.refresh_audio_devices", lambda: None)
 
     mgr = AudioManager(chunk_size=1280)
+    mgr._wasapi_retry_delay = 0.0
     mgr.start()
     try:
-        # Initial fallback opens DirectSound #1 Headset (Earphone)
+        # 1. Fallback stays on the user's Headset (Earphone) over DirectSound at native 16 kHz
+        # (avoiding 16 kHz -> 44.1 kHz -> 16 kHz double-resampling, NEVER jumping to laptop mic!)
         assert mgr.resolved_input_device is not None
         assert mgr.resolved_input_device["index"] == 1
+        assert mgr.resolved_input_device["name"] == "Headset (Earphone)"
+        assert mgr.input_sample_rate == 16000
 
-        # Simulate sustained near-zero RMS (1-LSB noise floor, NOT bit-exact zero!)
-        near_silent = np.ones((3528, 1), dtype=np.int16)  # RMS = 1.0 < 3.0
-        for _ in range(80):
-            mgr._input_stream_callback(near_silent, 3528, None, sd.CallbackFlags())
+        # 2. Quiet-room Bluetooth Headset (RMS = 1.0..2.0) MUST stay healthy forever and NEVER
+        # fail over to the laptop's Microphone Array!
+        quiet_earphone = np.ones((1280, 1), dtype=np.int16)
+        for _ in range(150):
+            mgr._input_stream_callback(quiet_earphone, 1280, None, sd.CallbackFlags())
 
-        healthy, reason = mgr.is_input_stream_healthy(max_silent_callbacks=75)
-        assert healthy is False
-        assert reason.startswith("sustained_silent_audio_")
+        healthy, reason = mgr.is_input_stream_healthy()
+        assert healthy is True and reason == "ok"
 
-        # Recovery with demote_current=True demotes BOTH #0 and #1 Headset (Earphone)
-        # AND skips virtual #2 Stereo Mix -> switches directly to #3 Microphone Array!
-        assert mgr.restart_streams(demote_current=True, retry_delay=0.0) is True
+        # 3. Even if restart_streams() is invoked (e.g. after transient hang), it reopens the
+        # user's active Headset (Earphone) rather than demoting it to Microphone Array.
+        assert mgr.restart_streams(retry_delay=0.0) is True
         assert mgr.resolved_input_device is not None
-        assert mgr.resolved_input_device["index"] == 3
-        assert "Microphone Array" in mgr.resolved_input_device["name"]
-        assert mgr.input_sample_rate == 48000
+        assert mgr.resolved_input_device["name"] == "Headset (Earphone)"
 
-        # Quiet room on built-in WASAPI Microphone Array (hardware noise gate RMS=1.0)
-        # must NOT trigger a false failover restart.
-        quiet_room = np.ones((3840, 1), dtype=np.int16)
-        for _ in range(90):
-            mgr._input_stream_callback(quiet_room, 3840, None, sd.CallbackFlags())
-        healthy_quiet, reason_quiet = mgr.is_input_stream_healthy(max_silent_callbacks=75)
-        assert healthy_quiet is True and reason_quiet == "ok"
-
-        # Candidate order places virtual/loopback Stereo Mix AFTER real Microphone Array
-        ordered = list_candidate_audio_devices(
-            None,
-            kind="input",
-            preferred_hostapi="WASAPI",
-            demoted_device_names={"headset (earphone)"},
-        )
+        # 4. Candidate order places virtual/loopback Stereo Mix AFTER real Microphone Array
+        ordered = list_candidate_audio_devices(None, kind="input", preferred_hostapi="WASAPI")
         names = [d["name"] for d in ordered]
+        assert names[0] == "Headset (Earphone)"
         assert names.index("Microphone Array (Realtek(R) Audio)") < names.index(
             "Stereo Mix (Realtek HD Audio)"
         )
+    finally:
+        mgr.stop()
+
+
+def test_primary_wasapi_settle_retry_and_native_blocksize_fallback_avoid_directsound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient WASAPI -9999 recovers via settle retry or blocksize=0 without dropping to DS."""
+    fake_hostapis = [
+        {"name": "Windows DirectSound", "default_input_device": 1, "default_output_device": 2},
+        {"name": "Windows WASAPI", "default_input_device": 0, "default_output_device": 2},
+    ]
+    fake_devices = [
+        {
+            "name": "Headset (Earphone)",
+            "hostapi": 1,
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 16000.0,
+        },
+        {
+            "name": "Headset (Earphone)",
+            "hostapi": 0,
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 44100.0,
+        },
+        {
+            "name": "Headphones (Earphone)",
+            "hostapi": 1,
+            "max_input_channels": 0,
+            "max_output_channels": 2,
+            "default_samplerate": 48000.0,
+        },
+    ]
+
+    # Case A: Fails first 2 WASAPI attempts (auto_convert + None), succeeds on settle retry #3
+    wasapi_attempts = [0]
+
+    class _SettleRetryStream:
+        def __init__(self, device: int, blocksize: int = 0, **_kw: Any) -> None:
+            self.device = device
+            self.blocksize = blocksize
+            self.active = True
+            self.stopped = False
+
+        def start(self) -> None:
+            if self.device == 0:
+                wasapi_attempts[0] += 1
+                if wasapi_attempts[0] <= 2:
+                    raise sd.PortAudioError("Transient SCO wake [PaErrorCode -9999]")
+
+        def stop(self) -> None:
+            self.active = False
+            self.stopped = True
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(sd, "query_devices", lambda: fake_devices)
+    monkeypatch.setattr(sd, "query_hostapis", lambda: fake_hostapis)
+    monkeypatch.setattr(sd, "check_input_settings", lambda **_kw: None)
+    monkeypatch.setattr(sd, "InputStream", _SettleRetryStream)
+    monkeypatch.setattr(sd, "OutputStream", _SettleRetryStream)
+    monkeypatch.setattr(
+        "clea.surfaces.voice.audio.get_os_default_audio_endpoint_ids",
+        lambda: ("cap-earphone", "ren-earphone"),
+    )
+
+    mgr = AudioManager(chunk_size=1280)
+    mgr._wasapi_retry_delay = 0.0
+    mgr.start()
+    try:
+        assert mgr.resolved_input_device is not None
+        assert mgr.resolved_input_device["index"] == 0
+        assert mgr.resolved_input_device["hostapi_name"] == "Windows WASAPI"
+        assert mgr._input_stream is not None
+        assert mgr._input_stream.blocksize == 0  # type: ignore[attr-defined]
+        assert wasapi_attempts[0] == 3
+
+        # Small 10ms (160-sample) zero callbacks under native WASAPI blocksize=0 count in
+        # 80ms units so 1.6s of zeros = 20 blocks (< 125 threshold, never false-restarting!)
+        zero_10ms = np.zeros((160, 1), dtype=np.int16)
+        for _ in range(160):
+            mgr._input_stream_callback(zero_10ms, 160, None, sd.CallbackFlags())
+        assert mgr._consecutive_zero_callbacks == 20
+        ok_short, _ = mgr.is_input_stream_healthy(max_zero_callbacks=125)
+        assert ok_short is True
     finally:
         mgr.stop()
 
@@ -924,10 +1017,13 @@ def test_resample_scales_float32_with_overshoot_or_nan_while_preserving_int16_sc
     assert list(res_scaled) == [1000, 0, -1000, 32767, -32768]
 
 
-def test_silent_failover_handles_mme_31char_truncation_os_aliases_and_fallback_builtin_wasapi(
+@pytest.mark.asyncio
+async def test_os_default_audio_hotswap_and_mme_truncation_matching_and_thread_safe_wake_word(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Demotion catches MME 31-char truncation & OS aliases; fallback WASAPI builtin stays up."""
+    """OS default hot-swap rebinds streams to Bluetooth; MME truncation stays on same headset."""
+    # 1. MME 31-char truncated headset stays grouped right after its full WASAPI name
     fake_hostapis = [
         {"name": "MME", "default_input_device": 0, "default_output_device": 5},
         {"name": "Windows DirectSound", "default_input_device": 2, "default_output_device": 5},
@@ -985,27 +1081,25 @@ def test_silent_failover_handles_mme_31char_truncation_os_aliases_and_fallback_b
     monkeypatch.setattr(sd, "check_input_settings", lambda **_kw: None)
     monkeypatch.setattr("clea.surfaces.voice.audio.refresh_audio_devices", lambda: None)
 
-    # 1. Demoting full WASAPI headset name demotes truncated MME name AND OS-default aliases!
-    ordered = list_candidate_audio_devices(
-        None,
-        kind="input",
-        preferred_hostapi="WASAPI",
-        demoted_device_names={"headset (sony wh-1000xm5 hands-free ag audio)"},
-    )
-    assert ordered[0]["index"] == 4
-    assert "Microphone Array" in ordered[0]["name"]
+    ordered = list_candidate_audio_devices(None, kind="input", preferred_hostapi="WASAPI")
+    assert ordered[0]["index"] == 3
+    assert ordered[1]["index"] == 1  # Same headset via truncated MME BEFORE laptop mic!
 
-    # 2. Built-in WASAPI Microphone Array opened via fallback (idx_pos > 0) must NOT fail over
-    # in a quiet room when hardware noise suppression produces RMS < 3.0.
-    class _FallbackToBuiltinStream:
-        def __init__(self, device: int, **_kw: Any) -> None:
-            self.device = device
+    # 2. OS default audio endpoint hot-swap (e.g. Bluetooth earphones connected after logon):
+    # AudioManager detects default change while healthy, and VoiceRunner's watchdog rebinds!
+    endpoint_state = [("cap-realtek", "ren-speakers")]
+    monkeypatch.setattr(
+        "clea.surfaces.voice.audio.get_os_default_audio_endpoint_ids",
+        lambda: endpoint_state[0],
+    )
+
+    class _OkStream:
+        def __init__(self, **_kw: Any) -> None:
             self.active = True
             self.stopped = False
 
         def start(self) -> None:
-            if self.device in (0, 1, 2, 3):
-                raise sd.PortAudioError("Simulated Bluetooth/alias endpoint unavailable")
+            pass
 
         def stop(self) -> None:
             self.active = False
@@ -1014,22 +1108,100 @@ def test_silent_failover_handles_mme_31char_truncation_os_aliases_and_fallback_b
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(sd, "InputStream", _FallbackToBuiltinStream)
-    monkeypatch.setattr(sd, "OutputStream", _FallbackToBuiltinStream)
+    monkeypatch.setattr(sd, "InputStream", _OkStream)
+    monkeypatch.setattr(sd, "OutputStream", _OkStream)
 
     mgr = AudioManager(chunk_size=1280)
     mgr.start()
     try:
-        assert mgr.resolved_input_device is not None
-        assert mgr.resolved_input_device["index"] == 4
-        assert mgr._opened_via_fallback is True
-        quiet_room = np.ones((3840, 1), dtype=np.int16)  # RMS = 1.0 < 3.0
-        for _ in range(90):
-            mgr._input_stream_callback(quiet_room, 3840, None, sd.CallbackFlags())
-        healthy, reason = mgr.is_input_stream_healthy(max_silent_callbacks=75)
-        assert healthy is True and reason == "ok"
+        assert mgr.has_default_audio_device_changed() == (False, "ok")
+
+        # Transient None from Core Audio does not trigger spurious restart
+        endpoint_state[0] = (None, None)  # type: ignore[list-item]
+        assert mgr.has_default_audio_device_changed() == (False, "ok")
+
+        # User connects Bluetooth earphones -> both capture & render default IDs change
+        endpoint_state[0] = ("cap-earphone", "ren-earphone")
+        assert mgr.has_default_audio_device_changed() == (True, "os_default_audio_changed")
+
+        # Pinned devices ignore OS default changes
+        mgr.input_device = "Headset"
+        mgr.output_device = "Speakers"
+        assert mgr.has_default_audio_device_changed() == (False, "pinned")
+        mgr.input_device = None
+        mgr.output_device = None
+
+        # Wire into VoiceRunner watchdog and verify automatic hot-swap recovery & wake reset
+        reset_calls = [0]
+        mock_model = MagicMock()
+        mock_model.predict.return_value = {"hey_jarvis_v0.1": 0.0}
+
+        def _count_reset() -> None:
+            reset_calls[0] += 1
+
+        mock_model.reset.side_effect = _count_reset
+        detector = WakeWordDetector(
+            model_name="hey_jarvis",
+            threshold=0.25,
+            model_instance=mock_model,
+        )
+
+        restart_calls = [0]
+        orig_restart = mgr.restart_streams
+
+        def _spy_restart(*a: Any, **kw: Any) -> bool:
+            restart_calls[0] += 1
+            return orig_restart(*a, **kw)
+
+        monkeypatch.setattr(mgr, "restart_streams", _spy_restart)
+
+        runner = VoiceRunner(
+            config=VoiceConfig(wake_word_model="hey_jarvis", wake_threshold=0.25),
+            data_dir=tmp_path,
+            backend_factory=_FlakyStartBackend,
+            audio_manager=mgr,
+            wake_word_detector=detector,
+            enable_hotkey=False,
+        )
+        runner._audio_health_poll_interval = 0.05
+        await runner.start()
+        try:
+            # Flip OS default again after start() so watchdog triggers hot-swap rebind
+            endpoint_state[0] = ("cap-earphone-2", "ren-earphone-2")
+            for _ in range(40):
+                if restart_calls[0] >= 1:
+                    break
+                await asyncio.sleep(0.05)
+            assert restart_calls[0] >= 1
+            assert reset_calls[0] >= 2  # startup reset + post-hotswap reset
+            assert mgr.has_default_audio_device_changed() == (False, "ok")
+        finally:
+            await runner.stop()
     finally:
         mgr.stop()
+
+    # 3. Concurrent WakeWordDetector.process_audio() and reset() remain thread-safe under RLock
+    import concurrent.futures
+
+    conc_model = MagicMock()
+    conc_model.predict.return_value = {"hey_jarvis_v0.1": 0.1}
+    conc_model.reset = MagicMock()
+    conc_det = WakeWordDetector(model_name="hey_jarvis", threshold=0.3, model_instance=conc_model)
+    chunk_bytes = (np.full(1280, 500, dtype=np.int16)).tobytes()
+
+    def _run_predicts() -> None:
+        for _ in range(50):
+            conc_det.process_audio(chunk_bytes)
+
+    def _run_resets() -> None:
+        for _ in range(50):
+            conc_det.reset()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_run_predicts)
+        f2 = pool.submit(_run_resets)
+        f1.result()
+        f2.result()
 
 
 def test_layer3_open_url_invalidates_stale_cache_when_new_app_installed() -> None:
