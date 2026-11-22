@@ -278,6 +278,7 @@ class CleaDaemon:
         self._action_verifier = action_verifier
         self._server: Server | None = None
         self._busy_sessions: set[str] = set()
+        self._busy_turn_tokens: dict[str, str] = {}
         self._connections: set[_Connection] = set()
         self._shared_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._active_conversation_id: str | None = None
@@ -2542,6 +2543,7 @@ class CleaDaemon:
         )
 
         self._busy_sessions.add(session.id)
+        self._busy_turn_tokens[session.id] = turn_req_id
         try:
             self._spawn_background_task(
                 self._run_voice_chat_turn(
@@ -2553,7 +2555,7 @@ class CleaDaemon:
                 name=f"voice-chat-{session.id}",
             )
         except Exception:
-            self._busy_sessions.discard(session.id)
+            self._release_busy_session(session.id, turn_req_id)
             raise
 
         await self._respond(
@@ -3828,6 +3830,15 @@ class CleaDaemon:
                 image_mime_type=image_mime_type,
             )
 
+    def _release_busy_session(self, session_id: str, token: str | None = None) -> None:
+        """Release a session lock only if it is still held by ``token``."""
+        if token is not None:
+            owner = self._busy_turn_tokens.get(session_id)
+            if owner is not None and owner != token:
+                return
+        self._busy_turn_tokens.pop(session_id, None)
+        self._busy_sessions.discard(session_id)
+
     async def _run_voice_chat_turn(
         self,
         *,
@@ -3851,7 +3862,7 @@ class CleaDaemon:
                     busy_already_acquired=True,
                 )
         finally:
-            self._busy_sessions.discard(session.id)
+            self._release_busy_session(session.id, request_id)
 
     async def _chat_turn(
         self,
@@ -3930,6 +3941,7 @@ class CleaDaemon:
                     )
                 return
             self._busy_sessions.add(session.id)
+            self._busy_turn_tokens[session.id] = request_id
 
         state = _TurnState()
         started_at = _now_iso()
@@ -4143,6 +4155,10 @@ class CleaDaemon:
                     await self._respond(ws, req, error=err_msg, session_id=session.id)
                 return
 
+            # Release the per-session busy guard as soon as run_turn finishes
+            # so a follow-up turn triggered right after the final token/transcript
+            # doesn't collide with post-turn status persistence or broadcasts.
+            self._release_busy_session(session.id, request_id)
             await task_status("succeeded")
             for c in list(self._connections):
                 if (ws is None or c.ws != ws) and (not c.is_voice or not broadcast_all_ui):
@@ -4169,7 +4185,7 @@ class CleaDaemon:
                 self._active_task_handles.pop(request_id, None)
                 self._task_metadata.pop(request_id, None)
             self._cancelled_task_ids.discard(request_id)
-            self._busy_sessions.discard(session.id)
+            self._release_busy_session(session.id, request_id)
             self._reset_session_idle_timer(session.id)
 
     # ------------------------------------------------------------------ delegated voice tasks
@@ -4195,6 +4211,7 @@ class CleaDaemon:
             )
             return
         self._busy_sessions.add(session.id)
+        self._busy_turn_tokens[session.id] = req.id
 
         state = _TurnState()
         started_at = _now_iso()
@@ -4387,6 +4404,7 @@ class CleaDaemon:
                 return
 
             task_finished = True
+            self._release_busy_session(session.id, req.id)
             await task_status("succeeded")
             with contextlib.suppress(ConnectionClosed):
                 await self._respond(
@@ -4402,7 +4420,7 @@ class CleaDaemon:
                 self._active_task_handles.pop(req.id, None)
                 self._task_metadata.pop(req.id, None)
             self._cancelled_task_ids.discard(req.id)
-            self._busy_sessions.discard(session.id)
+            self._release_busy_session(session.id, req.id)
 
 
 def build_daemon(
