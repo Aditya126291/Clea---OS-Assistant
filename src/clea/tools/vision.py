@@ -12,7 +12,6 @@ import contextlib
 import ctypes
 import io
 import logging
-import subprocess
 import sys
 import time
 import uuid
@@ -40,6 +39,7 @@ from clea.tools.clipboard import (
     get_default_clipboard_service,
 )
 from clea.tools.registry import RiskLevel, ToolRegistry
+from clea.tools.subprocess_utils import run_powershell_hidden
 from clea.tools.system_controls import format_window_layout_summary, inspect_window_layout
 
 _ORIG_INSPECT_WINDOW_LAYOUT = inspect_window_layout
@@ -873,13 +873,9 @@ class Win32ScreenVisionBackend:
             f"$txts -join [Environment]::NewLine"
         )
         try:
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2.0,
+            res = run_powershell_hidden(
+                ps_script,
+                timeout=1.5,
                 check=False,
             )
             if res.returncode == 0 and res.stdout.strip():
@@ -1440,12 +1436,13 @@ def register_vision_tools(
     registry.register(
         name="inspect_screen",
         description=(
-            "Inspect the active screen or a specific background window, or inspect recently copied "
-            "clipboard images/text. Automatically routes to clipboard if an image was copied "
-            "in the last 10 seconds, or targets the active foreground or named application window. "
-            "Window inspections automatically attach deterministic [OS Window Geometry (Z-order)] "
-            "metadata (bounds, detected_slot, width_ratio, extends_behind_foreground) as ground "
-            "truth for window layout and split-screen verification."
+            "Capture and visually inspect the active window, a specific background window, or "
+            "recently copied clipboard images/text. Use this when you need to read visual content "
+            "on screen or when UI Automation lacks elements. For checking window placement, "
+            "Z-order, or split-screen alignment without image capture overhead, prefer the "
+            "lightweight zero-image inspect_window_layout tool instead. Automatically routes to "
+            "clipboard if an image was copied in the last 10 seconds, and attaches "
+            "[OS Window Geometry (Z-order)] metadata on window captures."
         ),
         input_schema={
             "type": "object",

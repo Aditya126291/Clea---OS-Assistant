@@ -31,6 +31,7 @@ from clea.tools.guards import (
     Win32FocusPreconditionBackend,
 )
 from clea.tools.registry import RiskLevel, ToolRegistry
+from clea.tools.subprocess_utils import run_hidden, run_powershell_hidden
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,18 @@ SW_RESTORE = 9
 WM_CLOSE = 0x0010
 MONITOR_DEFAULTTONEAREST = 2
 GA_ROOT = 2
+
+# Win32 Z-order & extended window style constants
+HWND_TOP = 0
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
 
 # Win32 Virtual Key codes
 VK_VOLUME_MUTE = 0xAD  # 173
@@ -126,6 +139,7 @@ class MEMORYSTATUSEX(ctypes.Structure):
 
 _SYSTEM_CONTROLS_USER32: Any = None
 _SYSTEM_CONTROLS_KERNEL32: Any = None
+_SYSTEM_CONTROLS_DWMAPI: Any = None
 
 
 def _configure_system_controls_user32(u32: Any) -> Any:
@@ -217,6 +231,20 @@ def _configure_system_controls_user32(u32: Any) -> Any:
             wintypes.BOOL,
         ]
         u32.MoveWindow.restype = wintypes.BOOL
+    if hasattr(u32, "SetWindowPos"):
+        u32.SetWindowPos.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        u32.SetWindowPos.restype = wintypes.BOOL
+    if hasattr(u32, "GetWindowLongW"):
+        u32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u32.GetWindowLongW.restype = ctypes.c_long
     if hasattr(u32, "PostMessageW"):
         u32.PostMessageW.argtypes = [
             ctypes.c_void_p,
@@ -315,6 +343,28 @@ def _get_kernel32(kernel32: Any = None) -> Any:
     return None
 
 
+def _get_dwmapi(dwmapi: Any = None) -> Any:
+    global _SYSTEM_CONTROLS_DWMAPI
+    if dwmapi is not None:
+        return dwmapi
+    if _SYSTEM_CONTROLS_DWMAPI is not None:
+        return _SYSTEM_CONTROLS_DWMAPI
+    if sys.platform == "win32" and hasattr(ctypes, "WinDLL"):
+        with contextlib.suppress(Exception):
+            loaded = ctypes.WinDLL("dwmapi", use_last_error=True)
+            if hasattr(loaded, "DwmGetWindowAttribute"):
+                loaded.DwmGetWindowAttribute.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                ]
+                loaded.DwmGetWindowAttribute.restype = ctypes.c_long
+            _SYSTEM_CONTROLS_DWMAPI = loaded
+            return _SYSTEM_CONTROLS_DWMAPI
+    return None
+
+
 def _resolve_psutil(psutil_mod: Any = None) -> Any:
     """Resolve psutil module if provided or installed in python environment."""
     if psutil_mod is not None:
@@ -352,16 +402,9 @@ def _is_window_cloaked_sc(hwnd: int, user32: Any) -> bool:
     if sys.platform != "win32" or not isinstance(user32, ctypes.CDLL):
         return False
     try:
-        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+        dwmapi = _get_dwmapi()
+        if dwmapi is None or not hasattr(dwmapi, "DwmGetWindowAttribute"):
             return False
-        dwmapi.DwmGetWindowAttribute.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
         cloaked = ctypes.c_uint32(0)
         hr = dwmapi.DwmGetWindowAttribute(
             ctypes.c_void_p(hwnd),
@@ -370,6 +413,19 @@ def _is_window_cloaked_sc(hwnd: int, user32: Any) -> bool:
             ctypes.sizeof(cloaked),
         )
         return hr == 0 and bool(cloaked.value)
+    except Exception:
+        return False
+
+
+def _is_overlay_or_tool_window_sc(hwnd: int, user32: Any) -> bool:
+    """Return True for WS_EX_TOOLWINDOW or WS_EX_TOPMOST floating overlays."""
+    if not hwnd or user32 is None or not hasattr(user32, "GetWindowLongW"):
+        return False
+    try:
+        raw_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if not isinstance(raw_style, int) or isinstance(raw_style, bool):
+            return False
+        return bool(raw_style & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST))
     except Exception:
         return False
 
@@ -484,6 +540,37 @@ def _resolve_root_hwnd_sc(hwnd: int, user32: Any) -> int:
     return int(hwnd)
 
 
+_BROWSER_WINDOW_TITLE_SUFFIXES: tuple[str, ...] = (
+    " - google chrome",
+    " - microsoft edge",
+    " - microsoft\u200b edge",
+    " - brave",
+    " - mozilla firefox",
+    " - arc",
+)
+
+_BROWSER_QUERY_ALIASES: frozenset[str] = frozenset(
+    {
+        "chrome",
+        "chrome.exe",
+        "google chrome",
+        "edge",
+        "msedge",
+        "msedge.exe",
+        "microsoft edge",
+        "brave",
+        "firefox",
+        "mozilla firefox",
+        "arc",
+    }
+)
+
+
+def _is_browser_tab_window_title(title: str) -> bool:
+    low = (title or "").strip().lower()
+    return any(low.endswith(suffix) for suffix in _BROWSER_WINDOW_TITLE_SUFFIXES)
+
+
 def _resolve_target_window(
     user32: Any,
     title_query: str | int | None = None,
@@ -495,17 +582,27 @@ def _resolve_target_window(
         else:
             raise ValueError("title_query must be a string or integer HWND.")
 
-    def _rank_key(item: dict[str, Any]) -> tuple[int, int, int]:
-        return (
-            0 if item.get("is_foreground") else 1,
-            1 if _is_window_cloaked_sc(item["hwnd"], user32) else 0,
-            len(item["title"]),
-        )
-
     if title_query and title_query.strip():
         q = title_query.strip()
         q_lower = q.lower()
+        is_browser_q = q_lower in _BROWSER_QUERY_ALIASES
         windows = _enumerate_windows_ctypes(user32)
+
+        def _rank_key(item: dict[str, Any]) -> tuple[int, int, int, int]:
+            title_str = str(item.get("title") or "")
+            is_browser_tab = _is_browser_tab_window_title(title_str)
+            # For non-browser targets (e.g. "YouTube" PWA, "Spotify"), strictly prefer
+            # standalone PWA/native windows over generic browser tabs ("... - Google Chrome").
+            # For browser targets (e.g. "Chrome"), prefer actual browser windows over PWAs.
+            pwa_vs_browser_penalty = (
+                (0 if is_browser_tab else 1) if is_browser_q else (1 if is_browser_tab else 0)
+            )
+            return (
+                pwa_vs_browser_penalty,
+                0 if item.get("is_foreground") else 1,
+                1 if _is_window_cloaked_sc(item["hwnd"], user32) else 0,
+                len(title_str),
+            )
 
         # 1. Match by numeric HWND if q is digit
         if q.isdigit():
@@ -523,7 +620,7 @@ def _resolve_target_window(
             resolved = _resolve_root_hwnd_sc(chosen["hwnd"], user32)
             return resolved, _get_window_title_ctypes(resolved, user32) or chosen["title"]
 
-        # 3. Substring match (case-insensitive, prioritize foreground/uncloaked then shortest title)
+        # 3. Substring match (case-insensitive, prioritizing standalone PWA vs browser tab)
         matches = [w for w in windows if q_lower in w["title"].lower()]
         if not matches:
             for alias_term in _WINDOW_TITLE_ALIASES.get(q_lower, ()):
@@ -669,16 +766,9 @@ def _get_dwm_frame_insets_sc(hwnd: int, u32: Any) -> tuple[int, int, int, int]:
     if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)):
         return (0, 0, 0, 0)
     with contextlib.suppress(Exception):
-        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+        dwmapi = _get_dwmapi()
+        if dwmapi is None or not hasattr(dwmapi, "DwmGetWindowAttribute"):
             return (0, 0, 0, 0)
-        dwmapi.DwmGetWindowAttribute.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
         win_rect = RECT()
         frame_rect = RECT()
         if not u32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
@@ -699,6 +789,32 @@ def _get_dwm_frame_insets_sc(hwnd: int, u32: Any) -> tuple[int, int, int, int]:
     return (0, 0, 0, 0)
 
 
+def _raise_window_z_order_sc(
+    u32: Any,
+    hwnd: int,
+    *,
+    force_topmost_bump: bool = False,
+) -> None:
+    """Promote *hwnd* to the top of the normal Z-order using SetWindowPos / BringWindowToTop."""
+    if u32 is None or not hwnd:
+        return
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+    if hasattr(u32, "SetWindowPos"):
+        is_live = isinstance(u32, ctypes.CDLL)
+        with contextlib.suppress(Exception):
+            if force_topmost_bump:
+                topmost_arg = ctypes.c_void_p(HWND_TOPMOST) if is_live else HWND_TOPMOST
+                notopmost_arg = ctypes.c_void_p(HWND_NOTOPMOST) if is_live else HWND_NOTOPMOST
+                u32.SetWindowPos(hwnd, topmost_arg, 0, 0, 0, 0, flags)
+                u32.SetWindowPos(hwnd, notopmost_arg, 0, 0, 0, 0, flags)
+            else:
+                top_arg = ctypes.c_void_p(HWND_TOP) if is_live else HWND_TOP
+                u32.SetWindowPos(hwnd, top_arg, 0, 0, 0, 0, flags)
+    if hasattr(u32, "BringWindowToTop"):
+        with contextlib.suppress(Exception):
+            u32.BringWindowToTop(hwnd)
+
+
 def _move_window_snap_sc(
     u32: Any,
     hwnd: int,
@@ -710,12 +826,14 @@ def _move_window_snap_sc(
     snap_restore_guard: PreconditionGuard | None = None,
     work_area: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """Restore/unmaximize as needed and MoveWindow compensating for invisible DWM borders."""
+    """Restore/unmaximize, MoveWindow compensating for DWM borders, and raise Z-order."""
     is_live = isinstance(u32, ctypes.CDLL)
+    was_zoomed = False
     if is_live:
         if hasattr(u32, "IsIconic") and bool(u32.IsIconic(hwnd)) and hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_RESTORE)
         if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)) and hasattr(u32, "ShowWindow"):
+            was_zoomed = True
             u32.ShowWindow(hwnd, SW_SHOWNORMAL)
     elif hasattr(u32, "ShowWindow"):
         u32.ShowWindow(hwnd, SW_RESTORE)
@@ -733,6 +851,18 @@ def _move_window_snap_sc(
             h + inset_t + inset_b,
             True,
         )
+        # Re-read DWM frame insets after un-maximizing so invisible borders are compensated
+        if is_live and was_zoomed and (inset_l, inset_t, inset_r, inset_b) == (0, 0, 0, 0):
+            new_l, new_t, new_r, new_b = _get_dwm_frame_insets_sc(hwnd, u32)
+            if (new_l, new_t, new_r, new_b) != (0, 0, 0, 0):
+                u32.MoveWindow(
+                    hwnd,
+                    x - new_l,
+                    y - new_t,
+                    w + new_l + new_r,
+                    h + new_t + new_b,
+                    True,
+                )
         if not is_live:
             with contextlib.suppress(Exception):
                 moved_map = getattr(u32, "_clea_last_moved_rects", None)
@@ -751,6 +881,7 @@ def _move_window_snap_sc(
                         int(work_area[2]),
                         int(work_area[3]),
                     )
+    _raise_window_z_order_sc(u32, hwnd)
 
 
 def _read_process_name_sc(hwnd: int, user32: Any, kernel32: Any = None) -> str:
@@ -803,16 +934,7 @@ def _get_extended_frame_bounds_sc(
 
     dwm = dwmapi
     if dwm is None and sys.platform == "win32" and isinstance(user32, ctypes.CDLL):
-        with contextlib.suppress(Exception):
-            dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
-            if hasattr(dwm, "DwmGetWindowAttribute"):
-                dwm.DwmGetWindowAttribute.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_uint32,
-                    ctypes.c_void_p,
-                    ctypes.c_uint32,
-                ]
-                dwm.DwmGetWindowAttribute.restype = ctypes.c_long
+        dwm = _get_dwmapi()
 
     rect = RECT()
     if dwm is not None and hasattr(dwm, "DwmGetWindowAttribute"):
@@ -1101,6 +1223,8 @@ def inspect_window_layout(
             title = str(item.get("title") or "").strip()
             if not title or title.lower() == "program manager":
                 continue
+            if _is_overlay_or_tool_window_sc(h, u32):
+                continue
             is_min = False
             if active_backend is not None:
                 is_min = active_backend.is_minimized(h)
@@ -1182,6 +1306,7 @@ def inspect_window_layout(
         is_max = bool(cand["is_maximized"])
 
         extends_behind_fg = False
+        occluding_titles: list[str] = []
         if z_idx > 0:
             for higher in raw_candidates[:z_idx]:
                 hl, ht, hr, hb = higher["bounds"]
@@ -1191,7 +1316,9 @@ def inspect_window_layout(
                 ix_b = min(bottom, hb)
                 if (ix_r - ix_l) > tolerance_px and (ix_b - ix_t) > tolerance_px:
                     extends_behind_fg = True
-                    break
+                    higher_label = str(higher.get("title") or higher.get("app_name") or "").strip()
+                    if higher_label and higher_label not in occluding_titles:
+                        occluding_titles.append(higher_label)
 
         width_ratio, detected_slot = _detect_window_slot(
             cand["bounds"],
@@ -1239,6 +1366,8 @@ def inspect_window_layout(
                 "width_ratio": width_ratio,
                 "detected_slot": detected_slot,
                 "extends_behind_foreground": extends_behind_fg,
+                "occluded_by_unrelated_window": extends_behind_fg,
+                "occluding_windows": occluding_titles,
             }
         )
 
@@ -1270,7 +1399,7 @@ def manage_window(
     user32: Any = None,
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
-    verify_timeout_s: float = 1.0,
+    verify_timeout_s: float = 0.6,
 ) -> dict[str, Any]:
     """Manage application windows using Win32 ctypes."""
     if not isinstance(action, str):
@@ -1409,15 +1538,31 @@ def manage_window(
                 expected_snap=snap_side,
                 timeout_s=verify_timeout_s,
             )
-            if not outcome.verified and isinstance(u32, ctypes.CDLL):
-                _move_window_snap_sc(u32, hwnd, x, y, w, h)
-                outcome = active_verifier.verify_window_state(
-                    hwnd,
-                    expected_snap=snap_side,
-                    timeout_s=verify_timeout_s,
-                )
+            if not outcome.verified:
+                if outcome.occluded_by_unrelated_window:
+                    _raise_window_z_order_sc(u32, hwnd, force_topmost_bump=True)
+                    _focus_window_hwnd_sc(u32, hwnd, restore_if_iconic=False)
+                    outcome = active_verifier.verify_window_state(
+                        hwnd,
+                        expected_snap=snap_side,
+                        timeout_s=verify_timeout_s,
+                    )
+                elif isinstance(u32, ctypes.CDLL):
+                    _move_window_snap_sc(
+                        u32, hwnd, x, y, w, h, work_area=(left, top, right, bottom)
+                    )
+                    _raise_window_z_order_sc(u32, hwnd, force_topmost_bump=True)
+                    _focus_window_hwnd_sc(u32, hwnd, restore_if_iconic=False)
+                    outcome = active_verifier.verify_window_state(
+                        hwnd,
+                        expected_snap=snap_side,
+                        timeout_s=verify_timeout_s,
+                    )
             result["verification"] = outcome.to_dict()
             result["verified"] = outcome.verified
+            if outcome.occluded_by_unrelated_window:
+                result["occluded_by_unrelated_window"] = True
+                result["occluding_windows"] = list(outcome.occluding_windows)
         return result
 
     if norm_action == "maximize":
@@ -1582,22 +1727,12 @@ def _run_coreaudio_powershell(
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> tuple[int | None, bool | None]:
     """Run CoreAudio helper via PowerShell."""
-    runner = powershell_runner or subprocess.run
     ps_exe = shutil.which("powershell.exe") or "powershell.exe"
-    proc = runner(
-        [
-            ps_exe,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f"& {{ {_COREAUDIO_POWERSHELL_SCRIPT} }} -Action {action} -Scalar {scalar:.4f}",
-        ],
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    proc = run_powershell_hidden(
+        f"& {{ {_COREAUDIO_POWERSHELL_SCRIPT} }} -Action {action} -Scalar {scalar:.4f}",
         timeout=8.0,
+        ps_exe=ps_exe,
+        runner=powershell_runner,
         check=False,
     )
     if proc.returncode != 0:
@@ -1835,7 +1970,6 @@ def _handle_brightness_control(
     if norm_action == "set" and value is None:
         raise ValueError("value (0..100) is required when action is 'set'.")
 
-    runner = powershell_runner or subprocess.run
     ps_exe = shutil.which("powershell.exe") or "powershell.exe"
 
     def _get_brightness() -> int:
@@ -1843,14 +1977,11 @@ def _handle_brightness_control(
             "(Get-CimInstance -Namespace root\\wmi -ClassName "
             "WmiMonitorBrightness).CurrentBrightness"
         )
-        proc = runner(
-            [ps_exe, "-NoProfile", "-NonInteractive", "-Command", cmd],
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        proc = run_powershell_hidden(
+            cmd,
             timeout=8.0,
+            ps_exe=ps_exe,
+            runner=powershell_runner,
             check=False,
         )
         if proc.returncode != 0:
@@ -1872,14 +2003,11 @@ def _handle_brightness_control(
             f"-Arguments @{{Timeout = 1; Brightness = [uint32]{clamped}}} "
             "} else { throw 'WmiMonitorBrightnessMethods not available' }"
         )
-        proc = runner(
-            [ps_exe, "-NoProfile", "-NonInteractive", "-Command", script],
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        proc = run_powershell_hidden(
+            script,
             timeout=8.0,
+            ps_exe=ps_exe,
+            runner=powershell_runner,
             check=False,
         )
         if proc.returncode != 0:
@@ -2127,19 +2255,15 @@ def _get_network_info(
     connected = False
     ssid: str | None = None
     signal: str | None = None
-    runner = powershell_runner or subprocess.run
 
     netsh_exe = shutil.which("netsh.exe") or shutil.which("netsh")
     if netsh_exe:
         try:
-            proc = runner(
+            proc = run_hidden(
                 [netsh_exe, "wlan", "show", "interfaces"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=4.0,
                 check=False,
+                runner=powershell_runner,
             )
             out = proc.stdout or ""
             for line in out.splitlines():
@@ -2238,12 +2362,8 @@ def _get_top_processes(psutil_mod: Any = None, limit: int = 5) -> list[dict[str,
     tasklist_exe = shutil.which("tasklist.exe") or shutil.which("tasklist")
     if tasklist_exe:
         try:
-            proc = subprocess.run(
+            proc = run_hidden(
                 [tasklist_exe, "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=4.0,
                 check=False,
             )
@@ -2300,12 +2420,8 @@ def _inspect_port(
     netstat_exe = shutil.which("netstat.exe") or shutil.which("netstat")
     if netstat_exe:
         try:
-            proc = subprocess.run(
+            proc = run_hidden(
                 [netstat_exe, "-ano", "-p", "tcp"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=4.0,
                 check=False,
             )
@@ -2328,21 +2444,17 @@ def _inspect_port(
     # 2. Try PowerShell Get-NetTCPConnection fallback if netstat did not resolve a listener
     if found_pid is None:
         try:
-            runner = powershell_runner or subprocess.run
             ps_exe = shutil.which("powershell.exe") or "powershell.exe"
             script = (
                 f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
                 "-ErrorAction SilentlyContinue | "
                 "Select-Object -ExpandProperty OwningProcess -First 1)"
             )
-            ps_proc = runner(
-                [ps_exe, "-NoProfile", "-NonInteractive", "-Command", script],
-                shell=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+            ps_proc = run_powershell_hidden(
+                script,
                 timeout=4.0,
+                ps_exe=ps_exe,
+                runner=powershell_runner,
                 check=False,
             )
             out_pid = (ps_proc.stdout or "").strip()
@@ -2376,12 +2488,8 @@ def _inspect_port(
         tasklist_exe = shutil.which("tasklist.exe") or shutil.which("tasklist")
         if tasklist_exe:
             try:
-                proc = subprocess.run(
+                proc = run_hidden(
                     [tasklist_exe, "/FI", f"PID eq {found_pid}", "/FO", "CSV", "/NH"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     timeout=3.0,
                     check=False,
                 )
@@ -2434,10 +2542,8 @@ def _inspect_port(
     else:
         taskkill_exe = shutil.which("taskkill.exe") or shutil.which("taskkill")
         if taskkill_exe:
-            kill_proc = subprocess.run(
+            kill_proc = run_hidden(
                 [taskkill_exe, "/F", "/PID", str(found_pid)],
-                capture_output=True,
-                text=True,
                 timeout=4.0,
                 check=False,
             )
@@ -2609,13 +2715,14 @@ def register_system_control_tools(
         description=(
             "Inspect and control application window placement on Windows. "
             "Supported actions: 'list' (all visible windows), 'inspect_layout' / 'layout' "
-            "(deterministic Win32 Z-order layout and slot geometry), 'focus', "
-            "'snap_left' (snap window to left half / 50% of screen), "
-            "'snap_right' (snap window to right half / 50% of screen), "
+            "(deterministic zero-image Win32 Z-order layout and slot geometry), 'focus', "
+            "'snap_left' (snap window to left half / 50% of screen, promote Z-order, and "
+            "verify bounds & occlusion), 'snap_right' (snap window to right half / 50% of "
+            "screen, promote Z-order, and verify bounds & occlusion), "
             "'maximize', 'minimize', 'restore', 'close'. "
             "Specify the target window by app name or window title substring in `title_query` "
-            "(e.g., 'Calculator', 'Notepad', 'Chrome'), or omit `title_query` to act on the "
-            "current foreground window."
+            "(e.g., 'Calculator', 'YouTube', 'Notepad', 'Chrome'), or omit `title_query` to act on "
+            "the current foreground window."
         ),
         input_schema={
             "type": "object",
@@ -2644,10 +2751,12 @@ def register_system_control_tools(
         registry.register(
             name="inspect_window_layout",
             description=(
-                "Return deterministic Win32 window geometry in Z-order (front-to-back) with "
+                "Prefer this lightweight zero-image tool over inspect_screen whenever checking "
+                "window layout, Z-order, occlusion, or split-screen alignment. Returns "
+                "deterministic Win32 window geometry in Z-order (front-to-back) with "
                 "DWMWA_EXTENDED_FRAME_BOUNDS, monitor rcWork, width_ratio, detected_slot "
                 "('left_half', 'right_half', 'maximized', 'full_width', 'custom'), and "
-                "extends_behind_foreground to verify true 50/50 split-screen vs occluded windows."
+                "extends_behind_foreground / occluded_by_unrelated_window."
             ),
             input_schema={
                 "type": "object",

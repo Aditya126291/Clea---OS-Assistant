@@ -249,6 +249,30 @@ BASE_VOICE_SYSTEM_INSTRUCTION = (
     "`look_at_screen` when an application exposes no useful semantic elements in `ui_snapshot` "
     "(such as custom `<canvas>`/video surfaces) or when visual layout inspection is genuinely "
     "required.\n"
+    "       5) **Autonomous Desktop Operator & Cheap-First Escalation Policy (No Chatbot "
+    "Refusals on Local Logged-In Apps)**: You are a local Windows desktop operator acting "
+    "directly on the user's own machine where their desktop apps and browsers (YouTube, Spotify, "
+    "WhatsApp, Gmail, etc.) are already signed in. NEVER refuse with cloud-chatbot excuses like "
+    "'I don't have access to your YouTube watch history / account / Spotify library / private "
+    "videos'. Navigating History, Library, Liked Songs, or Inbox inside the user's local app is "
+    "authorized local UI operation—complete the full requested workflow end-to-end instead of "
+    "stopping after Step 1 and making the user steer:\n"
+    "          - Step A (Deterministic / Cheap First): Prefer direct native paths first — direct "
+    "URIs/deep-links (e.g. `https://www.youtube.com/feed/history`, `spotify:`), media keys "
+    "(`control_media_volume`), WinRT `GSMTC`, Win32 window controls (`control_system`), and "
+    "Windows UI Automation (`ui_snapshot` / `ui_act` / `ui_batch`).\n"
+    "          - Step B (Mechanical Verification): Verify outcomes deterministically via "
+    "`verification.verified`, `GSMTC` playback state, Win32 Z-order/bounds geometry, and UIA "
+    "diffs rather than taking verification screenshots. When snapping or when the user reports "
+    "a target window is not visible, check for unrelated higher Z-order occluding windows "
+    "(`extends_behind_foreground`) and cleanly raise/re-snap the requested target.\n"
+    "          - Step C (Targeted Single-Shot Escalation Only on Failure): Only if Step A/B "
+    "fails or `ui_snapshot` lacks usable controls in a dynamic web/Electron app, escalate to a "
+    "single targeted `look_at_screen`/`inspect_screen` call to locate and act on the element, "
+    "then re-verify mechanically—never default to repeated vision loops when cheap tools work.\n"
+    "          - Pause and ask the user ONLY on genuine blockers (login/2FA wall, missing "
+    "credentials, ambiguous user choice, destructive confirmation, or `user_interrupted` / "
+    "`focus_lost`).\n"
     "     * `inspect_git_workspace(repo_path?, include_diff?, diff_stat_only?)`: read-only "
     "Git inspection for branch, status, worktrees, recent commits, and optional diffs.\n"
     "  5. General Spoken Q&A:\n"
@@ -572,28 +596,53 @@ async def load_voice_memory_context(
     data_dir: Path | None = None,
     request_fn: Callable[[BaseRequest], Awaitable[dict[str, Any]]] | None = None,
 ) -> str:
-    """Load long-term memory, episode summaries, voice tail, and active text chat context."""
-    mem_result = await _run_request(
-        MemoryGetRequest(),
-        request_fn=request_fn,
-        daemon_url=daemon_url,
-        token=token,
-        data_dir=data_dir,
+    """Load long-term memory, episode summaries, voice tail, and active text chat concurrently."""
+    req_kwargs: dict[str, Any] = {
+        "request_fn": request_fn,
+        "daemon_url": daemon_url,
+        "token": token,
+        "data_dir": data_dir,
+    }
+    target_chat_id = (
+        active_conversation_id
+        if (active_conversation_id and active_conversation_id != _VOICE_COMPANION_SESSION_ID)
+        else None
     )
+
+    coros: list[Awaitable[dict[str, Any]]] = [
+        _run_request(MemoryGetRequest(), **req_kwargs),
+        _run_request(MemoryEpisodesRequest(), **req_kwargs),
+        _run_request(VoiceHistoryRequest(params=VoiceHistoryParams(limit=15)), **req_kwargs),
+        _run_request(
+            MemoryListFactsRequest(params=MemoryListFactsParams(limit=25, status="active")),
+            **req_kwargs,
+        ),
+    ]
+    if target_chat_id:
+        coros.append(
+            _run_request(
+                TranscriptsGetRequest(params=TranscriptsGetParams(session_id=target_chat_id)),
+                **req_kwargs,
+            )
+        )
+
+    results = await asyncio.gather(*coros, return_exceptions=True)
+
+    mem_raw = results[0]
+    if isinstance(mem_raw, BaseException):
+        raise mem_raw
+    mem_result = mem_raw
+
     parts: list[str] = []
     content = str(mem_result.get("long_term") or mem_result.get("content") or "").strip()
     if content:
         parts.append(content)
 
-    try:
-        ep_result = await _run_request(
-            MemoryEpisodesRequest(),
-            request_fn=request_fn,
-            daemon_url=daemon_url,
-            token=token,
-            data_dir=data_dir,
-        )
-        episodes = ep_result.get("episodes") or []
+    ep_raw = results[1]
+    if isinstance(ep_raw, BaseException):
+        logger.debug("Skipping optional episode summaries for voice context: %s", ep_raw)
+    else:
+        episodes = ep_raw.get("episodes") or []
         if isinstance(episodes, list) and episodes:
             ep_lines: list[str] = []
             for ep in episodes[:5]:
@@ -604,18 +653,12 @@ async def load_voice_memory_context(
                         ep_lines.append(f"- ({day}) {summary}" if day else f"- {summary}")
             if ep_lines:
                 parts.append("### Recent Episodes\n" + "\n".join(ep_lines))
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skipping optional episode summaries for voice context: %s", exc)
 
-    try:
-        vh_result = await _run_request(
-            VoiceHistoryRequest(params=VoiceHistoryParams(limit=15)),
-            request_fn=request_fn,
-            daemon_url=daemon_url,
-            token=token,
-            data_dir=data_dir,
-        )
-        messages = vh_result.get("messages") or []
+    vh_raw = results[2]
+    if isinstance(vh_raw, BaseException):
+        logger.debug("Skipping optional Voice Companion tail for voice context: %s", vh_raw)
+    else:
+        messages = vh_raw.get("messages") or []
         if isinstance(messages, list) and messages:
             vc_lines: list[str] = ["## Recent Voice Companion History"]
             last_call_id: str | None = None
@@ -637,19 +680,13 @@ async def load_voice_memory_context(
                 vc_lines.append(f"- {prefix}**{speaker}:** {text}")
             if len(vc_lines) > 1:
                 parts.append("\n".join(vc_lines))
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skipping optional Voice Companion tail for voice context: %s", exc)
 
     if "## Active Memory Facts" not in content:
-        try:
-            facts_result = await _run_request(
-                MemoryListFactsRequest(params=MemoryListFactsParams(limit=25, status="active")),
-                request_fn=request_fn,
-                daemon_url=daemon_url,
-                token=token,
-                data_dir=data_dir,
-            )
-            facts = facts_result.get("facts") or []
+        facts_raw = results[3]
+        if isinstance(facts_raw, BaseException):
+            logger.debug("Skipping optional active memory facts for voice context: %s", facts_raw)
+        else:
+            facts = facts_raw.get("facts") or []
             if isinstance(facts, list) and facts:
                 fact_lines: list[str] = ["## Active Memory Facts"]
                 for fact in facts:
@@ -660,22 +697,15 @@ async def load_voice_memory_context(
                             fact_lines.append(f"- [{category}] {fact_text}")
                 if len(fact_lines) > 1:
                     parts.append("\n".join(fact_lines))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Skipping optional active memory facts for voice context: %s", exc)
 
-    target_chat_id = active_conversation_id
-    if target_chat_id and target_chat_id != _VOICE_COMPANION_SESSION_ID:
-        try:
-            tr_res = await _run_request(
-                TranscriptsGetRequest(params=TranscriptsGetParams(session_id=target_chat_id)),
-                request_fn=request_fn,
-                daemon_url=daemon_url,
-                token=token,
-                data_dir=data_dir,
-            )
-            chat_msgs = tr_res.get("messages") or []
+    if target_chat_id and len(results) > 4:
+        tr_raw = results[4]
+        if isinstance(tr_raw, BaseException):
+            logger.debug("Skipping active text chat context for voice: %s", tr_raw)
+        else:
+            chat_msgs = tr_raw.get("messages") or []
             if isinstance(chat_msgs, list) and chat_msgs:
-                chat_title = str(tr_res.get("title") or "Conversation").strip()
+                chat_title = str(tr_raw.get("title") or "Conversation").strip()
                 chat_lines = [
                     "## Active Focused Text Chat (Read-Only Context)",
                     f"Active Conversation ID: `{target_chat_id}`",
@@ -700,8 +730,6 @@ async def load_voice_memory_context(
                         chat_lines.append(f"- **{speaker}:** {text}")
                 if len(chat_lines) > 4:
                     parts.append("\n".join(chat_lines))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Skipping active text chat context for voice: %s", exc)
 
     return "\n\n".join(parts)
 

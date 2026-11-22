@@ -425,6 +425,8 @@ class GeminiLiveBackend(VoiceBackend):
 
         # 3. Tool call cancellations
         if msg.tool_call_cancellation is not None and msg.tool_call_cancellation.ids:
+            self._turn_completed = False
+            self._last_assistant_transcript = None
             await self._events_queue.put(
                 ToolCallCancellationEvent(call_ids=list(msg.tool_call_cancellation.ids))
             )
@@ -556,6 +558,19 @@ class GeminiLiveBackend(VoiceBackend):
                 )
                 return
             raise
+
+    def drain_contiguous_tool_calls(self, first_event: ToolCallEvent) -> list[ToolCallEvent]:
+        """Drain any immediately queued contiguous ToolCallEvents from this backend."""
+        batch: list[ToolCallEvent] = [first_event]
+        internal_deque = getattr(self._events_queue, "_queue", None)
+        while internal_deque and isinstance(internal_deque[0], ToolCallEvent):
+            try:
+                nxt = self._events_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(nxt, ToolCallEvent):
+                batch.append(nxt)
+        return batch
 
     async def events(self) -> AsyncIterator[VoiceBackendEvent]:
         """Yield normalized VoiceBackendEvent stream for active session."""

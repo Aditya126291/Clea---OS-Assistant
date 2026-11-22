@@ -8,13 +8,11 @@ This module provides three tools:
 
 from __future__ import annotations
 
-import base64
 import fnmatch
 import logging
 import os
 import re
 import shutil
-import subprocess
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -24,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from clea.tools.registry import RiskLevel, ToolRegistry
+from clea.tools.subprocess_utils import run_hidden, run_powershell_hidden
 
 logger = logging.getLogger(__name__)
 
@@ -905,7 +904,7 @@ def _read_pdf_content(
                 cmd = [pdftotext, "-f", str(p_num), "-l", str(p_num), str(file_path), "-"]
             except (ValueError, AttributeError):
                 pass
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = run_hidden(cmd, capture_output=True, text=True, timeout=15.0, check=False)
         if proc.returncode == 0 and proc.stdout.strip():
             return proc.stdout.strip(), None
 
@@ -1031,19 +1030,17 @@ def _recycle_path(target: Path) -> str:
             f"[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, "
             f"[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)"
         )
-        encoded_cmd = base64.b64encode(ps_cmd.encode("utf-16le")).decode("ascii")
-
         ps_exe = (
             shutil.which("powershell.exe")
             or shutil.which("powershell")
             or shutil.which("pwsh")
             or "powershell.exe"
         )
-        proc = subprocess.run(
-            [ps_exe, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_cmd],
-            capture_output=True,
-            text=True,
-            timeout=15,
+        proc = run_powershell_hidden(
+            ps_cmd,
+            encoded=True,
+            timeout=15.0,
+            ps_exe=ps_exe,
             check=False,
         )
         if proc.returncode != 0:

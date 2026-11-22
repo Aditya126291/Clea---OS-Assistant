@@ -12,6 +12,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from clea.tools.subprocess_utils import run_hidden
+
 DEFAULT_WORKSPACE_ROOT: Path = Path(__file__).resolve().parents[3]
 GIT_TIMEOUT_SECONDS: float = 5.0
 MAX_DIFF_CHARS: int = 4000
@@ -63,7 +65,7 @@ def _run_git(
     repo_dir: Path,
     args: list[str],
     *,
-    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> str:
     """Execute a strictly allowlisted read-only git subcommand with ``shell=False``."""
     if not args or args[0] not in ALLOWED_GIT_SUBCOMMANDS:
@@ -71,16 +73,16 @@ def _run_git(
     if args[0] == "worktree" and (len(args) < 2 or args[1] != "list"):
         raise ValueError(f"Only 'git worktree list' is permitted: {args!r}")
 
-    proc = run_fn(
+    proc = run_hidden(
         ["git", *args],
         cwd=str(repo_dir),
-        shell=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         timeout=GIT_TIMEOUT_SECONDS,
         check=False,
+        runner=run_fn,
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
@@ -177,7 +179,7 @@ def inspect_git_workspace(
     diff_stat_only: bool = True,
     *,
     default_root: Path | None = None,
-    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> dict[str, Any]:
     """Inspect a Git repository or worktree strictly via read-only commands."""
     repo_dir = resolve_git_repo_path(repo_path, default_root=default_root)

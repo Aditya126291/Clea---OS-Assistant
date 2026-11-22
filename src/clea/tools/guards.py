@@ -232,6 +232,8 @@ class VerificationOutcome:
     work_area: tuple[int, int, int, int] | None = None
     elapsed_ms: float = 0.0
     actual: dict[str, Any] = field(default_factory=dict)
+    occluded_by_unrelated_window: bool = False
+    occluding_windows: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.verified and self.status == "verified":
@@ -259,7 +261,7 @@ class VerificationOutcome:
         return "failed"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "verified": self.verified,
             "status": self.status,
             "outcome_kind": self.outcome_kind,
@@ -267,6 +269,10 @@ class VerificationOutcome:
             "actual": dict(self.actual),
             "elapsed_ms": round(self.elapsed_ms, 2),
         }
+        if self.occluded_by_unrelated_window:
+            payload["occluded_by_unrelated_window"] = True
+            payload["occluding_windows"] = list(self.occluding_windows)
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +371,14 @@ def _configure_guard_win32_dlls(
         if hasattr(user32, "IsChild"):
             user32.IsChild.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             user32.IsChild.restype = wintypes.BOOL
+
+        if hasattr(user32, "GetWindow"):
+            user32.GetWindow.argtypes = [ctypes.c_void_p, wintypes.UINT]
+            user32.GetWindow.restype = ctypes.c_void_p
+
+        if hasattr(user32, "GetWindowLongW"):
+            user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.GetWindowLongW.restype = ctypes.c_long
 
     if isinstance(dwmapi, ctypes.CDLL) and hasattr(dwmapi, "DwmGetWindowAttribute"):
         dwmapi.DwmGetWindowAttribute.argtypes = [
@@ -644,6 +658,154 @@ class Win32FocusPreconditionBackend:
         if hwnd <= 0:
             return None
         return self.get_window_context(hwnd)
+
+    def _is_window_cloaked(self, hwnd: int) -> bool:
+        if not hwnd or hwnd <= 0 or self._dwmapi is None:
+            return False
+        if not hasattr(self._dwmapi, "DwmGetWindowAttribute"):
+            return False
+        try:
+            cloaked = ctypes.c_uint32(0)
+            hr = self._dwmapi.DwmGetWindowAttribute(
+                hwnd,
+                14,  # DWMWA_CLOAKED
+                ctypes.byref(cloaked),
+                ctypes.sizeof(cloaked),
+            )
+            return hr == 0 and bool(cloaked.value)
+        except Exception:
+            return False
+
+    def _is_overlay_or_tool_window(self, hwnd: int) -> bool:
+        if not hwnd or hwnd <= 0 or self._user32 is None:
+            return False
+        if not hasattr(self._user32, "GetWindowLongW"):
+            return False
+        try:
+            raw_style = self._user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+            if not isinstance(raw_style, int) or isinstance(raw_style, bool):
+                return False
+            # WS_EX_TOOLWINDOW (0x80) or WS_EX_TOPMOST (0x8) floating overlays
+            return bool(raw_style & (0x00000080 | 0x00000008))
+        except Exception:
+            return False
+
+    def find_occluding_windows(
+        self,
+        hwnd: int,
+        *,
+        target_bounds: tuple[int, int, int, int] | None = None,
+        tolerance_px: int = _DEFAULT_BOUNDS_TOLERANCE_PX,
+    ) -> list[dict[str, Any]]:
+        """Return visible, non-overlay windows strictly above *hwnd* in Z-order that overlap it."""
+        if not hwnd or hwnd <= 0 or self._user32 is None:
+            return []
+        bounds = (
+            target_bounds
+            if target_bounds is not None
+            else self.get_extended_frame_bounds(hwnd)
+        )
+        if bounds is None:
+            return []
+        tl, tt, tr, tb = bounds
+        target_area = max(1, (tr - tl) * (tb - tt))
+
+        higher_hwnds: list[int] = []
+        seen: set[int] = {int(hwnd)}
+        used_get_window = False
+        if hasattr(self._user32, "GetWindow"):
+            cur = int(hwnd)
+            for _ in range(256):
+                try:
+                    raw_prev = self._user32.GetWindow(cur, 3)  # GW_HWNDPREV
+                except Exception:
+                    break
+                if not isinstance(raw_prev, int) or isinstance(raw_prev, bool):
+                    break
+                used_get_window = True
+                if raw_prev <= 0 or raw_prev in seen:
+                    break
+                seen.add(raw_prev)
+                higher_hwnds.append(raw_prev)
+                cur = raw_prev
+
+        if not used_get_window and hasattr(self._user32, "EnumWindows"):
+            enum_higher: list[int] = []
+            found_target = False
+
+            def _on_enum(raw_h: int, _lparam: Any) -> bool:
+                nonlocal found_target
+                if found_target:
+                    return False
+                if not isinstance(raw_h, int) or isinstance(raw_h, bool) or raw_h <= 0:
+                    return True
+                if raw_h == int(hwnd) or self.is_same_window_tree(hwnd, raw_h):
+                    found_target = True
+                    return False
+                if raw_h not in seen:
+                    seen.add(raw_h)
+                    enum_higher.append(raw_h)
+                return True
+
+            with contextlib.suppress(Exception):
+                if isinstance(self._user32, ctypes.CDLL) and hasattr(ctypes, "WINFUNCTYPE"):
+                    cb = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.c_void_p, wintypes.LPARAM)(
+                        _on_enum
+                    )
+                    self._user32.EnumWindows(cb, 0)
+                else:
+                    self._user32.EnumWindows(_on_enum, 0)
+            if found_target:
+                higher_hwnds = enum_higher
+
+        ignored_titles = {"program manager", "windows input experience", "default ime"}
+        occluders: list[dict[str, Any]] = []
+        for other in higher_hwnds:
+            if self.is_same_window_tree(hwnd, other):
+                continue
+            if hasattr(self._user32, "IsWindowVisible"):
+                try:
+                    vis = self._user32.IsWindowVisible(other)
+                    if not (isinstance(vis, int | bool) and bool(vis)):
+                        continue
+                except Exception:
+                    continue
+            if self.is_minimized(other):
+                continue
+            if self._is_overlay_or_tool_window(other):
+                continue
+            if self._is_window_cloaked(other):
+                continue
+            title = self._read_title(other).strip()
+            if not title or title.lower() in ignored_titles:
+                continue
+            ob = self.get_extended_frame_bounds(other)
+            if ob is None:
+                continue
+            ol, ot, or_, obot = ob
+            if (or_ - ol) < 80 or (obot - ot) < 80:
+                continue
+            ix_l = max(tl, ol)
+            ix_t = max(tt, ot)
+            ix_r = min(tr, or_)
+            ix_b = min(tb, obot)
+            if (ix_r - ix_l) <= tolerance_px or (ix_b - ix_t) <= tolerance_px:
+                continue
+            overlap_area = (ix_r - ix_l) * (ix_b - ix_t)
+            overlap_ratio = overlap_area / float(target_area)
+            if overlap_ratio < 0.05:
+                continue
+            _, proc_name = self._read_pid_and_process(other)
+            occluders.append(
+                {
+                    "hwnd": other,
+                    "title": title,
+                    "process_name": proc_name,
+                    "bounds": ob,
+                    "overlap_ratio": round(overlap_ratio, 3),
+                }
+            )
+        return occluders
 
 
 # ---------------------------------------------------------------------------
@@ -1128,10 +1290,11 @@ class ActionVerifier:
         expected_snap: str | None = None,
         expected_bounds: tuple[int, int, int, int] | None = None,
         timeout_s: float = 0.6,
-        poll_interval_s: float = 0.05,
+        poll_interval_s: float = 0.02,
         tolerance_px: int = _DEFAULT_BOUNDS_TOLERANCE_PX,
+        check_occlusion: bool | None = None,
     ) -> VerificationOutcome:
-        """Poll Win32 window state and DWM bounds until settled or timeout expires."""
+        """Poll Win32 window state, DWM bounds, and Z-order occlusion until settled or timeout."""
         valid_states = {"closed", "minimized", "maximized", "focused", "restored"}
         valid_snaps = {"left", "snap_left", "right", "snap_right"}
 
@@ -1158,6 +1321,10 @@ class ActionVerifier:
             if bw <= 0 or bh <= 0:
                 raise ValueError("expected_bounds width and height must be positive.")
 
+        should_check_occlusion = (
+            bool(check_occlusion) if check_occlusion is not None else (norm_snap is not None)
+        )
+
         backend = self._get_focus_backend()
         start = self._monotonic()
         deadline = start + max(0.0, float(timeout_s))
@@ -1169,6 +1336,7 @@ class ActionVerifier:
         last_work: tuple[int, int, int, int] | None = None
         last_minimized = False
         last_foreground_hwnd: int | None = None
+        last_occluders: list[dict[str, Any]] = []
 
         while True:
             valid = backend.is_window_valid(hwnd)
@@ -1211,6 +1379,7 @@ class ActionVerifier:
                     last_reason = "window_not_minimized"
                 else:
                     matched = True
+                    last_occluders = []
                     if last_minimized:
                         matched = False
                         last_reason = "window_minimized"
@@ -1268,12 +1437,29 @@ class ActionVerifier:
                             matched = False
                             last_reason = "bounds_mismatch"
 
+                    if (
+                        matched
+                        and should_check_occlusion
+                        and hasattr(backend, "find_occluding_windows")
+                    ):
+                        with contextlib.suppress(Exception):
+                            occluders = backend.find_occluding_windows(
+                                hwnd,
+                                target_bounds=last_bounds,
+                                tolerance_px=tolerance_px,
+                            )
+                            if isinstance(occluders, list) and occluders:
+                                last_occluders = occluders
+                                matched = False
+                                last_reason = "occluded_by_unrelated_window"
+
                     if matched:
                         elapsed_ms = max(0.0, (self._monotonic() - start) * 1000.0)
                         actual_payload: dict[str, Any] = {
                             "hwnd": hwnd,
                             "valid": True,
                             "minimized": last_minimized,
+                            "occluded_by_unrelated_window": False,
                         }
                         if last_foreground_hwnd is not None:
                             actual_payload["foreground_hwnd"] = last_foreground_hwnd
@@ -1293,16 +1479,26 @@ class ActionVerifier:
                             work_area=last_work,
                             elapsed_ms=elapsed_ms,
                             actual=actual_payload,
+                            occluded_by_unrelated_window=False,
                         )
 
             now = self._monotonic()
             if now >= deadline:
                 elapsed_ms = max(0.0, (now - start) * 1000.0)
+                occluded = bool(last_occluders)
+                occluder_names = tuple(
+                    str(item.get("title") or item.get("process_name") or item.get("hwnd") or "")
+                    for item in last_occluders
+                    if isinstance(item, dict)
+                )
                 fail_payload: dict[str, Any] = {
                     "hwnd": hwnd,
                     "valid": valid,
                     "minimized": last_minimized,
                 }
+                if occluded:
+                    fail_payload["occluded_by_unrelated_window"] = True
+                    fail_payload["occluding_windows"] = list(occluder_names)
                 if last_foreground_hwnd is not None:
                     fail_payload["foreground_hwnd"] = last_foreground_hwnd
                 if last_bounds is not None:
@@ -1315,11 +1511,17 @@ class ActionVerifier:
                     verified=False,
                     status="timeout",
                     reason=last_reason,
-                    actual_status="minimized" if last_minimized else "mismatch",
+                    actual_status=(
+                        "occluded"
+                        if occluded
+                        else ("minimized" if last_minimized else "mismatch")
+                    ),
                     actual_bounds=last_bounds,
                     expected_bounds=last_expected_rect,
                     work_area=last_work,
                     elapsed_ms=elapsed_ms,
                     actual=fail_payload,
+                    occluded_by_unrelated_window=occluded,
+                    occluding_windows=occluder_names,
                 )
             self._sleep(min(interval, max(0.0, deadline - now)))

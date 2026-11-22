@@ -129,7 +129,8 @@ def _merge_token_usage(acc: TokenUsage | None, hop: TokenUsage) -> TokenUsage:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FIRST_EVENT_TIMEOUT = 15.0
+DEFAULT_FIRST_EVENT_TIMEOUT = 10.0
+DEFAULT_STREAM_EVENT_TIMEOUT = 25.0
 
 
 class _NullAsyncContext:
@@ -169,6 +170,7 @@ class GeminiProvider(LLMProvider):
         api_key: str | None = None,
         model: str | None = None,
         first_event_timeout_s: float | None = None,
+        stream_event_timeout_s: float | None = None,
         max_retries: int = 1,
     ) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -183,6 +185,15 @@ class GeminiProvider(LLMProvider):
             env_timeout = os.environ.get("CLEA_FIRST_EVENT_TIMEOUT")
             self.first_event_timeout_s = (
                 float(env_timeout) if env_timeout is not None else DEFAULT_FIRST_EVENT_TIMEOUT
+            )
+        if stream_event_timeout_s is not None:
+            self.stream_event_timeout_s = max(0.05, float(stream_event_timeout_s))
+        else:
+            env_stream_timeout = os.environ.get("CLEA_STREAM_EVENT_TIMEOUT")
+            self.stream_event_timeout_s = (
+                max(0.05, float(env_stream_timeout))
+                if env_stream_timeout is not None
+                else DEFAULT_STREAM_EVENT_TIMEOUT
             )
         self.max_retries = max_retries
         self.last_response_headers: dict[str, str] = {}
@@ -373,7 +384,23 @@ class GeminiProvider(LLMProvider):
                     yield c
 
             if stream_iter is not None:
-                async for event in stream_iter:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(
+                            stream_iter.__anext__(),
+                            timeout=self.stream_event_timeout_s,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        logger.error(
+                            "Gemini stream stalled mid-turn waiting for next event after %.1fs.",
+                            self.stream_event_timeout_s,
+                        )
+                        raise TimeoutError(
+                            f"Gemini stream stalled waiting for next event after "
+                            f"{self.stream_event_timeout_s:.1f}s."
+                        ) from exc
                     for c in _handle_event(event):
                         yield c
         finally:

@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import subprocess
+import threading
 import time
 from collections.abc import Awaitable, Coroutine, Iterable, Sequence
 from datetime import UTC, datetime
@@ -309,6 +310,8 @@ class CleaDaemon:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._active_task_handles: dict[str, asyncio.Task[Any]] = {}
         self._task_metadata: dict[str, dict[str, Any]] = {}
+        self._recent_task_records: dict[str, dict[str, Any]] = {}
+        self._bg_task_write_lock = threading.Lock()
         self._cancelled_task_ids: set[str] = set()
         self._task_started_at: dict[str, str] = {}
         self._consolidation_task_terminal: dict[str, bool] = {}
@@ -336,7 +339,7 @@ class CleaDaemon:
             register_timer_tools(self.agent.registry, self.timer_manager)
         self.clipboard_service = clipboard_service or ClipboardService()
         if hasattr(self.timer_manager, "on_tick") and self.timer_manager.on_tick is None:
-            self.timer_manager.on_tick = self._on_housekeeping_tick
+            self.timer_manager.on_tick = self._on_housekeeping_tick_async
         set_default_clipboard_service(self.clipboard_service)
         try:
             self.agent.registry.get("read_clipboard")
@@ -370,6 +373,10 @@ class CleaDaemon:
         self.clipboard_service.poll_sequence()
         with contextlib.suppress(Exception):
             self.artifact_store.prune_expired()
+
+    async def _on_housekeeping_tick_async(self) -> None:
+        """Offload periodic housekeeping off the asyncio event loop."""
+        await asyncio.to_thread(self._on_housekeeping_tick)
 
     def housekeeping_tick(self) -> None:
         """Explicit entry point for the periodic housekeeping tick."""
@@ -437,18 +444,21 @@ class CleaDaemon:
 
     async def start(self) -> None:
         """Acquire single-instance lock, listen on localhost, and write the session token."""
-        self.agent.memory.ensure_initialized()
-        self.agent.memory.migrate_legacy_daily_logs()
-        self.agent.memory.purge_trash()
-        try:
-            self.agent.memory.prune_diagnostic_logs()
-        except Exception as exc:
-            logger.warning("Failed pruning diagnostic logs on daemon startup: %s", exc)
-        self._reconcile_orphaned_tasks()
-        with contextlib.suppress(Exception):
-            self.clipboard_service.poll_sequence()
-        with contextlib.suppress(Exception):
-            self.artifact_store.prune_expired()
+
+        def _startup_storage_init() -> None:
+            self.agent.memory.ensure_initialized()
+            self.agent.memory.purge_trash()
+            try:
+                self.agent.memory.prune_diagnostic_logs()
+            except Exception as exc:
+                logger.warning("Failed pruning diagnostic logs on daemon startup: %s", exc)
+            self._reconcile_orphaned_tasks()
+            with contextlib.suppress(Exception):
+                self.clipboard_service.poll_sequence()
+            with contextlib.suppress(Exception):
+                self.artifact_store.prune_expired()
+
+        await asyncio.to_thread(_startup_storage_init)
         self._instance_lock.acquire(host=self.host, port=self.port)
         try:
             self._server = await serve(
@@ -534,13 +544,19 @@ class CleaDaemon:
         self._task_metadata.clear()
         self._cancelled_task_ids.clear()
         with contextlib.suppress(Exception):
-            self.agent.memory.reconcile_orphaned_background_tasks(
-                reason="Interrupted by daemon shutdown"
+            await self.agent.aclose()
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                self.agent.memory.reconcile_orphaned_background_tasks,
+                reason="Interrupted by daemon shutdown",
             )
         with contextlib.suppress(Exception):
-            self.consolidation.reconcile_orphaned_running(reason="Interrupted by daemon shutdown")
+            await asyncio.to_thread(
+                self.consolidation.reconcile_orphaned_running,
+                reason="Interrupted by daemon shutdown",
+            )
         with contextlib.suppress(Exception):
-            self.agent.memory.close()
+            await asyncio.to_thread(self.agent.memory.close)
         auth.remove_token(self.token_file, self.token)
         self._instance_lock.release()
 
@@ -623,6 +639,58 @@ class CleaDaemon:
             time_str = datetime.now().astimezone().strftime("%H:%M")
         return f"Summarising session {time_str}"
 
+    def _schedule_record_background_task(
+        self,
+        *,
+        task_id: str,
+        title: str,
+        status: str,
+        started_at: str,
+        finished_at: str | None = None,
+        kind: str = "background_task",
+        detail: str | None = None,
+        session_id: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Record background task status in memory immediately and persist off the event loop."""
+        prev = self._recent_task_records.get(task_id)
+        effective_started_at = started_at
+        if (
+            prev
+            and prev.get("status") in ("queued", "running")
+            and isinstance(prev.get("started_at"), str)
+            and prev["started_at"]
+        ):
+            effective_started_at = prev["started_at"]
+        self._recent_task_records[task_id] = {
+            "task_id": task_id,
+            "title": title,
+            "status": status,
+            "kind": kind,
+            "started_at": effective_started_at,
+            "finished_at": finished_at,
+            "detail": detail,
+            "session_id": session_id if session_id is not None else (prev or {}).get("session_id"),
+        }
+
+        def _persist() -> None:
+            with self._bg_task_write_lock:
+                with contextlib.suppress(Exception):
+                    self.agent.memory.record_background_task(
+                        task_id=task_id,
+                        title=title,
+                        status=status,
+                        started_at=effective_started_at,
+                        finished_at=finished_at,
+                        kind=kind,
+                        detail=detail,
+                        session_id=session_id,
+                    )
+
+        return self._spawn_background_task(
+            asyncio.to_thread(_persist),
+            name=f"persist-bg-task-{task_id[:16]}",
+        )
+
     async def _emit_consolidation_task_status(
         self,
         session_id: str,
@@ -641,17 +709,16 @@ class CleaDaemon:
             started_at = self._task_started_at.pop(task_id, now_iso)
             self._consolidation_task_terminal[task_id] = True
         finished_at = now_iso if status in ("succeeded", "failed", "cancelled") else None
-        with contextlib.suppress(Exception):
-            self.agent.memory.record_background_task(
-                task_id=task_id,
-                title=title,
-                status=status,
-                started_at=started_at,
-                finished_at=finished_at,
-                kind="background_task",
-                detail=detail,
-                session_id=canonical_sid,
-            )
+        persist_task = self._schedule_record_background_task(
+            task_id=task_id,
+            title=title,
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            kind="background_task",
+            detail=detail,
+            session_id=canonical_sid,
+        )
         await self._broadcast(
             TaskStatusEvent(
                 data=TaskStatusData(
@@ -665,6 +732,9 @@ class CleaDaemon:
                 )
             )
         )
+        if status in ("succeeded", "failed", "cancelled"):
+            with contextlib.suppress(Exception):
+                await persist_task
 
     async def _run_startup_consolidation(self) -> None:
         try:
@@ -972,14 +1042,14 @@ class CleaDaemon:
     def _schedule_trash_purge(self, delay_seconds: float = 15.0) -> None:
         async def _purge_after_delay() -> None:
             await asyncio.sleep(delay_seconds)
-            purged = self.agent.memory.purge_trash(min_age_seconds=10.0)
+            purged = await asyncio.to_thread(self.agent.memory.purge_trash, min_age_seconds=10.0)
             if purged > 0:
                 logger.info("Purged %d transcripts from trash", purged)
 
         self._spawn_background_task(_purge_after_delay(), name="trash-purge")
 
     async def _broadcast_conversation_updated(self, session_id: str) -> None:
-        tr = self.agent.memory.get_transcript(session_id)
+        tr = await asyncio.to_thread(self.agent.memory.get_transcript, session_id)
         if not tr:
             return
         msgs = tr.get("messages", [])
@@ -1181,6 +1251,18 @@ class CleaDaemon:
         )
 
     async def _dispatch_request(self, conn: _Connection, req: Any) -> None:
+        rpc_start = time.perf_counter()
+        method = req.method
+        try:
+            await self._dispatch_request_impl(conn, req)
+        finally:
+            logger.debug(
+                "rpc_timing method=%s total_ms=%.1f",
+                method,
+                (time.perf_counter() - rpc_start) * 1000.0,
+            )
+
+    async def _dispatch_request_impl(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         method = req.method
 
@@ -1798,7 +1880,8 @@ class CleaDaemon:
                     ),
                 )
             )
-            memory_ctx = self.agent.memory.build_injected_context(
+            memory_ctx = await asyncio.to_thread(
+                self.agent.memory.build_injected_context,
                 include_voice_tail=True,
                 voice_tail_turns=15,
                 active_conversation_id=self._active_conversation_id,
@@ -1825,7 +1908,11 @@ class CleaDaemon:
                     await self._respond(ws, req, error=str(exc))
                     return
                 if req.params.reason == "transcript_sync":
-                    persisted = self._persist_voice_transcript(req_call_id, req.params.transcript)
+                    persisted = await asyncio.to_thread(
+                        self._persist_voice_transcript,
+                        req_call_id,
+                        req.params.transcript,
+                    )
                     await self._respond(
                         ws,
                         req,
@@ -1839,10 +1926,22 @@ class CleaDaemon:
                         await self._broadcast_conversation_updated(VOICE_COMPANION_SESSION_ID)
                         await self._broadcast_conversation_updated(req_call_id)
                     return
-                tr = self.agent.memory.get_transcript(req_call_id)
-                if tr and tr.get("messages"):
+                tr = await asyncio.to_thread(self.agent.memory.get_transcript, req_call_id)
+                cons_task = (
                     self._schedule_consolidation_now(req_call_id)
-                self._schedule_diagnostic_log_pruning()
+                    if tr and tr.get("messages")
+                    else None
+                )
+                if cons_task is not None and not cons_task.done():
+                    cons_task.add_done_callback(
+                        lambda t: (
+                            self._schedule_diagnostic_log_pruning()
+                            if not t.cancelled() and self._server is not None
+                            else None
+                        )
+                    )
+                else:
+                    self._schedule_diagnostic_log_pruning()
                 self._ended_voice_call_ids.discard(req_call_id)
                 await self._respond(
                     ws,
@@ -1888,14 +1987,26 @@ class CleaDaemon:
             self._screen_capture_target = None
 
             # Persist transcript to logs/transcripts/ and schedule consolidation if non-empty
-            persisted = self._persist_voice_transcript(
+            persisted = await asyncio.to_thread(
+                self._persist_voice_transcript,
                 ended_id,
                 getattr(req.params, "transcript", None),
             )
-            if persisted and req.params.reason != "transcript_sync":
+            cons_task = (
                 self._schedule_consolidation_now(ended_id)
-
-            self._schedule_diagnostic_log_pruning()
+                if persisted and req.params.reason != "transcript_sync"
+                else None
+            )
+            if cons_task is not None and not cons_task.done():
+                cons_task.add_done_callback(
+                    lambda t: (
+                        self._schedule_diagnostic_log_pruning()
+                        if not t.cancelled() and self._server is not None
+                        else None
+                    )
+                )
+            else:
+                self._schedule_diagnostic_log_pruning()
 
             await self._broadcast(
                 CallEndedEvent(
@@ -1926,7 +2037,9 @@ class CleaDaemon:
         elif method == "voice.history":
             limit = getattr(req.params, "limit", 100) or 100
             limit = max(1, min(int(limit), 500))
-            tail = self.agent.memory.get_voice_companion_tail(max_turns=limit)
+            tail = await asyncio.to_thread(
+                self.agent.memory.get_voice_companion_tail, max_turns=limit
+            )
             items: list[VoiceHistoryMessageItem] = []
             for m in tail:
                 if not isinstance(m, dict):
@@ -1954,7 +2067,9 @@ class CleaDaemon:
         elif method == "voice.list_conversations":
             limit = getattr(req.params, "limit", 10) or 10
             limit = max(1, min(int(limit), 100))
-            convs_raw = self.agent.memory.list_conversations(limit=limit)
+            convs_raw = await asyncio.to_thread(
+                self.agent.memory.list_conversations, limit=limit
+            )
             items = [VoiceConversationListItem(**c) for c in convs_raw]
             await self._respond(
                 ws,
@@ -1965,7 +2080,9 @@ class CleaDaemon:
             query = getattr(req.params, "query", "")
             limit = getattr(req.params, "limit", 8) or 8
             limit = max(1, min(int(limit), 50))
-            hits_raw = self.agent.memory.search_conversations(query=query, limit=limit)
+            hits_raw = await asyncio.to_thread(
+                self.agent.memory.search_conversations, query=query, limit=limit
+            )
             hits = [ConversationSearchHit(**hit) for hit in hits_raw]
             await self._respond(
                 ws,
@@ -1980,7 +2097,8 @@ class CleaDaemon:
             max_turns = getattr(req.params, "max_turns", 40) or 40
             max_turns = max(1, min(int(max_turns), 500))
             try:
-                data = self.agent.memory.read_conversation(
+                data = await asyncio.to_thread(
+                    self.agent.memory.read_conversation,
                     conversation_id=cid,
                     max_turns=max_turns,
                 )
@@ -2017,7 +2135,9 @@ class CleaDaemon:
             query = getattr(req.params, "query", "")
             limit = getattr(req.params, "limit", 10) or 10
             limit = max(1, min(int(limit), 50))
-            hits_raw = self.agent.memory.search_memory(query=query, limit=limit)
+            hits_raw = await asyncio.to_thread(
+                self.agent.memory.search_memory, query=query, limit=limit
+            )
             hits = [MemorySearchHit(**hit) for hit in hits_raw]
             await self._respond(
                 ws,
@@ -2043,7 +2163,8 @@ class CleaDaemon:
                 )
                 return
             try:
-                res = self.agent.memory.append_to_active_chat(
+                res = await asyncio.to_thread(
+                    self.agent.memory.append_to_active_chat,
                     self._active_conversation_id,
                     content=content,
                     label=label,
@@ -2551,7 +2672,8 @@ class CleaDaemon:
             return
         section = _resolve_memory_section(req.params.category)
         try:
-            entry = self.agent.memory.add_or_update_entry(
+            entry = await asyncio.to_thread(
+                self.agent.memory.add_or_update_entry,
                 text=fact_text,
                 section=section,
                 source="stated",
@@ -2601,7 +2723,7 @@ class CleaDaemon:
             await self._respond(ws, req, error="query_or_id must not be empty.")
             return
 
-        removed = self.agent.memory.remove_entries(query_or_id)
+        removed = await asyncio.to_thread(self.agent.memory.remove_entries, query_or_id)
         removed_ids = [e.id for e in removed]
         db_deleted: list[str] = []
         with contextlib.suppress(Exception):
@@ -2733,8 +2855,10 @@ class CleaDaemon:
     async def _handle_activity_list(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         limit = getattr(req.params, "limit", 10) or 10
-        raw_tasks = self.agent.memory.load_background_tasks()
+        raw_tasks = await asyncio.to_thread(self.agent.memory.load_background_tasks)
         records: dict[str, dict[str, Any]] = dict(raw_tasks)
+        for tid, rec in list(self._recent_task_records.items()):
+            records[tid] = dict(rec)
 
         # Include live tracked tasks in case persistence hasn't flushed yet
         for tid, handle in list(self._active_task_handles.items()):
@@ -2790,7 +2914,8 @@ class CleaDaemon:
             self._cancelled_task_ids.add(task_id)
             handle.cancel()
             with contextlib.suppress(Exception):
-                self.agent.memory.record_background_task(
+                await asyncio.to_thread(
+                    self.agent.memory.record_background_task,
                     task_id=task_id,
                     title=title,
                     status="cancelled",
@@ -2826,7 +2951,7 @@ class CleaDaemon:
             )
             return
 
-        existing = self.agent.memory.load_background_tasks().get(task_id)
+        existing = (await asyncio.to_thread(self.agent.memory.load_background_tasks)).get(task_id)
         if existing is not None:
             prev_status = str(existing.get("status", ""))
             if prev_status in ("running", "queued"):
@@ -2834,7 +2959,8 @@ class CleaDaemon:
                 kind = str(existing.get("kind") or "background_task")
                 started_at = str(existing.get("started_at") or now_iso)
                 session_id = existing.get("session_id")
-                self.agent.memory.record_background_task(
+                await asyncio.to_thread(
+                    self.agent.memory.record_background_task,
                     task_id=task_id,
                     title=title,
                     status="cancelled",
@@ -3216,11 +3342,17 @@ class CleaDaemon:
                     focus_backend=self._focus_backend,
                     media_backend=self._media_backend,
                 )
+                verify_start = time.perf_counter()
                 verify_res = await asyncio.to_thread(
                     active_verifier.verify_window_state,
                     int(res["hwnd"]),
                     expected_state=expected_state,
                     expected_snap=expected_snap,
+                )
+                logger.debug(
+                    "rpc_timing method=os.control_system action=%s verifier_ms=%.1f",
+                    action,
+                    (time.perf_counter() - verify_start) * 1000.0,
                 )
                 res = dict(res)
                 res["verification"] = verify_res.to_dict()
@@ -3841,7 +3973,8 @@ class CleaDaemon:
             finished_at = None if status == "running" else _now_iso()
             if broadcast_all_ui:
                 with contextlib.suppress(Exception):
-                    self.agent.memory.record_background_task(
+                    await asyncio.to_thread(
+                        self.agent.memory.record_background_task,
                         task_id=request_id,
                         title=title,
                         status=status,
@@ -4082,7 +4215,8 @@ class CleaDaemon:
         async def task_status(status: str, detail: str | None = None) -> None:
             finished_at = None if status == "running" else _now_iso()
             with contextlib.suppress(Exception):
-                self.agent.memory.record_background_task(
+                await asyncio.to_thread(
+                    self.agent.memory.record_background_task,
                     task_id=req.id,
                     title=title,
                     status=status,
@@ -4349,6 +4483,7 @@ def build_daemon(
         memory=resolved_memory,
         working_memory=working_memory,
         fact_reconciler=fact_reconciler,
+        background_memory_hooks=True,
     )
     return CleaDaemon(
         agent=agent,

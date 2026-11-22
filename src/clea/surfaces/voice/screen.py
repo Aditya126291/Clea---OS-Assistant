@@ -313,6 +313,7 @@ class ScreenCaptureService:
         *,
         target: str = "full_screen",
         monitor: int | None = None,
+        include_layout: bool = True,
     ) -> ScreenCaptureResult:
         """Capture a fresh active-window or active-monitor frame with blocklist & metadata."""
         with self._seq_lock:
@@ -377,10 +378,11 @@ class ScreenCaptureService:
                 )
                 if not monitors and target_mon is not None:
                     virtual_origin = (min(0, target_mon.left), min(0, target_mon.top))
-                layout_items = inspect_window_layout_win32(api)
-                if layout_items:
-                    window_layout = layout_items
-                    window_geometry_summary = format_window_geometry_z_order(layout_items)
+                if include_layout:
+                    layout_items = inspect_window_layout_win32(api)
+                    if layout_items:
+                        window_layout = layout_items
+                        window_geometry_summary = format_window_geometry_z_order(layout_items)
 
         effective_monitor_index = (
             target_mon.index

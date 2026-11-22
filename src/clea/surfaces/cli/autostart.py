@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from clea.tools.subprocess_utils import run_hidden
+
 TASK_NAME = "CleaDaemon"
 DAEMON_BG_ARGS = "-m clea daemon --background"
 DAEMON_DESCRIPTION = "Clea personal AI assistant localhost daemon"
@@ -167,11 +169,12 @@ def install_autostart(
     try:
         tmp_file.write(xml)
         tmp_file.close()
-        proc = runner(  # type: ignore[operator]
+        proc = run_hidden(
             ["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"],
             capture_output=True,
             text=True,
             check=False,
+            runner=runner,  # type: ignore[arg-type]
         )
     finally:
         xml_path.unlink(missing_ok=True)
@@ -197,11 +200,12 @@ def uninstall_autostart(
 ) -> bool:
     """Remove the Windows Task Scheduler logon task. Returns True if removed, False if absent."""
     _require_windows()
-    proc = runner(  # type: ignore[operator]
+    proc = run_hidden(
         ["schtasks", "/Delete", "/TN", task_name, "/F"],
         capture_output=True,
         text=True,
         check=False,
+        runner=runner,  # type: ignore[arg-type]
     )
     if proc.returncode == 0:
         return True
@@ -218,11 +222,12 @@ def status_autostart(
 ) -> AutostartStatus:
     """Query Windows Task Scheduler for the current status of ``task_name``."""
     _require_windows()
-    proc = runner(  # type: ignore[operator]
+    proc = run_hidden(
         ["schtasks", "/Query", "/TN", task_name, "/V", "/FO", "LIST"],
         capture_output=True,
         text=True,
         check=False,
+        runner=runner,  # type: ignore[arg-type]
     )
     if proc.returncode != 0:
         return AutostartStatus(installed=False, task_name=task_name)

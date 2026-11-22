@@ -27,6 +27,7 @@ from clea.core.protocol import (
 )
 from clea.paths import default_data_dir
 from clea.tools.registry import RiskLevel, ToolRegistry
+from clea.tools.subprocess_utils import popen_hidden, resolve_powershell_exe
 
 logger = logging.getLogger(__name__)
 
@@ -306,16 +307,14 @@ def _send_powershell_toast(title: str, body: str) -> None:
         "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Clea').Show($toast)\n"
     )
     encoded_cmd = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-
-    creation_flags = 0
-    if sys.platform == "win32":
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-
-    subprocess.Popen(
+    ps_exe = resolve_powershell_exe() or "powershell"
+    popen_hidden(
         [
-            "powershell",
+            ps_exe,
             "-NoProfile",
             "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
             "-EncodedCommand",
@@ -323,7 +322,6 @@ def _send_powershell_toast(title: str, body: str) -> None:
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=creation_flags,
     )
 
 

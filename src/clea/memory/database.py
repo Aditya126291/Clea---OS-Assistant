@@ -199,18 +199,22 @@ class MemoryDatabase:
         self.db_path = Path(db_path).expanduser().resolve()
         self._lock = threading.RLock()
         self._schema_ensured = False
+        self._wal_configured = False
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            need_wal = not self._wal_configured or not self.db_path.exists()
             conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             try:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA synchronous=NORMAL;")
                 conn.execute("PRAGMA busy_timeout=5000;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
                 conn.execute("PRAGMA foreign_keys=ON;")
+                if need_wal:
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    self._wal_configured = True
                 yield conn
                 conn.commit()
             except Exception:
@@ -221,100 +225,105 @@ class MemoryDatabase:
 
     def ensure_schema(self) -> None:
         """Create Tier 2 and Tier 3 tables, FTS5 virtual table, triggers, and indexes."""
-        with self._connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS episodic_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL UNIQUE,
-                    surface TEXT NOT NULL CHECK (surface IN ('chat', 'voice')),
-                    started_at TEXT NOT NULL DEFAULT '',
-                    ended_at TEXT NOT NULL DEFAULT '',
-                    title TEXT NOT NULL DEFAULT '',
-                    summary TEXT NOT NULL DEFAULT '',
-                    topics TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE VIRTUAL TABLE IF NOT EXISTS episodic_sessions_fts USING fts5(
-                    session_id UNINDEXED,
-                    surface UNINDEXED,
-                    title,
-                    summary,
-                    topics,
-                    content='episodic_sessions',
-                    content_rowid='id',
-                    tokenize='porter unicode61'
-                );
-
-                CREATE TRIGGER IF NOT EXISTS episodic_sessions_ai
-                AFTER INSERT ON episodic_sessions BEGIN
-                    INSERT INTO episodic_sessions_fts(
-                        rowid, session_id, surface, title, summary, topics
-                    )
-                    VALUES (
-                        new.id, new.session_id, new.surface, new.title, new.summary, new.topics
+        with self._lock:
+            if self._schema_ensured and self.db_path.exists():
+                return
+            with self._connect() as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS episodic_sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL UNIQUE,
+                        surface TEXT NOT NULL CHECK (surface IN ('chat', 'voice')),
+                        started_at TEXT NOT NULL DEFAULT '',
+                        ended_at TEXT NOT NULL DEFAULT '',
+                        title TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        topics TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL
                     );
-                END;
 
-                CREATE TRIGGER IF NOT EXISTS episodic_sessions_ad
-                AFTER DELETE ON episodic_sessions BEGIN
-                    INSERT INTO episodic_sessions_fts(
-                        episodic_sessions_fts, rowid, session_id, surface, title, summary, topics
-                    )
-                    VALUES (
-                        'delete', old.id, old.session_id, old.surface, old.title, old.summary,
-                        old.topics
+                    CREATE VIRTUAL TABLE IF NOT EXISTS episodic_sessions_fts USING fts5(
+                        session_id UNINDEXED,
+                        surface UNINDEXED,
+                        title,
+                        summary,
+                        topics,
+                        content='episodic_sessions',
+                        content_rowid='id',
+                        tokenize='porter unicode61'
                     );
-                END;
 
-                CREATE TRIGGER IF NOT EXISTS episodic_sessions_au
-                AFTER UPDATE ON episodic_sessions BEGIN
-                    INSERT INTO episodic_sessions_fts(
-                        episodic_sessions_fts, rowid, session_id, surface, title, summary, topics
-                    )
-                    VALUES (
-                        'delete', old.id, old.session_id, old.surface, old.title, old.summary,
-                        old.topics
-                    );
-                    INSERT INTO episodic_sessions_fts(
-                        rowid, session_id, surface, title, summary, topics
-                    )
-                    VALUES (
-                        new.id, new.session_id, new.surface, new.title, new.summary, new.topics
-                    );
-                END;
-
-                CREATE TABLE IF NOT EXISTS memory_facts (
-                    id TEXT PRIMARY KEY,
-                    category TEXT NOT NULL CHECK (
-                        category IN (
-                            'preference', 'environment', 'project',
-                            'workflow', 'identity', 'constraint'
+                    CREATE TRIGGER IF NOT EXISTS episodic_sessions_ai
+                    AFTER INSERT ON episodic_sessions BEGIN
+                        INSERT INTO episodic_sessions_fts(
+                            rowid, session_id, surface, title, summary, topics
                         )
-                    ),
-                    fact_key TEXT NOT NULL,
-                    fact_text TEXT NOT NULL,
-                    confidence REAL NOT NULL DEFAULT 0.9,
-                    source_surface TEXT NOT NULL DEFAULT 'chat' CHECK (
-                        source_surface IN ('chat', 'voice')
-                    ),
-                    source_session_id TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'active' CHECK (
-                        status IN ('active', 'superseded', 'deleted')
-                    ),
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+                        VALUES (
+                            new.id, new.session_id, new.surface, new.title, new.summary, new.topics
+                        );
+                    END;
 
-                CREATE INDEX IF NOT EXISTS idx_memory_facts_status_updated
-                ON memory_facts(status, updated_at DESC);
+                    CREATE TRIGGER IF NOT EXISTS episodic_sessions_ad
+                    AFTER DELETE ON episodic_sessions BEGIN
+                        INSERT INTO episodic_sessions_fts(
+                            episodic_sessions_fts, rowid, session_id, surface,
+                            title, summary, topics
+                        )
+                        VALUES (
+                            'delete', old.id, old.session_id, old.surface, old.title, old.summary,
+                            old.topics
+                        );
+                    END;
 
-                CREATE INDEX IF NOT EXISTS idx_memory_facts_category_key_status
-                ON memory_facts(category, fact_key, status);
-                """
-            )
-            self._schema_ensured = True
+                    CREATE TRIGGER IF NOT EXISTS episodic_sessions_au
+                    AFTER UPDATE ON episodic_sessions BEGIN
+                        INSERT INTO episodic_sessions_fts(
+                            episodic_sessions_fts, rowid, session_id, surface,
+                            title, summary, topics
+                        )
+                        VALUES (
+                            'delete', old.id, old.session_id, old.surface, old.title, old.summary,
+                            old.topics
+                        );
+                        INSERT INTO episodic_sessions_fts(
+                            rowid, session_id, surface, title, summary, topics
+                        )
+                        VALUES (
+                            new.id, new.session_id, new.surface, new.title, new.summary, new.topics
+                        );
+                    END;
+
+                    CREATE TABLE IF NOT EXISTS memory_facts (
+                        id TEXT PRIMARY KEY,
+                        category TEXT NOT NULL CHECK (
+                            category IN (
+                                'preference', 'environment', 'project',
+                                'workflow', 'identity', 'constraint'
+                            )
+                        ),
+                        fact_key TEXT NOT NULL,
+                        fact_text TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0.9,
+                        source_surface TEXT NOT NULL DEFAULT 'chat' CHECK (
+                            source_surface IN ('chat', 'voice')
+                        ),
+                        source_session_id TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active' CHECK (
+                            status IN ('active', 'superseded', 'deleted')
+                        ),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_memory_facts_status_updated
+                    ON memory_facts(status, updated_at DESC);
+
+                    CREATE INDEX IF NOT EXISTS idx_memory_facts_category_key_status
+                    ON memory_facts(category, fact_key, status);
+                    """
+                )
+                self._schema_ensured = True
 
     def _ensure_ready(self) -> None:
         if not self._schema_ensured or not self.db_path.exists():

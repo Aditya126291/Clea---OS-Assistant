@@ -166,6 +166,95 @@ def resolve_audio_device(
     return matches[0]
 
 
+def list_candidate_audio_devices(
+    spec: str | int | None,
+    kind: str = "input",
+    preferred_hostapi: str | None = "WASAPI",
+) -> list[dict[str, Any]]:
+    """Return an ordered list of candidate audio devices to try opening.
+
+    Always starts with the primary device chosen by :func:`resolve_audio_device`
+    (preserving ``AudioDeviceNotFoundError`` / ``AmbiguousAudioDeviceError``).
+    When *spec* is ``None`` (system default), appends same-name devices on other
+    host APIs (e.g. DirectSound / MME when a Bluetooth WASAPI endpoint fails
+    with PaErrorCode -9996), followed by other valid devices on the preferred
+    host API and remaining host APIs.
+    """
+    primary = resolve_audio_device(spec, kind=kind, preferred_hostapi=preferred_hostapi)
+    candidates: list[dict[str, Any]] = [primary]
+    seen_indices: set[int] = {int(primary["index"])}
+
+    # Explicit integer index -> honor the user's exact index without silent redirection
+    if isinstance(spec, int) or (isinstance(spec, str) and spec.strip().isdigit()):
+        return candidates
+
+    devices = list_audio_devices()
+    valid_devices = [
+        d
+        for d in devices
+        if (d["max_input_channels"] > 0 if kind == "input" else d["max_output_channels"] > 0)
+    ]
+
+    def _host_rank(dev: dict[str, Any]) -> int:
+        api = str(dev.get("hostapi_name", "")).upper()
+        if preferred_hostapi and preferred_hostapi.upper() in api:
+            return 0
+        if "DIRECTSOUND" in api:
+            return 1
+        if "MME" in api:
+            return 2
+        if "WASAPI" in api:
+            return 3
+        return 4
+
+    def _add(dev: dict[str, Any]) -> None:
+        idx = int(dev["index"])
+        if idx not in seen_indices:
+            seen_indices.add(idx)
+            candidates.append(dev)
+
+    primary_name_lower = str(primary.get("name", "")).strip().lower()
+
+    # 1. Same device name across alternate host APIs (e.g. DirectSound / MME fallback)
+    same_name = sorted(
+        [
+            d
+            for d in valid_devices
+            if str(d.get("name", "")).strip().lower() == primary_name_lower
+        ],
+        key=_host_rank,
+    )
+    for dev in same_name:
+        _add(dev)
+
+    # Explicit string query -> also include other host-API matches for that substring
+    if isinstance(spec, str) and spec.strip():
+        q = spec.strip().lower()
+        name_matches = sorted(
+            [d for d in valid_devices if q in str(d.get("name", "")).lower()],
+            key=_host_rank,
+        )
+        for dev in name_matches:
+            _add(dev)
+        return candidates
+
+    # 2. System default device from PortAudio (often MME/DirectSound)
+    try:
+        def_idx = sd.default.device[0 if kind == "input" else 1]
+        if def_idx is not None and def_idx >= 0:
+            match = next((d for d in valid_devices if d["index"] == def_idx), None)
+            if match is not None:
+                _add(match)
+    except Exception:
+        pass
+
+    # 3. Remaining valid devices ordered by host API preference (WASAPI -> DirectSound -> MME)
+    for dev in sorted(valid_devices, key=_host_rank):
+        _add(dev)
+
+    return candidates
+
+
 def negotiate_input_sample_rate(
     device_idx: int | None,
     default_samplerate: float | int | None = None,
@@ -331,6 +420,11 @@ class AudioManager:
         self._is_speaking = threading.Event()
         self._lock = threading.RLock()
         self._running = False
+        self._last_input_callback_time: float = 0.0
+        self._input_callback_count: int = 0
+        self._consecutive_zero_callbacks: int = 0
+        self._input_status_error_count: int = 0
+        self._health_monitored: bool = False
 
     @property
     def is_speaking(self) -> bool:
@@ -341,6 +435,59 @@ class AudioManager:
         """Set or update the microphone PCM data callback."""
         with self._lock:
             self._on_audio_input = callback
+
+    def flush_input_buffer(self) -> None:
+        """Flush buffered microphone samples (e.g. when returning to wake-word IDLE)."""
+        with self._lock:
+            self._input_accumulator.clear()
+            if self._chunk_buffer is not None:
+                self._chunk_buffer.clear()
+
+    def is_input_stream_healthy(
+        self,
+        *,
+        max_callback_gap_seconds: float = 5.0,
+        max_zero_callbacks: int = 125,
+    ) -> tuple[bool, str]:
+        """Check whether the microphone InputStream is alive and delivering real frames.
+
+        Returns ``(True, "ok")`` when healthy, or ``(False, reason)`` if the stream
+        stopped, callbacks stalled (WASAPI/Bluetooth hang), or sustained bit-exact
+        all-zero buffers indicate a dead endpoint.
+        """
+        with self._lock:
+            if not self._running or self._input_stream is None:
+                return False, "input_stream_not_running"
+            inp = self._input_stream
+            last_cb = self._last_input_callback_time
+            zero_streak = self._consecutive_zero_callbacks
+
+        try:
+            if getattr(inp, "stopped", False) is True or getattr(inp, "active", True) is False:
+                return False, "input_stream_inactive"
+        except Exception as exc:
+            return False, f"input_stream_status_error:{exc}"
+
+        if last_cb > 0.0:
+            gap = time.monotonic() - last_cb
+            if gap > max_callback_gap_seconds:
+                return False, f"input_callback_stalled_{gap:.1f}s"
+
+        if zero_streak >= max_zero_callbacks:
+            return False, f"sustained_zero_audio_{zero_streak}_blocks"
+
+        return True, "ok"
+
+    def restart_streams(self, *, max_attempts: int = 3, retry_delay: float = 0.5) -> bool:
+        """Stop streams, refresh PortAudio endpoints, and reopen audio I/O safely."""
+        try:
+            self.stop()
+            refresh_audio_devices()
+            self.start(max_attempts=max_attempts, retry_delay=retry_delay)
+            return True
+        except Exception as exc:
+            logger.warning("AudioManager stream recovery failed: %s", exc)
+            return False
 
     def start(self, *, max_attempts: int = 1, retry_delay: float = 1.0) -> None:
         """Start microphone input and audio output streams, retrying transient endpoint failures."""
@@ -365,8 +512,159 @@ class AudioManager:
                     time.sleep(retry_delay)
                 refresh_audio_devices()
 
+    def _open_input_stream(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[sd.InputStream, dict[str, Any], int, int]:
+        """Try opening and starting an InputStream across ordered candidate devices."""
+        last_exc: Exception | None = None
+        for idx_pos, dev in enumerate(candidates):
+            inp_idx = int(dev["index"])
+            native_rate = int(dev.get("default_samplerate", INPUT_AUDIO_SAMPLE_RATE_HZ))
+            host_name = str(dev.get("hostapi_name", "Unknown"))
+            logger.info(
+                "Audio input device: #%d '%s' (host API: %s, native rate: %d Hz, channels: %d)",
+                inp_idx,
+                dev["name"],
+                host_name,
+                native_rate,
+                dev.get("max_input_channels", 1),
+            )
+            sample_rate, channels = negotiate_input_sample_rate(
+                device_idx=inp_idx,
+                default_samplerate=native_rate,
+                candidate_rates=(16000, 48000, 44100),
+                preferred_channels=1,
+            )
+            blocksize = int(sample_rate * 0.08)
+            inp_wasapi = "WASAPI" in host_name.upper()
+            extra_options: list[Any] = (
+                [sd.WasapiSettings(auto_convert=True), None]
+                if (inp_wasapi and hasattr(sd, "WasapiSettings"))
+                else [None]
+            )
+
+            for extra in extra_options:
+                stream: sd.InputStream | None = None
+                try:
+                    stream = sd.InputStream(
+                        samplerate=sample_rate,
+                        channels=channels,
+                        dtype="int16",
+                        device=inp_idx,
+                        blocksize=blocksize,
+                        extra_settings=extra,
+                        callback=self._input_stream_callback,
+                    )
+                    stream.start()
+                    if idx_pos > 0:
+                        logger.warning(
+                            "Audio input fell back to #%d '%s' (host API: %s, %d Hz, %dch).",
+                            inp_idx,
+                            dev["name"],
+                            host_name,
+                            sample_rate,
+                            channels,
+                        )
+                    return stream, dev, sample_rate, channels
+                except (sd.PortAudioError, OSError) as exc:
+                    last_exc = exc
+                    if stream is not None:
+                        try:
+                            stream.stop()
+                            stream.close()
+                        except Exception:
+                            pass
+                    if extra is not None:
+                        logger.debug(
+                            "Input device #%d '%s' failed with WASAPI auto_convert (%s); "
+                            "retrying without extra_settings.",
+                            inp_idx,
+                            dev["name"],
+                            exc,
+                        )
+                        continue
+                    logger.warning(
+                        "Failed opening audio input device #%d '%s' (%s): %s%s",
+                        inp_idx,
+                        dev["name"],
+                        host_name,
+                        exc,
+                        "; trying fallback device..." if idx_pos + 1 < len(candidates) else ".",
+                    )
+                    break
+
+        assert last_exc is not None
+        raise last_exc
+
+    def _open_output_stream(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[sd.OutputStream, dict[str, Any]]:
+        """Try opening and starting an OutputStream across ordered candidate devices."""
+        last_exc: Exception | None = None
+        for idx_pos, dev in enumerate(candidates):
+            out_idx = int(dev["index"])
+            host_name = str(dev.get("hostapi_name", "Unknown"))
+            logger.info(
+                "Audio output device: #%d '%s' (host API: %s, native rate: %d Hz, channels: %d)",
+                out_idx,
+                dev["name"],
+                host_name,
+                int(dev.get("default_samplerate", OUTPUT_AUDIO_SAMPLE_RATE_HZ)),
+                dev.get("max_output_channels", 2),
+            )
+            out_wasapi = "WASAPI" in host_name.upper()
+            extra_options: list[Any] = (
+                [sd.WasapiSettings(auto_convert=True), None]
+                if (out_wasapi and hasattr(sd, "WasapiSettings"))
+                else [None]
+            )
+            for extra in extra_options:
+                stream: sd.OutputStream | None = None
+                try:
+                    stream = sd.OutputStream(
+                        samplerate=OUTPUT_AUDIO_SAMPLE_RATE_HZ,
+                        channels=AUDIO_CHANNELS,
+                        dtype="int16",
+                        device=out_idx,
+                        extra_settings=extra,
+                        callback=self._output_stream_callback,
+                    )
+                    stream.start()
+                    if idx_pos > 0:
+                        logger.warning(
+                            "Audio output fell back to #%d '%s' (host API: %s).",
+                            out_idx,
+                            dev["name"],
+                            host_name,
+                        )
+                    return stream, dev
+                except (sd.PortAudioError, OSError) as exc:
+                    last_exc = exc
+                    if stream is not None:
+                        try:
+                            stream.stop()
+                            stream.close()
+                        except Exception:
+                            pass
+                    if extra is not None:
+                        continue
+                    logger.warning(
+                        "Failed opening audio output device #%d '%s' (%s): %s%s",
+                        out_idx,
+                        dev["name"],
+                        host_name,
+                        exc,
+                        "; trying fallback device..." if idx_pos + 1 < len(candidates) else ".",
+                    )
+                    break
+
+        assert last_exc is not None
+        raise last_exc
+
     def _start_once(self) -> None:
-        """Start microphone input and audio output streams once."""
+        """Start microphone input and audio output streams once (with device fallback)."""
         with self._lock:
             if self._running:
                 return
@@ -375,102 +673,47 @@ class AudioManager:
             self._input_accumulator.clear()
             self._drain_output_queue()
             self._is_speaking.clear()
+            self._consecutive_zero_callbacks = 0
+            self._input_callback_count = 0
+            self._input_status_error_count = 0
 
-            # Resolve input & output devices
-            self.resolved_input_device = resolve_audio_device(
+            # Resolve ordered candidate input & output devices (raises on invalid/ambiguous spec)
+            input_candidates = list_candidate_audio_devices(
                 self.input_device,
                 kind="input",
                 preferred_hostapi=self.preferred_hostapi,
             )
-            self.resolved_output_device = resolve_audio_device(
+            output_candidates = list_candidate_audio_devices(
                 self.output_device,
                 kind="output",
                 preferred_hostapi=self.preferred_hostapi,
             )
-
-            inp_idx = self.resolved_input_device["index"]
-            out_idx = self.resolved_output_device["index"]
-
-            logger.info(
-                "Audio input device: #%d '%s' (host API: %s, native rate: %d Hz, channels: %d)",
-                inp_idx,
-                self.resolved_input_device["name"],
-                self.resolved_input_device.get("hostapi_name", "Unknown"),
-                int(
-                    self.resolved_input_device.get("default_samplerate", INPUT_AUDIO_SAMPLE_RATE_HZ)
-                ),
-                self.resolved_input_device.get("max_input_channels", 1),
-            )
-            logger.info(
-                "Audio output device: #%d '%s' (host API: %s, native rate: %d Hz, channels: %d)",
-                out_idx,
-                self.resolved_output_device["name"],
-                self.resolved_output_device.get("hostapi_name", "Unknown"),
-                int(
-                    self.resolved_output_device.get(
-                        "default_samplerate", OUTPUT_AUDIO_SAMPLE_RATE_HZ
-                    )
-                ),
-                self.resolved_output_device.get("max_output_channels", 2),
-            )
-
-            # Negotiate hardware sample rate and channels
-            native_rate = int(
-                self.resolved_input_device.get("default_samplerate", INPUT_AUDIO_SAMPLE_RATE_HZ)
-            )
-            sample_rate, channels = negotiate_input_sample_rate(
-                device_idx=inp_idx,
-                default_samplerate=native_rate,
-                candidate_rates=(16000, 48000, 44100),
-                preferred_channels=1,
-            )
-            self.input_sample_rate = sample_rate
-            self.input_channels = channels
-            blocksize = int(sample_rate * 0.08)
 
             if self._chunk_buffer is None:
                 self._chunk_buffer = AudioChunkBuffer(chunk_size=self.chunk_size or 1280)
             else:
                 self._chunk_buffer.clear()
 
-            inp_wasapi = "WASAPI" in self.resolved_input_device.get("hostapi_name", "").upper()
-            out_wasapi = "WASAPI" in self.resolved_output_device.get("hostapi_name", "").upper()
-            inp_extra = (
-                sd.WasapiSettings(auto_convert=True)
-                if (inp_wasapi and hasattr(sd, "WasapiSettings"))
-                else None
-            )
-            out_extra = (
-                sd.WasapiSettings(auto_convert=True)
-                if (out_wasapi and hasattr(sd, "WasapiSettings"))
-                else None
-            )
-
             try:
-                self._input_stream = sd.InputStream(
-                    samplerate=sample_rate,
-                    channels=channels,
-                    dtype="int16",
-                    device=inp_idx,
-                    blocksize=blocksize,
-                    extra_settings=inp_extra,
-                    callback=self._input_stream_callback,
+                inp_stream, chosen_in, sample_rate, channels = self._open_input_stream(
+                    input_candidates
                 )
-                self._output_stream = sd.OutputStream(
-                    samplerate=OUTPUT_AUDIO_SAMPLE_RATE_HZ,
-                    channels=AUDIO_CHANNELS,
-                    dtype="int16",
-                    device=out_idx,
-                    extra_settings=out_extra,
-                    callback=self._output_stream_callback,
-                )
-                self._input_stream.start()
-                self._output_stream.start()
+                self._input_stream = inp_stream
+                self.resolved_input_device = chosen_in
+                self.input_sample_rate = sample_rate
+                self.input_channels = channels
+
+                out_stream, chosen_out = self._open_output_stream(output_candidates)
+                self._output_stream = out_stream
+                self.resolved_output_device = chosen_out
+
+                self._last_input_callback_time = time.monotonic()
                 self._running = True
+                self._health_monitored = True
                 logger.info(
                     "AudioManager started (input=#%d, output=#%d, mute_while_speaking=%s).",
-                    inp_idx,
-                    out_idx,
+                    chosen_in["index"],
+                    chosen_out["index"],
                     self.mic_mute_while_speaking,
                 )
             except Exception:
@@ -537,14 +780,30 @@ class AudioManager:
         time_info: Any,
         status: sd.CallbackFlags,
     ) -> None:
+        self._last_input_callback_time = time.monotonic()
+        self._input_callback_count += 1
         if status:
-            logger.debug("Audio input status flag: %s", status)
+            self._input_status_error_count += 1
+            if self._input_status_error_count <= 3 or self._input_status_error_count % 50 == 0:
+                logger.warning(
+                    "Audio input status flag (%d total): %s",
+                    self._input_status_error_count,
+                    status,
+                )
+            else:
+                logger.debug("Audio input status flag: %s", status)
 
         if self.mic_mute_while_speaking and self._is_speaking.is_set():
             # Mute microphone while speaking; clear buffer to prevent stale stitching
+            self._consecutive_zero_callbacks = 0
             if self._chunk_buffer is not None:
                 self._chunk_buffer.clear()
             return
+
+        if indata.size > 0 and not np.any(indata):
+            self._consecutive_zero_callbacks += 1
+        else:
+            self._consecutive_zero_callbacks = 0
 
         cb = self._on_audio_input
         if cb is None:

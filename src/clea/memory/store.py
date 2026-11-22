@@ -162,6 +162,8 @@ class MemoryStore:
         self.db_path = self.base_dir / "memory.db"
         self.memory_db = MemoryDatabase(self.db_path)
         self.token_cap = token_cap
+        self._init_lock = threading.Lock()
+        self._initialized = False
     @property
     def _prune_lock(self) -> threading.Lock:
         return _get_dir_prune_lock(self.base_dir)
@@ -261,31 +263,38 @@ class MemoryStore:
         return summary_map
 
     def ensure_initialized(self) -> None:
-        """Create directories and default MEMORY.md if missing."""
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        self.episodes_dir.mkdir(parents=True, exist_ok=True)
-        self.transcripts_dir.mkdir(parents=True, exist_ok=True)
-        self.trash_dir.mkdir(parents=True, exist_ok=True)
+        """Create directories and default MEMORY.md if missing (idempotent fast-path)."""
+        if self._initialized and self.long_term_path.exists() and self.db_path.exists():
+            return
+        with self._init_lock:
+            if self._initialized and self.long_term_path.exists() and self.db_path.exists():
+                return
+            self.memory_dir.mkdir(parents=True, exist_ok=True)
+            self.episodes_dir.mkdir(parents=True, exist_ok=True)
+            self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+            self.trash_dir.mkdir(parents=True, exist_ok=True)
 
-        # Migrate legacy root MEMORY.md if present
-        legacy_root_long_term = self.base_dir / "MEMORY.md"
-        if legacy_root_long_term.exists() and not self.long_term_path.exists():
-            try:
-                shutil.copyfile(legacy_root_long_term, self.long_term_path)
-            except Exception as exc:
-                logger.warning("Could not migrate legacy root MEMORY.md: %s", exc)
+            # Migrate legacy root MEMORY.md if present
+            legacy_root_long_term = self.base_dir / "MEMORY.md"
+            if legacy_root_long_term.exists() and not self.long_term_path.exists():
+                try:
+                    shutil.copyfile(legacy_root_long_term, self.long_term_path)
+                except Exception as exc:
+                    logger.warning("Could not migrate legacy root MEMORY.md: %s", exc)
 
-        if not self.long_term_path.exists():
-            initial_text = self._build_empty_long_term_markdown()
-            self.long_term_path.write_text(initial_text, encoding="utf-8")
+            if not self.long_term_path.exists():
+                initial_text = self._build_empty_long_term_markdown()
+                self.long_term_path.write_text(initial_text, encoding="utf-8")
 
-        # Run idempotent migration of legacy daily logs if any exist
-        try:
-            self.migrate_legacy_daily_logs()
-        except Exception as exc:
-            logger.warning("Legacy daily log migration notice: %s", exc)
+            # Run idempotent migration of legacy daily logs ONCE per MemoryStore lifecycle
+            if not self._initialized:
+                try:
+                    self.migrate_legacy_daily_logs()
+                except Exception as exc:
+                    logger.warning("Legacy daily log migration notice: %s", exc)
 
-        self.memory_db.ensure_schema()
+            self.memory_db.ensure_schema()
+            self._initialized = True
 
     def close(self) -> None:
         """Close/checkpoint the underlying SQLite memory database."""
@@ -838,7 +847,8 @@ class MemoryStore:
                         )
                         updated_content = pattern.sub(lambda _, b=new_block: b, content, count=1)
                         ep_file.write_text(updated_content, encoding="utf-8")
-                        self._embed_item_if_needed(f"episode:{s}", summary.strip())
+                        if not trivial:
+                            self._embed_item_if_needed(f"episode:{s}", summary.strip())
                         self._sync_episodic_session_db(session_id=s, summary=summary, dt=dt)
                         return ep_file
 
@@ -854,7 +864,8 @@ class MemoryStore:
         with path.open("a", encoding="utf-8") as handle:
             handle.write("".join(chunks))
 
-        self._embed_item_if_needed(f"episode:{session_id}", summary.strip())
+        if not trivial:
+            self._embed_item_if_needed(f"episode:{session_id}", summary.strip())
         self._sync_episodic_session_db(session_id=session_id, summary=summary, dt=dt)
         return path
 
@@ -2695,7 +2706,8 @@ class MemoryStore:
                 shutil.copyfile(f, bak_dest)
             migrated_files += 1
 
-        logger.info(
+        log_fn = logger.info if migrated_sessions > 0 else logger.debug
+        log_fn(
             "Legacy daily log migration complete: %d sessions from %d files",
             migrated_sessions,
             migrated_files,

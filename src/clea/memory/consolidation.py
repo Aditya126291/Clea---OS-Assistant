@@ -687,6 +687,7 @@ class ConsolidationManager:
         session_id: str,
         *,
         force: bool = False,
+        wait_if_in_flight: bool = False,
         on_task_status: Callable[[str, str | None], Awaitable[None]] | None = None,
         task_callback: Any = None,
     ) -> bool:
@@ -705,14 +706,21 @@ class ConsolidationManager:
                 "Consolidation already in flight for session %s; coalescing duplicate trigger.",
                 session_id,
             )
+            if wait_if_in_flight:
+                async with lock:
+                    pass
             return True
 
         keys_to_mark = {session_id, lock_key}
         self._in_flight_sessions.update(keys_to_mark)
         try:
             async with lock:
-                if not self.should_consolidate(session_id, force=force):
-                    return True
+                if not force:
+                    should_run = await asyncio.to_thread(
+                        self.should_consolidate, session_id, force=False
+                    )
+                    if not should_run:
+                        return True
                 return await self._consolidate_session_locked(
                     session_id=session_id,
                     resolved_sid=resolved_sid,
@@ -736,7 +744,7 @@ class ConsolidationManager:
             if effective_status_cb is not None:
                 running_emitted = True
                 await effective_status_cb("running", None)
-            # Record in-flight running state on disk so unexpected crashes/restarts can recover.
+
             running_state = self.load_state()
             sessions_map = running_state.setdefault("sessions", {})
             prev_sess_info = sessions_map.get(session_id) or sessions_map.get(resolved_sid) or {}
@@ -792,7 +800,7 @@ class ConsolidationManager:
                     summary=summary,
                     trivial=True,
                 )
-                resolved_sid = self.memory.resolve_session_id(session_id)
+                res_sid = self.memory.resolve_session_id(session_id)
                 with self.memory._prune_lock:
                     state = self.load_state()
                     now_iso = datetime.now().astimezone().isoformat()
@@ -806,8 +814,8 @@ class ConsolidationManager:
                         effective_turn_count, now_iso, trivial=True
                     )
                     state.setdefault("sessions", {})[session_id] = sess_data
-                    if resolved_sid and resolved_sid != session_id:
-                        state["sessions"][resolved_sid] = sess_data
+                    if res_sid and res_sid != session_id:
+                        state["sessions"][res_sid] = sess_data
                     self._sync_voice_companion_state(state, transcript, now_iso)
                     state["last_consolidated_at"] = now_iso
                     self.save_state(state)
@@ -828,8 +836,9 @@ class ConsolidationManager:
 
             # Include current long-term memory entries for deduplication and
             # ADD/UPDATE/DELETE reconciliation
+            parsed_sections = await asyncio.to_thread(self.memory.parse_sections)
             existing_facts: list[str] = []
-            for sec_name, entries in self.memory.parse_sections().items():
+            for sec_name, entries in parsed_sections.items():
                 for entry in entries:
                     existing_facts.append(f"[{entry.id}] ({sec_name}) {entry.text}")
             if existing_facts:
@@ -854,7 +863,7 @@ class ConsolidationManager:
             prompt = "\n".join(t_lines)
             parsed_output, error_msg = await self._call_model_for_json(prompt)
 
-            state = self.load_state()
+            state = await asyncio.to_thread(self.load_state)
             now = datetime.now().astimezone()
             now_iso = now.isoformat()
             sess_info = state.setdefault("sessions", {}).get(session_id, {})
@@ -862,174 +871,188 @@ class ConsolidationManager:
             if parsed_output is None:
                 current_retries = int(sess_info.get("retry_count", 0)) + 1
                 sanitized_err = sanitize_error(error_msg)
-                pending_state = self.load_pending()
-                is_pending = current_retries < MAX_CONSOLIDATION_RETRIES
 
-                if is_pending:
-                    delay_sec = BACKOFF_DELAYS[min(current_retries - 1, len(BACKOFF_DELAYS) - 1)]
-                    next_retry = now + timedelta(seconds=delay_sec)
-                    next_retry_iso = next_retry.isoformat()
-                    logger.warning(
-                        "Session %s consolidation attempt %d/%d failed: %s. "
-                        "Pending, next retry: %s",
-                        session_id,
-                        current_retries,
-                        MAX_CONSOLIDATION_RETRIES,
-                        sanitized_err,
-                        next_retry_iso,
-                    )
-                    pending_state.setdefault("sessions", {})[session_id] = {
-                        "status": "pending",
+                def _record_failure() -> None:
+                    pending_state = self.load_pending()
+                    is_pending = current_retries < MAX_CONSOLIDATION_RETRIES
+
+                    if is_pending:
+                        delay_sec = BACKOFF_DELAYS[
+                            min(current_retries - 1, len(BACKOFF_DELAYS) - 1)
+                        ]
+                        next_retry = now + timedelta(seconds=delay_sec)
+                        next_retry_iso = next_retry.isoformat()
+                        logger.warning(
+                            "Session %s consolidation attempt %d/%d failed: %s. "
+                            "Pending, next retry: %s",
+                            session_id,
+                            current_retries,
+                            MAX_CONSOLIDATION_RETRIES,
+                            sanitized_err,
+                            next_retry_iso,
+                        )
+                        pending_state.setdefault("sessions", {})[session_id] = {
+                            "status": "pending",
+                            "retry_count": current_retries,
+                            "last_error": sanitized_err,
+                            "last_attempt_at": now_iso,
+                            "next_retry_at": next_retry_iso,
+                        }
+                    else:
+                        next_retry_iso = None
+                        logger.error(
+                            "Session %s consolidation failed after %d attempts "
+                            "(retry cap reached): %s",
+                            session_id,
+                            current_retries,
+                            sanitized_err,
+                        )
+                        pending_state.setdefault("sessions", {}).pop(session_id, None)
+
+                    self.save_pending(pending_state)
+
+                    preserved = {
+                        k: sess_info[k]
+                        for k in (
+                            "last_consolidated_turn",
+                            "last_consolidated_turn_count",
+                            "last_consolidated_message_idx",
+                            "last_consolidated_at",
+                            "consolidated_at",
+                        )
+                        if k in sess_info
+                    }
+                    fail_data = {
+                        **preserved,
+                        "status": "failed",
+                        "pending": is_pending,
                         "retry_count": current_retries,
+                        "error": sanitized_err,
                         "last_error": sanitized_err,
                         "last_attempt_at": now_iso,
                         "next_retry_at": next_retry_iso,
                     }
-                else:
-                    next_retry_iso = None
-                    logger.error(
-                        "Session %s consolidation failed after %d attempts (retry cap reached): %s",
-                        session_id,
-                        current_retries,
-                        sanitized_err,
-                    )
-                    pending_state.setdefault("sessions", {}).pop(session_id, None)
+                    state.setdefault("sessions", {})[session_id] = fail_data
+                    if resolved_sid and resolved_sid != session_id:
+                        state["sessions"][resolved_sid] = fail_data
+                    self.save_state(state)
 
-                self.save_pending(pending_state)
-
-                preserved = {
-                    k: sess_info[k]
-                    for k in (
-                        "last_consolidated_turn",
-                        "last_consolidated_turn_count",
-                        "last_consolidated_message_idx",
-                        "last_consolidated_at",
-                        "consolidated_at",
-                    )
-                    if k in sess_info
-                }
-                fail_data = {
-                    **preserved,
-                    "status": "failed",
-                    "pending": is_pending,
-                    "retry_count": current_retries,
-                    "error": sanitized_err,
-                    "last_error": sanitized_err,
-                    "last_attempt_at": now_iso,
-                    "next_retry_at": next_retry_iso,
-                }
-                state.setdefault("sessions", {})[session_id] = fail_data
-                if resolved_sid and resolved_sid != session_id:
-                    state["sessions"][resolved_sid] = fail_data
-                self.save_state(state)
+                await asyncio.to_thread(_record_failure)
                 if effective_status_cb is not None:
                     await effective_status_cb("failed", sanitized_err)
                 terminal_emitted = True
                 return False
 
-            # Clear from pending on successful consolidation
-            pending_state = self.load_pending()
-            if session_id in pending_state.get("sessions", {}):
-                pending_state["sessions"].pop(session_id, None)
-            if resolved_sid and resolved_sid in pending_state.get("sessions", {}):
-                pending_state["sessions"].pop(resolved_sid, None)
-            self.save_pending(pending_state)
+            def _apply_consolidation_sync() -> None:
+                # Clear from pending on successful consolidation
+                pending_state = self.load_pending()
+                if session_id in pending_state.get("sessions", {}):
+                    pending_state["sessions"].pop(session_id, None)
+                if resolved_sid and resolved_sid in pending_state.get("sessions", {}):
+                    pending_state["sessions"].pop(resolved_sid, None)
+                self.save_pending(pending_state)
 
-            # 1. Append episode summary
-            self.memory.append_episode(
-                session_id=session_id,
-                summary=parsed_output.summary,
-                trivial=False,
-            )
-            if (
-                not is_vc
-                and not is_synthetic_episodic_session(session_id)
-                and parsed_output.summary.strip()
-            ):
-                try:
-                    ep_title, _, ep_topics = build_extractive_session_summary(
-                        target_messages,
-                        fallback_title=str(transcript.get("title") or ""),
-                    )
-                    ep_surface = "voice" if transcript.get("is_voice_call") else "chat"
-                    self.memory.memory_db.upsert_episodic_session(
-                        session_id=session_id,
-                        surface=ep_surface,
-                        started_at=str(transcript.get("started_at") or ""),
-                        ended_at=str(transcript.get("updated_at") or ""),
-                        title=ep_title,
-                        summary=parsed_output.summary,
-                        topics=ep_topics,
-                    )
-                except Exception as db_ep_err:
-                    logger.debug("Skipping SQLite episodic sync for %s: %s", session_id, db_ep_err)
+                # 1. Append episode summary
+                self.memory.append_episode(
+                    session_id=session_id,
+                    summary=parsed_output.summary,
+                    trivial=False,
+                )
+                if (
+                    not is_vc
+                    and not is_synthetic_episodic_session(session_id)
+                    and parsed_output.summary.strip()
+                ):
+                    try:
+                        ep_title, _, ep_topics = build_extractive_session_summary(
+                            target_messages,
+                            fallback_title=str(transcript.get("title") or ""),
+                        )
+                        ep_surface = "voice" if transcript.get("is_voice_call") else "chat"
+                        self.memory.memory_db.upsert_episodic_session(
+                            session_id=session_id,
+                            surface=ep_surface,
+                            started_at=str(transcript.get("started_at") or ""),
+                            ended_at=str(transcript.get("updated_at") or ""),
+                            title=ep_title,
+                            summary=parsed_output.summary,
+                            topics=ep_topics,
+                        )
+                    except Exception as db_ep_err:
+                        logger.debug(
+                            "Skipping SQLite episodic sync for %s: %s", session_id, db_ep_err
+                        )
 
-            id_to_text: dict[str, str] = {}
-            for entries in self.memory.parse_sections().values():
-                for entry in entries:
-                    id_to_text[entry.id] = entry.text
+                id_to_text: dict[str, str] = {}
+                for entries in self.memory.parse_sections().values():
+                    for entry in entries:
+                        id_to_text[entry.id] = entry.text
 
-            # 2. Apply operations with safety rules
-            for op in parsed_output.operations:
-                if is_secret_or_sensitive(op.text):
-                    logger.warning(
-                        "Rejected memory operation containing secret pattern: %s (reason: %s)",
-                        op.text,
-                        op.reason,
-                    )
-                    continue
+                # 2. Apply operations with safety rules
+                for op in parsed_output.operations:
+                    if is_secret_or_sensitive(op.text):
+                        logger.warning(
+                            "Rejected memory operation containing secret pattern: %s (reason: %s)",
+                            op.text,
+                            op.reason,
+                        )
+                        continue
 
-                if op.target_section not in FIXED_SECTIONS:
-                    logger.warning("Ignored operation for unknown section: %s", op.target_section)
-                    continue
+                    if op.target_section not in FIXED_SECTIONS:
+                        logger.warning(
+                            "Ignored operation for unknown section: %s", op.target_section
+                        )
+                        continue
 
-                try:
-                    if op.op in ("remove", "delete"):
+                    try:
+                        if op.op in ("remove", "delete"):
+                            target_id = op.entry_id.strip("[]") if op.entry_id else None
+                            removed = self.memory.remove_entries(target_id) if target_id else []
+                            if not removed and op.text:
+                                self.memory.remove_entries(op.text)
+                        else:
+                            self.memory.add_or_update_entry(
+                                text=op.text,
+                                section=op.target_section,
+                                source=op.source_tag,
+                                entry_id=op.entry_id,
+                            )
+                    except Exception as op_err:
+                        logger.warning("Could not apply memory operation (%s): %s", op, op_err)
+                        continue
+
+                    try:
+                        fact_surface = (
+                            "voice" if (is_vc or transcript.get("is_voice_call")) else "chat"
+                        )
+                        fact_cat = normalize_fact_category(op.target_section)
                         target_id = op.entry_id.strip("[]") if op.entry_id else None
-                        removed = self.memory.remove_entries(target_id) if target_id else []
-                        if not removed and op.text:
-                            self.memory.remove_entries(op.text)
-                    else:
-                        self.memory.add_or_update_entry(
-                            text=op.text,
-                            section=op.target_section,
-                            source=op.source_tag,
-                            entry_id=op.entry_id,
-                        )
-                except Exception as op_err:
-                    logger.warning("Could not apply memory operation (%s): %s", op, op_err)
-                    continue
+                        if op.op in ("remove", "delete"):
+                            self.memory.memory_db.manage_fact(
+                                "delete",
+                                fact_id=target_id,
+                                query=op.text,
+                                source_surface=fact_surface,
+                                source_session_id=session_id,
+                            )
+                        else:
+                            old_text = id_to_text.get(target_id) if target_id else None
+                            db_action: Literal["add", "update"] = (
+                                "update" if op.op == "update" else "add"
+                            )
+                            self.memory.memory_db.manage_fact(
+                                db_action,
+                                fact_text=op.text,
+                                category=fact_cat,
+                                fact_id=target_id,
+                                query=old_text or op.text,
+                                source_surface=fact_surface,
+                                source_session_id=session_id,
+                            )
+                    except Exception as db_op_err:
+                        logger.debug("Skipping SQLite fact sync (%s): %s", op, db_op_err)
 
-                try:
-                    fact_surface = (
-                        "voice" if (is_vc or transcript.get("is_voice_call")) else "chat"
-                    )
-                    fact_cat = normalize_fact_category(op.target_section)
-                    target_id = op.entry_id.strip("[]") if op.entry_id else None
-                    if op.op in ("remove", "delete"):
-                        self.memory.memory_db.manage_fact(
-                            "delete",
-                            fact_id=target_id,
-                            query=op.text,
-                            source_surface=fact_surface,
-                            source_session_id=session_id,
-                        )
-                    else:
-                        old_text = id_to_text.get(target_id) if target_id else None
-                        db_action: Literal["add", "update"] = (
-                            "update" if op.op == "update" else "add"
-                        )
-                        self.memory.memory_db.manage_fact(
-                            db_action,
-                            fact_text=op.text,
-                            category=fact_cat,
-                            fact_id=target_id,
-                            query=old_text or op.text,
-                            source_surface=fact_surface,
-                            source_session_id=session_id,
-                        )
-                except Exception as db_op_err:
-                    logger.debug("Skipping SQLite fact sync (%s): %s", op, db_op_err)
+            await asyncio.to_thread(_apply_consolidation_sync)
 
             # 2b. Backfill Layer 3 semantic embeddings for newly consolidated episodes & facts
             try:
@@ -1038,26 +1061,29 @@ class ConsolidationManager:
                 logger.debug("Embedding backfill skipped after consolidation: %s", emb_err)
 
             # 3. Mark completed under prune lock to prevent concurrent checkpoint drift
-            resolved_sid = self.memory.resolve_session_id(session_id)
-            with self.memory._prune_lock:
-                state = self.load_state()
-                if is_vc:
-                    current_vc = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
-                    current_len = len(current_vc.get("messages", [])) if current_vc else 0
-                    effective_turn_count = min(turn_count, current_len)
-                else:
-                    effective_turn_count = turn_count
-                sess_data = self._build_completed_session_data(
-                    effective_turn_count,
-                    now_iso,
-                    retry_count=sess_info.get("retry_count", 0),
-                )
-                state.setdefault("sessions", {})[session_id] = sess_data
-                if resolved_sid and resolved_sid != session_id:
-                    state["sessions"][resolved_sid] = sess_data
-                self._sync_voice_companion_state(state, transcript, now_iso)
-                state["last_consolidated_at"] = now_iso
-                self.save_state(state)
+            def _mark_completed_sync() -> None:
+                res_sid = self.memory.resolve_session_id(session_id)
+                with self.memory._prune_lock:
+                    st = self.load_state()
+                    if is_vc:
+                        current_vc = self.memory.get_transcript(VOICE_COMPANION_SESSION_ID)
+                        current_len = len(current_vc.get("messages", [])) if current_vc else 0
+                        effective_turn_count = min(turn_count, current_len)
+                    else:
+                        effective_turn_count = turn_count
+                    sess_data = self._build_completed_session_data(
+                        effective_turn_count,
+                        now_iso,
+                        retry_count=sess_info.get("retry_count", 0),
+                    )
+                    st.setdefault("sessions", {})[session_id] = sess_data
+                    if res_sid and res_sid != session_id:
+                        st["sessions"][res_sid] = sess_data
+                    self._sync_voice_companion_state(st, transcript, now_iso)
+                    st["last_consolidated_at"] = now_iso
+                    self.save_state(st)
+
+            await asyncio.to_thread(_mark_completed_sync)
 
             logger.info("Successfully consolidated session %s", session_id)
             if effective_status_cb is not None:
@@ -1066,20 +1092,23 @@ class ConsolidationManager:
             return True
         except asyncio.CancelledError:
             try:
-                now_iso = datetime.now().astimezone().isoformat()
-                state = self.load_state()
-                prev = state.get("sessions", {}).get(session_id, {})
-                fail_data = {
-                    **prev,
-                    "status": "failed",
-                    "error": "Cancelled",
-                    "last_error": "Cancelled",
-                    "last_attempt_at": now_iso,
-                }
-                state.setdefault("sessions", {})[session_id] = fail_data
-                if resolved_sid and resolved_sid != session_id:
-                    state["sessions"][resolved_sid] = fail_data
-                self.save_state(state)
+                def _save_cancelled() -> None:
+                    now_iso_c = datetime.now().astimezone().isoformat()
+                    st = self.load_state()
+                    prev = st.get("sessions", {}).get(session_id, {})
+                    fail_data = {
+                        **prev,
+                        "status": "failed",
+                        "error": "Cancelled",
+                        "last_error": "Cancelled",
+                        "last_attempt_at": now_iso_c,
+                    }
+                    st.setdefault("sessions", {})[session_id] = fail_data
+                    if resolved_sid and resolved_sid != session_id:
+                        st["sessions"][resolved_sid] = fail_data
+                    self.save_state(st)
+
+                await asyncio.to_thread(_save_cancelled)
             except Exception:
                 pass
             if running_emitted and effective_status_cb is not None and not terminal_emitted:
@@ -1093,20 +1122,23 @@ class ConsolidationManager:
             sanitized_err = sanitize_error(str(exc) or type(exc).__name__)
             logger.exception("Unexpected error consolidating session %s", session_id)
             try:
-                now_iso = datetime.now().astimezone().isoformat()
-                state = self.load_state()
-                prev = state.get("sessions", {}).get(session_id, {})
-                fail_data = {
-                    **prev,
-                    "status": "failed",
-                    "error": sanitized_err,
-                    "last_error": sanitized_err,
-                    "last_attempt_at": now_iso,
-                }
-                state.setdefault("sessions", {})[session_id] = fail_data
-                if resolved_sid and resolved_sid != session_id:
-                    state["sessions"][resolved_sid] = fail_data
-                self.save_state(state)
+                def _save_unexpected_err() -> None:
+                    now_iso_e = datetime.now().astimezone().isoformat()
+                    st = self.load_state()
+                    prev = st.get("sessions", {}).get(session_id, {})
+                    fail_data = {
+                        **prev,
+                        "status": "failed",
+                        "error": sanitized_err,
+                        "last_error": sanitized_err,
+                        "last_attempt_at": now_iso_e,
+                    }
+                    st.setdefault("sessions", {})[session_id] = fail_data
+                    if resolved_sid and resolved_sid != session_id:
+                        st["sessions"][resolved_sid] = fail_data
+                    self.save_state(st)
+
+                await asyncio.to_thread(_save_unexpected_err)
             except Exception:
                 pass
             if running_emitted and effective_status_cb is not None and not terminal_emitted:
@@ -1150,7 +1182,10 @@ class ConsolidationManager:
             logger.warning("Cannot reconsolidate session %s: transcript not found", session_id)
             return False
         return await self.consolidate_session(
-            resolved_sid, force=True, on_task_status=on_task_status
+            resolved_sid,
+            force=True,
+            wait_if_in_flight=True,
+            on_task_status=on_task_status,
         )
 
     def reconcile_orphaned_running(

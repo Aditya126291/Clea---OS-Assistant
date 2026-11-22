@@ -11,8 +11,10 @@ import json
 import logging
 import logging.handlers
 import math
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -496,6 +498,19 @@ class VoiceRunner:
         self._frames_sent_window: int = 0
         self._last_fps_report_time: float = time.monotonic()
 
+        self._call_generation: int = 0
+        self._active_tool_calls: int = 0
+        self._tool_exec_lock: asyncio.Lock | None = None
+        self._active_tool_tasks: set[asyncio.Task[Any]] = set()
+        self._audio_health_task: asyncio.Task[None] | None = None
+        self._audio_health_poll_interval: float = 3.0
+        self._audio_send_task: asyncio.Task[None] | None = None
+        self._outbound_audio_queue: asyncio.Queue[bytes] | None = None
+        self._wake_word_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=32)
+        self._wake_word_thread: threading.Thread | None = None
+        self._wake_word_stop = threading.Event()
+        self._wake_word_pending_trigger: bool = False
+
     def _setup_voice_file_logging(self) -> None:
         """Ensure voice log file exists and receives log records."""
         try:
@@ -657,7 +672,7 @@ class VoiceRunner:
 
             for attempt in range(1, self._audio_init_retries + 1):
                 try:
-                    self._audio_manager.start()
+                    await asyncio.to_thread(self._audio_manager.start)
                     break
                 except AmbiguousAudioDeviceError:
                     raise
@@ -684,7 +699,7 @@ class VoiceRunner:
                             )
                     if self._stop_event.is_set():
                         raise
-                    refresh_audio_devices()
+                    await asyncio.to_thread(refresh_audio_devices)
 
             if self._audio_manager.resolved_input_device:
                 inp = self._audio_manager.resolved_input_device
@@ -705,10 +720,11 @@ class VoiceRunner:
                     int(out.get("default_samplerate", 24000)),
                 )
 
-            # 2. Initialize wake word detector if not provided
+            # 2. Initialize wake word detector off the event loop (ONNX load can take 5-15s)
             if self._wake_word is None:
                 try:
-                    self._wake_word = WakeWordDetector(
+                    self._wake_word = await asyncio.to_thread(
+                        WakeWordDetector,
                         model_name=self.config.wake_word_model,
                         threshold=self.config.wake_threshold,
                         data_dir=self.data_dir,
@@ -716,6 +732,15 @@ class VoiceRunner:
                 except WakeWordModelNotFoundError as exc:
                     logger.error(str(exc))
                     raise
+
+            # Start dedicated wake-word worker thread & audio health watchdog for live streams
+            # (mocked audio managers in direct unit tests retain synchronous _on_audio_chunk).
+            if getattr(self._audio_manager, "_health_monitored", False):
+                self._start_wake_word_worker()
+                self._audio_health_task = asyncio.create_task(
+                    self._audio_health_watchdog(),
+                    name="VoiceRunnerAudioHealthWatchdog",
+                )
 
             # 3. Initialize Win32 hotkey if enabled
             if self._enable_hotkey:
@@ -737,6 +762,10 @@ class VoiceRunner:
 
             logger.info("VoiceRunner started in state: IDLE (hotkey=%s).", self.config.hotkey)
         except Exception:
+            self._stop_wake_word_worker()
+            if self._audio_health_task is not None:
+                self._audio_health_task.cancel()
+                self._audio_health_task = None
             with contextlib.suppress(Exception):
                 self._screen_indicator.stop()
             if self._audio_manager is not None:
@@ -785,12 +814,28 @@ class VoiceRunner:
         if self._call_state in ("connecting", "active"):
             await self.end_call(reason="shutdown")
 
+        if self._audio_health_task is not None:
+            health_task = self._audio_health_task
+            self._audio_health_task = None
+            health_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await health_task
+
+        for task in list(self._active_tool_tasks):
+            if not task.done():
+                task.cancel()
+        if self._active_tool_tasks:
+            await asyncio.gather(*list(self._active_tool_tasks), return_exceptions=True)
+            self._active_tool_tasks.clear()
+
         for task in list(self._daemon_task_refs):
             if not task.done():
                 task.cancel()
         if self._daemon_task_refs:
             await asyncio.gather(*list(self._daemon_task_refs), return_exceptions=True)
             self._daemon_task_refs.clear()
+
+        self._stop_wake_word_worker()
 
         with contextlib.suppress(Exception):
             self._screen_indicator.stop()
@@ -823,6 +868,149 @@ class VoiceRunner:
         elif self._call_state in ("connecting", "active"):
             await self.end_call(reason="hotkey")
 
+    def _start_wake_word_worker(self) -> None:
+        """Start dedicated background thread for ONNX wake-word inference."""
+        if self._wake_word_thread is not None and self._wake_word_thread.is_alive():
+            return
+        self._wake_word_stop.clear()
+        self._drain_wake_word_queue()
+        thread = threading.Thread(
+            target=self._wake_word_worker_loop,
+            name="CleaVoiceWakeWordWorker",
+            daemon=True,
+        )
+        self._wake_word_thread = thread
+        thread.start()
+
+    def _stop_wake_word_worker(self) -> None:
+        """Stop the dedicated wake-word worker thread cleanly."""
+        self._wake_word_stop.set()
+        self._drain_wake_word_queue()
+        with contextlib.suppress(queue.Full):
+            self._wake_word_queue.put_nowait(None)
+        thread = self._wake_word_thread
+        self._wake_word_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    def _drain_wake_word_queue(self) -> None:
+        """Discard any pending audio chunks queued for wake-word inference."""
+        while True:
+            try:
+                self._wake_word_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _wake_word_worker_loop(self) -> None:
+        """Background consumer running openwakeword inference off the WASAPI thread."""
+        while not self._wake_word_stop.is_set():
+            try:
+                chunk = self._wake_word_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if chunk is None or self._wake_word_stop.is_set():
+                break
+            self._process_wake_word_chunk(chunk)
+
+    def _process_wake_word_chunk(self, pcm_bytes: bytes) -> None:
+        """Evaluate a 16 kHz PCM chunk with WakeWordDetector and trigger start_call."""
+        if (
+            self._call_state != "idle"
+            or self._wake_word is None
+            or self._wake_word_pending_trigger
+            or self._loop is None
+            or self._loop.is_closed()
+        ):
+            return
+        try:
+            detected, score, _key = self._wake_word.process_audio(pcm_bytes)
+            if detected:
+                self._wake_word_pending_trigger = True
+                self._wake_word.reset()
+                self._drain_wake_word_queue()
+                logger.info("Wake word detected locally with score %.3f!", score)
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.start_call(trigger="wake_word"),
+                    self._loop,
+                )
+
+                def _on_trigger_done(done_fut: Any) -> None:
+                    with contextlib.suppress(Exception):
+                        exc = done_fut.exception()
+                        if exc is not None:
+                            self._wake_word_pending_trigger = False
+                            logger.warning("Wake-word start_call failed: %s", exc)
+
+                fut.add_done_callback(_on_trigger_done)
+        except Exception:
+            logger.exception("Error during wake word processing.")
+
+    async def _audio_health_watchdog(self) -> None:
+        """Periodically verify AudioManager InputStream health and recover on stalls/hot-swaps."""
+        poll = max(0.05, float(self._audio_health_poll_interval))
+        while not self._stop_event.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=poll)
+            if self._stop_event.is_set():
+                break
+            am = self._audio_manager
+            if am is None or not getattr(am, "_health_monitored", False):
+                continue
+            health_fn = getattr(am, "is_input_stream_healthy", None)
+            restart_fn = getattr(am, "restart_streams", None)
+            if not callable(health_fn) or not callable(restart_fn):
+                continue
+            healthy, reason = health_fn()
+            if healthy:
+                continue
+            logger.warning(
+                "Audio input stream unhealthy (%s); attempting automatic recovery...",
+                reason,
+            )
+            recovered = await asyncio.to_thread(restart_fn)
+            if recovered:
+                self._drain_wake_word_queue()
+                if self._wake_word is not None:
+                    self._wake_word.reset()
+                inp = getattr(am, "resolved_input_device", None) or {}
+                logger.info(
+                    "Audio input stream recovered on #%s '%s' (host API: %s).",
+                    inp.get("index", "?"),
+                    inp.get("name", "unknown"),
+                    inp.get("hostapi_name", "Unknown"),
+                )
+
+    def _enqueue_outbound_audio(self, pcm_bytes: bytes) -> None:
+        """Bounded backpressure enqueue for outbound microphone PCM frames on event loop."""
+        q = self._outbound_audio_queue
+        if q is None or self._call_state != "active":
+            return
+        if q.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                q.get_nowait()
+        with contextlib.suppress(asyncio.QueueFull):
+            q.put_nowait(pcm_bytes)
+
+    async def _drain_outbound_audio(
+        self,
+        backend: VoiceBackend,
+        audio_queue: asyncio.Queue[bytes],
+    ) -> None:
+        """Drain bounded outbound PCM chunks to the active Live backend."""
+        try:
+            while self._call_state == "active" and self._active_backend is backend:
+                pcm_bytes = await audio_queue.get()
+                if self._call_state != "active" or self._active_backend is not backend:
+                    break
+                try:
+                    await backend.send_audio(pcm_bytes)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Ignoring outbound send_audio failure: %s", exc)
+        except asyncio.CancelledError:
+            pass
+
     def _on_audio_chunk(self, pcm_bytes: bytes) -> None:
         """Called on sounddevice input thread for each microphone chunk."""
         if self._loop is None or self._loop.is_closed():
@@ -840,18 +1028,20 @@ class VoiceRunner:
                 self._frames_sent_window = 0
                 self._last_fps_report_time = now
 
-            # Local wake word check in IDLE
-            try:
-                detected, score, _key = self._wake_word.process_audio(pcm_bytes)
-                if detected:
-                    self._wake_word.reset()
-                    logger.info("Wake word detected locally with score %.3f!", score)
-                    asyncio.run_coroutine_threadsafe(
-                        self.start_call(trigger="wake_word"),
-                        self._loop,
-                    )
-            except Exception:
-                logger.exception("Error during wake word processing.")
+            if self._wake_word_pending_trigger:
+                return
+
+            # Offload heavy ONNX inference off the real-time PortAudio callback thread
+            # when the worker thread is running; keep synchronous fallback for direct unit tests.
+            worker = self._wake_word_thread
+            if worker is not None and worker.is_alive():
+                if self._wake_word_queue.full():
+                    with contextlib.suppress(queue.Empty):
+                        self._wake_word_queue.get_nowait()
+                with contextlib.suppress(queue.Full):
+                    self._wake_word_queue.put_nowait(pcm_bytes)
+            else:
+                self._process_wake_word_chunk(pcm_bytes)
         elif self._call_state == "active" and self._active_backend is not None:
             # Check audio energy for real speech vs background silence
             rms = compute_audio_rms(pcm_bytes)
@@ -859,8 +1049,8 @@ class VoiceRunner:
                 self._last_user_speech_time = time.monotonic()
 
             is_speaking = bool(self._audio_manager and self._audio_manager.is_speaking)
-            if is_speaking:
-                # Keep disarmed while the assistant is speaking
+            if is_speaking or self._active_tool_calls > 0:
+                # Keep disarmed while the assistant is speaking or executing tools
                 self._stall_timer_armed = False
                 self._stall_accumulated_seconds = 0.0
                 self._audio_sent_start_time = None
@@ -883,16 +1073,35 @@ class VoiceRunner:
                 self._frames_sent_window = 0
                 self._last_fps_report_time = now
 
-            asyncio.run_coroutine_threadsafe(
-                self._active_backend.send_audio(pcm_bytes),
-                self._loop,
-            )
+            if self._outbound_audio_queue is not None and self._audio_send_task is not None:
+                with contextlib.suppress(RuntimeError):
+                    self._loop.call_soon_threadsafe(self._enqueue_outbound_audio, pcm_bytes)
+            else:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._active_backend.send_audio(pcm_bytes),
+                    self._loop,
+                )
+
+                def _log_send_err(done_fut: Any) -> None:
+                    with contextlib.suppress(Exception):
+                        exc = done_fut.exception()
+                        if exc is not None:
+                            logger.debug("Ignoring fallback send_audio failure: %s", exc)
+
+                fut.add_done_callback(_log_send_err)
 
     async def start_call(self, *, trigger: str = "manual") -> None:
         """Initiate transition to CONNECTING -> ACTIVE."""
         if self._call_state != "idle":
+            self._wake_word_pending_trigger = False
             logger.debug("Cannot start call; current state is %s", self._call_state)
             return
+
+        call_start_t0 = time.monotonic()
+        self._call_generation += 1
+        call_gen = self._call_generation
+        self._wake_word_pending_trigger = False
+        self._active_tool_calls = 0
 
         if self._call_id is None:
             self._call_id = new_id()
@@ -904,67 +1113,96 @@ class VoiceRunner:
         self._first_audio_latency_ms = None
         logger.info("Starting call (call_id=%s, trigger=%s)...", self._call_id, trigger)
 
+        backend: VoiceBackend | None = None
         try:
-            # 1. Start call in daemon if connected
+            # 1 & 2. Fetch call start + focused chat state concurrently when listener active
             memory_context: str | None = None
-            if self._daemon_ws is not None and trigger != "daemon_event":
-                start_req = VoiceStartCallRequest(
-                    params=VoiceStartCallParams(trigger=trigger)  # type: ignore[arg-type]
-                )
-                try:
-                    if self._daemon_listener_active:
-                        res = await self._request_daemon(start_req)
-                        if isinstance(res.get("call_id"), str) and res["call_id"]:
-                            self._call_id = res["call_id"]
-                        if isinstance(res.get("memory_context"), str):
-                            memory_context = res["memory_context"]
-                    else:
-                        await self._daemon_ws.send(start_req.model_dump_json())
-                except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
-                    logger.warning("Could not notify daemon of call start: %s", exc)
+            focus_res: dict[str, Any] | None = None
 
-            # 2. Resolve deterministic UI focus state for call startup context
+            if self._daemon_ws is not None:
+                if self._daemon_listener_active:
+                    coros: list[Coroutine[Any, Any, dict[str, Any]]] = []
+                    has_start_req = trigger != "daemon_event"
+                    if has_start_req:
+                        start_req = VoiceStartCallRequest(
+                            params=VoiceStartCallParams(trigger=trigger)  # type: ignore[arg-type]
+                        )
+                        coros.append(self._request_daemon(start_req))
+                    coros.append(self._request_daemon(ChatFocusRequest(params=ChatFocusParams())))
+                    gathered = await asyncio.gather(*coros, return_exceptions=True)
+                    idx = 0
+                    if has_start_req:
+                        start_raw = gathered[0]
+                        idx = 1
+                        if isinstance(start_raw, BaseException):
+                            logger.warning("Could not notify daemon of call start: %s", start_raw)
+                        else:
+                            if isinstance(start_raw.get("call_id"), str) and start_raw["call_id"]:
+                                self._call_id = start_raw["call_id"]
+                            if isinstance(start_raw.get("memory_context"), str):
+                                memory_context = start_raw["memory_context"]
+                    focus_raw = gathered[idx]
+                    if isinstance(focus_raw, BaseException):
+                        logger.warning("Could not query focused chat state: %s", focus_raw)
+                    else:
+                        focus_res = focus_raw
+                elif trigger != "daemon_event":
+                    start_req = VoiceStartCallRequest(
+                        params=VoiceStartCallParams(trigger=trigger)  # type: ignore[arg-type]
+                    )
+                    try:
+                        await self._daemon_ws.send(start_req.model_dump_json())
+                    except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
+                        logger.warning("Could not notify daemon of call start: %s", exc)
+
+            if self._call_generation != call_gen or self._call_state != "connecting":
+                logger.debug(
+                    "Call start aborted before system instruction (call_gen=%d).",
+                    call_gen,
+                )
+                return
+
             parsed_id, parsed_title = extract_focused_chat_from_context(memory_context)
             focused_chat_id = parsed_id
             focused_chat_title = parsed_title
             focused_chat_available = bool(parsed_id)
-            if self._daemon_ws is not None and self._daemon_listener_active:
-                try:
-                    focus_res = await self._request_daemon(
-                        ChatFocusRequest(params=ChatFocusParams())
-                    )
-                    raw_focus_id = focus_res.get("active_conversation_id")
-                    if (
-                        isinstance(raw_focus_id, str)
-                        and raw_focus_id.strip()
-                        and raw_focus_id.strip() != _VOICE_COMPANION_SESSION_ID
-                    ):
-                        focused_chat_id = " ".join(raw_focus_id.split())
-                        focused_chat_available = True
-                        focused_chat_title = parsed_title if parsed_id == focused_chat_id else None
-                    else:
-                        focused_chat_id = None
-                        focused_chat_title = None
-                        focused_chat_available = False
-                except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
-                    logger.warning("Could not query focused chat state: %s", exc)
+            if focus_res is not None:
+                raw_focus_id = focus_res.get("active_conversation_id")
+                if (
+                    isinstance(raw_focus_id, str)
+                    and raw_focus_id.strip()
+                    and raw_focus_id.strip() != _VOICE_COMPANION_SESSION_ID
+                ):
+                    focused_chat_id = " ".join(raw_focus_id.split())
+                    focused_chat_available = True
+                    focused_chat_title = parsed_title if parsed_id == focused_chat_id else None
+                else:
+                    focused_chat_id = None
+                    focused_chat_title = None
+                    focused_chat_available = False
 
-                if focused_chat_available and focused_chat_id and not focused_chat_title:
-                    try:
-                        tr_res = await self._request_daemon(
-                            TranscriptsGetRequest(
-                                params=TranscriptsGetParams(session_id=focused_chat_id)
-                            )
+            if (
+                self._daemon_ws is not None
+                and self._daemon_listener_active
+                and focused_chat_available
+                and focused_chat_id
+                and not focused_chat_title
+            ):
+                try:
+                    tr_res = await self._request_daemon(
+                        TranscriptsGetRequest(
+                            params=TranscriptsGetParams(session_id=focused_chat_id)
                         )
-                        raw_title = tr_res.get("title")
-                        if isinstance(raw_title, str) and raw_title.strip():
-                            focused_chat_title = " ".join(raw_title.split())
-                    except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
-                        logger.debug(
-                            "Could not fetch focused chat title for %s: %s",
-                            focused_chat_id,
-                            exc,
-                        )
+                    )
+                    raw_title = tr_res.get("title")
+                    if isinstance(raw_title, str) and raw_title.strip():
+                        focused_chat_title = " ".join(raw_title.split())
+                except (OSError, WebSocketException, TimeoutError, RuntimeError) as exc:
+                    logger.debug(
+                        "Could not fetch focused chat title for %s: %s",
+                        focused_chat_id,
+                        exc,
+                    )
 
             # 3. Resolve system instruction safely
             request_fn = self._request_daemon if self._daemon_listener_active else None
@@ -980,7 +1218,13 @@ class VoiceRunner:
                 request_fn=request_fn,
             )
 
-            # 3. Create backend and connect with latency measurement
+            if self._call_generation != call_gen or self._call_state != "connecting":
+                logger.debug("Call start aborted before backend.connect (call_gen=%d).", call_gen)
+                return
+
+            context_ms = (time.monotonic() - call_start_t0) * 1000.0
+
+            # 4. Create backend and connect with latency measurement
             session_cfg = VoiceSessionConfig(
                 system_instruction=system_instruction,
                 enable_web_search=self.config.enable_web_search,
@@ -994,6 +1238,23 @@ class VoiceRunner:
             backend = self._backend_factory()
             await backend.connect(session_cfg)
             self._connect_latency_ms = (time.monotonic() - connect_t0) * 1000
+
+            # Critical race guard: if end_call ran while backend.connect() was in flight,
+            # close the newly opened backend cleanly and never overwrite IDLE / a new call!
+            if (
+                self._call_generation != call_gen
+                or self._call_state != "connecting"
+                or self._call_id is None
+            ):
+                logger.info(
+                    "Call start superseded/ended during connect (call_gen=%d); "
+                    "closing orphan backend.",
+                    call_gen,
+                )
+                with contextlib.suppress(Exception):
+                    await backend.close()
+                return
+
             self._active_backend = backend
             self._stall_reconnected_once = False
             self._stall_timer_armed = False
@@ -1023,6 +1284,13 @@ class VoiceRunner:
                 )
             )
 
+            # Start bounded outbound audio drainer
+            outbound_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+            self._outbound_audio_queue = outbound_q
+            self._audio_send_task = asyncio.create_task(
+                self._drain_outbound_audio(backend, outbound_q),
+                name="VoiceRunnerOutboundAudio",
+            )
             # Start backend event consumer
             self._backend_consume_task = asyncio.create_task(
                 self._consume_backend_events(backend),
@@ -1038,12 +1306,31 @@ class VoiceRunner:
                 self._stall_watchdog(),
                 name="VoiceRunnerStallWatchdog",
             )
+            total_start_ms = (time.monotonic() - call_start_t0) * 1000.0
+            logger.debug(
+                "voice_turn_timing phase=call_start call_id=%s context_ms=%.1f "
+                "connect_ms=%.1f total_ms=%.1f",
+                self._call_id,
+                context_ms,
+                self._connect_latency_ms,
+                total_start_ms,
+            )
             logger.info(
                 "Call %s is now ACTIVE (connect_latency=%.1fms).",
                 self._call_id,
                 self._connect_latency_ms,
             )
         except Exception as exc:
+            if backend is not None and self._active_backend is not backend:
+                with contextlib.suppress(Exception):
+                    await backend.close()
+            if self._call_generation != call_gen:
+                logger.debug(
+                    "Ignoring start_call error for superseded call_gen=%d: %s",
+                    call_gen,
+                    exc,
+                )
+                return
             logger.error("Failed starting voice call: %s", exc)
             print(f"\n[ERROR] Voice call failed to start: {exc}", file=sys.stderr, flush=True)
             await self.end_call(reason=f"start_failed: {exc}", error=f"Voice call failed: {exc}")
@@ -1059,6 +1346,8 @@ class VoiceRunner:
         if self._call_state in ("idle", "ending"):
             return
 
+        # Invalidate any in-flight start_call immediately
+        self._call_generation += 1
         self._call_state = "ending"
         ended_call_id = self._call_id or new_id()
         transcript_snapshot = list(self._transcript_history)
@@ -1070,7 +1359,7 @@ class VoiceRunner:
             duration,
         )
 
-        # Cancel watchdog, screen watching, and consumer
+        # Cancel watchdog, outbound audio, active tool tasks, screen watching, and consumer
         if self._silence_watchdog_task is not None:
             self._silence_watchdog_task.cancel()
             self._silence_watchdog_task = None
@@ -1079,20 +1368,42 @@ class VoiceRunner:
             self._stall_watchdog_task.cancel()
             self._stall_watchdog_task = None
 
+        if self._audio_send_task is not None:
+            send_task = self._audio_send_task
+            self._audio_send_task = None
+            self._outbound_audio_queue = None
+            send_task.cancel()
+            if send_task is not asyncio.current_task():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await send_task
+        else:
+            self._outbound_audio_queue = None
+
+        current_task = asyncio.current_task()
+        for tool_task in list(self._active_tool_tasks):
+            if tool_task is not current_task and not tool_task.done():
+                tool_task.cancel()
+        self._active_tool_tasks.clear()
+        self._active_tool_calls = 0
+
         if self._watch_screen_task is not None:
             watch_task = self._watch_screen_task
             self._watch_screen_task = None
             watch_task.cancel()
-            if watch_task is not asyncio.current_task():
+            if watch_task is not current_task:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watch_task
 
         with contextlib.suppress(Exception):
             self._screen_indicator.hide()
 
-        # Stop audio playback and clear output buffer immediately
+        # Stop audio playback and flush stale input chunks immediately
         if self._audio_manager is not None:
             self._audio_manager.stop_output()
+            flush_fn = getattr(self._audio_manager, "flush_input_buffer", None)
+            if callable(flush_fn):
+                with contextlib.suppress(Exception):
+                    flush_fn()
 
         # Close backend
         if self._active_backend is not None:
@@ -1104,13 +1415,14 @@ class VoiceRunner:
         if self._backend_consume_task is not None:
             consume_task = self._backend_consume_task
             self._backend_consume_task = None
-            if consume_task is not asyncio.current_task():
+            if consume_task is not current_task:
                 consume_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await consume_task
 
         # Reset call and voice state immediately so hooks cannot block or corrupt IDLE/new calls
         self._call_state = "idle"
+        self._wake_word_pending_trigger = False
         self._stall_timer_armed = False
         self._stall_accumulated_seconds = 0.0
         self._audio_sent_start_time = None
@@ -1121,11 +1433,13 @@ class VoiceRunner:
         self._call_id = None
         self._transcript_history.clear()
         self._turn_launched_targets.clear()
+        self._drain_wake_word_queue()
         if self._wake_word is not None:
             self._wake_word.reset()
 
-        # Write usage & metrics record
-        self._write_metrics_record(
+        # Write usage & metrics record off the event loop
+        await asyncio.to_thread(
+            self._write_metrics_record,
             call_id=ended_call_id,
             reason=reason,
             duration_seconds=duration,
@@ -1154,25 +1468,63 @@ class VoiceRunner:
                 else:
                     await self._daemon_ws.send(end_req.model_dump_json())
 
-        # Safely persist non-empty transcript and trigger asynchronous call-end consolidation
+        # Persist transcript quickly (bounded wait so fast localhost RPC completes cleanly,
+        # detaching into background if slow) and always trigger consolidation in the background.
         request_fn = self._request_daemon if self._daemon_listener_active else None
-        await safe_store_voice_transcript(
-            call_id=ended_call_id,
-            entries=transcript_snapshot,
-            daemon_url=self.daemon_url,
-            token=self.token,
-            data_dir=self.data_dir,
-            request_fn=request_fn,
+        has_transcript = bool(normalize_voice_transcript(transcript_snapshot))
+
+        async def _store_transcript_task() -> None:
+            try:
+                await asyncio.wait_for(
+                    safe_store_voice_transcript(
+                        call_id=ended_call_id,
+                        entries=transcript_snapshot,
+                        daemon_url=self.daemon_url,
+                        token=self.token,
+                        data_dir=self.data_dir,
+                        request_fn=request_fn,
+                    ),
+                    timeout=10.0,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Timed out storing voice transcript for call %s.", ended_call_id
+                )
+
+        async def _consolidate_task(store_dep: asyncio.Task[Any]) -> None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await store_dep
+            try:
+                await asyncio.wait_for(
+                    safe_consolidate_voice_call(
+                        call_id=ended_call_id,
+                        entries=transcript_snapshot,
+                        daemon_url=self.daemon_url,
+                        token=self.token,
+                        data_dir=self.data_dir,
+                        request_fn=request_fn,
+                    ),
+                    timeout=10.0,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Timed out triggering consolidation for call %s.", ended_call_id
+                )
+
+        store_task = self._spawn_daemon_callback_task(
+            _store_transcript_task(),
+            name=f"post-call-store-{ended_call_id}",
         )
-        if normalize_voice_transcript(transcript_snapshot):
-            await safe_consolidate_voice_call(
-                call_id=ended_call_id,
-                entries=transcript_snapshot,
-                daemon_url=self.daemon_url,
-                token=self.token,
-                data_dir=self.data_dir,
-                request_fn=request_fn,
+        if has_transcript:
+            self._spawn_daemon_callback_task(
+                _consolidate_task(store_task),
+                name=f"post-call-consolidate-{ended_call_id}",
             )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(store_task), timeout=1.5)
+        if has_transcript:
+            # Yield once (0ms wall time) so immediate/mocked consolidation hooks start promptly
+            await asyncio.sleep(0)
 
         logger.info("Call %s ended. Runner is now IDLE.", ended_call_id)
 
@@ -1210,8 +1562,12 @@ class VoiceRunner:
         poll_interval = min(1.0, max(0.05, timeout / 2))
         while self._call_state == "active":
             await asyncio.sleep(poll_interval)
-            if self._audio_manager and self._audio_manager.is_speaking:
-                # Assistant is talking; don't count silence against user
+            if (
+                (self._audio_manager and self._audio_manager.is_speaking)
+                or self._active_tool_calls > 0
+                or self._state == "thinking"
+            ):
+                # Assistant is talking or executing tools; don't count silence against user
                 self._last_user_speech_time = time.monotonic()
                 continue
             elapsed = time.monotonic() - self._last_user_speech_time
@@ -1226,8 +1582,12 @@ class VoiceRunner:
         poll_interval = min(0.2, max(0.02, stall_limit / 4))
         while self._call_state == "active":
             await asyncio.sleep(poll_interval)
-            if self._audio_manager and self._audio_manager.is_speaking:
-                # Assistant is actively speaking; reset and disarm outbound stall timer
+            if (
+                (self._audio_manager and self._audio_manager.is_speaking)
+                or self._active_tool_calls > 0
+                or self._state == "thinking"
+            ):
+                # Assistant is speaking or executing tools; reset and disarm outbound stall timer
                 self._stall_timer_armed = False
                 self._stall_accumulated_seconds = 0.0
                 self._audio_sent_start_time = None
@@ -1400,12 +1760,14 @@ class VoiceRunner:
                         self._transcript_history.pop()
                     self._set_voice_state("thinking")
                     tool_batch = self._drain_contiguous_tool_calls(backend, event)
-                    await self._execute_tool_call_batch(tool_batch, backend)
+                    self._spawn_tool_batch_task(tool_batch, backend)
                 elif isinstance(event, ToolCallCancellationEvent):
                     for cid in event.call_ids:
                         fut = self._pending_tasks.pop(cid, None)
                         if fut and not fut.done():
                             fut.cancel()
+                    if self._state == "thinking" and self._active_tool_calls == 0:
+                        self._set_voice_state("listening")
                 elif isinstance(event, UsageUpdateEvent):
                     self._usage_record["input_tokens"] += event.input_tokens
                     self._usage_record["output_tokens"] += event.output_tokens
@@ -1459,26 +1821,61 @@ class VoiceRunner:
         """Reset per-turn launch deduplication state."""
         self._turn_launched_targets.clear()
 
+    def _spawn_tool_batch_task(
+        self,
+        batch: list[ToolCallEvent],
+        backend: VoiceBackend,
+    ) -> asyncio.Task[None]:
+        """Run a tool call batch off the backend event consumer loop (serialized FIFO)."""
+        if self._tool_exec_lock is None:
+            self._tool_exec_lock = asyncio.Lock()
+        lock = self._tool_exec_lock
+
+        async def _runner() -> None:
+            async with lock:
+                if self._call_state != "active" or self._active_backend is not backend:
+                    return
+                await self._execute_tool_call_batch(batch, backend)
+
+        task = asyncio.create_task(
+            _runner(),
+            name=f"VoiceRunnerToolBatch-{batch[0].name}",
+        )
+        self._active_tool_tasks.add(task)
+
+        def _done(done_task: asyncio.Task[None]) -> None:
+            self._active_tool_tasks.discard(done_task)
+            if not done_task.cancelled():
+                exc = done_task.exception()
+                if exc is not None:
+                    logger.warning("Tool batch task failed: %s", exc)
+
+        task.add_done_callback(_done)
+        return task
+
     def _drain_contiguous_tool_calls(
         self,
         backend: VoiceBackend,
         first_event: ToolCallEvent,
     ) -> list[ToolCallEvent]:
         """Drain any immediately queued contiguous ToolCallEvents from the backend queue."""
-        batch: list[ToolCallEvent] = [first_event]
-        q: asyncio.Queue[Any] | None = getattr(backend, "_events_queue", None) or getattr(
-            backend, "event_queue", None
-        )
-        if q is None:
-            return batch
-        internal_deque = getattr(q, "_queue", None)
-        while internal_deque and isinstance(internal_deque[0], ToolCallEvent):
-            try:
-                nxt = q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(nxt, ToolCallEvent):
-                batch.append(nxt)
+        drain_fn = getattr(backend, "drain_contiguous_tool_calls", None)
+        if callable(drain_fn):
+            batch = list(drain_fn(first_event))
+        else:
+            batch = [first_event]
+            q: asyncio.Queue[Any] | None = getattr(backend, "_events_queue", None) or getattr(
+                backend, "event_queue", None
+            )
+            if q is not None:
+                internal_deque = getattr(q, "_queue", None)
+                while internal_deque and isinstance(internal_deque[0], ToolCallEvent):
+                    try:
+                        nxt = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if isinstance(nxt, ToolCallEvent):
+                        batch.append(nxt)
         if len(batch) > 1:
             # If the same batch has both open_or_focus_app and open_url for the same target,
             # prioritize open_or_focus_app first so the installed app launches and open_url dedupes.
@@ -1509,55 +1906,115 @@ class VoiceRunner:
         backend: VoiceBackend,
     ) -> None:
         """Execute a batch of tool calls and send all responses in a single backend call."""
-        if len(batch) <= 1:
-            for ev in batch:
-                await self._handle_tool_call(ev, backend)
-            return
-
-        collected: list[VoiceToolResponse] = []
-
-        class _BatchProxy(VoiceBackend):
-            backend_name = backend.backend_name
-
-            @property
-            def model_name(self) -> str:
-                return backend.model_name
-
-            async def connect(self, config: VoiceSessionConfig) -> None:
-                await backend.connect(config)
-
-            async def close(self) -> None:
-                await backend.close()
-
-            async def send_audio(self, pcm_bytes: bytes) -> None:
-                await backend.send_audio(pcm_bytes)
-
-            async def send_video_frame(
-                self, image_bytes: bytes, *, mime_type: str = "image/jpeg"
-            ) -> None:
-                await backend.send_video_frame(image_bytes, mime_type=mime_type)
-
-            async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
-                await backend.send_text(text, end_of_turn=end_of_turn)
-
-            async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
-                collected.extend(responses)
-
-            def events(self) -> AsyncIterator[Any]:
-                return backend.events()
-
-        proxy = _BatchProxy()
-        for ev in batch:
-            if ev.name == "end_call":
-                if collected:
-                    await backend.send_tool_responses(list(collected))
-                    collected.clear()
-                await self._handle_tool_call(ev, backend)
+        batch_t0 = time.monotonic()
+        self._active_tool_calls += 1
+        # Disarm stall watchdog while tools execute so slow RPCs never cause false reconnects
+        self._stall_timer_armed = False
+        self._stall_accumulated_seconds = 0.0
+        self._audio_sent_start_time = None
+        try:
+            if len(batch) <= 1:
+                for ev in batch:
+                    try:
+                        await self._handle_tool_call(ev, backend)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Unhandled error in voice tool %s (%s): %s", ev.name, ev.call_id, exc
+                        )
+                        with contextlib.suppress(Exception):
+                            await backend.send_tool_responses(
+                                [
+                                    VoiceToolResponse(
+                                        call_id=ev.call_id,
+                                        name=ev.name,
+                                        response={"error": f"Tool execution failed: {exc}"},
+                                        is_error=True,
+                                        scheduling="when_idle",
+                                    )
+                                ]
+                            )
                 return
-            await self._handle_tool_call(ev, proxy)
 
-        if collected:
-            await backend.send_tool_responses(collected)
+            collected: list[VoiceToolResponse] = []
+
+            class _BatchProxy(VoiceBackend):
+                backend_name = backend.backend_name
+
+                @property
+                def model_name(self) -> str:
+                    return backend.model_name
+
+                async def connect(self, config: VoiceSessionConfig) -> None:
+                    await backend.connect(config)
+
+                async def close(self) -> None:
+                    await backend.close()
+
+                async def send_audio(self, pcm_bytes: bytes) -> None:
+                    await backend.send_audio(pcm_bytes)
+
+                async def send_video_frame(
+                    self, image_bytes: bytes, *, mime_type: str = "image/jpeg"
+                ) -> None:
+                    await backend.send_video_frame(image_bytes, mime_type=mime_type)
+
+                async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
+                    await backend.send_text(text, end_of_turn=end_of_turn)
+
+                async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
+                    collected.extend(responses)
+
+                def events(self) -> AsyncIterator[Any]:
+                    return backend.events()
+
+            proxy = _BatchProxy()
+            try:
+                for ev in batch:
+                    if ev.name == "end_call":
+                        if collected:
+                            await backend.send_tool_responses(list(collected))
+                            collected.clear()
+                        await self._handle_tool_call(ev, backend)
+                        return
+                    try:
+                        await self._handle_tool_call(ev, proxy)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Unhandled error in batched voice tool %s (%s): %s",
+                            ev.name,
+                            ev.call_id,
+                            exc,
+                        )
+                        collected.append(
+                            VoiceToolResponse(
+                                call_id=ev.call_id,
+                                name=ev.name,
+                                response={"error": f"Tool execution failed: {exc}"},
+                                is_error=True,
+                                scheduling="when_idle",
+                            )
+                        )
+            finally:
+                if collected:
+                    with contextlib.suppress(Exception):
+                        await backend.send_tool_responses(list(collected))
+                    collected.clear()
+        finally:
+            self._active_tool_calls = max(0, self._active_tool_calls - 1)
+            self._stall_timer_armed = False
+            self._stall_accumulated_seconds = 0.0
+            self._audio_sent_start_time = None
+            tool_ms = (time.monotonic() - batch_t0) * 1000.0
+            logger.debug(
+                "voice_turn_timing phase=tool_batch tools=%s count=%d tool_ms=%.1f",
+                [ev.name for ev in batch],
+                len(batch),
+                tool_ms,
+            )
 
     async def _verify_control_system_window_state(
         self,
@@ -1621,12 +2078,28 @@ class VoiceRunner:
             return
 
         try:
-            call_res = verify_fn(
+            ver_t0 = time.monotonic()
+            if inspect.iscoroutinefunction(verify_fn):
+                outcome = await verify_fn(
+                    target_hwnd,
+                    expected_state=expected_state,
+                    expected_snap=expected_snap,
+                )
+            else:
+                call_res = await asyncio.to_thread(
+                    verify_fn,
+                    target_hwnd,
+                    expected_state=expected_state,
+                    expected_snap=expected_snap,
+                )
+                outcome = await call_res if inspect.isawaitable(call_res) else call_res
+            verifier_ms = (time.monotonic() - ver_t0) * 1000.0
+            logger.debug(
+                "voice_turn_timing phase=window_verify action=%s hwnd=%s verifier_ms=%.1f",
+                eff_action,
                 target_hwnd,
-                expected_state=expected_state,
-                expected_snap=expected_snap,
+                verifier_ms,
             )
-            outcome = await call_res if inspect.isawaitable(call_res) else call_res
             if hasattr(outcome, "to_dict"):
                 ver_dict = outcome.to_dict()
             elif isinstance(outcome, dict):
@@ -1736,7 +2209,8 @@ class VoiceRunner:
                 sys.platform == "win32" and getattr(self._screen_service, "_grabber", None) is None
             ) or has_api:
                 with contextlib.suppress(Exception):
-                    mon = get_target_monitor(
+                    mon = await asyncio.to_thread(
+                        get_target_monitor,
                         monitor=monitor,
                         api=getattr(self._screen_service, "_api", None),
                     )
@@ -1810,9 +2284,16 @@ class VoiceRunner:
                                 mb, wb
                             ) > max(mt, wt)
                         if active_overlaps_target:
+                            cap_kwargs: dict[str, Any] = {"target": "active_window"}
+                            try:
+                                cap_sig = inspect.signature(self._screen_service.capture)
+                                if "include_layout" in cap_sig.parameters:
+                                    cap_kwargs["include_layout"] = False
+                            except (TypeError, ValueError):
+                                pass
                             candidate = await asyncio.to_thread(
                                 self._screen_service.capture,
-                                target="active_window",
+                                **cap_kwargs,
                             )
                             candidate_blocked = candidate.blocked or is_window_blocked(
                                 candidate.window_title or "",
@@ -1931,7 +2412,7 @@ class VoiceRunner:
                     self._screen_indicator.stop_watching()
 
             initial_bounds: tuple[int, int, int, int] | None = None
-            win_info = self._screen_service.get_active_window_info()
+            win_info = await asyncio.to_thread(self._screen_service.get_active_window_info)
             service_blocklist = getattr(self._screen_service, "blocklist", None)
             if win_info is not None and (
                 is_window_blocked(
@@ -1964,7 +2445,10 @@ class VoiceRunner:
                 sys.platform == "win32" and getattr(self._screen_service, "_grabber", None) is None
             ) or getattr(self._screen_service, "_has_injected_api", False):
                 with contextlib.suppress(Exception):
-                    mon = get_target_monitor(api=getattr(self._screen_service, "_api", None))
+                    mon = await asyncio.to_thread(
+                        get_target_monitor,
+                        api=getattr(self._screen_service, "_api", None),
+                    )
                     if mon is not None:
                         initial_bounds = mon.bounds
 
@@ -3374,10 +3858,17 @@ class VoiceRunner:
             target,
         )
         try:
+            burst_cap_kwargs: dict[str, Any] = {"target": target}
+            try:
+                cap_sig = inspect.signature(self._screen_service.capture)
+                if "include_layout" in cap_sig.parameters:
+                    burst_cap_kwargs["include_layout"] = False
+            except (TypeError, ValueError):
+                pass
             while time.monotonic() < t_end and self._call_state == "active":
                 res = await asyncio.to_thread(
                     self._screen_service.capture,
-                    target=target,
+                    **burst_cap_kwargs,
                 )
                 if res.monitor_bounds is not None:
                     self._screen_indicator.update_watch_bounds(res.monitor_bounds)
@@ -3401,7 +3892,9 @@ class VoiceRunner:
 
     async def _connect_daemon_and_listen(self) -> None:
         """Connect to Clea daemon and process incoming daemon requests/events."""
-        token = self.token or auth.read_token(auth.token_path(self.data_dir))
+        token = self.token or await asyncio.to_thread(
+            auth.read_token, auth.token_path(self.data_dir)
+        )
         if not token:
             logger.debug("No daemon token found; running offline until daemon starts.")
             with contextlib.suppress(TimeoutError):

@@ -39,6 +39,7 @@ from clea.tools.guards import (
     Win32FocusPreconditionBackend,
 )
 from clea.tools.registry import RiskLevel, ToolRegistry
+from clea.tools.subprocess_utils import run_powershell_hidden
 from clea.tools.system_controls import inspect_window_layout
 
 logger = logging.getLogger(__name__)
@@ -55,10 +56,18 @@ GA_ROOT: int = 2
 GW_OWNER: int = 4
 DWMWA_EXTENDED_FRAME_BOUNDS: int = 9
 DWMWA_CLOAKED: int = 14
+HWND_TOP: int = 0
+HWND_TOPMOST: int = -1
+HWND_NOTOPMOST: int = -2
+SWP_NOSIZE: int = 0x0001
+SWP_NOMOVE: int = 0x0002
+SWP_SHOWWINDOW: int = 0x0040
 VK_TAB_OS: int = 0x09
 VK_RETURN_OS: int = 0x0D
 MONITOR_DEFAULTTONEAREST: int = 2
 _STARTF_USESHOWWINDOW: int = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+
+_WINDOWS_OS_DWMAPI: Any = None
 
 # Virtual key codes for media & step volume controls
 VK_VOLUME_MUTE: int = 0xAD
@@ -530,6 +539,18 @@ def _get_win32_user32(user32: Any = None) -> Any:
         ]
         u32.MoveWindow.restype = wintypes.BOOL
 
+    if hasattr(u32, "SetWindowPos"):
+        u32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        u32.SetWindowPos.restype = wintypes.BOOL
+
     if hasattr(u32, "IsZoomed"):
         u32.IsZoomed.argtypes = [wintypes.HWND]
         u32.IsZoomed.restype = wintypes.BOOL
@@ -856,21 +877,38 @@ def resolve_app_spec(
     return spec.canonical_name, cmd
 
 
+def _get_win32_dwmapi(dwmapi: Any = None) -> Any:
+    """Return cached dwmapi ctypes DLL with explicit DwmGetWindowAttribute signature."""
+    global _WINDOWS_OS_DWMAPI
+    if dwmapi is not None:
+        return dwmapi
+    if _WINDOWS_OS_DWMAPI is not None:
+        return _WINDOWS_OS_DWMAPI
+    if sys.platform != "win32":
+        return None
+    with contextlib.suppress(Exception):
+        loaded = ctypes.WinDLL("dwmapi", use_last_error=True)
+        if hasattr(loaded, "DwmGetWindowAttribute"):
+            loaded.DwmGetWindowAttribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            loaded.DwmGetWindowAttribute.restype = ctypes.c_long
+        _WINDOWS_OS_DWMAPI = loaded
+        return _WINDOWS_OS_DWMAPI
+    return None
+
+
 def _is_window_cloaked_ctypes(hwnd: int, user32: Any) -> bool:
     """Return True when running on live Win32 and DWM reports the window is cloaked."""
     if sys.platform != "win32" or not isinstance(user32, ctypes.CDLL):
         return False
     try:
-        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+        dwmapi = _get_win32_dwmapi()
+        if dwmapi is None or not hasattr(dwmapi, "DwmGetWindowAttribute"):
             return False
-        dwmapi.DwmGetWindowAttribute.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
         cloaked = ctypes.c_uint32(0)
         hr = dwmapi.DwmGetWindowAttribute(
             ctypes.c_void_p(hwnd),
@@ -896,11 +934,31 @@ def _resolve_root_window_hwnd(hwnd: int, user32: Any) -> int:
     return int(hwnd)
 
 
+_BROWSER_WINDOW_TITLE_SUFFIXES: tuple[str, ...] = (
+    " - google chrome",
+    " - microsoft edge",
+    " - microsoft\u200b edge",
+    " - brave",
+    " - mozilla firefox",
+    " - arc",
+)
+
+_BROWSER_CANONICAL_NAMES: frozenset[str] = frozenset({"chrome", "edge", "firefox", "brave", "arc"})
+
+
+def _is_browser_tab_window_title(title: str | None) -> bool:
+    low = (title or "").strip().lower()
+    return any(low.endswith(suffix) for suffix in _BROWSER_WINDOW_TITLE_SUFFIXES)
+
+
 def _pick_best_matching_window(
     matches: list[EnumeratedWindow],
     user32: Any,
+    *,
+    prefer_standalone_pwa: bool = False,
+    prefer_browser_window: bool = False,
 ) -> EnumeratedWindow:
-    """Prefer foreground, non-minimized, unowned top-level windows when multiple match."""
+    """Prefer standalone PWA (when requested), foreground, non-minimized, unowned windows."""
     if len(matches) == 1:
         return matches[0]
     fg_hwnd = 0
@@ -909,7 +967,7 @@ def _pick_best_matching_window(
             fg = user32.GetForegroundWindow()
             fg_hwnd = int(fg) if fg else 0
 
-    def _score(win: EnumeratedWindow) -> tuple[int, int, int, int, int]:
+    def _score(win: EnumeratedWindow) -> tuple[int, int, int, int, int, int]:
         fg_root = _resolve_root_window_hwnd(fg_hwnd, user32) if fg_hwnd else 0
         is_fg = 1 if (fg_hwnd and (win.hwnd == fg_hwnd or win.hwnd == fg_root)) else 0
         uncloaked = 0 if _is_window_cloaked_ctypes(win.hwnd, user32) else 1
@@ -921,7 +979,18 @@ def _pick_best_matching_window(
         if user32 is not None and hasattr(user32, "GetWindow"):
             with contextlib.suppress(Exception):
                 unowned = 0 if user32.GetWindow(win.hwnd, GW_OWNER) else 1
-        return (is_fg, uncloaked, is_not_min, unowned, len(win.title or ""))
+        is_browser_tab = _is_browser_tab_window_title(win.title)
+        if prefer_standalone_pwa:
+            pwa_priority = 0 if is_browser_tab else 1
+            # Shorter standalone title beats noisy tab titles
+            title_tiebreak = -len(win.title or "")
+        elif prefer_browser_window:
+            pwa_priority = 1 if is_browser_tab else 0
+            title_tiebreak = len(win.title or "")
+        else:
+            pwa_priority = 0
+            title_tiebreak = len(win.title or "")
+        return (pwa_priority, is_fg, uncloaked, is_not_min, unowned, title_tiebreak)
 
     return max(matches, key=_score)
 
@@ -1079,6 +1148,12 @@ def _window_matches_spec(window: EnumeratedWindow, spec: _AppSpec) -> bool:
             return proc_lower in spec.process_names and any(
                 sub in title_lower for sub in spec.title_substrings
             )
+        if spec.canonical_name in {"chrome", "edge"}:
+            # Distinguish normal Chromium browser windows ("... - Google Chrome" / "... - Edge")
+            # from standalone Chromium PWAs (e.g. YouTube PWA) sharing chrome.exe / msedge.exe.
+            return proc_lower in spec.process_names and any(
+                sub in title_lower for sub in spec.title_substrings
+            )
         if spec.canonical_name == "explorer":
             return proc_lower in spec.process_names
         return proc_lower in spec.process_names
@@ -1119,7 +1194,10 @@ def _validate_target_path(
 
 _INSTALLED_APPS_CACHE: list[dict[str, str]] | None = None
 _INSTALLED_APPS_CACHE_TIME: float = 0.0
+_INSTALLED_APPS_FAILURE_UNTIL: float = 0.0
+_INSTALLED_APPS_CACHE_LOCK = threading.Lock()
 _APP_CACHE_TTL: float = 300.0  # 5 minutes
+_APP_CACHE_FAILURE_TTL: float = 45.0  # negative/failure backoff to avoid repeated 10s stalls
 
 
 def _is_disallowed_shell_app(name: str, appid: str) -> bool:
@@ -1155,59 +1233,61 @@ def get_installed_apps(
     app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
 ) -> list[dict[str, str]]:
     """Retrieve catalog of installed Start Menu / UWP apps via Get-StartApps with caching."""
-    global _INSTALLED_APPS_CACHE, _INSTALLED_APPS_CACHE_TIME
+    global _INSTALLED_APPS_CACHE, _INSTALLED_APPS_CACHE_TIME, _INSTALLED_APPS_FAILURE_UNTIL
     now = time.monotonic()
-    if (
-        not force_refresh
-        and _INSTALLED_APPS_CACHE is not None
-        and (now - _INSTALLED_APPS_CACHE_TIME) < _APP_CACHE_TTL
-    ):
-        return _INSTALLED_APPS_CACHE
-
-    if app_catalog_fetcher is not None:
-        raw_apps = app_catalog_fetcher()
-    else:
-        ps_exe = shutil.which("powershell.exe")
-        if not ps_exe:
+    with _INSTALLED_APPS_CACHE_LOCK:
+        if (
+            not force_refresh
+            and _INSTALLED_APPS_CACHE is not None
+            and (now - _INSTALLED_APPS_CACHE_TIME) < _APP_CACHE_TTL
+        ):
+            return list(_INSTALLED_APPS_CACHE)
+        if (
+            not force_refresh
+            and app_catalog_fetcher is None
+            and _INSTALLED_APPS_CACHE is None
+            and now < _INSTALLED_APPS_FAILURE_UNTIL
+        ):
             return []
-        try:
-            proc = subprocess.run(
-                [
-                    ps_exe,
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress",
-                ],
-                shell=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10.0,
-                check=False,
-            )
-            if proc.returncode != 0 or not proc.stdout.strip():
+
+        if app_catalog_fetcher is not None:
+            raw_apps = app_catalog_fetcher()
+        else:
+            ps_exe = shutil.which("powershell.exe")
+            if not ps_exe:
+                _INSTALLED_APPS_FAILURE_UNTIL = now + _APP_CACHE_FAILURE_TTL
                 return []
-            parsed = json.loads(proc.stdout.strip())
-            raw_apps = parsed if isinstance(parsed, list) else [parsed]
-        except Exception as exc:
-            logger.debug("Failed to retrieve StartApps: %s", exc)
-            return []
+            try:
+                proc = run_powershell_hidden(
+                    "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress",
+                    timeout=10.0,
+                    ps_exe=ps_exe,
+                    check=False,
+                )
+                if proc.returncode != 0 or not (proc.stdout or "").strip():
+                    _INSTALLED_APPS_FAILURE_UNTIL = time.monotonic() + _APP_CACHE_FAILURE_TTL
+                    return []
+                parsed = json.loads(proc.stdout.strip())
+                raw_apps = parsed if isinstance(parsed, list) else [parsed]
+            except Exception as exc:
+                logger.debug("Failed to retrieve StartApps: %s", exc)
+                _INSTALLED_APPS_FAILURE_UNTIL = time.monotonic() + _APP_CACHE_FAILURE_TTL
+                return []
 
-    cleaned: list[dict[str, str]] = []
-    for item in raw_apps:
-        if isinstance(item, dict) and "Name" in item and "AppID" in item:
-            name = str(item["Name"]).strip()
-            appid = str(item["AppID"]).strip()
-            if name and appid:
-                if _is_disallowed_shell_app(name, appid):
-                    continue
-                cleaned.append({"Name": name, "AppID": appid})
+        cleaned: list[dict[str, str]] = []
+        for item in raw_apps:
+            if isinstance(item, dict) and "Name" in item and "AppID" in item:
+                name = str(item["Name"]).strip()
+                appid = str(item["AppID"]).strip()
+                if name and appid:
+                    if _is_disallowed_shell_app(name, appid):
+                        continue
+                    cleaned.append({"Name": name, "AppID": appid})
 
-    _INSTALLED_APPS_CACHE = cleaned
-    _INSTALLED_APPS_CACHE_TIME = now
-    return cleaned
+        _INSTALLED_APPS_CACHE = cleaned
+        _INSTALLED_APPS_CACHE_TIME = time.monotonic()
+        _INSTALLED_APPS_FAILURE_UNTIL = 0.0
+        return list(cleaned)
 
 
 def find_matching_start_app(
@@ -1736,6 +1816,8 @@ def open_or_focus_app(
                 k32 = _get_win32_kernel32(kernel32)
                 windows = _enumerate_windows_ctypes(u32, k32)
 
+            matched_norm = normalize_launch_target(matched_name)
+            matched_is_browser = matched_norm in _BROWSER_CANONICAL_NAMES
             start_matches = [
                 win
                 for win in windows
@@ -1744,9 +1826,15 @@ def open_or_focus_app(
                     matched_name.lower() in (win.title or "").lower()
                     or matched_name.lower() in (win.process_name or "").lower()
                 )
+                and (matched_is_browser or not _is_browser_tab_window_title(win.title))
             ]
             if start_matches:
-                win = _pick_best_matching_window(start_matches, u32)
+                win = _pick_best_matching_window(
+                    start_matches,
+                    u32,
+                    prefer_standalone_pwa=not matched_is_browser,
+                    prefer_browser_window=matched_is_browser,
+                )
                 non_default = _check_interactive_desktop(desktop_name_fn)
                 if non_default is not None:
                     return _non_interactive_desktop_result(matched_name, non_default)
@@ -1918,20 +2006,10 @@ def _set_system_master_volume(level: int) -> None:
     if not ps_exe:
         raise RuntimeError("Neither pycaw nor PowerShell is available to set system volume.")
 
-    proc = subprocess.run(
-        [
-            ps_exe,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f"& {{ {_POWERSHELL_SET_VOLUME_SCRIPT} }} -Scalar {scalar:.4f}",
-        ],
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    proc = run_powershell_hidden(
+        f"& {{ {_POWERSHELL_SET_VOLUME_SCRIPT} }} -Scalar {scalar:.4f}",
         timeout=8.0,
+        ps_exe=ps_exe,
         check=False,
     )
     if proc.returncode != 0:
@@ -2435,27 +2513,16 @@ def read_clipboard(
 
     ps_exe = shutil.which("powershell.exe")
     if ps_exe:
-        runner = powershell_runner or subprocess.run
         try:
             inc_bytes_flag = " -IncludeImageBytes" if include_image_bytes else ""
-            cmd = [
-                ps_exe,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
+            proc = run_powershell_hidden(
                 (
                     f"& {{ {_POWERSHELL_READ_CLIPBOARD_HISTORY_SCRIPT} }} "
                     f"-MaxItems {int(max_items)} -MaxChars {int(cap)}{inc_bytes_flag}"
                 ),
-            ]
-            proc = runner(
-                cmd,
-                shell=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=10.0,
+                ps_exe=ps_exe,
+                runner=powershell_runner,
                 check=False,
             )
             if proc.returncode == 0 and proc.stdout.strip():
@@ -2565,21 +2632,11 @@ def select_clipboard_item(
     if not ps_exe:
         raise RuntimeError("powershell.exe is required for clipboard history operations.")
 
-    runner = powershell_runner or subprocess.run
-    proc = runner(
-        [
-            ps_exe,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f"& {{ {_POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT} }} -ItemIndex {index}",
-        ],
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    proc = run_powershell_hidden(
+        f"& {{ {_POWERSHELL_SELECT_CLIPBOARD_ITEM_SCRIPT} }} -ItemIndex {index}",
         timeout=10.0,
+        ps_exe=ps_exe,
+        runner=powershell_runner,
         check=False,
     )
     if proc.returncode != 0:
@@ -2851,25 +2908,15 @@ def _get_wmi_brightness(
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> int:
     """Read current display brightness percentage (0..100) via WmiMonitorBrightness."""
-    runner = powershell_runner or subprocess.run
     ps_exe = shutil.which("powershell.exe") or "powershell.exe"
-    proc = runner(
-        [
-            ps_exe,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            (
-                "(Get-CimInstance -Namespace root\\wmi "
-                "-ClassName WmiMonitorBrightness).CurrentBrightness"
-            ),
-        ],
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    proc = run_powershell_hidden(
+        (
+            "(Get-CimInstance -Namespace root\\wmi "
+            "-ClassName WmiMonitorBrightness).CurrentBrightness"
+        ),
         timeout=8.0,
+        ps_exe=ps_exe,
+        runner=powershell_runner,
         check=False,
     )
     if proc.returncode != 0:
@@ -2887,7 +2934,6 @@ def _set_wmi_brightness(
 ) -> None:
     """Set display brightness percentage (0..100) via WmiMonitorBrightnessMethods."""
     clamped = max(0, min(100, int(level)))
-    runner = powershell_runner or subprocess.run
     ps_exe = shutil.which("powershell.exe") or "powershell.exe"
     script = (
         "$b = Get-CimInstance -Namespace root\\wmi -ClassName WmiMonitorBrightnessMethods; "
@@ -2896,20 +2942,11 @@ def _set_wmi_brightness(
         f"-Arguments @{{Timeout = 1; Brightness = [uint32]{clamped}}} "
         "} else { throw 'WmiMonitorBrightnessMethods not available' }"
     )
-    proc = runner(
-        [
-            ps_exe,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ],
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    proc = run_powershell_hidden(
+        script,
         timeout=8.0,
+        ps_exe=ps_exe,
+        runner=powershell_runner,
         check=False,
     )
     if proc.returncode != 0:
@@ -2966,7 +3003,16 @@ def _resolve_window_hwnd(
                 fallback_matches.append(win)
 
         if fallback_matches:
-            best = _pick_best_matching_window(fallback_matches, u32)
+            query_norm = normalize_launch_target(target_app or target_title)
+            is_browser_q = query_norm in _BROWSER_CANONICAL_NAMES or _is_browser_tab_window_title(
+                target_title
+            )
+            best = _pick_best_matching_window(
+                fallback_matches,
+                u32,
+                prefer_standalone_pwa=not is_browser_q,
+                prefer_browser_window=is_browser_q,
+            )
             return _resolve_root_window_hwnd(int(best.hwnd), u32)
 
         raise ValueError(
@@ -3054,16 +3100,9 @@ def _get_dwm_frame_insets_os(hwnd: int, u32: Any) -> tuple[int, int, int, int]:
     if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)):
         return (0, 0, 0, 0)
     with contextlib.suppress(Exception):
-        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-        if not hasattr(dwmapi, "DwmGetWindowAttribute"):
+        dwmapi = _get_win32_dwmapi()
+        if dwmapi is None or not hasattr(dwmapi, "DwmGetWindowAttribute"):
             return (0, 0, 0, 0)
-        dwmapi.DwmGetWindowAttribute.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
         win_rect = _OSRECT()
         frame_rect = _OSRECT()
         if not u32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
@@ -3085,6 +3124,32 @@ def _get_dwm_frame_insets_os(hwnd: int, u32: Any) -> tuple[int, int, int, int]:
     return (0, 0, 0, 0)
 
 
+def _raise_window_z_order_os(
+    u32: Any,
+    hwnd: int,
+    *,
+    force_topmost_bump: bool = False,
+) -> None:
+    """Promote *hwnd* to the top of the normal Z-order via SetWindowPos / BringWindowToTop."""
+    if u32 is None or not hwnd:
+        return
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+    if hasattr(u32, "SetWindowPos"):
+        is_live = isinstance(u32, ctypes.CDLL)
+        with contextlib.suppress(Exception):
+            if force_topmost_bump:
+                topmost_arg = ctypes.c_void_p(HWND_TOPMOST) if is_live else HWND_TOPMOST
+                notopmost_arg = ctypes.c_void_p(HWND_NOTOPMOST) if is_live else HWND_NOTOPMOST
+                u32.SetWindowPos(hwnd, topmost_arg, 0, 0, 0, 0, flags)
+                u32.SetWindowPos(hwnd, notopmost_arg, 0, 0, 0, 0, flags)
+            else:
+                top_arg = ctypes.c_void_p(HWND_TOP) if is_live else HWND_TOP
+                u32.SetWindowPos(hwnd, top_arg, 0, 0, 0, 0, flags)
+    if hasattr(u32, "BringWindowToTop"):
+        with contextlib.suppress(Exception):
+            u32.BringWindowToTop(hwnd)
+
+
 def _move_window_snap_os(
     u32: Any,
     hwnd: int,
@@ -3096,11 +3161,14 @@ def _move_window_snap_os(
     guard: PreconditionGuard | None = None,
     work_area: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """Restore/unmaximize target window and MoveWindow with DWM invisible-border compensation."""
-    if isinstance(u32, ctypes.CDLL):
+    """Restore/unmaximize target window, MoveWindow with DWM compensation, and raise Z-order."""
+    is_live = isinstance(u32, ctypes.CDLL)
+    was_zoomed = False
+    if is_live:
         if hasattr(u32, "IsIconic") and bool(u32.IsIconic(hwnd)) and hasattr(u32, "ShowWindow"):
             u32.ShowWindow(hwnd, SW_RESTORE)
         if hasattr(u32, "IsZoomed") and bool(u32.IsZoomed(hwnd)) and hasattr(u32, "ShowWindow"):
+            was_zoomed = True
             u32.ShowWindow(hwnd, SW_SHOWNORMAL)
     elif hasattr(u32, "ShowWindow"):
         u32.ShowWindow(hwnd, SW_RESTORE)
@@ -3111,7 +3179,11 @@ def _move_window_snap_os(
     if hasattr(u32, "MoveWindow"):
         il, it, ir, ib = _get_dwm_frame_insets_os(hwnd, u32)
         u32.MoveWindow(hwnd, x - il, y - it, w + il + ir, h + it + ib, True)
-        if not isinstance(u32, ctypes.CDLL):
+        if is_live and was_zoomed and (il, it, ir, ib) == (0, 0, 0, 0):
+            nil, nit, nir, nib = _get_dwm_frame_insets_os(hwnd, u32)
+            if (nil, nit, nir, nib) != (0, 0, 0, 0):
+                u32.MoveWindow(hwnd, x - nil, y - nit, w + nil + nir, h + nit + nib, True)
+        if not is_live:
             try:
                 moved = getattr(u32, "_clea_last_moved_rects", None)
                 if not isinstance(moved, dict):
@@ -3131,6 +3203,7 @@ def _move_window_snap_os(
                     )
             except Exception:
                 pass
+    _raise_window_z_order_os(u32, hwnd)
 
 
 def control_system(
@@ -3156,7 +3229,7 @@ def control_system(
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
-    verify_timeout_s: float = 1.0,
+    verify_timeout_s: float = 0.6,
     **_extra: Any,
 ) -> dict[str, Any]:
     """Control Windows display brightness, window state, screen lock, or settings navigation."""
@@ -3400,17 +3473,33 @@ def control_system(
                     expected_snap=snap_side,
                     timeout_s=verify_timeout_s,
                 )
-                if not outcome.verified and isinstance(u32, ctypes.CDLL):
-                    _move_window_snap_os(u32, target_hwnd, x, y, w, h)
-                    if hasattr(u32, "SetForegroundWindow"):
-                        _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
-                    outcome = active_verifier.verify_window_state(
-                        target_hwnd,
-                        expected_snap=snap_side,
-                        timeout_s=verify_timeout_s,
-                    )
+                if not outcome.verified:
+                    if outcome.occluded_by_unrelated_window:
+                        _raise_window_z_order_os(u32, target_hwnd, force_topmost_bump=True)
+                        if hasattr(u32, "SetForegroundWindow"):
+                            _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
+                        outcome = active_verifier.verify_window_state(
+                            target_hwnd,
+                            expected_snap=snap_side,
+                            timeout_s=verify_timeout_s,
+                        )
+                    elif isinstance(u32, ctypes.CDLL):
+                        _move_window_snap_os(
+                            u32, target_hwnd, x, y, w, h, work_area=(left, top, right, bottom)
+                        )
+                        _raise_window_z_order_os(u32, target_hwnd, force_topmost_bump=True)
+                        if hasattr(u32, "SetForegroundWindow"):
+                            _focus_window_hwnd(u32, target_hwnd, restore_if_iconic=False)
+                        outcome = active_verifier.verify_window_state(
+                            target_hwnd,
+                            expected_snap=snap_side,
+                            timeout_s=verify_timeout_s,
+                        )
                 res_snap["verification"] = outcome.to_dict()
                 res_snap["verified"] = outcome.verified
+                if outcome.occluded_by_unrelated_window:
+                    res_snap["occluded_by_unrelated_window"] = True
+                    res_snap["occluding_windows"] = list(outcome.occluding_windows)
             return res_snap
 
         if normalized in ("minimize_window", "minimize"):
@@ -4475,23 +4564,12 @@ def _run_powershell_uia_json(
 ) -> dict[str, Any]:
     """Execute a PowerShell 5.1 UIA command with shell=False and parse its JSON output."""
     ps_exe = _resolve_powershell_exe(powershell_runner)
-    runner = powershell_runner or subprocess.run
-    cmd = [
-        ps_exe,
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        ps_command,
-    ]
     try:
-        proc = runner(
-            cmd,
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        proc = run_powershell_hidden(
+            ps_command,
             timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
+            ps_exe=ps_exe,
+            runner=powershell_runner,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -5465,27 +5543,17 @@ def inspect_ui_elements(
     )
 
     ps_exe = _resolve_powershell_exe(powershell_runner)
-    runner = powershell_runner or subprocess.run
     app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
-    cmd = [
-        ps_exe,
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        (
-            f"& {{ {_POWERSHELL_INSPECT_UI_SCRIPT} }} "
-            f"-TargetHwnd {hwnd} -MaxElements {clamped_max} -AppNameBase64 '{app_b64}'"
-        ),
-    ]
+    ps_cmd = (
+        f"& {{ {_POWERSHELL_INSPECT_UI_SCRIPT} }} "
+        f"-TargetHwnd {hwnd} -MaxElements {clamped_max} -AppNameBase64 '{app_b64}'"
+    )
     try:
-        proc = runner(
-            cmd,
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        proc = run_powershell_hidden(
+            ps_cmd,
             timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
+            ps_exe=ps_exe,
+            runner=powershell_runner,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -5633,32 +5701,22 @@ def click_ui_element(
             locate_guard.assert_ready("click_ui_locate")
 
         ps_exe = _resolve_powershell_exe(powershell_runner)
-        runner = powershell_runner or subprocess.run
         name_b64 = base64.b64encode(target_name.encode("utf-8")).decode("ascii")
         app_b64 = (
             base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
         )
         ct_arg = cleaned_ct or ""
-        cmd = [
-            ps_exe,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            (
-                f"& {{ {_POWERSHELL_CLICK_UI_SCRIPT} }} "
-                f"-TargetHwnd {target_hwnd} -TargetNameBase64 '{name_b64}' "
-                f"-ControlTypeFilter '{ct_arg}' -AppNameBase64 '{app_b64}'"
-            ),
-        ]
+        ps_cmd = (
+            f"& {{ {_POWERSHELL_CLICK_UI_SCRIPT} }} "
+            f"-TargetHwnd {target_hwnd} -TargetNameBase64 '{name_b64}' "
+            f"-ControlTypeFilter '{ct_arg}' -AppNameBase64 '{app_b64}'"
+        )
         try:
-            proc = runner(
-                cmd,
-                shell=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+            proc = run_powershell_hidden(
+                ps_cmd,
                 timeout=UI_AUTOMATION_TIMEOUT_SECONDS,
+                ps_exe=ps_exe,
+                runner=powershell_runner,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:

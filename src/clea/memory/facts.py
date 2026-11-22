@@ -638,7 +638,11 @@ class FactBankReconciler:
         if clean_text and is_secret_or_sensitive(clean_text) and not resolved_candidates:
             return ReconciliationResult()
 
-        existing = self._gather_relevant_facts(text=clean_text, candidates=resolved_candidates)
+        existing = await asyncio.to_thread(
+            self._gather_relevant_facts,
+            text=clean_text,
+            candidates=resolved_candidates,
+        )
         if self.provider is not None:
             batch = await self._call_llm_reconciler(
                 user_text=clean_text,
@@ -646,7 +650,8 @@ class FactBankReconciler:
                 existing_facts=existing,
             )
             if batch is not None and (batch.decisions or not resolved_candidates):
-                return self._execute_decisions(
+                return await asyncio.to_thread(
+                    self._execute_decisions,
                     batch.decisions,
                     source_surface=source_surface,
                     source_session_id=source_session_id,
@@ -655,8 +660,9 @@ class FactBankReconciler:
 
         if not resolved_candidates:
             return ReconciliationResult()
-        decisions = self._decisions_from_candidates(resolved_candidates)
-        return self._execute_decisions(
+        decisions = await asyncio.to_thread(self._decisions_from_candidates, resolved_candidates)
+        return await asyncio.to_thread(
+            self._execute_decisions,
             decisions,
             source_surface=source_surface,
             source_session_id=source_session_id,

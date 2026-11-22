@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 def register_memory_tools(registry: ToolRegistry, memory: MemoryStore) -> None:
     """Register memory read/write/search tools on the registry."""
 
-    async def remember_handler(fact: str, section: str = "Preferences") -> str:
+    def _remember_sync(fact: str, section: str) -> str:
         sec = section if section in FIXED_SECTIONS else "Preferences"
         entry = memory.add_or_update_entry(text=fact, section=sec, source="stated")
         try:
@@ -30,7 +31,10 @@ def register_memory_tools(registry: ToolRegistry, memory: MemoryStore) -> None:
             logger.debug("Failed mirroring remember tool to SQLite fact bank: %s", exc)
         return f"Remembered: {entry.text} in section '{sec}' [{entry.id}]."
 
-    async def forget_handler(query: str) -> str:
+    async def remember_handler(fact: str, section: str = "Preferences") -> str:
+        return await asyncio.to_thread(_remember_sync, fact, section)
+
+    def _forget_sync(query: str) -> str:
         matches = memory.find_matches(query)
         if not matches:
             db_deleted: list[str] = []
@@ -55,13 +59,21 @@ def register_memory_tools(registry: ToolRegistry, memory: MemoryStore) -> None:
         removed_lines = [e.format_line() for e in removed]
         return f"Forgot {len(removed)} entries matching '{query}':\n" + "\n".join(removed_lines)
 
+    async def forget_handler(query: str) -> str:
+        return await asyncio.to_thread(_forget_sync, query)
+
     async def search_episodic_memory_handler(
         query: str,
         limit: int = 5,
         surface: str | None = None,
     ) -> dict[str, Any]:
         capped_limit = max(1, min(int(limit or 5), 20))
-        hits = memory.search_episodic_memory(query, limit=capped_limit, surface=surface)
+        hits = await asyncio.to_thread(
+            memory.search_episodic_memory,
+            query,
+            limit=capped_limit,
+            surface=surface,
+        )
         return {
             "query": query,
             "count": len(hits),
@@ -80,7 +92,8 @@ def register_memory_tools(registry: ToolRegistry, memory: MemoryStore) -> None:
         act = str(action or "").strip().lower()
         if act not in ("add", "update", "delete"):
             raise ValueError(f"Unsupported action: {action!r}. Expected add, update, or delete.")
-        return memory.manage_fact(
+        return await asyncio.to_thread(
+            memory.manage_fact,
             act,  # type: ignore[arg-type]
             fact_text=fact_text,
             category=category,
