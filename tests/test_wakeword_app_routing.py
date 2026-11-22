@@ -1467,3 +1467,307 @@ async def test_open_or_focus_app_browser_reuse_and_voice_runner_open_url_context
     assert isinstance(rpc_calls[-1], OsOpenUrlRequest)
     assert rpc_calls[-1].params.prefer_browser is True
     assert rpc_calls[-1].params.user_request == "open Watch Later in Chrome"
+
+
+def test_audio_manager_batches_variable_wasapi_periods_without_drift_or_snr_loss() -> None:
+    """Native WASAPI 10ms / 448-frame callbacks batch before polyphase resampling (zero drift)."""
+    for orig_sr, cb_frames in ((44100, 448), (48000, 480), (48000, 144)):
+        t = np.arange(orig_sr, dtype=np.float32) / float(orig_sr)
+        sine = (np.sin(2.0 * np.pi * 440.0 * t) * 16000.0).astype(np.int16)
+
+        emitted: list[np.ndarray] = []
+
+        def _on_chunk(pcm: bytes, _out: list[np.ndarray] = emitted) -> None:
+            arr = np.frombuffer(pcm, dtype=np.int16)
+            assert len(arr) == 1280
+            _out.append(arr)
+
+        mgr = AudioManager(chunk_size=1280, on_audio_input=_on_chunk)
+        mgr.input_sample_rate = orig_sr
+        mgr.input_channels = 1
+
+        # Reuse a single buffer across callbacks just like PortAudio's C buffer
+        reusable = np.empty((cb_frames, 1), dtype=np.int16)
+        for off in range(0, len(sine) - cb_frames + 1, cb_frames):
+            reusable[:, 0] = sine[off : off + cb_frames]
+            mgr._input_stream_callback(reusable, cb_frames, None, sd.CallbackFlags())
+
+        assert len(emitted) >= 11
+        cat = np.concatenate(emitted)
+        t_ref = np.arange(len(cat), dtype=np.float32) / 16000.0
+        ref = np.sin(2.0 * np.pi * 440.0 * t_ref) * 16000.0
+        err = cat.astype(np.float32) - ref
+        snr_db = float(10.0 * np.log10(np.mean(ref**2) / (np.mean(err**2) + 1e-9)))
+        assert snr_db > 38.0, f"SNR degraded at {orig_sr} Hz cb={cb_frames}: {snr_db:.2f} dB"
+
+    # Empty callback must never clear an existing dead-zero streak
+    mgr_z = AudioManager(chunk_size=1280)
+    mgr_z.input_sample_rate = 16000
+    zeros_1280 = np.zeros((1280, 1), dtype=np.int16)
+    mgr_z._input_stream_callback(zeros_1280, 1280, None, sd.CallbackFlags())
+    assert mgr_z._consecutive_zero_callbacks == 1
+    mgr_z._input_stream_callback(np.empty((0, 1), dtype=np.int16), 0, None, sd.CallbackFlags())
+    assert mgr_z._consecutive_zero_callbacks == 1
+
+
+def test_audio_manager_start_failure_never_deadlocks_with_output_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OutputStream failure teardown does not deadlock against _output_stream_callback lock."""
+    import threading
+    import time
+
+    deadlocked = threading.Event()
+    fake_devices = [
+        {
+            "index": 0,
+            "name": "Test Headset",
+            "hostapi": 0,
+            "hostapi_name": "MME",
+            "max_input_channels": 1,
+            "max_output_channels": 2,
+            "default_samplerate": 16000.0,
+        }
+    ]
+
+    class _DummyIn:
+        def __init__(self, **_kw: Any) -> None:
+            self.active = True
+            self.stopped = False
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.active = False
+
+        def close(self) -> None:
+            pass
+
+    class _CallbackRacingOut:
+        def __init__(self, callback: Any = None, **_kw: Any) -> None:
+            self._cb = callback
+            self._stop = threading.Event()
+            self._t: threading.Thread | None = None
+
+        def start(self) -> None:
+            def _run() -> None:
+                out = np.zeros((240, 1), dtype=np.int16)
+                while not self._stop.is_set():
+                    self._cb(out, 240, None, sd.CallbackFlags())
+                    time.sleep(0.002)
+
+            self._t = threading.Thread(target=_run, daemon=True)
+            self._t.start()
+            time.sleep(0.03)
+            raise sd.PortAudioError("Simulated post-start output failure")
+
+        def stop(self) -> None:
+            self._stop.set()
+            if self._t is not None:
+                self._t.join(timeout=0.5)
+                if self._t.is_alive():
+                    deadlocked.set()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("clea.surfaces.voice.audio.list_audio_devices", lambda: fake_devices)
+    monkeypatch.setattr(sd, "check_input_settings", lambda **_kw: None)
+    monkeypatch.setattr(sd, "InputStream", _DummyIn)
+    monkeypatch.setattr(sd, "OutputStream", _CallbackRacingOut)
+    monkeypatch.setattr(
+        "clea.surfaces.voice.audio.get_os_default_audio_endpoint_ids",
+        lambda: ("cap-0", "ren-0"),
+    )
+
+    mgr = AudioManager(input_device=0, output_device=0)
+    with pytest.raises(sd.PortAudioError):
+        mgr.start()
+
+    assert not deadlocked.is_set()
+    assert mgr._running is False
+    assert mgr._input_stream is None
+    assert mgr._output_stream is None
+
+
+def test_get_os_default_audio_endpoint_ids_does_not_mutate_global_ole32() -> None:
+    """Core Audio endpoint query uses private ole32 handle (never mutates ctypes.windll.ole32)."""
+    import ctypes
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("Windows-only Core Audio test")
+
+    from clea.surfaces.voice.audio import get_os_default_audio_endpoint_ids
+
+    sentinel = (ctypes.c_void_p,)
+    orig_argtypes = getattr(ctypes.windll.ole32.CoCreateInstance, "argtypes", None)
+    ctypes.windll.ole32.CoCreateInstance.argtypes = sentinel
+    try:
+        cap_id, ren_id = get_os_default_audio_endpoint_ids()
+        assert tuple(ctypes.windll.ole32.CoCreateInstance.argtypes) == sentinel
+        cap_id2, ren_id2 = get_os_default_audio_endpoint_ids()
+        assert (cap_id, ren_id) == (cap_id2, ren_id2)
+    finally:
+        ctypes.windll.ole32.CoCreateInstance.argtypes = orig_argtypes
+
+
+@pytest.mark.asyncio
+async def test_transient_bluetooth_fallback_to_laptop_mic_reclaims_earphone_when_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Bluetooth HFP fails transiently at connect and falls back to laptop mic, reclaim idle."""
+    fake_hostapis = [
+        {"name": "Windows DirectSound", "default_input_device": 1, "default_output_device": 3},
+        {"name": "Windows WASAPI", "default_input_device": 0, "default_output_device": 3},
+    ]
+    fake_devices = [
+        {
+            "name": "Headset (Earphone)",
+            "hostapi": 1,
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 16000.0,
+        },
+        {
+            "name": "Headset (Earphone)",
+            "hostapi": 0,
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 44100.0,
+        },
+        {
+            "name": "Microphone Array (Realtek(R) Audio)",
+            "hostapi": 1,
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 48000.0,
+        },
+        {
+            "name": "Headphones (Earphone)",
+            "hostapi": 1,
+            "max_input_channels": 0,
+            "max_output_channels": 2,
+            "default_samplerate": 48000.0,
+        },
+    ]
+
+    bt_ready = [False]
+
+    class _BtHandshakeStream:
+        def __init__(self, device: int, **_kw: Any) -> None:
+            self.device = device
+            self.active = True
+            self.stopped = False
+
+        def start(self) -> None:
+            if self.device in (0, 1) and not bt_ready[0]:
+                raise sd.PortAudioError("Bluetooth HFP SCO handshake still in progress")
+
+        def stop(self) -> None:
+            self.active = False
+            self.stopped = True
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(sd, "query_devices", lambda: fake_devices)
+    monkeypatch.setattr(sd, "query_hostapis", lambda: fake_hostapis)
+    monkeypatch.setattr(sd, "check_input_settings", lambda **_kw: None)
+    monkeypatch.setattr(sd, "InputStream", _BtHandshakeStream)
+    monkeypatch.setattr(sd, "OutputStream", _BtHandshakeStream)
+    monkeypatch.setattr(
+        "clea.surfaces.voice.audio.get_os_default_audio_endpoint_ids",
+        lambda: ("cap-earphone", "ren-earphone"),
+    )
+    monkeypatch.setattr("clea.surfaces.voice.audio.refresh_audio_devices", lambda: None)
+
+    mgr = AudioManager(chunk_size=1280)
+    mgr._wasapi_retry_delay = 0.0
+    mgr._fallback_reclaim_base_delay = 0.01
+
+    mock_model = MagicMock()
+    mock_model.predict.return_value = {"hey_jarvis_v0.1": 0.0}
+    mock_model.reset = MagicMock()
+    detector = WakeWordDetector(model_name="hey_jarvis", threshold=0.25, model_instance=mock_model)
+
+    runner = VoiceRunner(
+        config=VoiceConfig(wake_word_model="hey_jarvis", wake_threshold=0.25),
+        data_dir=tmp_path,
+        backend_factory=_FlakyStartBackend,
+        audio_manager=mgr,
+        wake_word_detector=detector,
+        enable_hotkey=False,
+    )
+    runner._audio_health_poll_interval = 0.03
+    await runner.start()
+    try:
+        # Initially fell back to Realtek because Bluetooth HFP wasn't ready yet
+        assert mgr.resolved_input_device is not None
+        assert mgr.resolved_input_device["name"] == "Microphone Array (Realtek(R) Audio)"
+        assert mgr._input_fell_back_to_other_device is True
+
+        # Once Bluetooth finishes initializing, idle watchdog reclaims Headset (Earphone)
+        bt_ready[0] = True
+        for _ in range(40):
+            if (
+                mgr.resolved_input_device is not None
+                and mgr.resolved_input_device["name"] == "Headset (Earphone)"
+            ):
+                break
+            await asyncio.sleep(0.03)
+        assert mgr.resolved_input_device is not None
+        assert mgr.resolved_input_device["name"] == "Headset (Earphone)"
+        assert mgr._input_fell_back_to_other_device is False
+        assert mgr.should_reclaim_primary_input() == (False, "ok")
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_voice_runner_cancelled_start_call_restores_idle_and_wake_word(
+    tmp_path: Path,
+) -> None:
+    """Cancelling start_call mid-connect closes backend and restores IDLE so wake word works."""
+    connect_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    class _HangingBackend(_FlakyStartBackend):
+        async def connect(self, config: VoiceSessionConfig) -> None:
+            connect_started.set()
+            await never_finish.wait()
+
+    mock_model = MagicMock()
+    mock_model.predict.return_value = {"hey_jarvis_v0.1": 0.0}
+    mock_model.reset = MagicMock()
+    detector = WakeWordDetector(model_name="hey_jarvis", threshold=0.25, model_instance=mock_model)
+
+    audio = MagicMock(spec=AudioManager)
+    audio._health_monitored = False
+    audio.resolved_input_device = None
+    audio.resolved_output_device = None
+    audio.is_speaking = False
+
+    runner = VoiceRunner(
+        config=VoiceConfig(wake_word_model="hey_jarvis", wake_threshold=0.25),
+        data_dir=tmp_path,
+        backend_factory=_HangingBackend,
+        audio_manager=audio,
+        wake_word_detector=detector,
+        enable_hotkey=False,
+    )
+    await runner.start()
+    try:
+        task = asyncio.create_task(runner.start_call(trigger="wake_word"))
+        await asyncio.wait_for(connect_started.wait(), timeout=2.0)
+        assert runner.call_state == "connecting"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert runner.call_state == "idle"
+        assert runner._wake_word_pending_trigger is False
+        assert runner.call_id is None
+    finally:
+        await runner.stop()

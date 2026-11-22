@@ -162,8 +162,11 @@ class WakeWordDetector:
         data_dir: Path | None = None,
         model_instance: Any = None,
     ) -> None:
-        self.model_name = model_name
-        self.model_key = BUILTIN_WAKEWORDS.get(model_name, {}).get("model_key", model_name)
+        normalized_name = model_name.strip()
+        self.model_name = normalized_name
+        self.model_key = BUILTIN_WAKEWORDS.get(normalized_name, {}).get(
+            "model_key", normalized_name
+        )
         self.threshold = threshold
         self.data_dir = data_dir
         self._target_dir = wake_word_models_dir(data_dir)

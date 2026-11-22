@@ -944,13 +944,16 @@ class VoiceRunner:
                 self._peak_wake_score_window = score
             if detected:
                 self._wake_word_pending_trigger = True
-                self._wake_word.reset()
                 self._drain_wake_word_queue()
                 logger.info("Wake word detected locally with score %.3f!", score)
-                fut = asyncio.run_coroutine_threadsafe(
-                    self.start_call(trigger="wake_word"),
-                    self._loop,
-                )
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self.start_call(trigger="wake_word"),
+                        self._loop,
+                    )
+                except Exception:
+                    self._wake_word_pending_trigger = False
+                    raise
 
                 def _on_trigger_done(done_fut: Any) -> None:
                     with contextlib.suppress(Exception):
@@ -965,6 +968,8 @@ class VoiceRunner:
                             self._wake_word_pending_trigger = False
 
                 fut.add_done_callback(_on_trigger_done)
+                with contextlib.suppress(Exception):
+                    self._wake_word.reset()
         except Exception:
             logger.exception("Error during wake word processing.")
 
@@ -999,12 +1004,30 @@ class VoiceRunner:
                     if changed:
                         healthy = False
                         reason = change_reason
+            if healthy and self._call_state == "idle":
+                reclaim_fn = getattr(am, "should_reclaim_primary_input", None)
+                if callable(reclaim_fn):
+                    try:
+                        raw_reclaim = reclaim_fn()
+                        if (
+                            isinstance(raw_reclaim, tuple)
+                            and len(raw_reclaim) == 2
+                            and bool(raw_reclaim[0])
+                        ):
+                            healthy = False
+                            reason = str(raw_reclaim[1])
+                    except Exception as exc:
+                        logger.debug("Primary input reclaim check failed: %s", exc)
             if healthy:
                 continue
 
             telemetry_fn = getattr(am, "input_rms_telemetry", None)
             telemetry = telemetry_fn() if callable(telemetry_fn) else {}
-            if reason.startswith("os_default_"):
+            if reason == "os_default_reclaim_primary_input":
+                logger.info(
+                    "Re-attempting to open primary OS default input device while idle..."
+                )
+            elif reason.startswith("os_default_"):
                 logger.info(
                     "OS default audio endpoint changed (%s); rebinding audio streams to "
                     "the active OS default device...",
@@ -1020,6 +1043,13 @@ class VoiceRunner:
                 )
 
             recovered = await asyncio.to_thread(restart_fn)
+            if self._stop_event.is_set():
+                if recovered:
+                    stop_fn = getattr(am, "stop", None)
+                    if callable(stop_fn):
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(stop_fn)
+                break
             if recovered:
                 flush_fn = getattr(am, "flush_input_buffer", None)
                 if callable(flush_fn):
@@ -1029,7 +1059,9 @@ class VoiceRunner:
                 if self._wake_word is not None:
                     with contextlib.suppress(Exception):
                         await asyncio.to_thread(self._wake_word.reset)
-                if self._wake_word_thread is None or not self._wake_word_thread.is_alive():
+                if not self._stop_event.is_set() and (
+                    self._wake_word_thread is None or not self._wake_word_thread.is_alive()
+                ):
                     self._start_wake_word_worker()
                 inp = getattr(am, "resolved_input_device", None) or {}
                 out = getattr(am, "resolved_output_device", None) or {}
@@ -1393,6 +1425,16 @@ class VoiceRunner:
                 self._call_id,
                 self._connect_latency_ms,
             )
+        except asyncio.CancelledError:
+            if backend is not None and self._active_backend is not backend:
+                with contextlib.suppress(Exception):
+                    await backend.close()
+            if self._call_generation == call_gen and self._call_state == "connecting":
+                self._call_id = None
+                self._wake_word_pending_trigger = False
+                self._call_state = "idle"
+                self._set_voice_state("idle")
+            raise
         except Exception as exc:
             if backend is not None and self._active_backend is not backend:
                 with contextlib.suppress(Exception):
@@ -1509,7 +1551,8 @@ class VoiceRunner:
                     flush_fn()
         self._drain_wake_word_queue()
         if self._wake_word is not None:
-            self._wake_word.reset()
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self._wake_word.reset)
         if (
             self._audio_manager is not None
             and getattr(self._audio_manager, "_health_monitored", False)

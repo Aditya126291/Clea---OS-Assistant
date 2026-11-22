@@ -209,108 +209,144 @@ def _is_builtin_mic_input(name: str) -> bool:
     return any(pat in low for pat in _BUILTIN_MIC_PATTERNS)
 
 
+def _is_same_audio_device_name(name_a: str, name_b: str) -> bool:
+    """Return True when two host-API device names refer to the same physical endpoint.
+
+    Handles Windows MME 31-character truncation (``MAXPNAMELEN - 1``) by matching
+    long shared prefixes (>= 20 chars).
+    """
+    a = name_a.strip().lower()
+    b = name_b.strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(a) >= 20 and len(b) >= 20 and (a.startswith(b) or b.startswith(a))
+
+
+if sys.platform == "win32":
+    from ctypes import POINTER as _CT_POINTER
+    from ctypes import byref as _ct_byref
+    from ctypes import c_int as _ct_int
+    from ctypes import c_long as _ct_long
+    from ctypes import c_void_p as _ct_void_p
+    from ctypes import wintypes as _ct_wintypes
+
+    class _WinGUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", _ct_wintypes.DWORD),
+            ("Data2", _ct_wintypes.WORD),
+            ("Data3", _ct_wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+        @classmethod
+        def from_str(cls, text: str) -> _WinGUID:
+            parsed = uuid.UUID(text)
+            guid = cls()
+            guid.Data1 = parsed.fields[0]
+            guid.Data2 = parsed.fields[1]
+            guid.Data3 = parsed.fields[2]
+            for i, byte_val in enumerate(parsed.bytes[8:]):
+                guid.Data4[i] = byte_val
+            return guid
+
+    _CLSID_MMDEVICE_ENUMERATOR = _WinGUID.from_str("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+    _IID_IMMDEVICE_ENUMERATOR = _WinGUID.from_str("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    _OLE32_PRIVATE_LOCK = threading.Lock()
+    _OLE32_PRIVATE_DLL: Any = None
+
+    def _get_private_ole32() -> Any:
+        """Return a private ole32 WinDLL handle (never mutating global ctypes.windll.ole32)."""
+        global _OLE32_PRIVATE_DLL
+        if _OLE32_PRIVATE_DLL is not None:
+            return _OLE32_PRIVATE_DLL
+        with _OLE32_PRIVATE_LOCK:
+            if _OLE32_PRIVATE_DLL is None:
+                dll = ctypes.WinDLL("ole32")
+                dll.CoInitializeEx.argtypes = [_ct_void_p, _ct_wintypes.DWORD]
+                dll.CoInitializeEx.restype = _ct_long
+                dll.CoUninitialize.argtypes = []
+                dll.CoUninitialize.restype = None
+                dll.CoCreateInstance.argtypes = [
+                    _CT_POINTER(_WinGUID),
+                    _ct_void_p,
+                    _ct_wintypes.DWORD,
+                    _CT_POINTER(_WinGUID),
+                    _CT_POINTER(_ct_void_p),
+                ]
+                dll.CoCreateInstance.restype = _ct_long
+                dll.CoTaskMemFree.argtypes = [_ct_void_p]
+                dll.CoTaskMemFree.restype = None
+                _OLE32_PRIVATE_DLL = dll
+            return _OLE32_PRIVATE_DLL
+
+
 def get_os_default_audio_endpoint_ids() -> tuple[str | None, str | None]:
     """Return ``(default_capture_id, default_render_id)`` from Windows Core Audio (read-only).
 
     Queries ``IMMDeviceEnumerator::GetDefaultAudioEndpoint`` for ``eConsole`` without
-    reinitializing PortAudio or disrupting active audio streams. Returns ``(None, None)``
-    on non-Windows platforms or if Core Audio is unavailable.
+    reinitializing PortAudio or disrupting active audio streams. Uses a private
+    ``ole32`` handle with module-level GUID types so global ``ctypes.windll.ole32``
+    is never mutated. Returns ``(None, None)`` on non-Windows platforms or if Core
+    Audio is unavailable.
     """
     if sys.platform != "win32":
         return None, None
 
     try:
-        from ctypes import POINTER, byref, c_int, c_long, c_void_p, wintypes
-
-        class _GUID(ctypes.Structure):
-            _fields_ = [
-                ("Data1", wintypes.DWORD),
-                ("Data2", wintypes.WORD),
-                ("Data3", wintypes.WORD),
-                ("Data4", ctypes.c_ubyte * 8),
-            ]
-
-            @classmethod
-            def from_str(cls, text: str) -> _GUID:
-                parsed = uuid.UUID(text)
-                guid = cls()
-                guid.Data1 = parsed.fields[0]
-                guid.Data2 = parsed.fields[1]
-                guid.Data3 = parsed.fields[2]
-                for i, byte_val in enumerate(parsed.bytes[8:]):
-                    guid.Data4[i] = byte_val
-                return guid
-
-        clsid_enumerator = _GUID.from_str("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
-        iid_enumerator = _GUID.from_str("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
-
-        ole32 = ctypes.windll.ole32
-        ole32.CoInitializeEx.argtypes = [c_void_p, wintypes.DWORD]
-        ole32.CoInitializeEx.restype = c_long
-        ole32.CoUninitialize.argtypes = []
-        ole32.CoUninitialize.restype = None
-        ole32.CoCreateInstance.argtypes = [
-            POINTER(_GUID),
-            c_void_p,
-            wintypes.DWORD,
-            POINTER(_GUID),
-            POINTER(c_void_p),
-        ]
-        ole32.CoCreateInstance.restype = c_long
-        ole32.CoTaskMemFree.argtypes = [c_void_p]
-        ole32.CoTaskMemFree.restype = None
-
+        ole32 = _get_private_ole32()
         hr_init = int(ole32.CoInitializeEx(None, 0))  # COINIT_MULTITHREADED
         rpc_e_changed_mode = -2147417850  # 0x80010106
         should_uninit = hr_init in (0, 1)
         if not should_uninit and hr_init != rpc_e_changed_mode:
             return None, None
 
-        enum_ptr = c_void_p()
+        enum_ptr = _ct_void_p()
         try:
             hr_create = int(
                 ole32.CoCreateInstance(
-                    byref(clsid_enumerator),
+                    _ct_byref(_CLSID_MMDEVICE_ENUMERATOR),
                     None,
                     23,  # CLSCTX_ALL
-                    byref(iid_enumerator),
-                    byref(enum_ptr),
+                    _ct_byref(_IID_IMMDEVICE_ENUMERATOR),
+                    _ct_byref(enum_ptr),
                 )
             )
             if hr_create != 0 or not enum_ptr.value:
                 return None, None
 
-            def _vtable_fn(ptr: c_void_p, index: int, restype: Any, *argtypes: Any) -> Any:
-                vtbl = ctypes.cast(ptr, POINTER(POINTER(c_void_p)))[0]
-                return ctypes.WINFUNCTYPE(restype, c_void_p, *argtypes)(vtbl[index])
+            def _vtable_fn(ptr: _ct_void_p, index: int, restype: Any, *argtypes: Any) -> Any:
+                vtbl = ctypes.cast(ptr, _CT_POINTER(_CT_POINTER(_ct_void_p)))[0]
+                return ctypes.WINFUNCTYPE(restype, _ct_void_p, *argtypes)(vtbl[index])
 
-            def _release(ptr: c_void_p) -> None:
+            def _release(ptr: _ct_void_p) -> None:
                 if ptr.value:
-                    _vtable_fn(ptr, 2, wintypes.ULONG)(ptr)
+                    _vtable_fn(ptr, 2, _ct_wintypes.ULONG)(ptr)
 
             def _default_id(data_flow: int) -> str | None:
-                dev_ptr = c_void_p()
+                dev_ptr = _ct_void_p()
                 hr_dev = int(
                     _vtable_fn(
                         enum_ptr,
                         4,  # IMMDeviceEnumerator::GetDefaultAudioEndpoint
-                        c_long,
-                        c_int,
-                        c_int,
-                        POINTER(c_void_p),
-                    )(enum_ptr, data_flow, 0, byref(dev_ptr))  # eConsole = 0
+                        _ct_long,
+                        _ct_int,
+                        _ct_int,
+                        _CT_POINTER(_ct_void_p),
+                    )(enum_ptr, data_flow, 0, _ct_byref(dev_ptr))  # eConsole = 0
                 )
                 if hr_dev != 0 or not dev_ptr.value:
                     return None
-                id_ptr = wintypes.LPWSTR()
+                id_ptr = _ct_wintypes.LPWSTR()
                 try:
                     hr_id = int(
                         _vtable_fn(
                             dev_ptr,
                             5,  # IMMDevice::GetId
-                            c_long,
-                            POINTER(wintypes.LPWSTR),
-                        )(dev_ptr, byref(id_ptr))
+                            _ct_long,
+                            _CT_POINTER(_ct_wintypes.LPWSTR),
+                        )(dev_ptr, _ct_byref(id_ptr))
                     )
                     if hr_id != 0 or not id_ptr.value:
                         return None
@@ -390,25 +426,14 @@ def list_candidate_audio_devices(
             seen_indices.add(idx)
             candidates.append(dev)
 
-    primary_name_lower = str(primary.get("name", "")).strip().lower()
-
-    def _is_same_device_name(name_low: str) -> bool:
-        if name_low == primary_name_lower:
-            return True
-        # Windows MME truncates device names at 31 chars (MAXPNAMELEN - 1); match long prefixes
-        # so alternate host-API fallback stays on the exact same physical headset/mic.
-        return (
-            len(name_low) >= 20
-            and len(primary_name_lower) >= 20
-            and (primary_name_lower.startswith(name_low) or name_low.startswith(primary_name_lower))
-        )
+    primary_name = str(primary.get("name", ""))
 
     # 1. Same device name across alternate host APIs (e.g. DirectSound / MME fallback)
     same_name = sorted(
         [
             d
             for d in valid_devices
-            if _is_same_device_name(str(d.get("name", "")).strip().lower())
+            if _is_same_audio_device_name(str(d.get("name", "")), primary_name)
         ],
         key=_host_rank,
     )
@@ -483,18 +508,8 @@ def negotiate_input_sample_rate(
     return int(default_samplerate or 16000), preferred_channels
 
 
-def resample_to_16k_mono(
-    audio: np.ndarray,
-    orig_sr: int,
-    target_sr: int = 16000,
-) -> np.ndarray:
-    """Downmix to mono and resample audio to target sample rate (default: 16000 Hz) as np.int16.
-
-    Input audio can be a 1D or 2D array of numeric samples (int16, float32, etc.).
-    Normalized floating-point PCM in ``[-1.0, 1.0]`` is scaled to full-scale 16-bit signed PCM
-    before resampling, while already-scaled float arrays (e.g. ``[-32768, 32767]``) are preserved.
-    Returns a contiguous 1D np.int16 array with values clipped to [-32768, 32767].
-    """
+def _to_mono_int16_scale(audio: np.ndarray) -> np.ndarray:
+    """Convert numeric 1D/2D audio to a 1D mono array in signed 16-bit PCM scale."""
     if audio.size == 0:
         return np.empty(0, dtype=np.int16)
 
@@ -515,24 +530,64 @@ def resample_to_16k_mono(
     # Downmix multi-channel to mono
     if audio.ndim > 1:
         if audio.shape[1] == 1:
-            audio = audio[:, 0]
-        else:
-            audio = audio.mean(axis=1)
-    else:
-        audio = audio.reshape(-1)
+            return audio[:, 0]
+        return audio.mean(axis=1)
+    return audio.reshape(-1)
+
+
+def _resample_mono_scaled(
+    mono_audio: np.ndarray,
+    orig_sr: int,
+    target_sr: int = 16000,
+) -> np.ndarray:
+    """Resample an already mono int16-scaled 1D array to contiguous np.int16."""
+    if mono_audio.size == 0:
+        return np.empty(0, dtype=np.int16)
 
     if orig_sr == target_sr:
-        if audio.dtype == np.int16:
-            return np.ascontiguousarray(audio)
-        return np.ascontiguousarray(np.clip(np.round(audio), -32768, 32767).astype(np.int16))
+        if mono_audio.dtype == np.int16:
+            return np.ascontiguousarray(mono_audio)
+        return np.ascontiguousarray(np.clip(np.round(mono_audio), -32768, 32767).astype(np.int16))
 
     g = math.gcd(orig_sr, target_sr)
     up = target_sr // g
     down = orig_sr // g
 
     # Polyphase rational resampler with float32 computation
-    resampled = scipy.signal.resample_poly(audio.astype(np.float32), up, down)
+    resampled = scipy.signal.resample_poly(mono_audio.astype(np.float32, copy=False), up, down)
     return np.ascontiguousarray(np.clip(np.round(resampled), -32768, 32767).astype(np.int16))
+
+
+def _native_resample_block_size(orig_sr: int, target_sr: int, target_chunk_size: int) -> int:
+    """Return an exact native-rate block size aligned to the rational downsampling factor.
+
+    Ensures ``block_size * up / down`` is an exact integer (e.g. 3840 @ 48 kHz and
+    3528 @ 44.1 kHz for 1280 @ 16 kHz) so polyphase resampling never suffers 10 ms
+    boundary ringing or fractional sample-rate drift on variable WASAPI periods.
+    """
+    g = math.gcd(orig_sr, target_sr)
+    down = max(1, orig_sr // g)
+    approx = max(1, int(round(target_chunk_size * orig_sr / target_sr)))
+    return max(down, math.ceil(approx / down) * down)
+
+
+def resample_to_16k_mono(
+    audio: np.ndarray,
+    orig_sr: int,
+    target_sr: int = 16000,
+) -> np.ndarray:
+    """Downmix to mono and resample audio to target sample rate (default: 16000 Hz) as np.int16.
+
+    Input audio can be a 1D or 2D array of numeric samples (int16, float32, etc.).
+    Normalized floating-point PCM in ``[-1.0, 1.0]`` is scaled to full-scale 16-bit signed PCM
+    before resampling, while already-scaled float arrays (e.g. ``[-32768, 32767]``) are preserved.
+    Returns a contiguous 1D np.int16 array with values clipped to [-32768, 32767].
+    """
+    if audio.size == 0:
+        return np.empty(0, dtype=np.int16)
+
+    mono = _to_mono_int16_scale(audio)
+    return _resample_mono_scaled(mono, orig_sr=orig_sr, target_sr=target_sr)
 
 
 class AudioChunkBuffer:
@@ -620,8 +675,13 @@ class AudioManager:
         self._output_queue: queue.Queue[bytes] = queue.Queue()
         self._current_output_bytes = bytearray()
         self._input_accumulator = bytearray()
+        self._native_mono_chunks: list[np.ndarray] = []
+        self._native_mono_count: int = 0
+        self._native_mono_sr: int = 0
         self._is_speaking = threading.Event()
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._input_buf_lock = threading.Lock()
         self._running = False
         self._last_input_callback_time: float = 0.0
         self._input_callback_count: int = 0
@@ -633,6 +693,11 @@ class AudioManager:
         self._health_monitored: bool = False
         self._wasapi_retry_delay: float = 0.35
         self._default_endpoint_ids: tuple[str | None, str | None] = (None, None)
+        self._input_fell_back_to_other_device: bool = False
+        self._fallback_reclaim_attempts: int = 0
+        self._fallback_opened_at: float = 0.0
+        self._fallback_reclaim_max_attempts: int = 3
+        self._fallback_reclaim_base_delay: float = 3.0
 
     @property
     def is_speaking(self) -> bool:
@@ -690,13 +755,41 @@ class AudioManager:
             return True, "os_default_output_changed"
         return False, "ok"
 
+    def should_reclaim_primary_input(self) -> tuple[bool, str]:
+        """Check if a transient fallback to a non-default physical mic should reclaim primary.
+
+        Only triggers when ``self.input_device is None`` AND startup fell back to a
+        *different* physical microphone (e.g. built-in mic while Bluetooth HFP SCO was
+        still negotiating during connect). Bounded to ``_fallback_reclaim_max_attempts``
+        with exponential backoff so permanently broken devices never loop.
+        """
+        if self.input_device is not None:
+            return False, "pinned"
+        with self._lock:
+            if not self._running or not self._input_fell_back_to_other_device:
+                return False, "ok"
+            if self._fallback_reclaim_attempts >= self._fallback_reclaim_max_attempts:
+                return False, "reclaim_exhausted"
+            delay = self._fallback_reclaim_base_delay * (2**self._fallback_reclaim_attempts)
+            if (time.monotonic() - self._fallback_opened_at) < delay:
+                return False, "backoff"
+            self._fallback_reclaim_attempts += 1
+            return True, "os_default_reclaim_primary_input"
+
     def set_input_callback(self, callback: Callable[[bytes], None] | None) -> None:
         """Set or update the microphone PCM data callback."""
         with self._lock:
             self._on_audio_input = callback
 
+    def _clear_native_mono_buffer(self) -> None:
+        with self._input_buf_lock:
+            self._native_mono_chunks.clear()
+            self._native_mono_count = 0
+            self._native_mono_sr = 0
+
     def flush_input_buffer(self) -> None:
         """Flush buffered microphone samples (e.g. when returning to wake-word IDLE)."""
+        self._clear_native_mono_buffer()
         with self._lock:
             self._input_accumulator.clear()
             if self._chunk_buffer is not None:
@@ -744,14 +837,15 @@ class AudioManager:
         retry_delay: float = 0.5,
     ) -> bool:
         """Stop streams, refresh PortAudio endpoints, and reopen audio I/O safely."""
-        try:
-            self.stop()
-            refresh_audio_devices()
-            self.start(max_attempts=max_attempts, retry_delay=retry_delay)
-            return True
-        except Exception as exc:
-            logger.warning("AudioManager stream recovery failed: %s", exc)
-            return False
+        with self._lifecycle_lock:
+            try:
+                self.stop()
+                refresh_audio_devices()
+                self.start(max_attempts=max_attempts, retry_delay=retry_delay)
+                return True
+            except Exception as exc:
+                logger.warning("AudioManager stream recovery failed: %s", exc)
+                return False
 
     def start(self, *, max_attempts: int = 1, retry_delay: float = 1.0) -> None:
         """Start microphone input and audio output streams, retrying transient endpoint failures."""
@@ -812,22 +906,23 @@ class AudioManager:
                     preferred_channels=1,
                 )
             # On Windows WASAPI, pass blocksize=0 so PortAudio uses the native WASAPI engine
-            # period (~10 ms) instead of forcing an 80 ms ring-buffer adapter that causes
-            # 1.5-3.0s startup stalls and PaErrorCode -9999 on Bluetooth HFP SCO headsets;
-            # AudioChunkBuffer(1280) assembles exact 80 ms chunks downstream.
+            # period (~10 ms) without forcing an 80 ms PortAudio ring-buffer adapter; exact
+            # 80 ms native-rate blocks are accumulated before polyphase resampling downstream.
             blocksize = 0 if inp_wasapi else int(sample_rate * 0.08)
             extra_options: list[Any] = (
                 [sd.WasapiSettings(auto_convert=True), None]
                 if (inp_wasapi and hasattr(sd, "WasapiSettings"))
                 else [None]
             )
-            # Bluetooth HFP SCO endpoints often need ~300-400 ms to wake from A2DP idle;
-            # retry primary WASAPI once after a brief settle pause before falling back.
+            # Bluetooth HFP SCO endpoints often need ~350-800 ms to wake from A2DP idle;
+            # retry primary WASAPI after a brief settle pause before falling back.
             attempt_specs: list[tuple[Any, int, float]] = [
                 (extra, blocksize, 0.0) for extra in extra_options
             ]
             if idx_pos == 0 and inp_wasapi and self._wasapi_retry_delay >= 0.0:
                 attempt_specs.append((extra_options[0], blocksize, self._wasapi_retry_delay))
+                if len(extra_options) > 1:
+                    attempt_specs.append((extra_options[1], blocksize, 0.0))
 
             for attempt_idx, (extra, try_blocksize, delay_before) in enumerate(attempt_specs):
                 if delay_before > 0.0:
@@ -918,7 +1013,21 @@ class AudioManager:
                 if (out_wasapi and hasattr(sd, "WasapiSettings"))
                 else [None]
             )
-            for extra in extra_options:
+            attempt_specs: list[tuple[Any, float]] = [(extra, 0.0) for extra in extra_options]
+            if idx_pos == 0 and out_wasapi and self._wasapi_retry_delay >= 0.0:
+                attempt_specs.append((extra_options[0], self._wasapi_retry_delay))
+                if len(extra_options) > 1:
+                    attempt_specs.append((extra_options[1], 0.0))
+
+            for attempt_idx, (extra, delay_before) in enumerate(attempt_specs):
+                if delay_before > 0.0:
+                    logger.debug(
+                        "Retrying primary WASAPI output #%d '%s' after %.2fs settle pause...",
+                        out_idx,
+                        dev["name"],
+                        delay_before,
+                    )
+                    time.sleep(delay_before)
                 stream: sd.OutputStream | None = None
                 try:
                     stream = sd.OutputStream(
@@ -946,7 +1055,15 @@ class AudioManager:
                             stream.close()
                         except Exception:
                             pass
-                    if extra is not None:
+                    if attempt_idx + 1 < len(attempt_specs):
+                        logger.debug(
+                            "Output device #%d '%s' attempt %d/%d failed (%s); retrying...",
+                            out_idx,
+                            dev["name"],
+                            attempt_idx + 1,
+                            len(attempt_specs),
+                            exc,
+                        )
                         continue
                     logger.warning(
                         "Failed opening audio output device #%d '%s' (%s): %s%s",
@@ -962,21 +1079,31 @@ class AudioManager:
         raise last_exc
 
     def _start_once(self) -> None:
-        """Start microphone input and audio output streams once (with device fallback)."""
-        with self._lock:
-            if self._running:
-                return
+        """Start microphone input and audio output streams once (with device fallback).
 
-            self._current_output_bytes.clear()
-            self._input_accumulator.clear()
-            self._drain_output_queue()
-            self._is_speaking.clear()
-            self._consecutive_zero_callbacks = 0
-            self._consecutive_zero_samples = 0
-            self._last_input_rms = 0.0
-            self._peak_input_rms = 0.0
-            self._input_callback_count = 0
-            self._input_status_error_count = 0
+        Never holds ``self._lock`` across PortAudio ``start()`` / ``stop()`` / ``close()``
+        or blocking device probes so ``_output_stream_callback`` cannot deadlock against
+        stream startup or error teardown.
+        """
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._running:
+                    return
+                self._current_output_bytes.clear()
+                self._input_accumulator.clear()
+                self._drain_output_queue()
+                self._is_speaking.clear()
+                self._consecutive_zero_callbacks = 0
+                self._consecutive_zero_samples = 0
+                self._last_input_rms = 0.0
+                self._peak_input_rms = 0.0
+                self._input_callback_count = 0
+                self._input_status_error_count = 0
+                if self._chunk_buffer is None:
+                    self._chunk_buffer = AudioChunkBuffer(chunk_size=self.chunk_size or 1280)
+                else:
+                    self._chunk_buffer.clear()
+            self._clear_native_mono_buffer()
 
             # Capture current OS default endpoint IDs BEFORE resolving candidates so any
             # hot-swap occurring mid-startup is caught on the very next watchdog poll.
@@ -994,71 +1121,105 @@ class AudioManager:
                 preferred_hostapi=self.preferred_hostapi,
             )
 
-            if self._chunk_buffer is None:
-                self._chunk_buffer = AudioChunkBuffer(chunk_size=self.chunk_size or 1280)
-            else:
-                self._chunk_buffer.clear()
-
+            inp_stream: sd.InputStream | None = None
+            out_stream: sd.OutputStream | None = None
             try:
                 inp_stream, chosen_in, sample_rate, channels = self._open_input_stream(
                     input_candidates
                 )
+                out_stream, chosen_out = self._open_output_stream(output_candidates)
+            except Exception:
+                for stream in (inp_stream, out_stream):
+                    if stream is not None:
+                        try:
+                            stream.stop()
+                            stream.close()
+                        except Exception as exc:
+                            logger.debug("Error closing partial stream on startup failure: %s", exc)
+                self._clear_native_mono_buffer()
+                with self._lock:
+                    self._input_stream = None
+                    self._output_stream = None
+                    self._running = False
+                    self._input_accumulator.clear()
+                    if self._chunk_buffer is not None:
+                        self._chunk_buffer.clear()
+                self.stop_output()
+                raise
+
+            primary_in_name = str(input_candidates[0].get("name", "")) if input_candidates else ""
+            chosen_in_name = str(chosen_in.get("name", ""))
+            fell_back_other = (
+                self.input_device is None
+                and bool(primary_in_name)
+                and not _is_same_audio_device_name(chosen_in_name, primary_in_name)
+            )
+            now = time.monotonic()
+            with self._lock:
+                prev_defaults = self._default_endpoint_ids
                 self._input_stream = inp_stream
                 self.resolved_input_device = chosen_in
                 self.input_sample_rate = sample_rate
                 self.input_channels = channels
-
-                out_stream, chosen_out = self._open_output_stream(output_candidates)
                 self._output_stream = out_stream
                 self.resolved_output_device = chosen_out
-
                 self._default_endpoint_ids = captured_defaults
-                self._last_input_callback_time = time.monotonic()
+                self._input_fell_back_to_other_device = fell_back_other
+                if not fell_back_other or captured_defaults != prev_defaults:
+                    self._fallback_reclaim_attempts = 0
+                self._fallback_opened_at = now if fell_back_other else 0.0
+                self._last_input_callback_time = now
                 self._running = True
                 self._health_monitored = True
-                logger.info(
-                    "AudioManager started (input=#%d '%s' [%s, %d Hz, %dch], output=#%d '%s', "
-                    "mute_while_speaking=%s).",
-                    chosen_in["index"],
-                    chosen_in.get("name", "unknown"),
-                    chosen_in.get("hostapi_name", "Unknown"),
-                    sample_rate,
-                    channels,
-                    chosen_out["index"],
-                    chosen_out.get("name", "unknown"),
-                    self.mic_mute_while_speaking,
+
+            if fell_back_other:
+                logger.warning(
+                    "Primary OS default input '%s' was temporarily unavailable; using '%s' "
+                    "temporarily and will attempt to reclaim primary OS default while idle.",
+                    primary_in_name,
+                    chosen_in_name,
                 )
-            except Exception:
-                self.stop()
-                raise
+            logger.info(
+                "AudioManager started (input=#%d '%s' [%s, %d Hz, %dch], output=#%d '%s', "
+                "mute_while_speaking=%s).",
+                chosen_in["index"],
+                chosen_in.get("name", "unknown"),
+                chosen_in.get("hostapi_name", "Unknown"),
+                sample_rate,
+                channels,
+                chosen_out["index"],
+                chosen_out.get("name", "unknown"),
+                self.mic_mute_while_speaking,
+            )
 
     def stop(self) -> None:
         """Stop and close both audio streams."""
-        with self._lock:
-            self._running = False
-            inp = self._input_stream
-            out = self._output_stream
-            self._input_stream = None
-            self._output_stream = None
-            self._input_accumulator.clear()
-            if self._chunk_buffer is not None:
-                self._chunk_buffer.clear()
+        with self._lifecycle_lock:
+            with self._lock:
+                self._running = False
+                inp = self._input_stream
+                out = self._output_stream
+                self._input_stream = None
+                self._output_stream = None
+                self._input_accumulator.clear()
+                if self._chunk_buffer is not None:
+                    self._chunk_buffer.clear()
+            self._clear_native_mono_buffer()
+            self.stop_output()
 
-        self.stop_output()
+            if inp is not None:
+                try:
+                    inp.stop()
+                    inp.close()
+                except Exception as exc:
+                    logger.debug("Error stopping input stream: %s", exc)
 
-        if inp is not None:
-            try:
-                inp.stop()
-                inp.close()
-            except Exception as exc:
-                logger.debug("Error stopping input stream: %s", exc)
-
-        if out is not None:
-            try:
-                out.stop()
-                out.close()
-            except Exception as exc:
-                logger.debug("Error stopping output stream: %s", exc)
+            if out is not None:
+                try:
+                    out.stop()
+                    out.close()
+                except Exception as exc:
+                    logger.debug("Error stopping output stream: %s", exc)
 
     def play_audio(self, pcm_bytes: bytes) -> None:
         """Queue 24 kHz 16-bit mono PCM bytes for playback."""
@@ -1109,12 +1270,16 @@ class AudioManager:
             # Mute microphone while speaking; clear buffer to prevent stale stitching
             self._consecutive_zero_callbacks = 0
             self._consecutive_zero_samples = 0
+            self._clear_native_mono_buffer()
             if self._chunk_buffer is not None:
                 self._chunk_buffer.clear()
             return
 
+        if indata.size == 0:
+            return
+
         orig_sr = getattr(self, "input_sample_rate", INPUT_AUDIO_SAMPLE_RATE_HZ)
-        if indata.size > 0 and not np.any(indata):
+        if not np.any(indata):
             block_80ms = max(1, int(orig_sr * 0.08))
             chunk_frames = int(indata.shape[0])
             if chunk_frames >= block_80ms:
@@ -1130,13 +1295,8 @@ class AudioManager:
             self._consecutive_zero_callbacks = 0
             self._consecutive_zero_samples = 0
 
-        resampled_16k = resample_to_16k_mono(
-            indata,
-            orig_sr=orig_sr,
-            target_sr=INPUT_AUDIO_SAMPLE_RATE_HZ,
-        )
-
-        rms = compute_audio_rms(resampled_16k)
+        mono = _to_mono_int16_scale(indata)
+        rms = compute_audio_rms(mono)
         self._last_input_rms = rms
         if rms > self._peak_input_rms:
             self._peak_input_rms = rms
@@ -1146,13 +1306,67 @@ class AudioManager:
             return
 
         if self._chunk_buffer is not None:
-            self._chunk_buffer.extend(resampled_16k)
+            if orig_sr == INPUT_AUDIO_SAMPLE_RATE_HZ:
+                self._chunk_buffer.extend(
+                    _resample_mono_scaled(
+                        mono, orig_sr=orig_sr, target_sr=INPUT_AUDIO_SAMPLE_RATE_HZ
+                    )
+                )
+            else:
+                # Accumulate native-rate mono samples into exact rational-aligned blocks
+                # (e.g. 3840 @ 48 kHz, 3528 @ 44.1 kHz) BEFORE polyphase resampling so
+                # 10 ms / variable-period WASAPI callbacks have zero boundary ringing or drift.
+                native_block = _native_resample_block_size(
+                    orig_sr,
+                    INPUT_AUDIO_SAMPLE_RATE_HZ,
+                    self._chunk_buffer.chunk_size,
+                )
+                ready_blocks: list[np.ndarray] = []
+                with self._input_buf_lock:
+                    if self._native_mono_sr != orig_sr:
+                        self._native_mono_chunks.clear()
+                        self._native_mono_count = 0
+                        self._native_mono_sr = orig_sr
+                    # Copy out of PortAudio's reusable callback buffer before storing
+                    self._native_mono_chunks.append(np.array(mono, dtype=np.float32, copy=True))
+                    self._native_mono_count += len(mono)
+                    if self._native_mono_count >= native_block:
+                        combined = (
+                            self._native_mono_chunks[0]
+                            if len(self._native_mono_chunks) == 1
+                            else np.concatenate(self._native_mono_chunks)
+                        )
+                        offset = 0
+                        total = len(combined)
+                        while offset + native_block <= total:
+                            ready_blocks.append(combined[offset : offset + native_block])
+                            offset += native_block
+                        if offset < total:
+                            rem = np.array(combined[offset:], dtype=np.float32, copy=True)
+                            self._native_mono_chunks = [rem]
+                            self._native_mono_count = len(rem)
+                        else:
+                            self._native_mono_chunks = []
+                            self._native_mono_count = 0
+                for block in ready_blocks:
+                    resampled = _resample_mono_scaled(
+                        block,
+                        orig_sr=orig_sr,
+                        target_sr=INPUT_AUDIO_SAMPLE_RATE_HZ,
+                    )
+                    self._chunk_buffer.extend(resampled)
+
             for chunk in self._chunk_buffer.get_chunks():
                 try:
                     cb(chunk.tobytes())
                 except Exception:
                     logger.exception("Error in audio input callback.")
         else:
+            resampled_16k = _resample_mono_scaled(
+                mono,
+                orig_sr=orig_sr,
+                target_sr=INPUT_AUDIO_SAMPLE_RATE_HZ,
+            )
             try:
                 cb(resampled_16k.tobytes())
             except Exception:

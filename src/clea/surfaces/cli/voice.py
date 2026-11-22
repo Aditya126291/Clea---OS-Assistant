@@ -601,6 +601,15 @@ def run_voice_diagnose_mic(
                 f"Active selected output: #{selected_output['index']} '{selected_output['name']}' "
                 f"(host API: {selected_output.get('hostapi_name', 'Unknown')})"
             )
+        # Wait briefly for Bluetooth HFP SCO wake-up (can take 0.7-1.6s on cold connect)
+        # when using the real AudioManager so cold wake-up does not eat the sampling window.
+        if audio_manager_factory is None:
+            warmup_deadline = time.monotonic() + 2.0
+            while (
+                getattr(audio, "_input_callback_count", 0) == 0
+                and time.monotonic() < warmup_deadline
+            ):
+                time.sleep(0.05)
         print_fn(
             f"Sampling live mic audio for {sample_duration:.1f}s "
             f"(say '{config.wake_word_model}' to test wake score)..."
