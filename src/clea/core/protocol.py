@@ -269,6 +269,14 @@ class OsSelectClipboardItemParams(_Model):
 class OsOpenUrlParams(_Model):
     url: str = Field(description="URL to open (http or https)")
     browser: str | None = Field(default=None, description="Optional browser executable or name")
+    prefer_browser: bool = Field(
+        default=False,
+        description="Set true only when the user explicitly requests opening in a web browser",
+    )
+    user_request: str | None = Field(
+        default=None,
+        description="Optional user request text for explicit-browser detection",
+    )
 
 
 class OsControlSystemParams(_Model):
@@ -1472,6 +1480,13 @@ class OsOpenUrlResult(_Model):
     url: str
     browser: str | None = None
     message: str | None = None
+    routed_to_installed_app: bool = False
+    app_name: str | None = None
+    window_hwnd: int | None = None
+    window_title: str | None = None
+    resolution_layer: str | None = None
+    guidance: str | None = None
+    reused_browser_window: bool = False
 
 
 class OsControlSystemResult(_Model):

@@ -3216,10 +3216,32 @@ class CleaDaemon:
     async def _handle_os_open_url(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         try:
+            open_kwargs: dict[str, Any] = {}
+            accepted_params: set[str] | None = None
+            try:
+                sig = inspect.signature(open_url)
+                if not any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    accepted_params = set(sig.parameters.keys())
+            except (TypeError, ValueError):
+                accepted_params = None
+
+            if getattr(req.params, "prefer_browser", False) and (
+                accepted_params is None or "prefer_browser" in accepted_params
+            ):
+                open_kwargs["prefer_browser"] = True
+            if getattr(req.params, "user_request", None) and (
+                accepted_params is None or "user_request" in accepted_params
+            ):
+                open_kwargs["user_request"] = req.params.user_request
+
             if req.params.browser is not None:
-                res = await asyncio.to_thread(open_url, req.params.url, req.params.browser)
+                res = await asyncio.to_thread(
+                    open_url, req.params.url, req.params.browser, **open_kwargs
+                )
             else:
-                res = await asyncio.to_thread(open_url, req.params.url)
+                res = await asyncio.to_thread(open_url, req.params.url, **open_kwargs)
         except (
             ValueError,
             OSError,

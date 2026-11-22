@@ -446,6 +446,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print real-time audio statistics (RMS, frames/sec) and server message types",
     )
+    voice_parser.add_argument(
+        "--diagnose-mic",
+        action="store_true",
+        help=(
+            "Print candidate input devices, active selected device, 2s live RMS, and peak "
+            "wake-word score (read-only; never mutates %LOCALAPPDATA%\\clea)"
+        ),
+    )
     voice_subparsers = voice_parser.add_subparsers(dest="voice_subcommand")
 
     voice_doctor = voice_subparsers.add_parser(
@@ -503,10 +511,17 @@ def main(argv: list[str] | None = None) -> None:
         elif args.memory_subcommand == "reconsolidate":
             asyncio.run(_run_memory_reconsolidate_cmd(args.session_id, args.url))
     elif args.command == "voice":
-        from clea.surfaces.cli.voice import run_voice_doctor, run_voice_service, run_voice_test
+        from clea.surfaces.cli.voice import (
+            run_voice_diagnose_mic,
+            run_voice_doctor,
+            run_voice_service,
+            run_voice_test,
+        )
 
         debug_audio = getattr(args, "debug_audio", False)
-        if args.voice_subcommand == "doctor":
+        if getattr(args, "diagnose_mic", False):
+            run_voice_diagnose_mic()
+        elif args.voice_subcommand == "doctor":
             run_voice_doctor(download_models=args.download_models)
         elif args.voice_subcommand == "test":
             run_voice_test(debug_audio=debug_audio)

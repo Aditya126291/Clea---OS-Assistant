@@ -419,6 +419,14 @@ export type Url = string;
  * Optional browser executable or name
  */
 export type Browser = string | null;
+/**
+ * Set true only when the user explicitly requests opening in a web browser
+ */
+export type PreferBrowser = boolean;
+/**
+ * Optional user request text for explicit-browser detection
+ */
+export type UserRequest = string | null;
 export type FrameType55 = "request";
 export type Id56 = string;
 export type SessionId65 = string | null;
@@ -1097,13 +1105,20 @@ export type Status13 = string;
 export type Url1 = string;
 export type Browser1 = string | null;
 export type Message9 = string | null;
+export type RoutedToInstalledApp = boolean;
+export type AppName6 = string | null;
+export type WindowHwnd = number | null;
+export type WindowTitle2 = string | null;
+export type ResolutionLayer = string | null;
+export type Guidance = string | null;
+export type ReusedBrowserWindow = boolean;
 export type Ok18 = boolean;
 export type Success2 = boolean;
 export type Action9 = string;
 export type Status14 = string;
 export type Level3 = number | null;
 export type CurrentBrightness = number | null;
-export type WindowTitle2 = string | null;
+export type WindowTitle3 = string | null;
 export type Hwnd2 = number | null;
 export type Page1 = string | null;
 export type Uri1 = string | null;
@@ -1146,7 +1161,7 @@ export type Error7 = string | null;
 export type Ok23 = boolean;
 export type Status19 = "ok" | "minimized" | "not_found" | "empty" | "error" | "non_interactive_desktop";
 export type Source4 = string | null;
-export type WindowTitle3 = string | null;
+export type WindowTitle4 = string | null;
 export type ProcessName = string | null;
 export type Question1 = string | null;
 export type Width2 = number | null;
@@ -1158,7 +1173,7 @@ export type Message12 = string | null;
 export type ImageBase64 = string | null;
 export type ImageMimeType = string | null;
 export type Ok24 = boolean;
-export type WindowTitle4 = string;
+export type WindowTitle5 = string;
 export type Count = number;
 export type Index3 = number;
 export type Name6 = string;
@@ -1192,7 +1207,7 @@ export type Reason7 = string | null;
 export type Error9 = string | null;
 export type Ok27 = boolean;
 export type SnapshotId = string;
-export type WindowTitle5 = string;
+export type WindowTitle6 = string;
 export type Count1 = number;
 export type ElementCount = number | null;
 export type Ref2 = string;
@@ -1219,7 +1234,7 @@ export type Y6 = number | null;
 export type CharCount4 = number | null;
 export type IntervalMs2 = number | null;
 export type WindowChanged = boolean;
-export type WindowTitle6 = string;
+export type WindowTitle7 = string;
 export type Ref4 = string;
 export type Role9 = string;
 export type Name10 = string;
@@ -2003,6 +2018,8 @@ export interface OsOpenUrlRequest {
 export interface OsOpenUrlParams {
   url: Url;
   browser?: Browser;
+  prefer_browser?: PreferBrowser;
+  user_request?: UserRequest;
 }
 export interface OsControlSystemRequest {
   frame_type?: FrameType55;
@@ -3013,6 +3030,13 @@ export interface OsOpenUrlResult {
   url: Url1;
   browser?: Browser1;
   message?: Message9;
+  routed_to_installed_app?: RoutedToInstalledApp;
+  app_name?: AppName6;
+  window_hwnd?: WindowHwnd;
+  window_title?: WindowTitle2;
+  resolution_layer?: ResolutionLayer;
+  guidance?: Guidance;
+  reused_browser_window?: ReusedBrowserWindow;
 }
 export interface OsControlSystemResult {
   ok?: Ok18;
@@ -3021,7 +3045,7 @@ export interface OsControlSystemResult {
   status?: Status14;
   level?: Level3;
   current_brightness?: CurrentBrightness;
-  window_title?: WindowTitle2;
+  window_title?: WindowTitle3;
   hwnd?: Hwnd2;
   page?: Page1;
   uri?: Uri1;
@@ -3076,7 +3100,7 @@ export interface OsInspectScreenResult {
   ok?: Ok23;
   status?: Status19;
   source?: Source4;
-  window_title?: WindowTitle3;
+  window_title?: WindowTitle4;
   process_name?: ProcessName;
   question?: Question1;
   width?: Width2;
@@ -3090,7 +3114,7 @@ export interface OsInspectScreenResult {
 }
 export interface OsInspectUiElementsResult {
   ok?: Ok24;
-  window_title?: WindowTitle4;
+  window_title?: WindowTitle5;
   count?: Count;
   elements?: Elements;
 }
@@ -3134,7 +3158,7 @@ export interface OsGuiActionResult {
 export interface OsUiSnapshotResult {
   ok?: Ok27;
   snapshot_id?: SnapshotId;
-  window_title?: WindowTitle5;
+  window_title?: WindowTitle6;
   count?: Count1;
   element_count?: ElementCount;
   elements?: Elements1;
@@ -3172,7 +3196,7 @@ export interface OsUiActResult {
 }
 export interface UiDiff {
   window_changed?: WindowChanged;
-  window_title?: WindowTitle6;
+  window_title?: WindowTitle7;
   changed_values?: ChangedValues;
   added_elements?: AddedElements;
   removed_count?: RemovedCount3;

@@ -11,8 +11,12 @@ from typing import Any
 import numpy as np
 
 from clea.paths import default_data_dir
+from clea.surfaces.voice.audio import resample_to_16k_mono
 
 logger = logging.getLogger(__name__)
+
+WAKE_WORD_SAMPLE_RATE_HZ = 16000
+WAKE_WORD_CHUNK_SAMPLES = 1280
 
 MODELS_SUBDIR = "models"
 
@@ -162,6 +166,7 @@ class WakeWordDetector:
         self.threshold = threshold
         self.data_dir = data_dir
         self._target_dir = wake_word_models_dir(data_dir)
+        self._pending_samples: np.ndarray = np.empty(0, dtype=np.int16)
 
         if model_instance is not None:
             self._model = model_instance
@@ -190,29 +195,9 @@ class WakeWordDetector:
             inference_framework="onnx",
         )
 
-    def process_audio(self, pcm_bytes: bytes | np.ndarray) -> tuple[bool, float, str]:
-        """Process 16 kHz 16-bit mono audio chunk.
-
-        Returns (detected: bool, score: float, model_key: str).
-        """
-        if pcm_bytes is None:
-            return False, 0.0, ""
-
-        if isinstance(pcm_bytes, np.ndarray):
-            if pcm_bytes.size == 0:
-                return False, 0.0, ""
-            if np.issubdtype(pcm_bytes.dtype, np.floating):
-                pcm_bytes = np.nan_to_num(pcm_bytes, nan=0.0, posinf=32767.0, neginf=-32768.0)
-            audio_arr = np.ascontiguousarray(pcm_bytes.reshape(-1), dtype=np.int16)
-        else:
-            if not pcm_bytes:
-                return False, 0.0, ""
-            audio_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
-
-        if len(audio_arr) == 0:
-            return False, 0.0, ""
-
-        predictions = self._model.predict(audio_arr)
+    def _predict_single_chunk(self, chunk: np.ndarray) -> tuple[bool, float, str]:
+        """Run openwakeword predict on a single contiguous 1D int16 16 kHz array."""
+        predictions = self._model.predict(np.ascontiguousarray(chunk, dtype=np.int16))
 
         if predictions:
             if self.model_key in predictions:
@@ -239,8 +224,81 @@ class WakeWordDetector:
 
         return False, best_score, best_key
 
+    def process_audio(
+        self,
+        pcm_bytes: bytes | np.ndarray,
+        *,
+        sample_rate: int = WAKE_WORD_SAMPLE_RATE_HZ,
+    ) -> tuple[bool, float, str]:
+        """Process audio into guaranteed mono 16 kHz int16 chunks for openwakeword.
+
+        Normalized float inputs in ``[-1.0, 1.0]``, multi-channel arrays, and non-16 kHz
+        sample rates are automatically scaled, downmixed, and resampled. Multi-frame buffers
+        larger than 1280 samples (80 ms) are stepped into exact 1280-sample chunks.
+
+        Returns (detected: bool, score: float, model_key: str).
+        """
+        if pcm_bytes is None:
+            return False, 0.0, ""
+
+        if isinstance(pcm_bytes, np.ndarray):
+            if pcm_bytes.size == 0:
+                return False, 0.0, ""
+            audio_arr = resample_to_16k_mono(
+                pcm_bytes,
+                orig_sr=sample_rate,
+                target_sr=WAKE_WORD_SAMPLE_RATE_HZ,
+            )
+        else:
+            if not pcm_bytes:
+                return False, 0.0, ""
+            usable_len = len(pcm_bytes) - (len(pcm_bytes) % 2)
+            if usable_len == 0:
+                return False, 0.0, ""
+            raw_arr = np.frombuffer(pcm_bytes[:usable_len], dtype=np.int16)
+            if sample_rate != WAKE_WORD_SAMPLE_RATE_HZ:
+                audio_arr = resample_to_16k_mono(
+                    raw_arr,
+                    orig_sr=sample_rate,
+                    target_sr=WAKE_WORD_SAMPLE_RATE_HZ,
+                )
+            else:
+                audio_arr = np.ascontiguousarray(raw_arr, dtype=np.int16)
+
+        if len(audio_arr) == 0:
+            return False, 0.0, ""
+
+        if self._pending_samples.size > 0:
+            audio_arr = np.concatenate((self._pending_samples, audio_arr))
+            self._pending_samples = np.empty(0, dtype=np.int16)
+
+        if len(audio_arr) <= WAKE_WORD_CHUNK_SAMPLES:
+            return self._predict_single_chunk(audio_arr)
+
+        # Step multi-frame buffers through openwakeword in exact 1280-sample (80 ms) chunks.
+        best_score = 0.0
+        best_key = self.model_key
+        detected_any = False
+        offset = 0
+        total = len(audio_arr)
+        while offset + WAKE_WORD_CHUNK_SAMPLES <= total:
+            chunk = audio_arr[offset : offset + WAKE_WORD_CHUNK_SAMPLES]
+            offset += WAKE_WORD_CHUNK_SAMPLES
+            det, score, key = self._predict_single_chunk(chunk)
+            if score >= best_score:
+                best_score = score
+                best_key = key
+            if det:
+                detected_any = True
+
+        if offset < total:
+            self._pending_samples = np.ascontiguousarray(audio_arr[offset:], dtype=np.int16)
+
+        return detected_any, best_score, best_key
+
     def reset(self) -> None:
         """Reset internal prediction buffers and preprocessor state."""
+        self._pending_samples = np.empty(0, dtype=np.int16)
         if hasattr(self._model, "reset"):
             try:
                 self._model.reset()

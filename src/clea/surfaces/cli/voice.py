@@ -8,6 +8,7 @@ import logging.handlers
 import os
 import sys
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,7 @@ from clea.surfaces.voice.audio import (
     AudioManager,
     compute_audio_rms,
     list_audio_devices,
+    list_candidate_audio_devices,
     negotiate_input_sample_rate,
     resample_to_16k_mono,
     resolve_audio_device,
@@ -486,3 +488,149 @@ def run_voice_test(*, debug_audio: bool = False) -> None:
     finally:
         audio.stop()
     print("========================")
+
+
+def run_voice_diagnose_mic(
+    *,
+    duration: float = 2.0,
+    print_fn: Callable[[str], None] = print,
+    audio_manager_factory: Callable[..., AudioManager] | None = None,
+    detector_factory: Callable[..., WakeWordDetector] | None = None,
+) -> dict[str, Any]:
+    """Read-only microphone & wake-word diagnostic (never mutates %LOCALAPPDATA%\\clea).
+
+    Prints candidate input devices, active selected device, live RMS levels over
+    *duration* seconds (default 2.0s), and peak wake-word model score.
+    """
+    enable_per_monitor_dpi_awareness()
+    config = load_voice_config(create_if_missing=False)
+    sample_duration = max(0.2, float(duration))
+
+    print_fn("=== Clea Voice Mic Diagnostic (Read-Only) ===")
+    candidates: list[dict[str, Any]] = []
+    try:
+        candidates = list_candidate_audio_devices(
+            config.input_device,
+            kind="input",
+            preferred_hostapi=config.preferred_hostapi,
+        )
+    except Exception as exc:
+        print_fn(f"[FAIL] Could not enumerate candidate input devices: {exc}")
+        return {
+            "ok": False,
+            "error": str(exc),
+            "candidates": [],
+            "selected_device": None,
+            "mean_rms": 0.0,
+            "peak_rms": 0.0,
+            "peak_wake_score": 0.0,
+            "frames": 0,
+        }
+
+    print_fn(f"Candidate input devices ({len(candidates)}):")
+    for idx_pos, dev in enumerate(candidates):
+        print_fn(
+            f"  {idx_pos + 1}. #{dev['index']} '{dev['name']}' "
+            f"(host API: {dev.get('hostapi_name', 'Unknown')}, "
+            f"native rate: {int(dev.get('default_samplerate', 16000))} Hz, "
+            f"in_ch: {dev.get('max_input_channels', 0)})"
+        )
+
+    detector: WakeWordDetector | None = None
+    detector_note = ""
+    if detector_factory is not None:
+        detector = detector_factory(
+            model_name=config.wake_word_model,
+            threshold=config.wake_threshold,
+        )
+    else:
+        all_present, _missing = check_models_status(config.wake_word_model)
+        if all_present:
+            try:
+                detector = WakeWordDetector(
+                    model_name=config.wake_word_model,
+                    threshold=config.wake_threshold,
+                )
+            except Exception as exc:
+                detector_note = f"detector init failed: {exc}"
+        else:
+            detector_note = "wake-word model files not downloaded"
+
+    rms_values: list[float] = []
+    peak_wake_score = 0.0
+    wake_triggered = False
+
+    def _on_chunk(pcm_bytes: bytes) -> None:
+        nonlocal peak_wake_score, wake_triggered
+        rms = compute_audio_rms(pcm_bytes)
+        rms_values.append(rms)
+        if detector is not None:
+            try:
+                det, score, _key = detector.process_audio(pcm_bytes)
+                if score > peak_wake_score:
+                    peak_wake_score = float(score)
+                if det:
+                    wake_triggered = True
+            except Exception:
+                pass
+
+    factory = audio_manager_factory or AudioManager
+    audio = factory(
+        input_device=config.input_device,
+        output_device=config.output_device,
+        preferred_hostapi=config.preferred_hostapi,
+        on_audio_input=_on_chunk,
+        chunk_size=1280,
+    )
+
+    selected: dict[str, Any] | None = None
+    try:
+        audio.start()
+        selected = dict(audio.resolved_input_device) if audio.resolved_input_device else None
+        if selected:
+            print_fn(
+                f"Active selected input: #{selected['index']} '{selected['name']}' "
+                f"(host API: {selected.get('hostapi_name', 'Unknown')}, "
+                f"negotiated: {audio.input_sample_rate} Hz, {audio.input_channels}ch)"
+            )
+        print_fn(
+            f"Sampling live mic audio for {sample_duration:.1f}s "
+            f"(say '{config.wake_word_model}' to test wake score)..."
+        )
+        time.sleep(sample_duration)
+    finally:
+        audio.stop()
+
+    mean_rms = float(sum(rms_values) / len(rms_values)) if rms_values else 0.0
+    peak_rms = float(max(rms_values)) if rms_values else 0.0
+    print_fn(
+        f"Live 16 kHz mono int16 telemetry: frames={len(rms_values)}, "
+        f"mean_rms={mean_rms:.1f}, peak_rms={peak_rms:.1f}"
+    )
+    if detector is not None:
+        print_fn(
+            f"Wake word ({config.wake_word_model}): peak_score={peak_wake_score:.3f} "
+            f"(threshold={config.wake_threshold:.2f}, triggered={wake_triggered})"
+        )
+    else:
+        print_fn(f"Wake word ({config.wake_word_model}): skipped ({detector_note})")
+
+    if len(rms_values) == 0 or peak_rms < 3.0:
+        print_fn(
+            "[!] Warning: Captured audio is silent/dead (peak_rms < 3.0). "
+            "Check mic mute, Bluetooth HFP/A2DP conflict, or Windows privacy permissions."
+        )
+    print_fn("=============================================")
+    return {
+        "ok": True,
+        "candidates": candidates,
+        "selected_device": selected,
+        "sample_rate": audio.input_sample_rate,
+        "channels": audio.input_channels,
+        "frames": len(rms_values),
+        "mean_rms": round(mean_rms, 2),
+        "peak_rms": round(peak_rms, 2),
+        "peak_wake_score": round(peak_wake_score, 4),
+        "wake_threshold": config.wake_threshold,
+        "wake_triggered": wake_triggered,
+    }

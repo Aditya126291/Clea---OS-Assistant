@@ -230,23 +230,6 @@ _LAUNCH_APP_ALIASES: dict[str, str] = {
     "ms-settings": "settings",
     "taskmgr": "taskmgr",
     "task manager": "taskmgr",
-    "youtu.be": "youtube",
-    "youtube": "youtube",
-    "spotify": "spotify",
-    "whatsapp": "whatsapp",
-    "github": "github",
-    "mail": "gmail",
-    "gmail": "gmail",
-    "mail.google.com": "gmail",
-    "docs": "docs",
-    "docs.google.com": "docs",
-    "twitter": "x",
-    "x": "x",
-    "x.com": "x",
-    "twitter.com": "x",
-    "chatgpt": "chatgpt",
-    "reddit": "reddit",
-    "wikipedia": "wikipedia",
 }
 
 _LOCAL_FILE_EXTENSIONS: frozenset[str] = frozenset(
@@ -733,6 +716,19 @@ class VoiceRunner:
                     logger.error(str(exc))
                     raise
 
+            # Guarantee wake-word starts armed immediately in IDLE and discard audio queued
+            # during ONNX model load so the detector begins on fresh live 16 kHz frames.
+            self._call_state = "idle"
+            self._wake_word_pending_trigger = False
+            flush_fn = getattr(self._audio_manager, "flush_input_buffer", None)
+            if callable(flush_fn):
+                with contextlib.suppress(Exception):
+                    flush_fn()
+            self._drain_wake_word_queue()
+            if self._wake_word is not None:
+                with contextlib.suppress(Exception):
+                    self._wake_word.reset()
+
             # Start dedicated wake-word worker thread & audio health watchdog for live streams
             # (mocked audio managers in direct unit tests retain synchronous _on_audio_chunk).
             if getattr(self._audio_manager, "_health_monitored", False):
@@ -741,6 +737,14 @@ class VoiceRunner:
                     self._audio_health_watchdog(),
                     name="VoiceRunnerAudioHealthWatchdog",
                 )
+            logger.info(
+                "Wake-word listener armed (model=%s, threshold=%.2f, sample_rate=%d Hz, "
+                "worker_thread=%s).",
+                getattr(self._wake_word, "model_key", self.config.wake_word_model),
+                float(getattr(self._wake_word, "threshold", self.config.wake_threshold)),
+                int(getattr(self._audio_manager, "input_sample_rate", 16000)),
+                bool(self._wake_word_thread and self._wake_word_thread.is_alive()),
+            )
 
             # 3. Initialize Win32 hotkey if enabled
             if self._enable_hotkey:
@@ -936,6 +940,9 @@ class VoiceRunner:
 
                 def _on_trigger_done(done_fut: Any) -> None:
                     with contextlib.suppress(Exception):
+                        if done_fut.cancelled():
+                            self._wake_word_pending_trigger = False
+                            return
                         exc = done_fut.exception()
                         if exc is not None:
                             self._wake_word_pending_trigger = False
@@ -963,21 +970,53 @@ class VoiceRunner:
             healthy, reason = health_fn()
             if healthy:
                 continue
-            logger.warning(
-                "Audio input stream unhealthy (%s); attempting automatic recovery...",
-                reason,
+            demote_silent = reason.startswith(
+                ("sustained_zero_audio_", "sustained_silent_audio_")
             )
-            recovered = await asyncio.to_thread(restart_fn)
+            telemetry_fn = getattr(am, "input_rms_telemetry", None)
+            telemetry = telemetry_fn() if callable(telemetry_fn) else {}
+            logger.warning(
+                "Audio input stream unhealthy (%s, last_rms=%s, peak_rms=%s); "
+                "attempting automatic recovery (demote_current=%s)...",
+                reason,
+                telemetry.get("last_rms", "?"),
+                telemetry.get("peak_rms", "?"),
+                demote_silent,
+            )
+
+            def _invoke_restart(
+                fn: Callable[..., Any] = restart_fn,
+                demote: bool = demote_silent,
+            ) -> bool:
+                try:
+                    sig = inspect.signature(fn)
+                    if any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "demote_current"
+                        for p in sig.parameters.values()
+                    ):
+                        return bool(fn(demote_current=demote))
+                except (TypeError, ValueError):
+                    pass
+                return bool(fn())
+
+            recovered = await asyncio.to_thread(_invoke_restart)
             if recovered:
                 self._drain_wake_word_queue()
                 if self._wake_word is not None:
                     self._wake_word.reset()
+                if self._wake_word_thread is None or not self._wake_word_thread.is_alive():
+                    self._start_wake_word_worker()
                 inp = getattr(am, "resolved_input_device", None) or {}
+                post_telemetry = telemetry_fn() if callable(telemetry_fn) else {}
                 logger.info(
-                    "Audio input stream recovered on #%s '%s' (host API: %s).",
+                    "Audio input stream recovered on #%s '%s' (host API: %s, rate: %s Hz, "
+                    "channels: %s, last_rms: %s).",
                     inp.get("index", "?"),
                     inp.get("name", "unknown"),
                     inp.get("hostapi_name", "Unknown"),
+                    getattr(am, "input_sample_rate", "?"),
+                    getattr(am, "input_channels", "?"),
+                    post_telemetry.get("last_rms", "?"),
                 )
 
     def _enqueue_outbound_audio(self, pcm_bytes: bytes) -> None:
@@ -1436,6 +1475,13 @@ class VoiceRunner:
         self._drain_wake_word_queue()
         if self._wake_word is not None:
             self._wake_word.reset()
+        if (
+            self._audio_manager is not None
+            and getattr(self._audio_manager, "_health_monitored", False)
+            and not self._stop_event.is_set()
+            and (self._wake_word_thread is None or not self._wake_word_thread.is_alive())
+        ):
+            self._start_wake_word_worker()
 
         # Write usage & metrics record off the event loop
         await asyncio.to_thread(
@@ -3435,7 +3481,13 @@ class VoiceRunner:
                                 "deduplicated": True,
                                 "url": url,
                                 "target": norm_target,
-                                "app": prev.get("app") or norm_target,
+                                "app": prev.get("app") or prev.get("app_name") or norm_target,
+                                "guidance": (
+                                    "Installed app is already focused. Continue the task inside "
+                                    "this single app window using UIA (ui_snapshot/ui_act), "
+                                    "in-app keyboard shortcuts, or targeted screen inspection. "
+                                    "Do NOT call open_url again."
+                                ),
                                 "message": (
                                     f"Target '{norm_target}' was already launched or focused "
                                     "in this turn; skipped duplicate URL launch."
@@ -3448,14 +3500,25 @@ class VoiceRunner:
                 )
                 return
 
+            request_context = _req_str("reason") or _req_str("context")
+            if request_context is None and self._transcript_history:
+                last_entry = self._transcript_history[-1]
+                if (
+                    isinstance(last_entry, dict)
+                    and last_entry.get("role") == "user"
+                    and isinstance(last_entry.get("text"), str)
+                    and last_entry["text"].strip()
+                ):
+                    request_context = last_entry["text"].strip()
             browser_explicit = _is_browser_explicitly_requested(
-                _req_str("reason") or _req_str("context"),
+                request_context,
                 browser,
             ) or _parse_bool("prefer_browser", default=False)
 
-            # Installed-App-First Policy: when no browser is explicitly requested and the URL
-            # is a service/app target, resolve and launch the installed app first, falling back
-            # to the browser URL only if no installed app match exists.
+            # Installed-App-First Policy: for root service URLs without explicit browser request,
+            # focus/launch the installed app directly; deep URLs flow through daemon os.open_url
+            # which runs the full 3-layer OS resolver (AppUriHandlers -> URL Protocol -> Installed
+            # Apps / running standalone PWAs) and never spawns Chrome/Edge if an app is installed.
             if not browser_explicit and _is_app_candidate_url(url, norm_target):
                 try:
                     app_res = await self._rpc(
@@ -3474,7 +3537,21 @@ class VoiceRunner:
                     ):
                         enriched = dict(app_res)
                         enriched.setdefault("url", url)
-                        enriched.setdefault("resolved_via", "installed_app")
+                        if app_res.get("launched_app") is not False:
+                            enriched.setdefault("resolved_via", "installed_app")
+                            enriched.setdefault("routed_to_installed_app", True)
+                            enriched.setdefault("app_name", app_res.get("app") or norm_target)
+                            enriched.setdefault("window_hwnd", app_res.get("hwnd"))
+                            enriched.setdefault("resolution_layer", "installed_app")
+                            enriched.setdefault(
+                                "guidance",
+                                "Installed app is focused. Continue the task inside this single "
+                                "app window using UIA (ui_snapshot/ui_act), in-app keyboard "
+                                "shortcuts, or targeted screen inspection. Do NOT call open_url "
+                                "again.",
+                            )
+                        else:
+                            enriched.setdefault("routed_to_installed_app", False)
                         self._turn_launched_targets[norm_target] = enriched
                         await backend.send_tool_responses(
                             [
@@ -3497,6 +3574,8 @@ class VoiceRunner:
                         params=OsOpenUrlParams(
                             url=url,
                             browser=browser,
+                            prefer_browser=browser_explicit,
+                            user_request=request_context,
                         )
                     ),
                     timeout=10.0,

@@ -1104,10 +1104,10 @@ def _enumerate_windows_ctypes(user32: Any, kernel32: Any) -> list[EnumeratedWind
                 kernel32.CloseHandle(h_proc)
 
     def _on_window(hwnd: int, _lparam: int) -> bool:
-        if bool(user32.IsWindowVisible(hwnd)):
-            if _is_window_cloaked_ctypes(int(hwnd), user32) and not (
-                hasattr(user32, "IsIconic") and bool(user32.IsIconic(hwnd))
-            ):
+        is_vis = bool(user32.IsWindowVisible(hwnd))
+        is_iconic = bool(hasattr(user32, "IsIconic") and user32.IsIconic(hwnd))
+        if is_vis or is_iconic:
+            if _is_window_cloaked_ctypes(int(hwnd), user32) and not is_iconic:
                 return True
             length = int(user32.GetWindowTextLengthW(hwnd))
             title = ""
@@ -1132,8 +1132,15 @@ def _enumerate_windows_ctypes(user32: Any, kernel32: Any) -> list[EnumeratedWind
     return windows
 
 
-def _window_matches_spec(window: EnumeratedWindow, spec: _AppSpec) -> bool:
-    if not window.is_visible:
+def _window_matches_spec(
+    window: EnumeratedWindow,
+    spec: _AppSpec,
+    user32: Any = None,
+) -> bool:
+    is_iconic = bool(
+        user32 is not None and hasattr(user32, "IsIconic") and user32.IsIconic(window.hwnd)
+    )
+    if not window.is_visible and not is_iconic:
         return False
     title = (window.title or "").strip()
     if not title:
@@ -1197,6 +1204,7 @@ _INSTALLED_APPS_CACHE_TIME: float = 0.0
 _INSTALLED_APPS_FAILURE_UNTIL: float = 0.0
 _INSTALLED_APPS_CACHE_LOCK = threading.Lock()
 _APP_CACHE_TTL: float = 300.0  # 5 minutes
+_APP_CACHE_MISS_REFRESH_INTERVAL: float = 10.0  # throttle live PowerShell miss refreshes
 _APP_CACHE_FAILURE_TTL: float = 45.0  # negative/failure backoff to avoid repeated 10s stalls
 
 
@@ -1225,6 +1233,15 @@ def _is_disallowed_shell_app(name: str, appid: str) -> bool:
             return True
 
     return False
+
+
+def invalidate_installed_apps_cache() -> None:
+    """Clear the cached StartApps index so newly installed/uninstalled apps are picked up."""
+    global _INSTALLED_APPS_CACHE, _INSTALLED_APPS_CACHE_TIME, _INSTALLED_APPS_FAILURE_UNTIL
+    with _INSTALLED_APPS_CACHE_LOCK:
+        _INSTALLED_APPS_CACHE = None
+        _INSTALLED_APPS_CACHE_TIME = 0.0
+        _INSTALLED_APPS_FAILURE_UNTIL = 0.0
 
 
 def get_installed_apps(
@@ -1368,21 +1385,591 @@ _LOCAL_FILE_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
-_SERVICE_CANONICAL_APP_NAMES: dict[str, tuple[str, ...]] = {
-    "youtube": ("youtube",),
-    "spotify": ("spotify", "spotify music"),
-    "whatsapp": ("whatsapp", "whatsapp desktop"),
-    "netflix": ("netflix",),
-    "discord": ("discord",),
-    "slack": ("slack",),
-    "notion": ("notion",),
-    "chatgpt": ("chatgpt",),
-    "gmail": ("gmail",),
-    "docs": ("google docs",),
-    "github": ("github",),
-    "reddit": ("reddit",),
-    "twitter": ("twitter", "x"),
-}
+_INSTALLED_APP_ROUTED_GUIDANCE: str = (
+    "Installed app is focused. Continue the task inside this single app window using UIA "
+    "(ui_snapshot/ui_act), in-app keyboard shortcuts, or targeted screen inspection. "
+    "Do NOT call open_url again."
+)
+
+_STRIPPED_HOST_SUBDOMAINS: frozenset[str] = frozenset(
+    {"www", "open", "web", "app", "m", "mobile", "mail", "play", "desktop", "portal"}
+)
+
+_NON_APP_FALLBACK_SUBDOMAINS: frozenset[str] = frozenset(
+    {
+        "docs",
+        "doc",
+        "developer",
+        "developers",
+        "dev",
+        "api",
+        "status",
+        "support",
+        "help",
+        "blog",
+        "about",
+        "careers",
+        "jobs",
+        "legal",
+        "privacy",
+        "accounts",
+        "account",
+        "auth",
+        "login",
+        "id",
+        "billing",
+    }
+)
+
+_GENERIC_SLD_LABELS: frozenset[str] = frozenset({"co", "com", "org", "net", "edu", "gov", "ac"})
+
+_GENERIC_APP_QUALIFIERS: tuple[str, ...] = ("app", "pwa", "music", "messenger", "web")
+
+_BROWSER_APP_NAME_MARKERS: frozenset[str] = frozenset(
+    {
+        "chrome",
+        "google chrome",
+        "edge",
+        "microsoft edge",
+        "msedge",
+        "firefox",
+        "mozilla firefox",
+        "brave",
+        "opera",
+        "opera gx",
+        "opera gx browser",
+        "arc",
+        "safari",
+    }
+)
+
+_SAFE_URL_SCHEME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+
+_RESERVED_URL_SCHEMES: frozenset[str] = frozenset(
+    {
+        "http",
+        "https",
+        "mailto",
+        "file",
+        "ftp",
+        "ftps",
+        "ws",
+        "wss",
+        "javascript",
+        "data",
+        "vbscript",
+        "cmd",
+        "powershell",
+        "ms-settings",
+        "shell",
+        "about",
+        "chrome",
+        "edge",
+        "microsoft-edge",
+        "firefox",
+        "brave",
+        "opera",
+        "safari",
+    }
+)
+
+
+@dataclass(frozen=True)
+class UrlAppResolution:
+    """Dynamic 3-layer OS app resolution outcome for an http/https URL."""
+
+    app_name: str
+    resolution_layer: str  # "app_uri_handler" | "url_protocol" | "installed_app"
+    app_id: str | None = None
+    protocol_scheme: str | None = None
+    window: EnumeratedWindow | None = None
+    package_family_name: str | None = None
+    candidate_tokens: tuple[str, ...] = ()
+    from_cached_catalog: bool = False
+
+
+def _is_browser_app_name(name: str | None) -> bool:
+    low = " ".join((name or "").strip().lower().split())
+    return low in _BROWSER_APP_NAME_MARKERS
+
+
+def extract_url_app_tokens(url: str) -> list[str]:
+    """Dynamically extract ordered app/brand/protocol candidate tokens from any URL host.
+
+    Zero hardcoded domain-to-app dictionaries: strips generic subdomains (www, open, web,
+    app, m, mail, etc.) and public TLD suffixes purely structurally so arbitrary newly
+    installed apps resolve automatically.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return []
+    candidate = url.strip()
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+        host = (parsed.hostname or "").lower().strip(".")
+    except Exception:
+        return []
+    if not host or host == "localhost":
+        return []
+    # Ignore numeric IPv4/IPv6 addresses
+    if re.fullmatch(r"[0-9.]+", host) or ":" in host:
+        return []
+
+    labels = [lbl for lbl in host.split(".") if lbl]
+    if not labels:
+        return []
+
+    # Strip trailing public TLD / ccSLD suffixes
+    if (
+        len(labels) >= 3
+        and len(labels[-1]) == 2
+        and labels[-2] in _GENERIC_SLD_LABELS
+    ):
+        labels = labels[:-2]
+    elif len(labels) >= 2:
+        labels = labels[:-1]
+
+    # Strip leading generic web-host subdomains (www, open, web, app, m, mail, ...)
+    while len(labels) > 1 and labels[0] in _STRIPPED_HOST_SUBDOMAINS:
+        labels.pop(0)
+
+    if not labels:
+        return []
+
+    tokens: list[str] = []
+
+    def _add_token(tok: str) -> None:
+        cleaned = " ".join(tok.strip().lower().split())
+        if (
+            len(cleaned) >= 2
+            and cleaned not in _BROWSER_APP_NAME_MARKERS
+            and cleaned not in tokens
+        ):
+            tokens.append(cleaned)
+
+    brand = labels[-1]
+    brand_spaced = brand.replace("-", " ") if "-" in brand else ""
+    if len(labels) >= 2:
+        sub = labels[-2]
+        _add_token(f"{brand}-{sub}")
+        _add_token(f"{brand} {sub}")
+        _add_token(f"{sub}-{brand}")
+        _add_token(f"{sub} {brand}")
+        if sub not in _NON_APP_FALLBACK_SUBDOMAINS:
+            _add_token(brand)
+            if brand_spaced:
+                _add_token(brand_spaced)
+    else:
+        _add_token(brand)
+        if brand_spaced:
+            _add_token(brand_spaced)
+
+    return tokens
+
+
+def _find_app_uri_handlers(url: str) -> list[dict[str, str]]:
+    """Layer 1: Query Windows WinRT Launcher.FindAppUriHandlersAsync(uri) if available."""
+    if sys.platform != "win32":
+        return []
+    try:
+        from winrt.windows.foundation import Uri
+        from winrt.windows.system import Launcher
+    except ImportError:
+        return []
+
+    def _invoke_winrt_sync() -> Any:
+        uri = Uri(url)
+        op = Launcher.find_app_uri_handlers_async(uri)
+        if inspect.isawaitable(op):
+            import asyncio
+
+            return asyncio.run(op)
+        if hasattr(op, "get_results"):
+            return op.get_results()
+        return op
+
+    try:
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+            has_running_loop = True
+        except RuntimeError:
+            has_running_loop = False
+
+        if not has_running_loop:
+            handlers_raw = _invoke_winrt_sync()
+        else:
+            # Create AND await WinRT Uri/IAsyncOperation inside the dedicated worker thread
+            # so loop-bound/COM-STA objects never cross event loops or threads.
+            result_box: list[Any] = []
+            err_box: list[BaseException] = []
+
+            def _runner() -> None:
+                try:
+                    result_box.append(_invoke_winrt_sync())
+                except BaseException as exc:  # pragma: no cover - defensive
+                    err_box.append(exc)
+
+            t = threading.Thread(target=_runner, daemon=True)
+            t.start()
+            t.join(timeout=3.0)
+            if err_box:
+                return []
+            handlers_raw = result_box[0] if result_box else []
+    except Exception as exc:
+        logger.debug("WinRT FindAppUriHandlersAsync failed for %s: %s", url, exc)
+        return []
+
+    results: list[dict[str, str]] = []
+    for item in handlers_raw or ():
+        try:
+            display_info = getattr(item, "display_info", None)
+            name = str(getattr(display_info, "display_name", "") or "").strip()
+            aumid = str(getattr(item, "app_user_model_id", "") or "").strip()
+            pfn = str(getattr(item, "package_family_name", "") or "").strip()
+            if not name:
+                name = aumid or pfn
+            if not name or _is_browser_app_name(name):
+                continue
+            results.append(
+                {
+                    "name": name,
+                    "app_id": aumid,
+                    "package_family_name": pfn,
+                }
+            )
+        except Exception:
+            continue
+    return results
+
+
+def _clean_protocol_friendly_name(raw: Any, fallback: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        return fallback
+    text = raw.strip()
+    text = re.sub(r"^url\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s+protocol$", "", text, flags=re.IGNORECASE).strip()
+    return text or fallback
+
+
+def _extract_exe_stem_from_command(raw_cmd: Any) -> str:
+    if not isinstance(raw_cmd, str) or not raw_cmd.strip():
+        return ""
+    stripped = raw_cmd.strip()
+    if stripped.startswith('"'):
+        end = stripped.find('"', 1)
+        exe_part = stripped[1:end] if end > 1 else stripped.strip('"')
+    else:
+        exe_part = stripped.split()[0]
+    stem = Path(exe_part).stem.strip()
+    return stem
+
+
+def _check_url_protocol_registered(scheme: str) -> dict[str, str] | None:
+    """Layer 2: Query HKCU\\Software\\Classes\\<scheme> and HKCR\\<scheme> for URL Protocol."""
+    if sys.platform != "win32":
+        return None
+    clean_scheme = scheme.strip().lower()
+    if (
+        not clean_scheme
+        or len(clean_scheme) < 2
+        or clean_scheme in _RESERVED_URL_SCHEMES
+        or clean_scheme in _DISALLOWED_SHELL_BINARIES
+        or not _SAFE_URL_SCHEME_RE.fullmatch(clean_scheme)
+    ):
+        return None
+
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    roots = (
+        ("HKCU", winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{clean_scheme}"),
+        ("HKCR", winreg.HKEY_CLASSES_ROOT, clean_scheme),
+    )
+    for root_label, root_hive, subkey in roots:
+        try:
+            with winreg.OpenKey(root_hive, subkey) as key:
+                try:
+                    winreg.QueryValueEx(key, "URL Protocol")
+                except FileNotFoundError:
+                    continue
+
+                friendly_raw = ""
+                with contextlib.suppress(OSError):
+                    friendly_raw, _ = winreg.QueryValueEx(key, "")
+
+                cmd_raw = ""
+                with contextlib.suppress(OSError):
+                    with winreg.OpenKey(key, r"shell\open\command") as cmd_key:
+                        cmd_raw, _ = winreg.QueryValueEx(cmd_key, "")
+
+                exe_stem = _extract_exe_stem_from_command(cmd_raw)
+                friendly = _clean_protocol_friendly_name(
+                    friendly_raw, exe_stem or clean_scheme
+                )
+                if _is_browser_app_name(friendly) or _is_browser_app_name(exe_stem):
+                    continue
+                return {
+                    "scheme": clean_scheme,
+                    "app_name": friendly,
+                    "exe_stem": exe_stem,
+                    "command": str(cmd_raw or ""),
+                    "registry_root": root_label,
+                }
+        except OSError:
+            continue
+    return None
+
+
+def _window_matches_dynamic_tokens(
+    win: EnumeratedWindow,
+    tokens: list[str],
+    user32: Any = None,
+) -> bool:
+    """Return True if *win* is a standalone app/PWA window matching any dynamic token."""
+    is_iconic = bool(
+        user32 is not None and hasattr(user32, "IsIconic") and user32.IsIconic(win.hwnd)
+    )
+    if not win.is_visible and not is_iconic:
+        return False
+    title = (win.title or "").strip()
+    if not title or _is_browser_tab_window_title(title):
+        return False
+    title_low = title.lower()
+    proc_stem = Path(win.process_name or "").stem.strip().lower()
+    proc_is_browser = proc_stem in {"chrome", "msedge", "firefox", "brave", "opera", "arc"}
+
+    for tok in tokens:
+        t = tok.strip().lower()
+        if len(t) < 2:
+            continue
+        t_compact = re.sub(r"[^a-z0-9]+", "", t)
+        if not proc_is_browser and proc_stem and (
+            proc_stem == t or (t_compact and proc_stem == t_compact)
+        ):
+            return True
+        # Match whole word/phrase in standalone window title (works for PWAs & native apps)
+        if re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", title_low):
+            return True
+        if t_compact and len(t_compact) >= 3 and t_compact != t:
+            title_compact = re.sub(r"[^a-z0-9]+", "", title_low)
+            if title_compact == t_compact:
+                return True
+    return False
+
+
+def _find_matching_standalone_window(
+    tokens: list[str],
+    windows: list[EnumeratedWindow],
+    user32: Any,
+) -> EnumeratedWindow | None:
+    matches = [w for w in windows if _window_matches_dynamic_tokens(w, tokens, user32=user32)]
+    if not matches:
+        return None
+    return _pick_best_matching_window(matches, user32, prefer_standalone_pwa=True)
+
+
+def _match_catalog_entry_for_tokens(
+    tokens: list[str],
+    catalog: list[dict[str, str]],
+) -> dict[str, str] | None:
+    """Dynamically match candidate URL tokens against live StartApps / PWA catalog."""
+    if not tokens or not catalog:
+        return None
+
+    for tok in tokens:
+        t = tok.strip().lower()
+        if len(t) < 2 or _is_browser_app_name(t):
+            continue
+        t_compact = re.sub(r"[^a-z0-9]+", "", t)
+
+        # Pass 1: exact lowercase match
+        for entry in catalog:
+            name_low = " ".join(entry.get("Name", "").strip().lower().split())
+            if not name_low or _is_browser_app_name(name_low):
+                continue
+            if name_low == t:
+                return entry
+
+        # Pass 2: compact alphanumeric exact match (e.g. 'youtube-music' == 'YouTube Music')
+        if t_compact:
+            for entry in catalog:
+                name_low = " ".join(entry.get("Name", "").strip().lower().split())
+                if not name_low or _is_browser_app_name(name_low):
+                    continue
+                if re.sub(r"[^a-z0-9]+", "", name_low) == t_compact:
+                    return entry
+
+        # Pass 3: generic app qualifiers (e.g. '<brand> music', '<brand> pwa', '<brand> app')
+        for entry in catalog:
+            name_low = " ".join(entry.get("Name", "").strip().lower().split())
+            if not name_low or _is_browser_app_name(name_low):
+                continue
+            if any(name_low == f"{t} {q}" for q in _GENERIC_APP_QUALIFIERS):
+                return entry
+
+    return None
+
+
+def resolve_url_to_installed_app(
+    url: str,
+    *,
+    app_uri_handler_finder: Callable[[str], list[dict[str, str]]] | None = None,
+    url_protocol_checker: Callable[[str], bool | dict[str, Any] | None] | None = None,
+    app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
+    window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    user32: Any = None,
+    kernel32: Any = None,
+    force_refresh_catalog: bool = False,
+) -> UrlAppResolution | None:
+    """Dynamically resolve an http/https URL to an installed OS app using 3 live OS layers.
+
+    Resolution order (zero hardcoded domain-to-app dictionaries):
+      Layer 1: Windows ``AppUriHandlers`` (Store / MSIX apps via WinRT Launcher).
+      Layer 2: Windows Registry custom ``URL Protocol`` (``HKCU\\Software\\Classes\\<scheme>``
+               and ``HKCR\\<scheme>`` with ``URL Protocol`` value).
+      Layer 3: Currently open standalone app/PWA windows (excluding browser tab windows)
+               and the live cached ``get_installed_apps()`` catalog (StartApps / PWAs).
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    target_url = url.strip() if "://" in url else f"https://{url.strip()}"
+    tokens = extract_url_app_tokens(target_url)
+
+    def _get_windows() -> list[EnumeratedWindow]:
+        if window_enumerator is not None:
+            return list(window_enumerator())
+        if user32 is not None or sys.platform == "win32":
+            try:
+                u32 = _get_win32_user32(user32)
+                k32 = _get_win32_kernel32(kernel32)
+                return _enumerate_windows_ctypes(u32, k32)
+            except Exception:
+                return []
+        return []
+
+    windows_cache: list[EnumeratedWindow] | None = None
+
+    def _cached_windows() -> list[EnumeratedWindow]:
+        nonlocal windows_cache
+        if windows_cache is None:
+            windows_cache = _get_windows()
+        return windows_cache
+
+    # Layer 1: Windows AppUriHandlers (Store / MSIX Apps)
+    uri_finder = app_uri_handler_finder or _find_app_uri_handlers
+    try:
+        handlers = uri_finder(target_url) or []
+    except Exception as exc:
+        logger.debug("AppUriHandlers lookup error for %s: %s", target_url, exc)
+        handlers = []
+
+    for handler in handlers:
+        if not isinstance(handler, dict):
+            continue
+        h_name = str(handler.get("name") or handler.get("display_name") or "").strip()
+        h_aumid = str(handler.get("app_id") or handler.get("app_user_model_id") or "").strip()
+        h_pfn = str(handler.get("package_family_name") or "").strip()
+        if not h_name or _is_browser_app_name(h_name):
+            continue
+        win_tokens = [h_name.lower(), *tokens]
+        existing_win = _find_matching_standalone_window(win_tokens, _cached_windows(), user32)
+        return UrlAppResolution(
+            app_name=h_name,
+            resolution_layer="app_uri_handler",
+            app_id=h_aumid or None,
+            package_family_name=h_pfn or None,
+            window=existing_win,
+            candidate_tokens=tuple(tokens),
+        )
+
+    if not tokens:
+        return None
+
+    # Layer 2: Windows Registry Custom URL Protocol (Native Win32 / Electron Apps)
+    proto_checker = url_protocol_checker or _check_url_protocol_registered
+    protocol_candidates: list[str] = []
+    for tok in tokens:
+        for cand in (tok.replace(" ", "-"), re.sub(r"[^a-z0-9]+", "", tok)):
+            if (
+                len(cand) >= 2
+                and cand not in _RESERVED_URL_SCHEMES
+                and cand not in protocol_candidates
+                and _SAFE_URL_SCHEME_RE.fullmatch(cand)
+            ):
+                protocol_candidates.append(cand)
+
+    for scheme in protocol_candidates:
+        try:
+            proto_res = proto_checker(scheme)
+        except Exception as exc:
+            logger.debug("URL protocol check error for scheme '%s': %s", scheme, exc)
+            proto_res = None
+        if not proto_res:
+            continue
+        if isinstance(proto_res, dict):
+            app_name = str(proto_res.get("app_name") or scheme).strip()
+            exe_stem = str(proto_res.get("exe_stem") or "").strip()
+            resolved_scheme = str(proto_res.get("scheme") or scheme).strip().lower()
+        else:
+            app_name = scheme
+            exe_stem = ""
+            resolved_scheme = scheme
+        win_tokens = [
+            t for t in [app_name.lower(), exe_stem.lower(), resolved_scheme, *tokens] if t
+        ]
+        existing_win = _find_matching_standalone_window(win_tokens, _cached_windows(), user32)
+        return UrlAppResolution(
+            app_name=app_name,
+            resolution_layer="url_protocol",
+            protocol_scheme=resolved_scheme,
+            window=existing_win,
+            candidate_tokens=tuple(tokens),
+        )
+
+    # Layer 3: Running standalone app/PWA windows + Live installed apps catalog
+    existing_standalone = _find_matching_standalone_window(tokens, _cached_windows(), user32)
+    if existing_standalone is not None:
+        return UrlAppResolution(
+            app_name=existing_standalone.title.strip() or tokens[0],
+            resolution_layer="installed_app",
+            window=existing_standalone,
+            candidate_tokens=tuple(tokens),
+        )
+
+    was_cached = _INSTALLED_APPS_CACHE is not None and not force_refresh_catalog
+    cache_age = (time.monotonic() - _INSTALLED_APPS_CACHE_TIME) if was_cached else 0.0
+    catalog = get_installed_apps(
+        force_refresh=force_refresh_catalog,
+        app_catalog_fetcher=app_catalog_fetcher,
+    )
+    matched_entry = _match_catalog_entry_for_tokens(tokens, catalog)
+    # Automatic cache invalidation on miss so newly installed apps/PWAs are picked up
+    # immediately without restarting Clea (throttled for live PowerShell calls).
+    if matched_entry is None and was_cached and (
+        app_catalog_fetcher is not None or cache_age >= _APP_CACHE_MISS_REFRESH_INTERVAL
+    ):
+        invalidate_installed_apps_cache()
+        catalog = get_installed_apps(
+            force_refresh=True,
+            app_catalog_fetcher=app_catalog_fetcher,
+        )
+        matched_entry = _match_catalog_entry_for_tokens(tokens, catalog)
+        was_cached = False
+    if matched_entry is not None:
+        return UrlAppResolution(
+            app_name=matched_entry["Name"],
+            resolution_layer="installed_app",
+            app_id=matched_entry["AppID"],
+            candidate_tokens=tuple(tokens),
+            from_cached_catalog=was_cached,
+        )
+
+    return None
 
 
 def is_explicit_browser_request(
@@ -1439,14 +2026,7 @@ def _strip_browser_directive(text: str) -> str:
 
 
 def normalize_launch_target(target: str | None) -> str:
-    """Normalize app names, aliases, domains, and URLs to a canonical lowercase target token.
-
-    Examples:
-        "YouTube", "https://www.youtube.com", "youtube.com", "https://youtu.be/abc" -> "youtube"
-        "Spotify", "https://open.spotify.com" -> "spotify"
-        "WhatsApp", "https://web.whatsapp.com" -> "whatsapp"
-        "Visual Studio Code", "code.exe" -> "vscode"
-    """
+    """Normalize app names, aliases, domains, and URLs to a canonical lowercase target token."""
     if not isinstance(target, str):
         return ""
     stripped = _strip_browser_directive(target)
@@ -1474,34 +2054,18 @@ def normalize_launch_target(target: str | None) -> str:
         except Exception:
             host = ""
         if host:
+            if host == "youtu.be":
+                return "youtube"
+            if host in {"x.com", "www.x.com"}:
+                return "twitter"
             if host == "mail.google.com":
                 return "gmail"
             if host == "docs.google.com":
                 return "docs"
-            if host in {
-                "youtu.be",
-                "youtube.com",
-                "www.youtube.com",
-                "m.youtube.com",
-                "music.youtube.com",
-            }:
-                return "youtube"
-            if host in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
-                return "twitter"
-            for prefix in ("www.", "m.", "open.", "web.", "app."):
-                if host.startswith(prefix):
-                    host = host[len(prefix) :]
-                    break
-            parts = [p for p in host.split(".") if p]
-            if len(parts) >= 3 and parts[-2] in {"co", "com", "org", "net"} and len(parts[-1]) == 2:
-                stem = parts[-3]
-            elif len(parts) >= 2:
-                stem = parts[-2]
-            elif parts:
-                stem = parts[0]
-            else:
-                stem = low
-            return _APP_ALIASES.get(stem, stem)
+            tokens = extract_url_app_tokens(stripped)
+            if tokens:
+                stem = tokens[-1]
+                return _APP_ALIASES.get(stem, stem)
 
     if low.endswith(".exe"):
         low = low[:-4].strip()
@@ -1521,24 +2085,16 @@ def find_installed_service_app(
     target: str,
     catalog: list[dict[str, str]],
 ) -> dict[str, str] | None:
-    """Strictly match a service/URL target against installed Start Menu / Store / PWA apps."""
-    norm = normalize_launch_target(target)
-    if not norm:
+    """Dynamically match a service/URL target against installed Start Menu / Store / PWA apps."""
+    if not isinstance(target, str) or not target.strip() or not catalog:
         return None
-    expected_names = _SERVICE_CANONICAL_APP_NAMES.get(norm, (norm,))
-    for entry in catalog:
-        entry_name = entry.get("Name", "").strip().lower()
-        if entry_name in expected_names:
-            return entry
-    for entry in catalog:
-        entry_name = entry.get("Name", "").strip().lower()
-        if entry_name == "github desktop" and norm == "github":
-            continue
-        if normalize_launch_target(entry_name) == norm and any(
-            entry_name.startswith(exp) for exp in expected_names
-        ):
-            return entry
-    return None
+    tokens: list[str] = []
+    if "://" in target or ("." in target and " " not in target):
+        tokens.extend(extract_url_app_tokens(target))
+    norm = normalize_launch_target(target)
+    if norm and norm not in tokens:
+        tokens.append(norm)
+    return _match_catalog_entry_for_tokens(tokens, catalog)
 
 
 def has_installed_app(
@@ -1636,6 +2192,9 @@ def open_or_focus_app(
                 which_fn=which_fn,
                 env=env,
                 desktop_name_fn=desktop_name_fn,
+                user32=user32,
+                kernel32=kernel32,
+                window_enumerator=window_enumerator,
                 prefer_browser=True,
             )
             return {
@@ -1644,13 +2203,14 @@ def open_or_focus_app(
                 if url_res.get("ok", True)
                 else str(url_res.get("status") or "error"),
                 "app": norm_target or clean_target,
-                "window_title": None,
-                "hwnd": None,
+                "window_title": url_res.get("window_title"),
+                "hwnd": url_res.get("window_hwnd"),
                 "executable": url_res.get("browser") or "default",
                 "target_path": url_res.get("url", fallback_url),
                 "url": url_res.get("url", fallback_url),
                 "browser": url_res.get("browser") or "default",
                 "launched_app": False,
+                "reused_browser_window": bool(url_res.get("reused_browser_window", False)),
                 "normalized_target": norm_target,
             }
 
@@ -1722,7 +2282,7 @@ def open_or_focus_app(
             k32 = _get_win32_kernel32(kernel32)
             windows = _enumerate_windows_ctypes(u32, k32)
 
-        known_matches = [win for win in windows if _window_matches_spec(win, spec)]
+        known_matches = [win for win in windows if _window_matches_spec(win, spec, user32=u32)]
         if known_matches:
             win = _pick_best_matching_window(known_matches, u32)
             non_default = _check_interactive_desktop(desktop_name_fn)
@@ -1803,8 +2363,19 @@ def open_or_focus_app(
     ):
         raise ValueError(f"Application '{app_name}' is disallowed for security reasons.")
 
+    was_cached = _INSTALLED_APPS_CACHE is not None
     catalog = get_installed_apps(app_catalog_fetcher=app_catalog_fetcher)
     matched_app = find_matching_start_app(stripped, catalog)
+    # Automatic cache invalidation: if a target isn't in the cached StartApps snapshot,
+    # refresh once so newly installed apps are picked up immediately without restarting Clea.
+    if matched_app is None and was_cached:
+        invalidate_installed_apps_cache()
+        catalog = get_installed_apps(
+            force_refresh=True,
+            app_catalog_fetcher=app_catalog_fetcher,
+        )
+        matched_app = find_matching_start_app(stripped, catalog)
+
     if matched_app is not None:
         matched_name = matched_app["Name"]
         matched_appid = matched_app["AppID"]
@@ -1818,16 +2389,39 @@ def open_or_focus_app(
 
             matched_norm = normalize_launch_target(matched_name)
             matched_is_browser = matched_norm in _BROWSER_CANONICAL_NAMES
-            start_matches = [
-                win
-                for win in windows
-                if win.is_visible
-                and (
-                    matched_name.lower() in (win.title or "").lower()
-                    or matched_name.lower() in (win.process_name or "").lower()
+            match_tokens = [matched_name.lower()]
+            if matched_norm and len(matched_norm) >= 2 and matched_norm not in match_tokens:
+                match_tokens.append(matched_norm)
+
+            def _is_window_candidate(win: EnumeratedWindow) -> bool:
+                is_iconic = bool(
+                    u32 is not None
+                    and hasattr(u32, "IsIconic")
+                    and u32.IsIconic(win.hwnd)
                 )
-                and (matched_is_browser or not _is_browser_tab_window_title(win.title))
-            ]
+                if not win.is_visible and not is_iconic:
+                    return False
+                if not matched_is_browser and _is_browser_tab_window_title(win.title):
+                    return False
+                title_low = (win.title or "").lower()
+                proc_low = (win.process_name or "").lower()
+                proc_stem = Path(win.process_name or "").stem.strip().lower()
+                proc_is_browser = proc_stem in {
+                    "chrome",
+                    "msedge",
+                    "firefox",
+                    "brave",
+                    "opera",
+                    "arc",
+                }
+                for tok in match_tokens:
+                    if tok in title_low:
+                        return True
+                    if (matched_is_browser or not proc_is_browser) and tok in proc_low:
+                        return True
+                return False
+
+            start_matches = [win for win in windows if _is_window_candidate(win)]
             if start_matches:
                 win = _pick_best_matching_window(
                     start_matches,
@@ -1872,7 +2466,11 @@ def open_or_focus_app(
         launch_cmd = ["explorer.exe", f"shell:AppsFolder\\{matched_appid}"]
         if resolved_target is not None:
             launch_cmd.append(str(resolved_target))
-        popen_fn(launch_cmd, **_build_gui_popen_kwargs())
+        try:
+            popen_fn(launch_cmd, **_build_gui_popen_kwargs())
+        except OSError:
+            invalidate_installed_apps_cache()
+            raise
         return {
             "ok": True,
             "status": "launched",
@@ -1900,6 +2498,9 @@ def open_or_focus_app(
                 which_fn=which_fn,
                 env=env,
                 desktop_name_fn=desktop_name_fn,
+                user32=user32,
+                kernel32=kernel32,
+                window_enumerator=window_enumerator,
                 prefer_browser=True,
             )
             return {
@@ -1908,13 +2509,14 @@ def open_or_focus_app(
                 if url_res.get("ok", True)
                 else str(url_res.get("status") or "error"),
                 "app": norm_fallback or stripped,
-                "window_title": None,
-                "hwnd": None,
+                "window_title": url_res.get("window_title"),
+                "hwnd": url_res.get("window_hwnd"),
                 "executable": url_res.get("browser") or "default",
                 "target_path": url_res.get("url", fallback_url),
                 "url": url_res.get("url", fallback_url),
                 "browser": url_res.get("browser") or "default",
                 "launched_app": False,
+                "reused_browser_window": bool(url_res.get("reused_browser_window", False)),
                 "normalized_target": norm_fallback,
             }
 
@@ -2706,6 +3308,61 @@ def write_clipboard(
 # --------------------------------------------------------------------------- URL & System Controls
 
 
+def _find_existing_browser_window(
+    windows: list[EnumeratedWindow],
+    *,
+    browser_name: str | None,
+    url_tokens: list[str],
+    user32: Any,
+) -> EnumeratedWindow | None:
+    """Find an already-open browser window to reuse (preferring one already on the target site)."""
+    if not windows:
+        return None
+
+    b_low = (browser_name or "").strip().lower()
+    browser_spec = _KNOWN_APPS.get(b_low) if b_low else None
+
+    candidates: list[EnumeratedWindow] = []
+    for win in windows:
+        is_iconic = bool(
+            user32 is not None and hasattr(user32, "IsIconic") and user32.IsIconic(win.hwnd)
+        )
+        if not win.is_visible and not is_iconic:
+            continue
+        if browser_spec is not None:
+            if _window_matches_spec(win, browser_spec, user32=user32):
+                candidates.append(win)
+        elif b_low:
+            title_low = (win.title or "").lower()
+            proc_low = (win.process_name or "").lower()
+            if _is_browser_tab_window_title(win.title) and (
+                b_low in title_low or b_low in proc_low
+            ):
+                candidates.append(win)
+        else:
+            if _is_browser_tab_window_title(win.title):
+                candidates.append(win)
+
+    if not candidates:
+        return None
+
+    # Prefer a browser window already on that domain/site
+    if url_tokens:
+        domain_matches = [
+            win
+            for win in candidates
+            if any(
+                re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", (win.title or "").lower())
+                for tok in url_tokens
+                if len(tok) >= 2
+            )
+        ]
+        if domain_matches:
+            return _pick_best_matching_window(domain_matches, user32, prefer_browser_window=True)
+
+    return _pick_best_matching_window(candidates, user32, prefer_browser_window=True)
+
+
 def open_url(
     url: str,
     browser: str | None = None,
@@ -2716,13 +3373,26 @@ def open_url(
     env: dict[str, str] | None = None,
     desktop_name_fn: Callable[[], str | None] | None = None,
     app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
+    app_uri_handler_finder: Callable[[str], list[dict[str, str]]] | None = None,
+    url_protocol_checker: Callable[[str], bool | dict[str, Any] | None] | None = None,
     user32: Any = None,
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
     prefer_browser: bool = False,
     user_request: str | None = None,
 ) -> dict[str, Any]:
-    """Validate and open an http/https URL, preferring installed apps unless browser requested."""
+    """Validate and open an http/https URL using dynamic 3-layer OS app-first routing.
+
+    Unless the caller explicitly requests a browser (``prefer_browser=True``, ``browser=...``,
+    or browser phrasing in ``user_request``), resolves dynamically across:
+      1. Windows ``AppUriHandlers`` (Store / MSIX apps)
+      2. Windows Registry custom ``URL Protocol`` keys (native Win32 / Electron apps)
+      3. Running standalone app/PWA windows & live ``get_installed_apps()`` catalog
+
+    When an installed app matches, focuses/restores its single window (or launches once)
+    without spawning a browser. When browser opening is explicitly requested or no app
+    is installed, reuses any existing browser window and never spawns ``--new-window``.
+    """
     effective_popen = popen_fn if popen_fn is not None else subprocess.Popen
     if not isinstance(url, str):
         raise ValueError("url must be a string.")
@@ -2782,51 +3452,247 @@ def open_url(
         browser = extract_explicit_browser(user_request)
 
     norm_target = normalize_launch_target(target_url)
-    is_root_service_url = (
-        (parsed.path or "").strip() in {"", "/", "/app"}
-        and not parsed.query
-        and not parsed.fragment
+    url_tokens = extract_url_app_tokens(target_url)
+
+    # Keep hermetic unit tests isolated from real desktop windows unless a window enumerator
+    # or user32 double was supplied or this is a real (unmocked) OS invocation.
+    allow_live_win32 = (
+        window_enumerator is not None
+        or user32 is not None
+        or (popen_fn is None and startfile_fn is None and app_catalog_fetcher is None)
     )
-    if (
-        not explicit_browser
-        and browser is None
-        and is_root_service_url
-        and norm_target
-        and norm_target not in {"chrome", "edge", "firefox", "brave"}
-    ):
-        catalog = get_installed_apps(app_catalog_fetcher=app_catalog_fetcher)
-        matched_app = find_installed_service_app(norm_target, catalog)
-        if matched_app is not None:
-            app_res = open_or_focus_app(
-                matched_app["Name"],
-                user32=user32,
-                kernel32=kernel32,
-                window_enumerator=window_enumerator,
-                which_fn=which_fn,
-                popen_fn=effective_popen,
-                env=env,
-                app_catalog_fetcher=lambda: catalog,
-                startfile_fn=startfile_fn,
-                desktop_name_fn=desktop_name_fn,
-            )
-            return {
-                "ok": bool(app_res.get("ok", True)),
-                "success": bool(app_res.get("ok", True)),
-                "status": str(app_res.get("status") or "launched"),
-                "app": app_res.get("app"),
-                "window_title": app_res.get("window_title"),
-                "hwnd": app_res.get("hwnd"),
-                "executable": app_res.get("executable"),
-                "target_path": app_res.get("target_path"),
-                "url": target_url,
-                "browser": None,
-                "launched_app": True,
-                "normalized_target": norm_target,
-                "message": (
-                    f"Opened installed app '{app_res.get('app')}' for '{norm_target}' "
-                    "(app-first policy)."
-                ),
-            }
+    effective_win_enum: Callable[[], list[EnumeratedWindow]] | None = (
+        window_enumerator if window_enumerator is not None else (None if allow_live_win32 else list)
+    )
+
+    def _get_u32_optional() -> Any:
+        if user32 is not None:
+            return user32
+        if allow_live_win32 and sys.platform == "win32":
+            with contextlib.suppress(Exception):
+                return _get_win32_user32(None)
+        return None
+
+    def _enumerate_current_windows() -> list[EnumeratedWindow]:
+        if effective_win_enum is not None:
+            return list(effective_win_enum())
+        u32_live = _get_u32_optional()
+        if u32_live is None:
+            return []
+        try:
+            k32_live = _get_win32_kernel32(kernel32)
+            return _enumerate_windows_ctypes(u32_live, k32_live)
+        except Exception:
+            return []
+
+    def _make_routed_result(
+        *,
+        app_name: str,
+        status: str,
+        resolution_layer: str,
+        hwnd: int | None = None,
+        window_title: str | None = None,
+        executable: str | None = None,
+        target_path: str | None = None,
+        protocol_scheme: str | None = None,
+        ok: bool = True,
+    ) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "success": ok,
+            "status": status,
+            "app": app_name,
+            "app_name": app_name,
+            "window_title": window_title,
+            "hwnd": hwnd,
+            "window_hwnd": hwnd,
+            "executable": executable,
+            "target_path": target_path,
+            "url": target_url,
+            "browser": None,
+            "launched_app": True,
+            "routed_to_installed_app": True,
+            "resolution_layer": resolution_layer,
+            "protocol_scheme": protocol_scheme,
+            "normalized_target": norm_target or (url_tokens[0] if url_tokens else ""),
+            "guidance": _INSTALLED_APP_ROUTED_GUIDANCE,
+            "message": (
+                f"Routed URL to installed app '{app_name}' via {resolution_layer} "
+                "(app-first policy)."
+            ),
+        }
+
+    # Dynamic 3-Layer OS App-First URL Routing (applies to ALL http/https URLs including
+    # deep links unless the user/caller explicitly requested a browser).
+    if not explicit_browser and browser is None:
+        resolution = resolve_url_to_installed_app(
+            target_url,
+            app_uri_handler_finder=app_uri_handler_finder,
+            url_protocol_checker=url_protocol_checker,
+            app_catalog_fetcher=app_catalog_fetcher,
+            window_enumerator=effective_win_enum,
+            user32=user32,
+            kernel32=kernel32,
+        )
+
+        if resolution is not None:
+            non_default = _check_interactive_desktop(desktop_name_fn)
+            if non_default is not None:
+                return {
+                    "ok": False,
+                    "success": False,
+                    "url": target_url,
+                    "browser": None,
+                    "app": resolution.app_name,
+                    "app_name": resolution.app_name,
+                    "routed_to_installed_app": False,
+                    "resolution_layer": resolution.resolution_layer,
+                    "status": "non_interactive_desktop",
+                    "message": (
+                        f"Cannot focus or launch '{resolution.app_name}' visibly because the "
+                        f"daemon is running on isolated desktop '{non_default}' instead of "
+                        "'WinSta0\\Default'."
+                    ),
+                }
+
+            # If a standalone window for the resolved app is already open, focus/restore it!
+            if resolution.window is not None:
+                u32_active = _get_u32_optional()
+                target_hwnd = (
+                    _resolve_root_window_hwnd(int(resolution.window.hwnd), u32_active)
+                    if u32_active is not None
+                    else int(resolution.window.hwnd)
+                )
+                if u32_active is not None:
+                    _focus_window_hwnd(u32_active, target_hwnd, kernel32=kernel32)
+                return _make_routed_result(
+                    app_name=resolution.app_name,
+                    status="focused",
+                    resolution_layer=resolution.resolution_layer,
+                    hwnd=target_hwnd,
+                    window_title=resolution.window.title,
+                    protocol_scheme=resolution.protocol_scheme,
+                )
+
+            # Layer 1: AppUriHandlers launch via AUMID / AppsFolder or open_or_focus_app
+            if resolution.resolution_layer == "app_uri_handler":
+                if resolution.app_id:
+                    launch_cmd = ["explorer.exe", f"shell:AppsFolder\\{resolution.app_id}"]
+                    effective_popen(launch_cmd, **_build_gui_popen_kwargs())
+                    return _make_routed_result(
+                        app_name=resolution.app_name,
+                        status="launched",
+                        resolution_layer="app_uri_handler",
+                        executable=launch_cmd[0],
+                    )
+                app_res = open_or_focus_app(
+                    resolution.app_name,
+                    user32=user32,
+                    kernel32=kernel32,
+                    window_enumerator=effective_win_enum,
+                    which_fn=which_fn,
+                    popen_fn=effective_popen,
+                    env=env,
+                    app_catalog_fetcher=app_catalog_fetcher,
+                    startfile_fn=startfile_fn,
+                    desktop_name_fn=desktop_name_fn,
+                )
+                return _make_routed_result(
+                    app_name=str(app_res.get("app") or resolution.app_name),
+                    status=str(app_res.get("status") or "launched"),
+                    resolution_layer="app_uri_handler",
+                    hwnd=app_res.get("hwnd"),
+                    window_title=app_res.get("window_title"),
+                    executable=app_res.get("executable"),
+                    target_path=app_res.get("target_path"),
+                    ok=bool(app_res.get("ok", True)),
+                )
+
+            # Layer 2: Windows Registry custom URL Protocol launch (single-instance native)
+            if resolution.resolution_layer == "url_protocol" and resolution.protocol_scheme:
+                proto_uri = f"{resolution.protocol_scheme}:"
+                _open_via_shell(
+                    proto_uri,
+                    startfile_fn=startfile_fn,
+                    popen_fn=effective_popen,
+                )
+                return _make_routed_result(
+                    app_name=resolution.app_name,
+                    status="launched",
+                    resolution_layer="url_protocol",
+                    executable=proto_uri,
+                    protocol_scheme=resolution.protocol_scheme,
+                )
+
+            # Layer 3: Live StartApps / PWA launch with automatic cache invalidation on failure
+            if resolution.resolution_layer == "installed_app":
+                try:
+                    app_res = open_or_focus_app(
+                        resolution.app_name,
+                        user32=user32,
+                        kernel32=kernel32,
+                        window_enumerator=effective_win_enum,
+                        which_fn=which_fn,
+                        popen_fn=effective_popen,
+                        env=env,
+                        app_catalog_fetcher=app_catalog_fetcher,
+                        startfile_fn=startfile_fn,
+                        desktop_name_fn=desktop_name_fn,
+                    )
+                    return _make_routed_result(
+                        app_name=str(app_res.get("app") or resolution.app_name),
+                        status=str(app_res.get("status") or "launched"),
+                        resolution_layer="installed_app",
+                        hwnd=app_res.get("hwnd"),
+                        window_title=app_res.get("window_title"),
+                        executable=app_res.get("executable"),
+                        target_path=app_res.get("target_path"),
+                        ok=bool(app_res.get("ok", True)),
+                    )
+                except (OSError, ValueError) as exc:
+                    logger.debug(
+                        "Installed app launch failed for '%s' (%s); refreshing catalog cache.",
+                        resolution.app_name,
+                        exc,
+                    )
+                    invalidate_installed_apps_cache()
+                    refreshed_catalog = get_installed_apps(
+                        force_refresh=True,
+                        app_catalog_fetcher=app_catalog_fetcher,
+                    )
+                    refreshed_match = _match_catalog_entry_for_tokens(
+                        url_tokens, refreshed_catalog
+                    )
+                    if refreshed_match is not None:
+                        app_res = open_or_focus_app(
+                            refreshed_match["Name"],
+                            user32=user32,
+                            kernel32=kernel32,
+                            window_enumerator=effective_win_enum,
+                            which_fn=which_fn,
+                            popen_fn=effective_popen,
+                            env=env,
+                            app_catalog_fetcher=lambda: refreshed_catalog,
+                            startfile_fn=startfile_fn,
+                            desktop_name_fn=desktop_name_fn,
+                        )
+                        return _make_routed_result(
+                            app_name=str(app_res.get("app") or refreshed_match["Name"]),
+                            status=str(app_res.get("status") or "launched"),
+                            resolution_layer="installed_app",
+                            hwnd=app_res.get("hwnd"),
+                            window_title=app_res.get("window_title"),
+                            executable=app_res.get("executable"),
+                            target_path=app_res.get("target_path"),
+                            ok=bool(app_res.get("ok", True)),
+                        )
+                    # App was uninstalled -> fall through cleanly to browser opening.
+
+    # Browser path: explicit browser requested OR no installed app exists.
+    # Reuse any existing browser window (preferring one already on that domain/site)
+    # and NEVER pass --new-window.
+    reused_browser_hwnd: int | None = None
+    reused_browser_title: str | None = None
 
     if browser is None:
         non_default = _check_interactive_desktop(desktop_name_fn)
@@ -2837,11 +3703,29 @@ def open_url(
                 "url": target_url,
                 "browser": "default",
                 "status": "non_interactive_desktop",
+                "routed_to_installed_app": False,
                 "message": (
                     f"Cannot open '{target_url}' visibly because the daemon is running on "
                     f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
                 ),
             }
+        if allow_live_win32:
+            u32_b = _get_u32_optional()
+            existing_browser = _find_existing_browser_window(
+                _enumerate_current_windows(),
+                browser_name=None,
+                url_tokens=url_tokens,
+                user32=u32_b,
+            )
+            if existing_browser is not None:
+                reused_browser_hwnd = (
+                    _resolve_root_window_hwnd(int(existing_browser.hwnd), u32_b)
+                    if u32_b is not None
+                    else int(existing_browser.hwnd)
+                )
+                reused_browser_title = existing_browser.title
+                if u32_b is not None:
+                    _focus_window_hwnd(u32_b, reused_browser_hwnd, kernel32=kernel32)
         _open_via_shell(target_url, startfile_fn=startfile_fn, popen_fn=effective_popen)
         return {
             "ok": True,
@@ -2850,6 +3734,11 @@ def open_url(
             "browser": "default",
             "status": "opened",
             "launched_app": False,
+            "routed_to_installed_app": False,
+            "reused_browser_window": reused_browser_hwnd is not None,
+            "hwnd": reused_browser_hwnd,
+            "window_hwnd": reused_browser_hwnd,
+            "window_title": reused_browser_title,
             "normalized_target": norm_target,
         }
 
@@ -2886,12 +3775,32 @@ def open_url(
             "url": target_url,
             "browser": b_clean,
             "status": "non_interactive_desktop",
+            "routed_to_installed_app": False,
             "message": (
                 f"Cannot open '{target_url}' visibly because the daemon is running on "
                 f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
             ),
         }
 
+    if allow_live_win32:
+        u32_b = _get_u32_optional()
+        existing_browser = _find_existing_browser_window(
+            _enumerate_current_windows(),
+            browser_name=b_clean,
+            url_tokens=url_tokens,
+            user32=u32_b,
+        )
+        if existing_browser is not None:
+            reused_browser_hwnd = (
+                _resolve_root_window_hwnd(int(existing_browser.hwnd), u32_b)
+                if u32_b is not None
+                else int(existing_browser.hwnd)
+            )
+            reused_browser_title = existing_browser.title
+            if u32_b is not None:
+                _focus_window_hwnd(u32_b, reused_browser_hwnd, kernel32=kernel32)
+
+    # Never pass --new-window: reuse the existing browser window/tab bar cleanly.
     effective_popen([browser_exe, target_url], **_build_gui_popen_kwargs())
     return {
         "ok": True,
@@ -2900,6 +3809,11 @@ def open_url(
         "browser": b_clean,
         "status": "opened",
         "launched_app": False,
+        "routed_to_installed_app": False,
+        "reused_browser_window": reused_browser_hwnd is not None,
+        "hwnd": reused_browser_hwnd,
+        "window_hwnd": reused_browser_hwnd,
+        "window_title": reused_browser_title,
         "normalized_target": norm_target,
     }
 
