@@ -654,6 +654,7 @@ class AudioManager:
         mic_mute_while_speaking: bool = False,
         on_audio_input: Callable[[bytes], None] | None = None,
         chunk_size: int | None = None,
+        lazy_output: bool = True,
     ) -> None:
         self.input_device = input_device
         self.output_device = output_device
@@ -661,6 +662,7 @@ class AudioManager:
         self.mic_mute_while_speaking = mic_mute_while_speaking
         self._on_audio_input = on_audio_input
         self.chunk_size = chunk_size
+        self._lazy_output = bool(lazy_output)
         self._chunk_buffer: AudioChunkBuffer | None = (
             AudioChunkBuffer(chunk_size=chunk_size) if chunk_size else None
         )
@@ -669,9 +671,11 @@ class AudioManager:
 
         self.resolved_input_device: dict[str, Any] | None = None
         self.resolved_output_device: dict[str, Any] | None = None
+        self._output_candidates: list[dict[str, Any]] = []
 
         self._input_stream: sd.InputStream | None = None
         self._output_stream: sd.OutputStream | None = None
+        self._output_suspend_epoch: int = 0
         self._output_queue: queue.Queue[bytes] = queue.Queue()
         self._current_output_bytes = bytearray()
         self._input_accumulator = bytearray()
@@ -703,6 +707,47 @@ class AudioManager:
     def is_speaking(self) -> bool:
         """True when assistant audio is actively being played out."""
         return self._is_speaking.is_set()
+
+    @property
+    def is_output_stream_active(self) -> bool:
+        """True when the PortAudio OutputStream is currently open and active."""
+        with self._lock:
+            out = self._output_stream
+        if out is None:
+            return False
+        try:
+            return bool(getattr(out, "active", True)) and not bool(getattr(out, "stopped", False))
+        except Exception:
+            return False
+
+    def wait_for_input_callbacks(
+        self,
+        *,
+        timeout: float = 1.5,
+        poll_interval: float = 0.025,
+        min_callbacks: int = 1,
+        stop_event: Any = None,
+    ) -> bool:
+        """Wait briefly (off the callback path) for active input callbacks to arrive.
+
+        Returns True once ``_input_callback_count >= min_callbacks``, or False if
+        ``timeout`` expires, ``stop_event`` is set, or the manager stops.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        step = max(0.005, float(poll_interval))
+        target = max(1, int(min_callbacks))
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return False
+            with self._lock:
+                if not self._running:
+                    return False
+                if self._input_callback_count >= target:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            time.sleep(min(step, remaining))
 
     def input_rms_telemetry(self) -> dict[str, Any]:
         """Return snapshot of active input device and live RMS telemetry."""
@@ -836,12 +881,20 @@ class AudioManager:
         max_attempts: int = 3,
         retry_delay: float = 0.5,
     ) -> bool:
-        """Stop streams, refresh PortAudio endpoints, and reopen audio I/O safely."""
+        """Stop streams, refresh PortAudio endpoints, and reopen audio I/O safely.
+
+        Preserves the output stream's active vs suspended state so hot-swap rebinds
+        during IDLE never start zero-streaming on Bluetooth A2DP output.
+        """
         with self._lifecycle_lock:
+            with self._lock:
+                restore_output = self._output_stream is not None
             try:
                 self.stop()
                 refresh_audio_devices()
                 self.start(max_attempts=max_attempts, retry_delay=retry_delay)
+                if restore_output:
+                    self.start_output_stream()
                 return True
             except Exception as exc:
                 logger.warning("AudioManager stream recovery failed: %s", exc)
@@ -1123,11 +1176,13 @@ class AudioManager:
 
             inp_stream: sd.InputStream | None = None
             out_stream: sd.OutputStream | None = None
+            chosen_out: dict[str, Any] = output_candidates[0]
             try:
                 inp_stream, chosen_in, sample_rate, channels = self._open_input_stream(
                     input_candidates
                 )
-                out_stream, chosen_out = self._open_output_stream(output_candidates)
+                if not self._lazy_output:
+                    out_stream, chosen_out = self._open_output_stream(output_candidates)
             except Exception:
                 for stream in (inp_stream, out_stream):
                     if stream is not None:
@@ -1140,6 +1195,7 @@ class AudioManager:
                 with self._lock:
                     self._input_stream = None
                     self._output_stream = None
+                    self._output_candidates = []
                     self._running = False
                     self._input_accumulator.clear()
                     if self._chunk_buffer is not None:
@@ -1162,6 +1218,7 @@ class AudioManager:
                 self.input_sample_rate = sample_rate
                 self.input_channels = channels
                 self._output_stream = out_stream
+                self._output_candidates = list(output_candidates)
                 self.resolved_output_device = chosen_out
                 self._default_endpoint_ids = captured_defaults
                 self._input_fell_back_to_other_device = fell_back_other
@@ -1180,8 +1237,8 @@ class AudioManager:
                     chosen_in_name,
                 )
             logger.info(
-                "AudioManager started (input=#%d '%s' [%s, %d Hz, %dch], output=#%d '%s', "
-                "mute_while_speaking=%s).",
+                "AudioManager started (input=#%d '%s' [%s, %d Hz, %dch], output=#%d '%s' "
+                "[active=%s], mute_while_speaking=%s).",
                 chosen_in["index"],
                 chosen_in.get("name", "unknown"),
                 chosen_in.get("hostapi_name", "Unknown"),
@@ -1189,18 +1246,117 @@ class AudioManager:
                 channels,
                 chosen_out["index"],
                 chosen_out.get("name", "unknown"),
+                out_stream is not None,
                 self.mic_mute_while_speaking,
             )
+
+    def start_output_stream(self, *, _expected_suspend_epoch: int | None = None) -> bool:
+        """Open and start the OutputStream on demand (deadlock-free under _lifecycle_lock).
+
+        Returns True when the output stream is open and ready, or False if AudioManager
+        is not running (or running in a unit-test harness that never called ``start()``),
+        or if ``suspend_output_stream()`` superseded a pending ``play_audio()`` open.
+        """
+        with self._lock:
+            if not self._running or not self._health_monitored:
+                return False
+            if (
+                _expected_suspend_epoch is not None
+                and self._output_suspend_epoch != _expected_suspend_epoch
+            ):
+                return False
+            if self._output_stream is not None:
+                return True
+
+        with self._lifecycle_lock:
+            with self._lock:
+                if not self._running or not self._health_monitored:
+                    return False
+                if (
+                    _expected_suspend_epoch is not None
+                    and self._output_suspend_epoch != _expected_suspend_epoch
+                ):
+                    return False
+                if self._output_stream is not None:
+                    return True
+                candidates = list(self._output_candidates)
+
+            if not candidates:
+                candidates = list_candidate_audio_devices(
+                    self.output_device,
+                    kind="output",
+                    preferred_hostapi=self.preferred_hostapi,
+                )
+
+            out_stream, chosen_out = self._open_output_stream(candidates)
+            should_close = False
+            with self._lock:
+                if not self._running or (
+                    _expected_suspend_epoch is not None
+                    and self._output_suspend_epoch != _expected_suspend_epoch
+                ):
+                    should_close = True
+                else:
+                    self._output_stream = out_stream
+                    self._output_candidates = list(candidates)
+                    self.resolved_output_device = chosen_out
+
+            if should_close:
+                try:
+                    out_stream.stop()
+                    out_stream.close()
+                except Exception as exc:
+                    logger.debug("Error closing output stream after concurrent stop: %s", exc)
+                return False
+
+            logger.info(
+                "Audio output stream started on demand (output=#%d '%s' [%s]).",
+                chosen_out["index"],
+                chosen_out.get("name", "unknown"),
+                chosen_out.get("hostapi_name", "Unknown"),
+            )
+            return True
+
+    def suspend_output_stream(self, *, drain_timeout: float = 0.0) -> None:
+        """Stop and close the OutputStream while keeping microphone input alive for IDLE.
+
+        Prevents continuous zero-streaming to Bluetooth A2DP render endpoints while HFP
+        input is listening for the wake word. Never holds ``self._lock`` across PortAudio
+        ``stop()`` / ``close()`` so ``_output_stream_callback`` cannot deadlock.
+        """
+        if drain_timeout > 0.0:
+            deadline = time.monotonic() + float(drain_timeout)
+            while self._is_speaking.is_set() and time.monotonic() < deadline:
+                time.sleep(min(0.02, max(0.001, deadline - time.monotonic())))
+
+        with self._lifecycle_lock:
+            with self._lock:
+                self._output_suspend_epoch += 1
+                out = self._output_stream
+                self._output_stream = None
+                self._drain_output_queue()
+                self._current_output_bytes.clear()
+                self._is_speaking.clear()
+
+            if out is not None:
+                try:
+                    out.stop()
+                    out.close()
+                except Exception as exc:
+                    logger.debug("Error suspending output stream: %s", exc)
+                logger.info("Audio output stream suspended for IDLE.")
 
     def stop(self) -> None:
         """Stop and close both audio streams."""
         with self._lifecycle_lock:
             with self._lock:
                 self._running = False
+                self._output_suspend_epoch += 1
                 inp = self._input_stream
                 out = self._output_stream
                 self._input_stream = None
                 self._output_stream = None
+                self._output_candidates = []
                 self._input_accumulator.clear()
                 if self._chunk_buffer is not None:
                     self._chunk_buffer.clear()
@@ -1222,14 +1378,30 @@ class AudioManager:
                     logger.debug("Error stopping output stream: %s", exc)
 
     def play_audio(self, pcm_bytes: bytes) -> None:
-        """Queue 24 kHz 16-bit mono PCM bytes for playback."""
+        """Queue 24 kHz 16-bit mono PCM bytes for playback, opening output on demand."""
         if not pcm_bytes:
             return
+        need_open = False
+        epoch = 0
         with self._lock:
             if not self._running:
                 return
+            epoch = self._output_suspend_epoch
             self._output_queue.put(pcm_bytes)
             self._is_speaking.set()
+            need_open = self._output_stream is None and self._health_monitored
+        if need_open:
+            try:
+                opened = self.start_output_stream(_expected_suspend_epoch=epoch)
+            except Exception as exc:
+                logger.warning("Failed starting audio output stream on demand: %s", exc)
+                opened = False
+            if not opened:
+                with self._lock:
+                    if self._output_suspend_epoch == epoch:
+                        self._drain_output_queue()
+                        self._current_output_bytes.clear()
+                        self._is_speaking.clear()
 
     def stop_output(self) -> None:
         """Immediately drop all buffered output audio on barge-in."""

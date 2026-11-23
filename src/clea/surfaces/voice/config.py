@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
@@ -12,8 +13,10 @@ from clea.paths import default_data_dir
 
 MediaResolution = Literal["low", "medium", "high"]
 ConsentMode = Literal["ask", "auto_allow", "deny"]
+WakeWordEngine = Literal["auto", "livekit", "openwakeword"]
 
 VOICE_CONFIG_FILENAME = "voice_config.toml"
+DEFAULT_VAD_SILENCE_DURATION_MS = 1000
 
 
 class ScreenBlocklistConfig(BaseModel):
@@ -30,15 +33,38 @@ class VoiceConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
+    wake_word_engine: WakeWordEngine = Field(
+        default="auto",
+        description=(
+            "Wake word inference engine: 'auto' (livekit-wakeword v2 primary with "
+            "startup-only openwakeword fallback), 'livekit', or 'openwakeword'."
+        ),
+    )
     wake_word_model: str = Field(
         default="hey_jarvis",
         min_length=1,
-        description="Built-in openwakeword model name or path to a .onnx wake-word file.",
+        description="Built-in wake-word model name or path to a .onnx wake-word file.",
     )
     wake_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
+    livekit_wake_threshold: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Detection threshold in [0.0, 1.0] for livekit-wakeword v2 models (default 0.50)."
+        ),
+    )
     vad_mode: Literal["server", "client"] = Field(
         default="server",
         description="Voice Activity Detection mode: 'server' or 'client'.",
+    )
+    vad_silence_duration_ms: int = Field(
+        default=DEFAULT_VAD_SILENCE_DURATION_MS,
+        ge=100,
+        le=10000,
+        description=(
+            "Server-side Gemini Live VAD end-of-speech silence duration in milliseconds."
+        ),
     )
     input_device: str | int | None = None
     output_device: str | int | None = None
@@ -61,6 +87,8 @@ class VoiceConfig(BaseModel):
 
     @field_validator(
         "wake_threshold",
+        "livekit_wake_threshold",
+        "vad_silence_duration_ms",
         "silence_timeout_seconds",
         "stall_timeout_seconds",
         "stall_speech_rms_threshold",
@@ -122,14 +150,25 @@ def default_voice_config_toml() -> str:
     return """# Clea Voice Surface Configuration
 # Stored in Clea's user data directory; edit and restart the voice surface to apply changes.
 
+# Wake word engine: "auto" (livekit-wakeword v2 primary with startup-only openwakeword fallback),
+# "livekit", or "openwakeword".
+wake_word_engine = "auto"
+
 # Wake word model name (e.g. "hey_jarvis") or path to a custom .onnx model file.
 wake_word_model = "hey_jarvis"
 
-# Wake word detection threshold in [0.0, 1.0]. Calibrated for WASAPI input (0.30 default).
+# Legacy/openWakeWord detection threshold in [0.0, 1.0]. Calibrated for WASAPI input (0.30 default).
 wake_threshold = 0.30
+
+# Detection threshold in [0.0, 1.0] for livekit-wakeword v2 models (0.50 default).
+livekit_wake_threshold = 0.50
 
 # Voice Activity Detection mode: "server" (server-side Gemini VAD) or "client".
 vad_mode = "server"
+
+# Server-side Gemini Live VAD end-of-speech silence duration in milliseconds (default 1000).
+# Also configurable via CLEA_VAD_SILENCE_DURATION_MS environment variable.
+vad_silence_duration_ms = 1000
 
 # Global push-to-talk / call-toggle hotkey.
 hotkey = "Ctrl+Alt+V"
@@ -195,6 +234,15 @@ def ensure_voice_config(path: Path | None = None) -> Path:
     return target
 
 
+def _apply_voice_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
+    """Apply supported environment variable overrides on top of TOML config."""
+    merged = dict(raw)
+    raw_vad_ms = os.environ.get("CLEA_VAD_SILENCE_DURATION_MS")
+    if raw_vad_ms is not None and raw_vad_ms.strip():
+        merged["vad_silence_duration_ms"] = raw_vad_ms.strip()
+    return merged
+
+
 def load_voice_config(
     path: Path | None = None,
     *,
@@ -204,9 +252,9 @@ def load_voice_config(
     target = path if path is not None else voice_config_path()
     if not target.exists():
         if not create_if_missing:
-            return VoiceConfig()
+            return VoiceConfig.model_validate(_apply_voice_env_overrides({}))
         ensure_voice_config(target)
 
     raw_text = target.read_text(encoding="utf-8-sig")
     raw = tomllib.loads(raw_text)
-    return VoiceConfig.model_validate(raw)
+    return VoiceConfig.model_validate(_apply_voice_env_overrides(raw))

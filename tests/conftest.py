@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -18,25 +19,40 @@ _NO_MODELS_TESTS = {
 
 @pytest.fixture(autouse=True)
 def _sandbox_clea_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Ensure all test executions across the suite are strictly isolated from host Clea data."""
-    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("CLEA_DATA_DIR", str(tmp_path))
+    # Use a dedicated sandbox directory separate from each test's `tmp_path` fixture so
+    # pre-seeded logs/models never pollute tests that scan `tmp_path` (e.g. search_files).
+    clea_data = tmp_path_factory.mktemp("clea_data")
+    (clea_data / "logs").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CLEA_DATA_DIR", str(clea_data))
+    # Keep unit tests strictly offline and isolated from host wake-word/VAD env overrides.
+    monkeypatch.setenv("CLEA_WAKEWORD_AUTO_DOWNLOAD", "0")
+    monkeypatch.delenv("CLEA_WAKEWORD_MODEL_PATH", raising=False)
+    monkeypatch.delenv("CLEA_VAD_SILENCE_DURATION_MS", raising=False)
 
     host_clea = Path(os.environ.get("LOCALAPPDATA", "")) / "clea"
     if host_clea.exists():
         host_models = host_clea / "models"
         if host_models.exists() and request.node.name not in _NO_MODELS_TESTS:
-            try:
-                os.symlink(host_models, tmp_path / "models", target_is_directory=True)
-            except OSError:
-                pass
+            sandbox_models = clea_data / "models"
+            sandbox_models.mkdir(parents=True, exist_ok=True)
+            for item in host_models.iterdir():
+                if item.is_file():
+                    try:
+                        # Copy rather than symlink so test writes can NEVER mutate
+                        # host %LOCALAPPDATA%\clea.
+                        shutil.copy2(item, sandbox_models / item.name)
+                    except OSError:
+                        pass
 
         if request.node.name == "test_voice_doctor_diagnostics_output":
             host_token = host_clea / "session_token"
             if host_token.exists():
-                (tmp_path / "session_token").write_text(
+                (clea_data / "session_token").write_text(
                     host_token.read_text(encoding="utf-8"), encoding="utf-8"
                 )
 

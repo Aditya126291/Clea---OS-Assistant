@@ -165,10 +165,50 @@ class GeminiLiveBackend(VoiceBackend):
             )
 
         # VAD configuration
-        realtime_input_cfg = None
         if config.vad_mode == "client":
             realtime_input_cfg = types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+            )
+        else:
+            silence_ms = int(config.vad_silence_duration_ms)
+            if "vad_silence_duration_ms" not in config.model_fields_set:
+                env_silence = os.environ.get("CLEA_VAD_SILENCE_DURATION_MS", "").strip()
+                if env_silence:
+                    try:
+                        parsed_ms = int(env_silence)
+                        if 100 <= parsed_ms <= 10000:
+                            silence_ms = parsed_ms
+                        else:
+                            logger.warning(
+                                "Ignoring out-of-range CLEA_VAD_SILENCE_DURATION_MS=%r "
+                                "(expected 100..10000 ms); using %d ms.",
+                                env_silence,
+                                silence_ms,
+                            )
+                    except ValueError:
+                        logger.warning(
+                            "Ignoring invalid CLEA_VAD_SILENCE_DURATION_MS=%r; using %d ms.",
+                            env_silence,
+                            silence_ms,
+                        )
+            aad_kwargs: dict[str, Any] = {
+                "disabled": False,
+                "silence_duration_ms": silence_ms,
+            }
+            end_sens_enum = getattr(types, "EndSensitivity", None)
+            if end_sens_enum is not None:
+                end_low = getattr(end_sens_enum, "END_SENSITIVITY_LOW", None)
+                if end_low is not None:
+                    aad_kwargs["end_of_speech_sensitivity"] = end_low
+            act_handling_enum = getattr(types, "ActivityHandling", None)
+            activity_handling = (
+                getattr(act_handling_enum, "START_OF_ACTIVITY_INTERRUPTS", None)
+                if act_handling_enum is not None
+                else None
+            )
+            realtime_input_cfg = types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(**aad_kwargs),
+                activity_handling=activity_handling,
             )
 
         # Input audio transcription lock (guarded safely across google-genai versions)
@@ -242,10 +282,23 @@ class GeminiLiveBackend(VoiceBackend):
             self._receive_loop(),
             name="GeminiLiveBackendReceiveLoop",
         )
+        effective_aad = (
+            live_cfg.realtime_input_config.automatic_activity_detection
+            if live_cfg.realtime_input_config is not None
+            else None
+        )
+        effective_vad_silence = (
+            "disabled"
+            if (effective_aad is None or effective_aad.disabled)
+            else f"{effective_aad.silence_duration_ms}ms"
+        )
         logger.info(
-            "GeminiLiveBackend connected (model=%s, web_search=%s).",
+            "GeminiLiveBackend connected (model=%s, web_search=%s, vad_mode=%s, "
+            "vad_silence_duration=%s).",
             self._model_name,
             config.enable_web_search,
+            config.vad_mode,
+            effective_vad_silence,
         )
 
     async def _receive_loop(self) -> None:

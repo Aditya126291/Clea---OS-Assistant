@@ -40,8 +40,10 @@ from clea.surfaces.voice.runner import VoiceRunner, voice_log_path
 from clea.surfaces.voice.wake_word import (
     WakeWordDetector,
     WakeWordModelNotFoundError,
+    check_livekit_model_status,
     check_models_status,
     download_wake_word_models,
+    livekit_wake_word_models_dir,
     wake_word_models_dir,
 )
 from clea.surfaces.voice.win32 import enable_per_monitor_dpi_awareness
@@ -227,7 +229,12 @@ def run_voice_service(
             debug_audio=debug_audio,
         )
         print("Starting Clea voice service (press Ctrl+C to quit)...")
-        print(f"Wake word: '{config.wake_word_model}' (threshold: {config.wake_threshold})")
+        print(
+            f"Wake word: '{config.wake_word_model}' "
+            f"(engine={config.wake_word_engine}, "
+            f"livekit_threshold={config.livekit_wake_threshold:.2f}, "
+            f"fallback_threshold={config.wake_threshold:.2f})"
+        )
         print(f"Toggle hotkey: {config.hotkey}")
         print(f"Listening on mic for '{config.wake_word_model}' or press {config.hotkey}...")
         asyncio.run(runner.run_forever())
@@ -258,7 +265,18 @@ def run_voice_doctor(*, download_models: bool = False) -> None:
     print(f"Config path: {voice_config_path()}")
 
     config = load_voice_config()
-    print(f"Config: wake_word='{config.wake_word_model}', hotkey='{config.hotkey}'")
+    print(
+        f"Config: wake_word='{config.wake_word_model}', engine='{config.wake_word_engine}', "
+        f"hotkey='{config.hotkey}'"
+    )
+    print(
+        f"        thresholds: livekit={config.livekit_wake_threshold:.2f}, "
+        f"openwakeword={config.wake_threshold:.2f}"
+    )
+    print(
+        f"        vad_mode='{config.vad_mode}', "
+        f"vad_silence_duration_ms={config.vad_silence_duration_ms}"
+    )
     print(f"        google_search_grounding={config.enable_web_search}")
     print(f"        preferred_hostapi='{config.preferred_hostapi}'")
 
@@ -336,6 +354,19 @@ def run_voice_doctor(*, download_models: bool = False) -> None:
             print(f"[!] Microphone check error: {exc}")
 
     # 4. Check Wake Word Models
+    lk_present, lk_path, lk_url = check_livekit_model_status(config.wake_word_model)
+    print(f"LiveKit wake-word cache dir: {livekit_wake_word_models_dir()}")
+    if lk_present:
+        print(f"[OK] livekit-wakeword v2 model cached at {lk_path}.")
+    elif lk_url:
+        print(
+            f"[i] livekit-wakeword v2 model not cached yet at {lk_path} "
+            "(will download lazily on first voice startup)."
+        )
+        print(f"    Source URL: {lk_url}")
+    else:
+        print(f"[i] livekit-wakeword v2 custom model not found at {lk_path}.")
+
     models_dir = wake_word_models_dir()
     print(f"Models directory: {models_dir}")
     all_present, missing = check_models_status(config.wake_word_model)
@@ -422,26 +453,25 @@ def run_voice_test(*, debug_audio: bool = False) -> None:
 
         # 2. Wake word model verification
         print("2. Testing wake word detector loading...")
-        all_present, missing = check_models_status(config.wake_word_model)
-        if not all_present:
-            print(
-                f"   [!] Missing wake word models ({len(missing)} files). "
-                "Run 'clea voice doctor --download-models'."
+        try:
+            detector = WakeWordDetector(
+                model_name=config.wake_word_model,
+                threshold=config.wake_threshold,
+                livekit_threshold=config.livekit_wake_threshold,
+                engine=config.wake_word_engine,
             )
-        else:
-            try:
-                detector = WakeWordDetector(
-                    model_name=config.wake_word_model,
-                    threshold=config.wake_threshold,
-                )
-                # Feed a dummy 1280-sample (2560 bytes) silence chunk
-                silence = b"\x00" * 2560
-                det, score, key = detector.process_audio(silence)
-                print(
-                    f"   [OK] Wake word model loaded successfully (dummy test score: {score:.3f})."
-                )
-            except Exception as exc:
-                print(f"   [FAIL] Wake word detector failed: {exc}")
+            # Feed a dummy 1280-sample (2560 bytes) silence chunk
+            silence = b"\x00" * 2560
+            det, score, key = detector.process_audio(silence)
+            print(
+                f"   [OK] Wake word model loaded successfully "
+                f"(engine={detector.active_engine}, model={detector.model_key}, "
+                f"threshold={detector.threshold:.2f}, dummy test score: {score:.3f})."
+            )
+        except WakeWordModelNotFoundError as exc:
+            print(f"   [!] Wake word models missing: {exc}")
+        except Exception as exc:
+            print(f"   [FAIL] Wake word detector failed: {exc}")
 
         # 3. If debug_audio is True, test mic input stream for 2 seconds and print statistics
         if debug_audio:
@@ -492,15 +522,16 @@ def run_voice_test(*, debug_audio: bool = False) -> None:
 
 def run_voice_diagnose_mic(
     *,
-    duration: float = 2.0,
+    duration: float = 4.0,
     print_fn: Callable[[str], None] = print,
     audio_manager_factory: Callable[..., AudioManager] | None = None,
     detector_factory: Callable[..., WakeWordDetector] | None = None,
 ) -> dict[str, Any]:
     """Read-only microphone & wake-word diagnostic (never mutates %LOCALAPPDATA%\\clea).
 
-    Prints candidate input devices, active selected device, live RMS levels over
-    *duration* seconds (default 2.0s), and peak wake-word model score.
+    Prints candidate input devices, active selected device, active wake-word engine/model/
+    threshold, whether idle output streaming is suspended (``idle_output_active=False``),
+    live RMS levels over *duration* seconds (default 4.0s), and peak wake-word model score.
     """
     enable_per_monitor_dpi_awareness()
     config = load_voice_config(create_if_missing=False)
@@ -521,6 +552,10 @@ def run_voice_diagnose_mic(
             "error": str(exc),
             "candidates": [],
             "selected_device": None,
+            "wake_word_engine": None,
+            "wake_word_model_path": None,
+            "idle_output_active": False,
+            "duration": sample_duration,
             "mean_rms": 0.0,
             "peak_rms": 0.0,
             "peak_wake_score": 0.0,
@@ -542,26 +577,54 @@ def run_voice_diagnose_mic(
         detector = detector_factory(
             model_name=config.wake_word_model,
             threshold=config.wake_threshold,
+            livekit_threshold=config.livekit_wake_threshold,
+            engine=config.wake_word_engine,
+            allow_download=False,
         )
     else:
-        all_present, _missing = check_models_status(config.wake_word_model)
-        if all_present:
-            try:
-                detector = WakeWordDetector(
-                    model_name=config.wake_word_model,
-                    threshold=config.wake_threshold,
-                )
-            except Exception as exc:
-                detector_note = f"detector init failed: {exc}"
-        else:
-            detector_note = "wake-word model files not downloaded"
+        try:
+            detector = WakeWordDetector(
+                model_name=config.wake_word_model,
+                threshold=config.wake_threshold,
+                livekit_threshold=config.livekit_wake_threshold,
+                engine=config.wake_word_engine,
+                allow_download=False,
+            )
+        except WakeWordModelNotFoundError as exc:
+            detector_note = f"wake-word model files not available locally ({exc})"
+        except Exception as exc:
+            detector_note = f"detector init failed: {exc}"
+
+    active_engine: str | None = None
+    active_model_path: str | None = None
+    active_threshold = config.wake_threshold
+    if detector is not None:
+        active_engine = str(getattr(detector, "active_engine", config.wake_word_engine))
+        raw_path = getattr(detector, "model_path", None)
+        active_model_path = str(raw_path) if raw_path is not None else None
+        active_threshold = float(getattr(detector, "threshold", config.wake_threshold))
+        model_display = active_model_path or str(
+            getattr(detector, "model_key", config.wake_word_model)
+        )
+        print_fn(
+            f"Active wake-word engine: {active_engine} "
+            f"(model={model_display}, threshold={active_threshold:.2f})"
+        )
+    else:
+        print_fn(
+            f"Active wake-word engine: unavailable ({detector_note}; "
+            f"requested={config.wake_word_engine})"
+        )
 
     rms_values: list[float] = []
     peak_wake_score = 0.0
     wake_triggered = False
+    warming_up = audio_manager_factory is None
 
     def _on_chunk(pcm_bytes: bytes) -> None:
         nonlocal peak_wake_score, wake_triggered
+        if warming_up:
+            return
         rms = compute_audio_rms(pcm_bytes)
         rms_values.append(rms)
         if detector is not None:
@@ -585,11 +648,13 @@ def run_voice_diagnose_mic(
 
     selected: dict[str, Any] | None = None
     selected_output: dict[str, Any] | None = None
+    idle_output_active = False
     try:
         audio.start()
         selected = dict(audio.resolved_input_device) if audio.resolved_input_device else None
         raw_out = getattr(audio, "resolved_output_device", None)
         selected_output = dict(raw_out) if raw_out else None
+        idle_output_active = bool(getattr(audio, "is_output_stream_active", False))
         if selected:
             print_fn(
                 f"Active selected input: #{selected['index']} '{selected['name']}' "
@@ -599,17 +664,33 @@ def run_voice_diagnose_mic(
         if selected_output:
             print_fn(
                 f"Active selected output: #{selected_output['index']} '{selected_output['name']}' "
-                f"(host API: {selected_output.get('hostapi_name', 'Unknown')})"
+                f"(host API: {selected_output.get('hostapi_name', 'Unknown')}, "
+                f"idle_output_active={idle_output_active})"
             )
+        else:
+            print_fn(f"Idle output streaming: idle_output_active={idle_output_active}")
         # Wait briefly for Bluetooth HFP SCO wake-up (can take 0.7-1.6s on cold connect)
         # when using the real AudioManager so cold wake-up does not eat the sampling window.
         if audio_manager_factory is None:
-            warmup_deadline = time.monotonic() + 2.0
-            while (
-                getattr(audio, "_input_callback_count", 0) == 0
-                and time.monotonic() < warmup_deadline
-            ):
-                time.sleep(0.05)
+            wait_fn = getattr(audio, "wait_for_input_callbacks", None)
+            if callable(wait_fn):
+                wait_fn(timeout=2.0)
+            else:
+                warmup_deadline = time.monotonic() + 2.0
+                while (
+                    getattr(audio, "_input_callback_count", 0) == 0
+                    and time.monotonic() < warmup_deadline
+                ):
+                    time.sleep(0.05)
+            flush_fn = getattr(audio, "flush_input_buffer", None)
+            if callable(flush_fn):
+                flush_fn()
+            if detector is not None:
+                detector.reset()
+            rms_values.clear()
+            peak_wake_score = 0.0
+            wake_triggered = False
+            warming_up = False
         print_fn(
             f"Sampling live mic audio for {sample_duration:.1f}s "
             f"(say '{config.wake_word_model}' to test wake score)..."
@@ -626,8 +707,9 @@ def run_voice_diagnose_mic(
     )
     if detector is not None:
         print_fn(
-            f"Wake word ({config.wake_word_model}): peak_score={peak_wake_score:.3f} "
-            f"(threshold={config.wake_threshold:.2f}, triggered={wake_triggered})"
+            f"Wake word ({active_engine}:{config.wake_word_model}): "
+            f"peak_score={peak_wake_score:.3f} "
+            f"(threshold={active_threshold:.2f}, triggered={wake_triggered})"
         )
     else:
         print_fn(f"Wake word ({config.wake_word_model}): skipped ({detector_note})")
@@ -648,12 +730,16 @@ def run_voice_diagnose_mic(
         "candidates": candidates,
         "selected_device": selected,
         "selected_output_device": selected_output,
+        "wake_word_engine": active_engine,
+        "wake_word_model_path": active_model_path,
+        "idle_output_active": idle_output_active,
+        "duration": sample_duration,
         "sample_rate": audio.input_sample_rate,
         "channels": audio.input_channels,
         "frames": len(rms_values),
         "mean_rms": round(mean_rms, 2),
         "peak_rms": round(peak_rms, 2),
         "peak_wake_score": round(peak_wake_score, 4),
-        "wake_threshold": config.wake_threshold,
+        "wake_threshold": active_threshold,
         "wake_triggered": wake_triggered,
     }

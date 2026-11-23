@@ -487,12 +487,14 @@ class VoiceRunner:
         self._active_tool_tasks: set[asyncio.Task[Any]] = set()
         self._audio_health_task: asyncio.Task[None] | None = None
         self._audio_health_poll_interval: float = 3.0
+        self._input_warmup_timeout: float = 1.5
         self._audio_send_task: asyncio.Task[None] | None = None
         self._outbound_audio_queue: asyncio.Queue[bytes] | None = None
         self._wake_word_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=32)
         self._wake_word_thread: threading.Thread | None = None
         self._wake_word_stop = threading.Event()
         self._wake_word_pending_trigger: bool = False
+        self._wake_word_warming_up: bool = False
         self._peak_wake_score_window: float = 0.0
 
     def _setup_voice_file_logging(self) -> None:
@@ -708,8 +710,9 @@ class VoiceRunner:
                 )
 
             # 2. Initialize wake word detector off the event loop (ONNX load can take 5-15s).
-            # Keep self._wake_word unpublished until the worker thread is started and stale
-            # audio buffered during model load has been flushed, eliminating startup races.
+            # Keep self._wake_word unpublished until the input stream has warmed up, stale
+            # audio buffered during model load/warm-up has been flushed, and the detector
+            # has been cleanly reset, eliminating startup races.
             detector = self._wake_word
             self._wake_word = None
             if detector is None:
@@ -718,29 +721,32 @@ class VoiceRunner:
                         WakeWordDetector,
                         model_name=self.config.wake_word_model,
                         threshold=self.config.wake_threshold,
+                        livekit_threshold=self.config.livekit_wake_threshold,
+                        engine=self.config.wake_word_engine,
                         data_dir=self.data_dir,
                     )
                 except WakeWordModelNotFoundError as exc:
                     logger.error(str(exc))
                     raise
 
-            with contextlib.suppress(Exception):
-                detector.reset()
-
-            # Start dedicated wake-word worker thread & audio health watchdog for live streams
-            # (mocked audio managers in direct unit tests retain synchronous _on_audio_chunk).
+            # Wait briefly for cold Bluetooth HFP SCO callbacks to start arriving before
+            # flushing warm-up buffers and resetting the wake-word detector.
             if getattr(self._audio_manager, "_health_monitored", False):
+                await self._wait_for_input_warmup(self._audio_manager, reason="startup")
                 self._start_wake_word_worker()
 
-            # Discard audio queued during ONNX model load so the detector begins on fresh
-            # live 16 kHz frames, then publish detector and arm IDLE atomically.
+            # Discard audio queued during ONNX model load / Bluetooth SCO warm-up so the
+            # detector begins on fresh live 16 kHz frames, then reset and arm IDLE atomically.
             flush_fn = getattr(self._audio_manager, "flush_input_buffer", None)
             if callable(flush_fn):
                 with contextlib.suppress(Exception):
                     flush_fn()
             self._drain_wake_word_queue()
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(detector.reset)
             self._call_state = "idle"
             self._wake_word_pending_trigger = False
+            self._wake_word_warming_up = False
             self._peak_wake_score_window = 0.0
             self._wake_word = detector
 
@@ -749,13 +755,21 @@ class VoiceRunner:
                     self._audio_health_watchdog(),
                     name="VoiceRunnerAudioHealthWatchdog",
                 )
+            active_engine = getattr(self._wake_word, "active_engine", self.config.wake_word_engine)
+            active_model_path = getattr(self._wake_word, "model_path", None)
+            idle_output_active = bool(
+                getattr(self._audio_manager, "is_output_stream_active", False)
+            )
             logger.info(
-                "Wake-word listener armed (model=%s, threshold=%.2f, sample_rate=%d Hz, "
-                "worker_thread=%s).",
+                "Wake-word listener armed (engine=%s, model=%s, model_path=%s, threshold=%.2f, "
+                "sample_rate=%d Hz, worker_thread=%s, idle_output_active=%s).",
+                active_engine,
                 getattr(self._wake_word, "model_key", self.config.wake_word_model),
+                str(active_model_path) if active_model_path else "custom",
                 float(getattr(self._wake_word, "threshold", self.config.wake_threshold)),
                 int(getattr(self._audio_manager, "input_sample_rate", 16000)),
                 bool(self._wake_word_thread and self._wake_word_thread.is_alive()),
+                idle_output_active,
             )
 
             # 3. Initialize Win32 hotkey if enabled
@@ -934,6 +948,7 @@ class VoiceRunner:
             self._call_state != "idle"
             or self._wake_word is None
             or self._wake_word_pending_trigger
+            or self._wake_word_warming_up
             or self._loop is None
             or self._loop.is_closed()
         ):
@@ -943,6 +958,12 @@ class VoiceRunner:
             if score > self._peak_wake_score_window:
                 self._peak_wake_score_window = score
             if detected:
+                if (
+                    self._call_state != "idle"
+                    or self._wake_word_pending_trigger
+                    or self._wake_word_warming_up
+                ):
+                    return
                 self._wake_word_pending_trigger = True
                 self._drain_wake_word_queue()
                 logger.info("Wake word detected locally with score %.3f!", score)
@@ -972,6 +993,63 @@ class VoiceRunner:
                     self._wake_word.reset()
         except Exception:
             logger.exception("Error during wake word processing.")
+
+    async def _wait_for_input_warmup(
+        self,
+        am: AudioManager,
+        *,
+        reason: str,
+    ) -> bool:
+        """Wait briefly (off the callback path) for cold Bluetooth HFP SCO callbacks to arrive.
+
+        Prevents calling ``WakeWordDetector.reset()`` while ``_input_callback_count == 0``
+        immediately after initial bind or an ``os_default_*`` hot-swap rebind.
+        """
+        raw_count = getattr(am, "_input_callback_count", None)
+        if not isinstance(raw_count, int):
+            return True
+        if raw_count > 0:
+            return True
+
+        timeout = max(0.0, float(self._input_warmup_timeout))
+        if timeout <= 0.0:
+            return False
+
+        start_t = time.monotonic()
+        deadline = start_t + timeout
+        poll_step = 0.025
+        while not self._stop_event.is_set():
+            if getattr(am, "_running", True) is False:
+                return False
+            cb_count = getattr(am, "_input_callback_count", 0)
+            if isinstance(cb_count, int) and cb_count > 0:
+                elapsed_ms = (time.monotonic() - start_t) * 1000.0
+                if elapsed_ms >= 50.0:
+                    telemetry_fn = getattr(am, "input_rms_telemetry", None)
+                    tel = telemetry_fn() if callable(telemetry_fn) else {}
+                    logger.info(
+                        "Input stream warm-up after %s completed in %.0fms "
+                        "(callbacks=%d, last_rms=%s).",
+                        reason,
+                        elapsed_ms,
+                        cb_count,
+                        tel.get("last_rms", "?"),
+                    )
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=min(poll_step, remaining))
+
+        if not self._stop_event.is_set():
+            logger.info(
+                "Input stream warm-up after %s reached %.2fs bound with 0 callbacks; "
+                "flushing and resetting wake-word detector.",
+                reason,
+                timeout,
+            )
+        return False
 
     async def _audio_health_watchdog(self) -> None:
         """Periodically verify AudioManager InputStream health and follow OS default hot-swaps."""
@@ -1042,43 +1120,57 @@ class VoiceRunner:
                     telemetry.get("peak_rms", "?"),
                 )
 
-            recovered = await asyncio.to_thread(restart_fn)
-            if self._stop_event.is_set():
+            # Pause wake-word scoring across stream rebind + cold SCO warm-up so stale
+            # warm-up frames are flushed before resetting and re-arming WakeWordDetector.
+            self._wake_word_warming_up = True
+            self._drain_wake_word_queue()
+            try:
+                recovered = await asyncio.to_thread(restart_fn)
+                if self._stop_event.is_set():
+                    if recovered:
+                        stop_fn = getattr(am, "stop", None)
+                        if callable(stop_fn):
+                            with contextlib.suppress(Exception):
+                                await asyncio.to_thread(stop_fn)
+                    break
                 if recovered:
-                    stop_fn = getattr(am, "stop", None)
-                    if callable(stop_fn):
+                    warmed_up = await self._wait_for_input_warmup(am, reason=reason)
+                    if self._stop_event.is_set():
+                        break
+                    flush_fn = getattr(am, "flush_input_buffer", None)
+                    if callable(flush_fn):
                         with contextlib.suppress(Exception):
-                            await asyncio.to_thread(stop_fn)
-                break
-            if recovered:
-                flush_fn = getattr(am, "flush_input_buffer", None)
-                if callable(flush_fn):
-                    with contextlib.suppress(Exception):
-                        flush_fn()
-                self._drain_wake_word_queue()
-                if self._wake_word is not None:
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(self._wake_word.reset)
-                if not self._stop_event.is_set() and (
-                    self._wake_word_thread is None or not self._wake_word_thread.is_alive()
-                ):
-                    self._start_wake_word_worker()
-                inp = getattr(am, "resolved_input_device", None) or {}
-                out = getattr(am, "resolved_output_device", None) or {}
-                post_telemetry = telemetry_fn() if callable(telemetry_fn) else {}
-                logger.info(
-                    "Audio streams rebound to input=#%s '%s' (%s, %s Hz, %sch, last_rms=%s) "
-                    "and output=#%s '%s' (%s).",
-                    inp.get("index", "?"),
-                    inp.get("name", "unknown"),
-                    inp.get("hostapi_name", "Unknown"),
-                    getattr(am, "input_sample_rate", "?"),
-                    getattr(am, "input_channels", "?"),
-                    post_telemetry.get("last_rms", "?"),
-                    out.get("index", "?"),
-                    out.get("name", "unknown"),
-                    out.get("hostapi_name", "Unknown"),
-                )
+                            flush_fn()
+                    self._drain_wake_word_queue()
+                    if self._wake_word is not None:
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(self._wake_word.reset)
+                    if not self._stop_event.is_set() and (
+                        self._wake_word_thread is None or not self._wake_word_thread.is_alive()
+                    ):
+                        self._start_wake_word_worker()
+                    inp = getattr(am, "resolved_input_device", None) or {}
+                    out = getattr(am, "resolved_output_device", None) or {}
+                    post_telemetry = telemetry_fn() if callable(telemetry_fn) else {}
+                    logger.info(
+                        "Audio streams rebound to input=#%s '%s' (%s, %s Hz, %sch, "
+                        "callbacks=%s, last_rms=%s, warmed_up=%s) and output=#%s '%s' "
+                        "(%s, active=%s).",
+                        inp.get("index", "?"),
+                        inp.get("name", "unknown"),
+                        inp.get("hostapi_name", "Unknown"),
+                        getattr(am, "input_sample_rate", "?"),
+                        getattr(am, "input_channels", "?"),
+                        post_telemetry.get("callback_count", "?"),
+                        post_telemetry.get("last_rms", "?"),
+                        warmed_up,
+                        out.get("index", "?"),
+                        out.get("name", "unknown"),
+                        out.get("hostapi_name", "Unknown"),
+                        bool(getattr(am, "is_output_stream_active", False)),
+                    )
+            finally:
+                self._wake_word_warming_up = False
 
     def _enqueue_outbound_audio(self, pcm_bytes: bytes) -> None:
         """Bounded backpressure enqueue for outbound microphone PCM frames on event loop."""
@@ -1133,7 +1225,7 @@ class VoiceRunner:
                 self._frames_sent_window = 0
                 self._last_fps_report_time = now
 
-            if self._wake_word_pending_trigger:
+            if self._wake_word_pending_trigger or self._wake_word_warming_up:
                 return
 
             # Offload heavy ONNX inference off the real-time PortAudio callback thread
@@ -1338,6 +1430,7 @@ class VoiceRunner:
                 session_resumption=SessionResumptionConfig(enabled=True),
                 transcription_language=self.config.transcription_language,
                 vad_mode=self.config.vad_mode,
+                vad_silence_duration_ms=self.config.vad_silence_duration_ms,
             )
             connect_t0 = time.monotonic()
             backend = self._backend_factory()
@@ -1358,6 +1451,37 @@ class VoiceRunner:
                 )
                 with contextlib.suppress(Exception):
                     await backend.close()
+                return
+
+            # Open output stream on demand now that the call is activating (suspended in IDLE
+            # so Bluetooth A2DP never streams zeros alongside HFP wake-word listening).
+            if self._audio_manager is not None:
+                start_out_fn = getattr(self._audio_manager, "start_output_stream", None)
+                if callable(start_out_fn):
+                    try:
+                        await asyncio.to_thread(start_out_fn)
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not start audio output stream on call start: %s", exc
+                        )
+
+            if (
+                self._call_generation != call_gen
+                or self._call_state != "connecting"
+                or self._call_id is None
+            ):
+                logger.info(
+                    "Call start superseded/ended during output stream open (call_gen=%d); "
+                    "cleaning up orphan backend.",
+                    call_gen,
+                )
+                with contextlib.suppress(Exception):
+                    await backend.close()
+                if self._audio_manager is not None and self._call_state in ("idle", "ending"):
+                    suspend_out_fn = getattr(self._audio_manager, "suspend_output_stream", None)
+                    if callable(suspend_out_fn):
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(suspend_out_fn)
                 return
 
             self._active_backend = backend
@@ -1430,6 +1554,11 @@ class VoiceRunner:
                 with contextlib.suppress(Exception):
                     await backend.close()
             if self._call_generation == call_gen and self._call_state == "connecting":
+                if self._audio_manager is not None:
+                    suspend_out_fn = getattr(self._audio_manager, "suspend_output_stream", None)
+                    if callable(suspend_out_fn):
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(suspend_out_fn)
                 self._call_id = None
                 self._wake_word_pending_trigger = False
                 self._call_state = "idle"
@@ -1535,8 +1664,14 @@ class VoiceRunner:
                 with contextlib.suppress(asyncio.CancelledError):
                     await consume_task
 
-        # While still in "ending" state, clear call state and reset wake-word buffers BEFORE
+        # While still in "ending" state, suspend output stream for IDLE (stopping Bluetooth
+        # A2DP zero-streaming), clear call state, and reset wake-word buffers BEFORE
         # re-arming IDLE so the wake-word worker cannot race with reset() or reuse stale call_id.
+        if self._audio_manager is not None:
+            suspend_out_fn = getattr(self._audio_manager, "suspend_output_stream", None)
+            if callable(suspend_out_fn):
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(suspend_out_fn)
         self._call_id = None
         self._transcript_history.clear()
         self._turn_launched_targets.clear()

@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from clea.surfaces.voice.config import MediaResolution
+from clea.surfaces.voice.config import DEFAULT_VAD_SILENCE_DURATION_MS, MediaResolution
 
 INPUT_AUDIO_SAMPLE_RATE_HZ = 16_000
 OUTPUT_AUDIO_SAMPLE_RATE_HZ = 24_000
@@ -1354,6 +1354,11 @@ class VoiceSessionConfig(_StrictModel):
     language_code: str | None = None
     transcription_language: str | None = "en-IN"
     vad_mode: Literal["server", "client"] = "server"
+    vad_silence_duration_ms: int = Field(
+        default=DEFAULT_VAD_SILENCE_DURATION_MS,
+        ge=100,
+        le=10000,
+    )
     reconnect_limit: int = Field(default=3, ge=0)
 
 

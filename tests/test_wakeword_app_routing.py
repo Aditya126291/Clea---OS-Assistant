@@ -1168,8 +1168,8 @@ async def test_os_default_audio_hotswap_and_mme_truncation_matching_and_thread_s
         try:
             # Flip OS default again after start() so watchdog triggers hot-swap rebind
             endpoint_state[0] = ("cap-earphone-2", "ren-earphone-2")
-            for _ in range(40):
-                if restart_calls[0] >= 1:
+            for _ in range(80):
+                if restart_calls[0] >= 1 and reset_calls[0] >= 2:
                     break
                 await asyncio.sleep(0.05)
             assert restart_calls[0] >= 1
@@ -1581,7 +1581,8 @@ def test_audio_manager_start_failure_never_deadlocks_with_output_callback(
         lambda: ("cap-0", "ren-0"),
     )
 
-    mgr = AudioManager(input_device=0, output_device=0)
+    # 1. Eager output startup failure tears down both streams cleanly without deadlocking
+    mgr = AudioManager(input_device=0, output_device=0, lazy_output=False)
     with pytest.raises(sd.PortAudioError):
         mgr.start()
 
@@ -1589,6 +1590,20 @@ def test_audio_manager_start_failure_never_deadlocks_with_output_callback(
     assert mgr._running is False
     assert mgr._input_stream is None
     assert mgr._output_stream is None
+
+    # 2. Default lazy-output mode stays suspended in IDLE and fails cleanly on demand
+    mgr_lazy = AudioManager(input_device=0, output_device=0)
+    mgr_lazy.start()
+    try:
+        assert mgr_lazy._running is True
+        assert mgr_lazy.is_output_stream_active is False
+        assert mgr_lazy._output_stream is None
+        with pytest.raises(sd.PortAudioError):
+            mgr_lazy.start_output_stream()
+        assert not deadlocked.is_set()
+        assert mgr_lazy._output_stream is None
+    finally:
+        mgr_lazy.stop()
 
 
 def test_get_os_default_audio_endpoint_ids_does_not_mutate_global_ole32() -> None:

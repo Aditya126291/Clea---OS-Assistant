@@ -450,8 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--diagnose-mic",
         action="store_true",
         help=(
-            "Print candidate input devices, active selected device, 2s live RMS, and peak "
-            "wake-word score (read-only; never mutates %LOCALAPPDATA%\\clea)"
+            "Print candidate input devices, active selected device, wake-word engine/threshold, "
+            "idle output state, 4s live RMS, and peak wake-word score "
+            "(read-only; never mutates %LOCALAPPDATA%\\clea)"
         ),
     )
     voice_subparsers = voice_parser.add_subparsers(dest="voice_subcommand")
