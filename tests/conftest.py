@@ -33,6 +33,16 @@ def _sandbox_clea_environment(
     monkeypatch.setenv("CLEA_WAKEWORD_AUTO_DOWNLOAD", "0")
     monkeypatch.delenv("CLEA_WAKEWORD_MODEL_PATH", raising=False)
     monkeypatch.delenv("CLEA_VAD_SILENCE_DURATION_MS", raising=False)
+    # Never auto-attach to the user's live Chrome during pytest runs.
+    monkeypatch.setenv("CLEA_CDP_DISABLE_AUTO_DISCOVERY", "1")
+    monkeypatch.delenv("CLEA_CDP_WS_URL", raising=False)
+    monkeypatch.delenv("CLEA_CDP_URL", raising=False)
+
+    from clea.tools.cdp_bridge import set_default_cdp_bridge
+    from clea.tools.windows_os import clear_last_screen_geometry
+
+    set_default_cdp_bridge(None)
+    clear_last_screen_geometry()
 
     host_clea = Path(os.environ.get("LOCALAPPDATA", "")) / "clea"
     if host_clea.exists():

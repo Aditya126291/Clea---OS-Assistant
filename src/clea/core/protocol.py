@@ -335,8 +335,23 @@ class OsInspectScreenParams(_Model):
     include_image: bool = True
 
 
-GuiActionType = Literal["click_at", "type_text", "press_keys", "scroll", "wait"]
+GuiActionType = Literal[
+    "click_at",
+    "double_click",
+    "right_click",
+    "move",
+    "type_text",
+    "press_keys",
+    "scroll",
+    "wait",
+    "navigate_back",
+    "navigate_forward",
+    "click",
+    "type",
+    "press",
+]
 GuiClickButton = Literal["left", "right", "double"]
+GuiCoordSpace = Literal["normalized_1000", "image", "screen"]
 
 
 class OsInspectUiElementsParams(_Model):
@@ -352,14 +367,24 @@ class OsClickUiElementParams(_Model):
 
 class OsGuiActionParams(_Model):
     action: GuiActionType
-    x: int | None = None
-    y: int | None = None
+    x: int | float | None = None
+    y: int | float | None = None
     text: str | None = None
     keys: list[str] | None = None
     clicks: int = 1
     button: GuiClickButton = "left"
     delta: int = 0
     seconds: float = 1.0
+    coord_space: GuiCoordSpace | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    screen_width: int | None = None
+    screen_height: int | None = None
+    virtual_left: int | None = None
+    virtual_top: int | None = None
+    dpi_scale: float | None = None
+    ref: str | None = None
+    key: str | None = None
     app_name: str | None = Field(
         default=None,
         description=(
@@ -372,7 +397,9 @@ class OsGuiActionParams(_Model):
     )
 
 
-UiActAction = Literal["click", "set_value", "type", "clear", "double_click", "right_click"]
+UiActAction = Literal[
+    "click", "set_value", "type", "clear", "double_click", "right_click", "press"
+]
 UiBatchOp = Literal["act", "press_keys", "scroll", "wait", "click_at"]
 
 
@@ -397,8 +424,16 @@ class UiBatchStep(_Model):
     keys: list[str] | None = None
     delta: int | None = None
     seconds: float | None = None
-    x: int | None = None
-    y: int | None = None
+    x: int | float | None = None
+    y: int | float | None = None
+    coord_space: GuiCoordSpace | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    screen_width: int | None = None
+    screen_height: int | None = None
+    virtual_left: int | None = None
+    virtual_top: int | None = None
+    dpi_scale: float | None = None
     clicks: int | None = None
     button: GuiClickButton | None = None
     interval_ms: int | None = None
@@ -1478,6 +1513,7 @@ class OsOpenUrlResult(_Model):
     success: bool = True
     status: str = "opened"
     url: str
+    title: str | None = None
     browser: str | None = None
     message: str | None = None
     routed_to_installed_app: bool = False
@@ -1487,6 +1523,12 @@ class OsOpenUrlResult(_Model):
     resolution_layer: str | None = None
     guidance: str | None = None
     reused_browser_window: bool = False
+    target_id: str | None = None
+    is_pwa: bool | None = None
+    cdp_used: bool = False
+    before_url: str | None = None
+    after_url: str | None = None
+    state_diff: dict[str, Any] | None = None
 
 
 class OsControlSystemResult(_Model):
@@ -1556,6 +1598,14 @@ class OsInspectScreenResult(_Model):
     question: str | None = None
     width: int | None = None
     height: int | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    screen_width: int | None = None
+    screen_height: int | None = None
+    virtual_left: int | None = None
+    virtual_top: int | None = None
+    dpi_scale: float | None = None
+    coord_space: str | None = None
     artifact_path: str | None = None
     uia_text: str | None = None
     text: str | None = None
@@ -1576,6 +1626,12 @@ class UiElementItem(_Model):
 
 class OsInspectUiElementsResult(_Model):
     ok: bool = True
+    status: str | None = None
+    source: str | None = None
+    cdp_available: bool | None = None
+    hint: str | None = None
+    message: str | None = None
+    error: str | None = None
     window_title: str = ""
     count: int = 0
     elements: list[UiElementItem] = Field(default_factory=list)
@@ -1589,6 +1645,10 @@ class OsClickUiElementResult(_Model):
     x: int = 0
     y: int = 0
     method: str = "invoke"
+    cdp_available: bool | None = None
+    hint: str | None = None
+    message: str | None = None
+    state_diff: dict[str, Any] | None = None
     reason: str | None = None
     error: str | None = None
     aborted_precondition: PreconditionAbortInfo | None = None
@@ -1597,15 +1657,36 @@ class OsClickUiElementResult(_Model):
 class OsGuiActionResult(_Model):
     ok: bool = True
     status: str = "completed"
+    source: str | None = None
     action: str = ""
+    method: str | None = None
+    direction: str | None = None
     x: int | None = None
     y: int | None = None
+    physical_x: int | None = None
+    physical_y: int | None = None
+    coord_space: str | None = None
     clicks: int | None = None
     button: str | None = None
     char_count: int | None = None
     keys: list[str] | None = None
     delta: int | None = None
     seconds: float | None = None
+    ref: str | None = None
+    url: str | None = None
+    title: str | None = None
+    before_url: str | None = None
+    after_url: str | None = None
+    before_title: str | None = None
+    after_title: str | None = None
+    target_id: str | None = None
+    is_pwa: bool | None = None
+    cdp_available: bool | None = None
+    hint: str | None = None
+    message: str | None = None
+    state_diff: dict[str, Any] | None = None
+    circuit_breaker_tripped: bool | None = None
+    suggested_recovery: list[str] | None = None
     reason: str | None = None
     error: str | None = None
     aborted_precondition: PreconditionAbortInfo | None = None
@@ -1626,8 +1707,20 @@ class UiSnapshotElement(_Model):
 
 class OsUiSnapshotResult(_Model):
     ok: bool = True
+    status: str | None = None
+    source: str | None = None
     snapshot_id: str = ""
     window_title: str = ""
+    process_name: str | None = None
+    url: str | None = None
+    title: str | None = None
+    target_id: str | None = None
+    is_pwa: bool | None = None
+    cdp_available: bool | None = None
+    hint: str | None = None
+    message: str | None = None
+    error: str | None = None
+    truncated: bool | None = None
     count: int = 0
     element_count: int | None = None
     elements: list[UiSnapshotElement] = Field(default_factory=list)
@@ -1652,6 +1745,7 @@ class UiDiff(_Model):
 class OsUiActResult(_Model):
     ok: bool = True
     status: str = "completed"
+    source: str | None = None
     snapshot_id: str = ""
     action: str = ""
     ref: str = ""
@@ -1662,6 +1756,18 @@ class OsUiActResult(_Model):
     y: int | None = None
     char_count: int | None = None
     interval_ms: int | None = None
+    url: str | None = None
+    title: str | None = None
+    before_url: str | None = None
+    after_url: str | None = None
+    before_title: str | None = None
+    after_title: str | None = None
+    target_id: str | None = None
+    is_pwa: bool | None = None
+    cdp_available: bool | None = None
+    hint: str | None = None
+    message: str | None = None
+    state_diff: dict[str, Any] | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
     reason: str | None = None
@@ -1679,6 +1785,7 @@ class OsUiBatchResult(_Model):
     ] = "completed"
     steps_executed: int = 0
     step_results: list[dict[str, Any]] = Field(default_factory=list)
+    state_diff: dict[str, Any] | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
     reason: str | None = None

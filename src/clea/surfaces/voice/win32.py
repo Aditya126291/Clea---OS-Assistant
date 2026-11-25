@@ -785,6 +785,52 @@ def get_target_monitor(
     return None
 
 
+def get_dpi_scale_for_monitor(
+    hmonitor: int = 0,
+    *,
+    hwnd: int | None = None,
+    api: Win32API | None = None,
+) -> float:
+    """Return effective DPI scale factor (e.g. 1.0, 1.25, 1.5, 2.0) for a monitor or window."""
+    if api is None:
+        if sys.platform != "win32":
+            return 1.0
+        try:
+            api = Win32API()
+        except OSError:
+            return 1.0
+
+    # 1. Per-monitor effective DPI via shcore.GetDpiForMonitor
+    if hmonitor and api.shcore is not None and hasattr(api.shcore, "GetDpiForMonitor"):
+        with contextlib.suppress(Exception):
+            dpi_x = ctypes.c_uint(0)
+            dpi_y = ctypes.c_uint(0)
+            hr = api.shcore.GetDpiForMonitor(
+                hmonitor,
+                MDT_EFFECTIVE_DPI,
+                ctypes.byref(dpi_x),
+                ctypes.byref(dpi_y),
+            )
+            if hr == 0 and dpi_x.value > 0:
+                return round(dpi_to_scale_factor(int(dpi_x.value)), 4)
+
+    # 2. Per-window DPI via user32.GetDpiForWindow
+    if hwnd and hasattr(api.user32, "GetDpiForWindow"):
+        with contextlib.suppress(Exception):
+            raw_dpi = api.user32.GetDpiForWindow(hwnd)
+            if isinstance(raw_dpi, int) and not isinstance(raw_dpi, bool) and raw_dpi > 0:
+                return round(dpi_to_scale_factor(raw_dpi), 4)
+
+    # 3. System DPI via user32.GetDpiForSystem
+    if hasattr(api.user32, "GetDpiForSystem"):
+        with contextlib.suppress(Exception):
+            raw_dpi = api.user32.GetDpiForSystem()
+            if isinstance(raw_dpi, int) and not isinstance(raw_dpi, bool) and raw_dpi > 0:
+                return round(dpi_to_scale_factor(raw_dpi), 4)
+
+    return 1.0
+
+
 def get_window_bounds(
     hwnd: int,
     api: Win32API | None = None,

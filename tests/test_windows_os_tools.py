@@ -2468,7 +2468,7 @@ def test_ui_snapshot_parses_mixed_controls_filters_and_populates_ref_store() -> 
             EnumeratedWindow(
                 hwnd=777,
                 title="Search Portal - Browser",
-                process_name="msedge.exe",
+                process_name="firefox.exe",
                 is_visible=True,
             )
         ],

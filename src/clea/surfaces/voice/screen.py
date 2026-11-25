@@ -29,6 +29,7 @@ from clea.surfaces.voice.win32 import (
     enable_per_monitor_dpi_awareness,
     enumerate_monitors,
     format_window_geometry_z_order,
+    get_dpi_scale_for_monitor,
     get_monitor_for_window,
     get_target_monitor,
     get_window_bounds,
@@ -64,6 +65,14 @@ class ScreenCaptureResult:
     capture_seq: int = 0
     window_layout: list[dict[str, Any]] | None = None
     window_geometry_summary: str | None = None
+    image_width: int = 0
+    image_height: int = 0
+    screen_width: int = 0
+    screen_height: int = 0
+    virtual_left: int = 0
+    virtual_top: int = 0
+    dpi_scale: float = 1.0
+    coord_space: str = "normalized_1000"
 
 
 def is_window_blocked(
@@ -417,8 +426,10 @@ class ScreenCaptureService:
 
         try:
             img = self._grab_screen_region(capture_bounds, virtual_origin=virtual_origin)
+            raw_w, raw_h = img.width, img.height
             if target == "active_window":
                 frame_bytes, mime_type = encode_native_frame(img)
+                encoded_w, encoded_h = raw_w, raw_h
             else:
                 frame_bytes = encode_frame(
                     img,
@@ -426,6 +437,40 @@ class ScreenCaptureService:
                     quality=self.jpeg_quality,
                 )
                 mime_type = "image/jpeg"
+                longest = max(raw_w, raw_h)
+                if (
+                    self.image_max_side is not None
+                    and self.image_max_side > 0
+                    and longest > self.image_max_side
+                    and longest > 0
+                ):
+                    scale = self.image_max_side / float(longest)
+                    encoded_w = max(1, int(round(raw_w * scale)))
+                    encoded_h = max(1, int(round(raw_h * scale)))
+                else:
+                    encoded_w, encoded_h = raw_w, raw_h
+
+            geom_bounds = capture_bounds or effective_monitor_bounds
+            if (
+                geom_bounds is not None
+                and geom_bounds[2] > geom_bounds[0]
+                and geom_bounds[3] > geom_bounds[1]
+            ):
+                v_left, v_top = int(geom_bounds[0]), int(geom_bounds[1])
+                s_width = int(geom_bounds[2] - geom_bounds[0])
+                s_height = int(geom_bounds[3] - geom_bounds[1])
+            else:
+                v_left, v_top = int(virtual_origin[0]), int(virtual_origin[1])
+                s_width, s_height = raw_w, raw_h
+
+            dpi_scale = 1.0
+            if self._has_injected_api or (sys.platform == "win32" and self._grabber is None):
+                with contextlib.suppress(Exception):
+                    dpi_scale = get_dpi_scale_for_monitor(
+                        target_mon.hmonitor if target_mon is not None else 0,
+                        hwnd=win_info.hwnd if win_info is not None else None,
+                        api=self._get_api(),
+                    )
 
             return ScreenCaptureResult(
                 image_bytes=frame_bytes,
@@ -444,6 +489,14 @@ class ScreenCaptureService:
                 capture_seq=seq,
                 window_layout=window_layout,
                 window_geometry_summary=window_geometry_summary,
+                image_width=encoded_w,
+                image_height=encoded_h,
+                screen_width=s_width,
+                screen_height=s_height,
+                virtual_left=v_left,
+                virtual_top=v_top,
+                dpi_scale=dpi_scale,
+                coord_space="normalized_1000",
             )
         except Exception as exc:
             logger.warning("Screen capture failed: %s", exc)

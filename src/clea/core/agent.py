@@ -18,6 +18,16 @@ from clea.memory.store import MemoryStore
 from clea.memory.three_tier import build_extractive_session_summary
 from clea.memory.working import WorkingMemoryManager
 from clea.providers.base import LLMProvider, Message, TokenUsage, ToolCall
+from clea.tools.action_harness import (
+    ActionCircuitBreaker,
+    StateCaptureFn,
+    capture_desktop_state,
+    compute_state_diff,
+    is_state_diff_tool,
+    merge_tool_state_diff,
+)
+from clea.tools.cdp_bridge import CDPBridge
+from clea.tools.guards import FocusPreconditionBackend, MediaVerificationBackend
 from clea.tools.registry import ConfirmationCallback, ToolDefinition, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -59,17 +69,19 @@ _BASE_SYSTEM_PROMPT = (
     "precondition checks enforce that it is focused and not minimized without un-minimizing it). "
     "When opening or launching a service or application, ALWAYS enforce the Installed-App-First "
     "Policy: launch or focus the installed native, Microsoft Store, or PWA desktop app first via "
-    "`open_or_focus_app`. If an app is installed on the machine (native, Store, or PWA), stay "
-    "inside that single app window for all follow-up tasks (playlists, Watch Later, watch "
-    "history, search, playback, library navigation) using Windows UI Automation "
-    "(`ui_snapshot`/`ui_act`/`ui_batch`), in-app keyboard shortcuts, native protocols, or "
-    "targeted screen inspection—do NOT call `open_url` to jump into Chrome/Edge for an installed "
-    "app. Only open a browser URL via `open_url` or `open_path_or_url` if (a) the user "
-    "explicitly requests the browser/Chrome/Edge or web version (e.g., 'open YouTube in "
-    "Chrome/browser/web'), or (b) no installed application exists on the device. Never fire "
-    "both an app launch and a browser URL launch for the same target in the same turn, and never "
-    "spawn duplicate app or browser windows when an instance is already open—focus and reuse the "
-    "existing single window. "
+    "`open_or_focus_app` so you stay inside that single app window. For web apps and installed "
+    "Chromium PWAs (such as YouTube Watch Later `https://www.youtube.com/playlist?list=WL`), "
+    "call `open_url(url)` directly WITHOUT `browser=...` to navigate directly inside the "
+    "installed PWA via CDP (keeping you inside that single app window without spawning Chrome); "
+    "pass `browser=\"chrome\"` (or `\"edge\"`) ONLY when the user explicitly requests the "
+    "browser/Chrome/Edge or web version, OR when no installed application exists on the device. "
+    "Prefer `open_url` and CDP element refs (`b1`..`bN` from `ui_snapshot` -> `ui_act` / "
+    "`gui_action`) over screenshots or pixel clicking; if you ever click from `look_at_screen` / "
+    "`inspect_screen`, always pass `coord_space=\"normalized_1000\"` with `[0..1000]` coordinates. "
+    "NEVER claim a navigation or UI action succeeded unless the returned `state_diff`, URL, or "
+    "title confirms it. Never fire both an app launch and a browser URL launch for the same "
+    "target in the same turn, and never spawn duplicate app or browser windows when an instance "
+    "is already open—focus and reuse the existing single window. "
     "When the user asks to save clipboard contents to a "
     "file (e.g., 'save my clipboard to desktop', 'save what I copied as youtube_url.txt'), "
     "invoke `save_clipboard_to_file` directly rather than reading and writing manually with "
@@ -115,22 +127,26 @@ _BASE_SYSTEM_PROMPT = (
     "only opening an app) and NEVER refuse with 'I don't have access to your watch history / "
     "Spotify library / account'. Complete multi-step local desktop tasks end-to-end autonomously.\n"
     "- **Cheap-first escalation ladder (minimize vision token burn):**\n"
-    "  1. **Step A (Deterministic / Cheap First):** Prefer direct native paths first — focus "
-    "and stay inside the already-open single installed app window via `open_or_focus_app` / "
-    "`manage_window`, native custom protocols (e.g., `spotify:`), media keys, WinRT `GSMTC`, "
-    "and Windows UI Automation (`ui_snapshot` + `ui_act` / `ui_batch` / `click_ui_element`, or "
-    "`gui_action` in-app keyboard/input shortcuts). Only call `open_url` when the user "
-    "explicitly asks for the browser/Chrome/Edge or when no installed app exists on the device "
-    "(and reuse any already-open browser window rather than spawning duplicates).\n"
-    "  2. **Step B (Mechanical Verification):** Verify outcomes deterministically using tool "
-    "results, `GSMTC` live playback state/title, Win32 Z-order/bounds via `inspect_window_layout`, "
-    "or window title/UIA state—do NOT take verification screenshots when mechanical checks "
-    "suffice.\n"
-    "  3. **Step C (Targeted Single-Shot Escalation Only on Failure):** If Step A/B fails or UIA "
-    "lacks usable elements inside a dynamic web/Electron app, automatically escalate to a single "
-    "targeted `inspect_screen` call to locate and act on the element, then re-verify mechanically. "
-    "Do NOT stop early to make the user steer, and do NOT default to repeated vision loops when "
-    "cheap tools already work.\n"
+    "  1. **Step A (Deterministic / Cheap First):** Prefer direct deterministic paths first — "
+    "direct URL navigation via `open_url(url)` (without `browser=...` to navigate directly inside "
+    "an installed PWA such as YouTube Watch Later `https://www.youtube.com/playlist?list=WL`, or "
+    "with `browser=\"chrome\"` when the user explicitly requests Chrome/browser), "
+    "`open_or_focus_app` / `manage_window`, native custom protocols (e.g., `spotify:`), media "
+    "keys, WinRT `GSMTC`, and `ui_snapshot` + `ui_act` / `ui_batch` (CDP refs `b1`..`bN` for "
+    "Chrome/PWAs, bounded native UIA refs `e1`..`eN` for Windows apps) rather than screenshots or "
+    "blind pixel clicks. Reuse any already-open app or browser window instead of spawning "
+    "duplicate app or browser windows.\n"
+    "  2. **Step B (Mechanical Verification):** Verify outcomes deterministically using the "
+    "returned `state_diff` (`url_changed`, `title_changed`, `window_changed`, `after.url` / "
+    "`after.title`), `GSMTC` live playback state/title, Win32 Z-order/bounds via "
+    "`inspect_window_layout`, or UIA diffs—do NOT take verification screenshots when mechanical "
+    "checks suffice, and NEVER claim a navigation succeeded unless `state_diff` / URL / title "
+    "confirms it.\n"
+    "  3. **Step C (Targeted Single-Shot Escalation Only on Failure):** If Step A/B fails or "
+    "`ui_snapshot` lacks usable controls in a canvas/video surface, escalate to a single targeted "
+    "`inspect_screen` call, use `coord_space=\"normalized_1000\"` if clicking visually, and "
+    "re-verify via `state_diff`. If a click circuit breaker blocks blind clicks, switch "
+    "immediately to `open_url()`, CDP refs (`b1`..`bN`), `navigate_back`, or ask the user.\n"
     "- **Pause only on genuine blockers:** login wall, missing credentials, ambiguous user choice, "
     "destructive confirmation, or `user_interrupted` / `focus_lost`."
 )
@@ -396,6 +412,32 @@ def _extract_launch_target(
         return ("file", raw_target.lower())
 
     return None
+
+
+def _is_deep_web_url(raw: str | None) -> bool:
+    """Return True when *raw* is an http/https URL with a non-root path, query, or fragment."""
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    stripped = raw.strip()
+    if "://" not in stripped and "/" not in stripped and "?" not in stripped:
+        return False
+    candidate = stripped if "://" in stripped else f"https://{stripped}"
+    with contextlib.suppress(Exception):
+        parsed = urllib.parse.urlsplit(candidate)
+        path = (parsed.path or "").strip("/")
+        return bool(path or parsed.query or parsed.fragment)
+    return False
+
+
+def _canonical_deep_url_key(norm_target: str, raw_url: str) -> str:
+    candidate = raw_url.strip()
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    with contextlib.suppress(Exception):
+        parsed = urllib.parse.urlsplit(candidate)
+        suffix = f"{parsed.path or ''}?{parsed.query or ''}#{parsed.fragment or ''}".rstrip("?#")
+        return f"{norm_target}:{suffix.lower()}"
+    return f"{norm_target}:{raw_url.strip().lower()}"
 
 
 def _user_explicitly_requested_browser(user_text: str, arguments: dict[str, Any] | None) -> bool:
@@ -819,6 +861,10 @@ class AgentLoop:
         auto_reconcile_llm: bool = False,
         background_memory_hooks: bool = False,
         background_memory_timeout_seconds: float = 30.0,
+        focus_backend: FocusPreconditionBackend | None = None,
+        media_backend: MediaVerificationBackend | None = None,
+        cdp_bridge: CDPBridge | None = None,
+        state_capture_fn: StateCaptureFn | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -838,8 +884,33 @@ class AgentLoop:
         self.auto_reconcile_llm = bool(auto_reconcile_llm)
         self.background_memory_hooks = bool(background_memory_hooks)
         self.background_memory_timeout_seconds = max(1.0, float(background_memory_timeout_seconds))
+        self._focus_backend = focus_backend
+        self._media_backend = media_backend
+        self._cdp_bridge = cdp_bridge
+        self._state_capture_fn = state_capture_fn
         self._background_memory_tasks: set[asyncio.Task[Any]] = set()
         self._session_memory_locks: dict[str, asyncio.Lock] = {}
+
+    async def _capture_desktop_state(self) -> dict[str, Any] | None:
+        """Capture lightweight foreground window, CDP page, and GSMTC state if configured."""
+        if self._state_capture_fn is not None:
+            with contextlib.suppress(Exception):
+                return await asyncio.to_thread(self._state_capture_fn)
+            return None
+        if (
+            self._focus_backend is None
+            and self._cdp_bridge is None
+            and self._media_backend is None
+        ):
+            return None
+        with contextlib.suppress(Exception):
+            return await asyncio.to_thread(
+                capture_desktop_state,
+                focus_backend=self._focus_backend,
+                cdp_bridge=self._cdp_bridge,
+                media_backend=self._media_backend,
+            )
+        return None
 
     def _spawn_memory_task(
         self,
@@ -1038,6 +1109,7 @@ class AgentLoop:
         launched_targets_in_turn: dict[str, dict[str, Any]] = {}
         failed_app_targets_in_turn: set[str] = set()
         unrecovered_failures: dict[str, dict[str, Any]] = {}
+        circuit_breaker = ActionCircuitBreaker()
 
         tools = self.registry.list_definitions()
         tools_schema_tokens_est = _estimate_tokens(json.dumps([t.model_dump() for t in tools]))
@@ -1191,12 +1263,58 @@ class AgentLoop:
                 executed_in_round: list[ToolCall] = []
                 for call in ordered_calls:
                     executed_in_round.append(call)
-                    launch_info = _extract_launch_target(call.name, call.arguments)
 
-                    # Fix 2: Per-turn single-target launch deduplication
+                    # Hard click / snapshot-failure circuit breaker (per-turn)
+                    blocked_payload = circuit_breaker.check_before_tool(call.name, call.arguments)
+                    if blocked_payload is not None:
+                        if on_tool_start is not None:
+                            await on_tool_start(call)
+                        output = _serialize_tool_output(blocked_payload)
+                        if on_tool_end is not None:
+                            await on_tool_end(call, output, True)
+                        tool_msg = Message(
+                            role="tool",
+                            content=output,
+                            tool_call_id=call.id,
+                            tool_name=call.name,
+                            is_error=True,
+                        )
+                        self.working_memory.tag_tool_artifact(
+                            tool_msg,
+                            turn_number=session.turn_count,
+                        )
+                        session.messages.append(tool_msg)
+                        if _is_mutating_tool(call.name, call.arguments):
+                            unrecovered_failures[_tool_target_key(call.name, call.arguments)] = {
+                                "tool": call.name,
+                                "reason": "blocked_by_circuit_breaker",
+                                "detail": str(blocked_payload.get("reason") or ""),
+                            }
+                        continue
+
+                    launch_info = _extract_launch_target(call.name, call.arguments)
+                    raw_url_arg = str(
+                        (call.arguments or {}).get("url")
+                        or (call.arguments or {}).get("target")
+                        or ""
+                    ).strip()
+                    is_deep_url_call = (
+                        launch_info is not None
+                        and launch_info[0] == "url"
+                        and _is_deep_web_url(raw_url_arg)
+                    )
+                    dedup_key = (
+                        _canonical_deep_url_key(launch_info[1], raw_url_arg)
+                        if is_deep_url_call and launch_info is not None and launch_info[1]
+                        else (launch_info[1] if launch_info is not None else "")
+                    )
+
+                    # Fix 2: Per-turn single-target launch deduplication (deep URLs use full
+                    # path+query keys so navigating to a deep link inside an already-focused
+                    # PWA is never mistakenly deduplicated against open_or_focus_app).
                     if launch_info is not None:
                         launch_kind, norm_target = launch_info
-                        if norm_target and norm_target in launched_targets_in_turn:
+                        if dedup_key and dedup_key in launched_targets_in_turn:
                             if on_tool_start is not None:
                                 await on_tool_start(call)
                             dedup_result = {
@@ -1204,7 +1322,7 @@ class AgentLoop:
                                 "status": "deduplicated",
                                 "deduplicated": True,
                                 "target": norm_target,
-                                "original_launch": launched_targets_in_turn[norm_target],
+                                "original_launch": launched_targets_in_turn[dedup_key],
                                 "message": (
                                     f"Target '{norm_target}' was already launched or focused in "
                                     "this turn; skipped duplicate launch."
@@ -1235,12 +1353,19 @@ class AgentLoop:
                     raw_result: Any = None
                     handled_via_app_first = False
 
-                    # Fix 2: Installed-App-First redirect when URL launch is attempted without
-                    # explicit browser request and open_or_focus_app is available
+                    should_capture_diff = is_state_diff_tool(call.name, call.arguments)
+                    before_state = (
+                        await self._capture_desktop_state() if should_capture_diff else None
+                    )
+
+                    # Fix 2: Installed-App-First redirect for root/shorthand URLs without explicit
+                    # browser request; deep URLs flow directly into open_url so Layer-3 CDP can
+                    # navigate inside an installed Chromium PWA.
                     if launch_info is not None:
                         launch_kind, norm_target = launch_info
                         if (
                             launch_kind == "url"
+                            and not is_deep_url_call
                             and norm_target
                             and norm_target not in failed_app_targets_in_turn
                             and not _user_explicitly_requested_browser(user_text, call.arguments)
@@ -1267,7 +1392,7 @@ class AgentLoop:
                                             "arguments": {"app_name": norm_target},
                                         }
                                     )
-                                    launched_targets_in_turn[norm_target] = {
+                                    launched_targets_in_turn[dedup_key or norm_target] = {
                                         "tool": "open_or_focus_app",
                                         "kind": "app",
                                         "target": norm_target,
@@ -1315,13 +1440,47 @@ class AgentLoop:
                                     and _detect_tool_failure(call, raw_result, output, is_error)
                                     is None
                                 ):
-                                    launched_targets_in_turn[norm_target] = {
+                                    launched_targets_in_turn[dedup_key or norm_target] = {
                                         "tool": call.name,
                                         "kind": launch_kind,
                                         "target": norm_target,
                                     }
                                 elif launch_kind == "app":
                                     failed_app_targets_in_turn.add(norm_target)
+
+                    # Capture post-action desktop/CDP/media state_diff and update circuit breaker
+                    merged_state_diff: dict[str, Any] | None = None
+                    if should_capture_diff:
+                        after_state = await self._capture_desktop_state()
+                        captured_diff = (
+                            compute_state_diff(before_state, after_state)
+                            if (before_state is not None or after_state is not None)
+                            else None
+                        )
+                        merged_state_diff = merge_tool_state_diff(captured_diff, raw_result)
+                        if (
+                            merged_state_diff is not None
+                            and not is_error
+                            and isinstance(raw_result, dict)
+                            and ("state_diff" not in raw_result or captured_diff is not None)
+                        ):
+                            raw_result = dict(raw_result)
+                            raw_result["state_diff"] = merged_state_diff
+                            if "attachment" in raw_result:
+                                clean_result = {
+                                    k: v for k, v in raw_result.items() if k != "attachment"
+                                }
+                                output = _serialize_tool_output(clean_result)
+                            else:
+                                output = _serialize_tool_output(raw_result)
+
+                    circuit_breaker.record_outcome(
+                        call.name,
+                        call.arguments,
+                        result=raw_result,
+                        is_error=is_error,
+                        state_diff=merged_state_diff,
+                    )
 
                     if on_tool_end is not None:
                         await on_tool_end(call, output, is_error)

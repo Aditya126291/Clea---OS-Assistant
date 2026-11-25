@@ -30,6 +30,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from clea.tools.cdp_bridge import (
+    CDP_REMOTE_DEBUGGING_HINT,
+    CDPBridge,
+    get_default_cdp_bridge,
+    has_explicit_default_cdp_bridge,
+    is_cdp_ref,
+    is_chromium_app_name,
+    is_chromium_process,
+)
 from clea.tools.guards import (
     ActionVerifier,
     FocusPreconditionBackend,
@@ -566,6 +575,10 @@ def _get_win32_user32(user32: Any = None) -> Any:
     if hasattr(u32, "AllowSetForegroundWindow"):
         u32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
         u32.AllowSetForegroundWindow.restype = wintypes.BOOL
+
+    if hasattr(u32, "GetSystemMetrics"):
+        u32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u32.GetSystemMetrics.restype = ctypes.c_int
 
     with contextlib.suppress(Exception):
         if hasattr(u32, "SetProcessDpiAwarenessContext"):
@@ -1389,6 +1402,13 @@ _INSTALLED_APP_ROUTED_GUIDANCE: str = (
     "Installed app is focused. Continue the task inside this single app window using UIA "
     "(ui_snapshot/ui_act), in-app keyboard shortcuts, or targeted screen inspection. "
     "Do NOT call open_url again."
+)
+
+_CDP_PWA_NAVIGATED_GUIDANCE: str = (
+    "Installed PWA navigated directly via CDP inside its single app window. "
+    "Verify the returned URL/title, use ui_snapshot()/ui_act() with CDP refs (b1..bN) "
+    "for in-page actions, or call open_url(url) without browser=... for further in-PWA "
+    "deep-link navigation."
 )
 
 _STRIPPED_HOST_SUBDOMAINS: frozenset[str] = frozenset(
@@ -3363,6 +3383,19 @@ def _find_existing_browser_window(
     return _pick_best_matching_window(candidates, user32, prefer_browser_window=True)
 
 
+def _is_deep_url(url: str) -> bool:
+    """Return True if *url* has a non-root path, query string, or fragment."""
+    with contextlib.suppress(Exception):
+        parsed = urllib.parse.urlsplit(url if "://" in url else f"https://{url}")
+        path = (parsed.path or "").strip("/")
+        return bool(path or parsed.query or parsed.fragment)
+    return False
+
+
+def _is_chromium_browser_name(browser_name: str | None) -> bool:
+    return is_chromium_app_name(browser_name)
+
+
 def open_url(
     url: str,
     browser: str | None = None,
@@ -3380,6 +3413,8 @@ def open_url(
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
     prefer_browser: bool = False,
     user_request: str | None = None,
+    cdp_bridge: CDPBridge | None = None,
+    pwa_launch_settle_s: float | None = None,
 ) -> dict[str, Any]:
     """Validate and open an http/https URL using dynamic 3-layer OS app-first routing.
 
@@ -3445,6 +3480,9 @@ def open_url(
     if not parsed.netloc or any(ch.isspace() for ch in parsed.netloc):
         raise ValueError(f"Invalid URL: host/domain is required in {url!r}")
 
+    if isinstance(browser, str) and not browser.strip():
+        browser = None
+
     explicit_browser = bool(prefer_browser) or is_explicit_browser_request(
         user_request, browser=browser
     )
@@ -3460,6 +3498,22 @@ def open_url(
         window_enumerator is not None
         or user32 is not None
         or (popen_fn is None and startfile_fn is None and app_catalog_fetcher is None)
+    )
+    allow_live_cdp = (
+        cdp_bridge is not None
+        or has_explicit_default_cdp_bridge()
+        or (
+            popen_fn is None
+            and startfile_fn is None
+            and app_catalog_fetcher is None
+            and user32 is None
+            and window_enumerator is None
+        )
+    )
+    effective_cdp_bridge: CDPBridge | None = (
+        cdp_bridge
+        if cdp_bridge is not None
+        else (get_default_cdp_bridge() if allow_live_cdp else None)
     )
     effective_win_enum: Callable[[], list[EnumeratedWindow]] | None = (
         window_enumerator if window_enumerator is not None else (None if allow_live_win32 else list)
@@ -3496,6 +3550,7 @@ def open_url(
         target_path: str | None = None,
         protocol_scheme: str | None = None,
         ok: bool = True,
+        guidance: str | None = None,
     ) -> dict[str, Any]:
         return {
             "ok": ok,
@@ -3515,7 +3570,7 @@ def open_url(
             "resolution_layer": resolution_layer,
             "protocol_scheme": protocol_scheme,
             "normalized_target": norm_target or (url_tokens[0] if url_tokens else ""),
-            "guidance": _INSTALLED_APP_ROUTED_GUIDANCE,
+            "guidance": _INSTALLED_APP_ROUTED_GUIDANCE if guidance is None else guidance,
             "message": (
                 f"Routed URL to installed app '{app_name}' via {resolution_layer} "
                 "(app-first policy)."
@@ -3565,6 +3620,42 @@ def open_url(
                 )
                 if u32_active is not None:
                     _focus_window_hwnd(u32_active, target_hwnd, kernel32=kernel32)
+
+                # If this is a Chromium PWA window and CDP is enabled, navigate it directly!
+                if effective_cdp_bridge is not None and is_chromium_process(
+                    resolution.window.process_name
+                ):
+                    nav = effective_cdp_bridge.navigate_sync(
+                        target_url,
+                        prefer_pwa=True,
+                        create_if_missing=False,
+                        preferred_browser=resolution.window.process_name,
+                    )
+                    if isinstance(nav, dict) and nav.get("ok"):
+                        routed = _make_routed_result(
+                            app_name=resolution.app_name,
+                            status="navigated",
+                            resolution_layer=resolution.resolution_layer,
+                            hwnd=target_hwnd,
+                            window_title=str(nav.get("title") or resolution.window.title or ""),
+                            protocol_scheme=resolution.protocol_scheme,
+                            guidance=_CDP_PWA_NAVIGATED_GUIDANCE,
+                        )
+                        routed["url"] = str(nav.get("url") or target_url)
+                        routed["title"] = str(nav.get("title") or "")
+                        routed["target_id"] = nav.get("target_id")
+                        routed["is_pwa"] = bool(nav.get("is_pwa", True))
+                        routed["cdp_used"] = True
+                        routed["before_url"] = nav.get("before_url")
+                        routed["after_url"] = nav.get("after_url")
+                        if isinstance(nav.get("state_diff"), dict):
+                            routed["state_diff"] = nav["state_diff"]
+                        routed["message"] = (
+                            f"Navigated installed PWA '{resolution.app_name}' directly via CDP "
+                            f"to {routed['url']}."
+                        )
+                        return routed
+
                 return _make_routed_result(
                     app_name=resolution.app_name,
                     status="focused",
@@ -3626,6 +3717,56 @@ def open_url(
 
             # Layer 3: Live StartApps / PWA launch with automatic cache invalidation on failure
             if resolution.resolution_layer == "installed_app":
+                if effective_cdp_bridge is not None:
+                    nav_existing = effective_cdp_bridge.navigate_sync(
+                        target_url,
+                        prefer_pwa=True,
+                        create_if_missing=False,
+                    )
+                    if isinstance(nav_existing, dict) and nav_existing.get("ok"):
+                        matched_hwnd: int | None = None
+                        if allow_live_win32:
+                            u32_pwa = _get_u32_optional()
+                            if u32_pwa is not None:
+                                nav_title = str(nav_existing.get("title") or resolution.app_name)
+                                for cand in _enumerate_current_windows():
+                                    if not is_chromium_process(cand.process_name):
+                                        continue
+                                    cand_low = (cand.title or "").lower()
+                                    if (
+                                        (nav_title and nav_title.lower() in cand_low)
+                                        or (
+                                            resolution.app_name
+                                            and resolution.app_name.lower() in cand_low
+                                        )
+                                    ) and not _is_browser_tab_window_title(cand.title):
+                                        matched_hwnd = _resolve_root_window_hwnd(
+                                            int(cand.hwnd), u32_pwa
+                                        )
+                                        _focus_window_hwnd(u32_pwa, matched_hwnd, kernel32=kernel32)
+                                        break
+                        routed_cdp = _make_routed_result(
+                            app_name=resolution.app_name,
+                            status="navigated",
+                            resolution_layer="installed_app",
+                            hwnd=matched_hwnd,
+                            window_title=str(nav_existing.get("title") or resolution.app_name),
+                            guidance=_CDP_PWA_NAVIGATED_GUIDANCE,
+                        )
+                        routed_cdp["url"] = str(nav_existing.get("url") or target_url)
+                        routed_cdp["title"] = str(nav_existing.get("title") or "")
+                        routed_cdp["target_id"] = nav_existing.get("target_id")
+                        routed_cdp["is_pwa"] = bool(nav_existing.get("is_pwa", True))
+                        routed_cdp["cdp_used"] = True
+                        routed_cdp["before_url"] = nav_existing.get("before_url")
+                        routed_cdp["after_url"] = nav_existing.get("after_url")
+                        if isinstance(nav_existing.get("state_diff"), dict):
+                            routed_cdp["state_diff"] = nav_existing["state_diff"]
+                        routed_cdp["message"] = (
+                            f"Navigated installed PWA '{resolution.app_name}' directly via CDP "
+                            f"to {routed_cdp['url']}."
+                        )
+                        return routed_cdp
                 try:
                     app_res = open_or_focus_app(
                         resolution.app_name,
@@ -3639,7 +3780,7 @@ def open_url(
                         startfile_fn=startfile_fn,
                         desktop_name_fn=desktop_name_fn,
                     )
-                    return _make_routed_result(
+                    routed_l3 = _make_routed_result(
                         app_name=str(app_res.get("app") or resolution.app_name),
                         status=str(app_res.get("status") or "launched"),
                         resolution_layer="installed_app",
@@ -3649,6 +3790,55 @@ def open_url(
                         target_path=app_res.get("target_path"),
                         ok=bool(app_res.get("ok", True)),
                     )
+                    if (
+                        routed_l3.get("ok")
+                        and effective_cdp_bridge is not None
+                        and _is_deep_url(target_url)
+                    ):
+                        settle_budget = (
+                            max(0.0, float(pwa_launch_settle_s))
+                            if pwa_launch_settle_s is not None
+                            else (1.5 if popen_fn is None else 0.0)
+                        )
+                        deadline = time.monotonic() + settle_budget
+                        nav = effective_cdp_bridge.navigate_sync(
+                            target_url,
+                            prefer_pwa=True,
+                            create_if_missing=False,
+                        )
+                        while (
+                            isinstance(nav, dict)
+                            and not nav.get("ok")
+                            and nav.get("cdp_available") is True
+                            and nav.get("status") == "target_not_found"
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(min(0.2, max(0.01, deadline - time.monotonic())))
+                            nav = effective_cdp_bridge.navigate_sync(
+                                target_url,
+                                prefer_pwa=True,
+                                create_if_missing=False,
+                            )
+                        if isinstance(nav, dict) and nav.get("ok"):
+                            routed_l3["status"] = "navigated"
+                            routed_l3["url"] = str(nav.get("url") or target_url)
+                            routed_l3["title"] = str(nav.get("title") or "")
+                            routed_l3["window_title"] = (
+                                str(nav.get("title") or "") or routed_l3.get("window_title")
+                            )
+                            routed_l3["target_id"] = nav.get("target_id")
+                            routed_l3["is_pwa"] = bool(nav.get("is_pwa", True))
+                            routed_l3["cdp_used"] = True
+                            routed_l3["guidance"] = _CDP_PWA_NAVIGATED_GUIDANCE
+                            routed_l3["message"] = (
+                                f"Launched and navigated installed PWA '{routed_l3['app_name']}' "
+                                f"directly via CDP to {routed_l3['url']}."
+                            )
+                            routed_l3["before_url"] = nav.get("before_url")
+                            routed_l3["after_url"] = nav.get("after_url")
+                            if isinstance(nav.get("state_diff"), dict):
+                                routed_l3["state_diff"] = nav["state_diff"]
+                    return routed_l3
                 except (OSError, ValueError) as exc:
                     logger.debug(
                         "Installed app launch failed for '%s' (%s); refreshing catalog cache.",
@@ -3746,6 +3936,72 @@ def open_url(
     if b_clean in _DISALLOWED_SHELL_BINARIES or _SHELL_METACHAR_RE.search(b_clean):
         raise ValueError(f"Disallowed browser name: {browser!r}")
 
+    non_default = _check_interactive_desktop(desktop_name_fn)
+    if non_default is not None:
+        return {
+            "ok": False,
+            "success": False,
+            "url": target_url,
+            "browser": b_clean,
+            "status": "non_interactive_desktop",
+            "routed_to_installed_app": False,
+            "message": (
+                f"Cannot open '{target_url}' visibly because the daemon is running on "
+                f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
+            ),
+        }
+
+    # Prefer CDP direct tab navigation for explicit Chromium browser requests (reuses the
+    # existing regular browser window without hijacking any standalone PWA window).
+    if effective_cdp_bridge is not None and _is_chromium_browser_name(b_clean):
+        nav = effective_cdp_bridge.navigate_sync(
+            target_url,
+            prefer_pwa=False,
+            create_if_missing=True,
+            preferred_browser=b_clean,
+        )
+        if isinstance(nav, dict) and nav.get("ok"):
+            if allow_live_win32:
+                u32_b = _get_u32_optional()
+                existing_browser = _find_existing_browser_window(
+                    _enumerate_current_windows(),
+                    browser_name=b_clean,
+                    url_tokens=url_tokens,
+                    user32=u32_b,
+                )
+                if existing_browser is not None:
+                    reused_browser_hwnd = (
+                        _resolve_root_window_hwnd(int(existing_browser.hwnd), u32_b)
+                        if u32_b is not None
+                        else int(existing_browser.hwnd)
+                    )
+                    reused_browser_title = existing_browser.title
+                    if u32_b is not None:
+                        _focus_window_hwnd(u32_b, reused_browser_hwnd, kernel32=kernel32)
+            cdp_result: dict[str, Any] = {
+                "ok": True,
+                "success": True,
+                "url": str(nav.get("url") or target_url),
+                "title": str(nav.get("title") or ""),
+                "browser": b_clean,
+                "status": "navigated",
+                "launched_app": False,
+                "routed_to_installed_app": False,
+                "reused_browser_window": True,
+                "hwnd": reused_browser_hwnd,
+                "window_hwnd": reused_browser_hwnd,
+                "window_title": str(nav.get("title") or "") or reused_browser_title,
+                "target_id": nav.get("target_id"),
+                "is_pwa": bool(nav.get("is_pwa", False)),
+                "cdp_used": True,
+                "before_url": nav.get("before_url"),
+                "after_url": nav.get("after_url"),
+                "normalized_target": norm_target,
+            }
+            if isinstance(nav.get("state_diff"), dict):
+                cdp_result["state_diff"] = nav["state_diff"]
+            return cdp_result
+
     browser_exe: str | None = None
     env_map = dict(os.environ) if env is None else env
     if b_clean in _KNOWN_APPS:
@@ -3766,21 +4022,6 @@ def open_url(
 
     if not browser_exe:
         raise ValueError(f"Browser '{browser}' could not be resolved to an executable.")
-
-    non_default = _check_interactive_desktop(desktop_name_fn)
-    if non_default is not None:
-        return {
-            "ok": False,
-            "success": False,
-            "url": target_url,
-            "browser": b_clean,
-            "status": "non_interactive_desktop",
-            "routed_to_installed_app": False,
-            "message": (
-                f"Cannot open '{target_url}' visibly because the daemon is running on "
-                f"isolated desktop '{non_default}' instead of 'WinSta0\\Default'."
-            ),
-        }
 
     if allow_live_win32:
         u32_b = _get_u32_optional()
@@ -4544,14 +4785,219 @@ KEYEVENTF_UNICODE: int = 0x0004
 MAX_GUI_TYPE_TEXT_LEN: int = 2000
 MAX_UI_INSPECT_ELEMENTS: int = 150
 UI_AUTOMATION_TIMEOUT_SECONDS: float = 5.0
+UIA_MAX_DEPTH: int = 8
+UIA_MAX_NODES: int = 250
+
+SM_CXSCREEN_OS: int = 0
+SM_CYSCREEN_OS: int = 1
+SM_XVIRTUALSCREEN_OS: int = 76
+SM_YVIRTUALSCREEN_OS: int = 77
+SM_CXVIRTUALSCREEN_OS: int = 78
+SM_CYVIRTUALSCREEN_OS: int = 79
 
 VALID_GUI_ACTIONS: frozenset[str] = frozenset(
-    {"click_at", "type_text", "press_keys", "scroll", "wait"}
+    {
+        "click_at",
+        "double_click",
+        "right_click",
+        "move",
+        "type_text",
+        "press_keys",
+        "scroll",
+        "wait",
+        "navigate_back",
+        "navigate_forward",
+        "click",
+        "type",
+        "press",
+    }
 )
+VALID_COORD_SPACES: frozenset[str] = frozenset({"normalized_1000", "image", "screen"})
 VALID_UI_ACT_ACTIONS: frozenset[str] = frozenset(
-    {"click", "double_click", "right_click", "set_value", "type", "clear"}
+    {"click", "double_click", "right_click", "set_value", "type", "clear", "press"}
 )
 VALID_CLICK_BUTTONS: frozenset[str] = frozenset({"left", "right", "double"})
+
+_SCREEN_GEOMETRY_LOCK = threading.RLock()
+_LAST_SCREEN_GEOMETRY: dict[str, Any] | None = None
+
+
+def set_last_screen_geometry(
+    *,
+    image_width: int,
+    image_height: int,
+    screen_width: int,
+    screen_height: int,
+    virtual_left: int = 0,
+    virtual_top: int = 0,
+    dpi_scale: float = 1.0,
+    coord_space: str = "normalized_1000",
+) -> dict[str, Any]:
+    """Store the latest screenshot geometry so subsequent gui_action calls scale accurately."""
+    global _LAST_SCREEN_GEOMETRY
+    geom = {
+        "image_width": max(1, int(image_width)),
+        "image_height": max(1, int(image_height)),
+        "screen_width": max(1, int(screen_width)),
+        "screen_height": max(1, int(screen_height)),
+        "virtual_left": int(virtual_left),
+        "virtual_top": int(virtual_top),
+        "dpi_scale": float(dpi_scale) if dpi_scale and dpi_scale > 0 else 1.0,
+        "coord_space": str(coord_space or "normalized_1000"),
+    }
+    with _SCREEN_GEOMETRY_LOCK:
+        _LAST_SCREEN_GEOMETRY = geom
+    return dict(geom)
+
+
+def get_last_screen_geometry() -> dict[str, Any] | None:
+    """Return a copy of the latest recorded screenshot geometry, if available."""
+    with _SCREEN_GEOMETRY_LOCK:
+        return dict(_LAST_SCREEN_GEOMETRY) if _LAST_SCREEN_GEOMETRY is not None else None
+
+
+def clear_last_screen_geometry() -> None:
+    """Clear the cached screenshot geometry."""
+    global _LAST_SCREEN_GEOMETRY
+    with _SCREEN_GEOMETRY_LOCK:
+        _LAST_SCREEN_GEOMETRY = None
+
+
+def _query_virtual_screen_metrics(user32: Any = None) -> tuple[int, int, int, int]:
+    """Return physical (virtual_left, virtual_top, screen_width, screen_height)."""
+    u32 = user32
+    if u32 is None and sys.platform == "win32":
+        with contextlib.suppress(Exception):
+            u32 = _get_win32_user32(None)
+    if u32 is not None and hasattr(u32, "GetSystemMetrics"):
+        with contextlib.suppress(Exception):
+            v_w = int(u32.GetSystemMetrics(SM_CXVIRTUALSCREEN_OS) or 0)
+            v_h = int(u32.GetSystemMetrics(SM_CYVIRTUALSCREEN_OS) or 0)
+            if v_w > 0 and v_h > 0:
+                v_l = int(u32.GetSystemMetrics(SM_XVIRTUALSCREEN_OS) or 0)
+                v_t = int(u32.GetSystemMetrics(SM_YVIRTUALSCREEN_OS) or 0)
+                return (v_l, v_t, v_w, v_h)
+            p_w = int(u32.GetSystemMetrics(SM_CXSCREEN_OS) or 0)
+            p_h = int(u32.GetSystemMetrics(SM_CYSCREEN_OS) or 0)
+            if p_w > 0 and p_h > 0:
+                return (0, 0, p_w, p_h)
+    return (0, 0, 1920, 1080)
+
+
+def convert_coordinates_to_screen(
+    x: int | float,
+    y: int | float,
+    *,
+    coord_space: str | None = None,
+    screen_width: int | None = None,
+    screen_height: int | None = None,
+    virtual_left: int | None = None,
+    virtual_top: int | None = None,
+    image_width: int | None = None,
+    image_height: int | None = None,
+    dpi_scale: float | None = None,
+    user32: Any = None,
+) -> tuple[int, int, dict[str, Any]]:
+    """Convert ``(x, y)`` from ``normalized_1000``, ``image``, or ``screen`` to physical pixels."""
+    space = (coord_space or "screen").strip().lower()
+    if space not in VALID_COORD_SPACES:
+        raise ValueError(
+            f"Unsupported coord_space {coord_space!r}. Must be one of {sorted(VALID_COORD_SPACES)}."
+        )
+    if (
+        isinstance(x, bool)
+        or isinstance(y, bool)
+        or not isinstance(x, (int, float))
+        or not isinstance(y, (int, float))
+    ):
+        raise ValueError("x and y must be numbers.")
+    if not math.isfinite(float(x)) or not math.isfinite(float(y)):
+        raise ValueError("x and y must be finite numbers.")
+    if float(x) < 0 or float(y) < 0:
+        raise ValueError("x and y must be non-negative.")
+
+    if space == "screen":
+        px = int(round(float(x)))
+        py = int(round(float(y)))
+        return px, py, {
+            "coord_space": "screen",
+            "physical_x": px,
+            "physical_y": py,
+        }
+
+    cached = get_last_screen_geometry()
+    fallback_l, fallback_t, fallback_w, fallback_h = (
+        (
+            cached["virtual_left"],
+            cached["virtual_top"],
+            cached["screen_width"],
+            cached["screen_height"],
+        )
+        if cached is not None
+        else _query_virtual_screen_metrics(user32=user32)
+    )
+    v_left = int(virtual_left) if virtual_left is not None else int(fallback_l)
+    v_top = int(virtual_top) if virtual_top is not None else int(fallback_t)
+    s_width = int(screen_width) if screen_width is not None else int(fallback_w)
+    s_height = int(screen_height) if screen_height is not None else int(fallback_h)
+    eff_dpi = (
+        float(dpi_scale)
+        if dpi_scale is not None and dpi_scale > 0
+        else (float(cached["dpi_scale"]) if cached is not None else 1.0)
+    )
+    if s_width <= 0 or s_height <= 0:
+        raise ValueError("screen_width and screen_height must be positive integers.")
+
+    if space == "normalized_1000":
+        if float(x) > 1000.0 or float(y) > 1000.0:
+            raise ValueError("x and y must be within [0, 1000] for coord_space='normalized_1000'.")
+        raw_px = v_left + int(round((float(x) / 1000.0) * s_width))
+        raw_py = v_top + int(round((float(y) / 1000.0) * s_height))
+        px = max(v_left, min(v_left + s_width - 1, raw_px))
+        py = max(v_top, min(v_top + s_height - 1, raw_py))
+        return px, py, {
+            "coord_space": "normalized_1000",
+            "physical_x": px,
+            "physical_y": py,
+            "screen_width": s_width,
+            "screen_height": s_height,
+            "virtual_left": v_left,
+            "virtual_top": v_top,
+            "dpi_scale": eff_dpi,
+        }
+
+    # space == "image"
+    img_w = (
+        int(image_width)
+        if image_width is not None
+        else (int(cached["image_width"]) if cached is not None else 0)
+    )
+    img_h = (
+        int(image_height)
+        if image_height is not None
+        else (int(cached["image_height"]) if cached is not None else 0)
+    )
+    if img_w <= 0 or img_h <= 0:
+        raise ValueError(
+            "image_width and image_height are required for coord_space='image' when no prior "
+            "screen geometry is cached."
+        )
+    raw_px = v_left + int(round((float(x) / float(img_w)) * s_width))
+    raw_py = v_top + int(round((float(y) / float(img_h)) * s_height))
+    px = max(v_left, min(v_left + s_width - 1, raw_px))
+    py = max(v_top, min(v_top + s_height - 1, raw_py))
+    return px, py, {
+        "coord_space": "image",
+        "physical_x": px,
+        "physical_y": py,
+        "image_width": img_w,
+        "image_height": img_h,
+        "screen_width": s_width,
+        "screen_height": s_height,
+        "virtual_left": v_left,
+        "virtual_top": v_top,
+        "dpi_scale": eff_dpi,
+    }
 VALID_UI_CONTROL_TYPES: tuple[str, ...] = (
     "Button",
     "Edit",
@@ -4759,9 +5205,6 @@ _LAST_UI_SNAPSHOT: dict[str, Any] | None = None
 _LAST_UI_SNAPSHOT_TIME: float = 0.0
 _LAST_UI_WINDOW_TITLE: str = ""
 
-VALID_UI_ACT_ACTIONS: frozenset[str] = frozenset(
-    {"click", "set_value", "type", "clear", "double_click", "right_click"}
-)
 VALID_UI_BATCH_OPS: frozenset[str] = frozenset({"act", "press_keys", "scroll", "wait", "click_at"})
 
 
@@ -5026,43 +5469,85 @@ _POWERSHELL_UIA_RESOLVE_WINDOW = (
     "} "
 )
 
-_POWERSHELL_UIA_TYPES_COND = (
-    "$ctList = @("
-    "[System.Windows.Automation.ControlType]::Button,"
-    "[System.Windows.Automation.ControlType]::Edit,"
-    "[System.Windows.Automation.ControlType]::MenuItem,"
-    "[System.Windows.Automation.ControlType]::TabItem,"
-    "[System.Windows.Automation.ControlType]::Hyperlink,"
-    "[System.Windows.Automation.ControlType]::ListItem,"
-    "[System.Windows.Automation.ControlType]::CheckBox,"
-    "[System.Windows.Automation.ControlType]::RadioButton,"
-    "[System.Windows.Automation.ControlType]::ComboBox,"
-    "[System.Windows.Automation.ControlType]::Text"
+_POWERSHELL_UIA_BOUNDED_WALK_SETUP = (
+    "$ctAllowed = @("
+    "'Button','Edit','MenuItem','TabItem','Hyperlink',"
+    "'ListItem','CheckBox','RadioButton','ComboBox','Text'"
     "); "
-    "$ctConds = @(); "
-    "foreach ($ct in $ctList) { "
-    "  $ctConds += New-Object System.Windows.Automation.PropertyCondition("
-    "[System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct) "
-    "}; "
-    "$typeCond = New-Object System.Windows.Automation.OrCondition($ctConds); "
+    "$uiaCacheReq = New-Object System.Windows.Automation.CacheRequest; "
+    "$uiaCacheReq.TreeScope = [System.Windows.Automation.TreeScope]::Element; "
+    "$uiaCacheReq.AutomationElementMode = "
+    "[System.Windows.Automation.AutomationElementMode]::Full; "
+    "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::NameProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::AutomationIdProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::ControlTypeProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::BoundingRectangleProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::IsOffscreenProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::IsEnabledProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::HasKeyboardFocusProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.ValuePattern]::Pattern); "
+    "$uiaCacheReq.Add([System.Windows.Automation.ValuePattern]::ValueProperty); "
+    "$uiaCacheReq.Add([System.Windows.Automation.RangeValuePattern]::Pattern); "
+    "$uiaCacheReq.Add([System.Windows.Automation.RangeValuePattern]::ValueProperty); "
+    "function Get-UiaProps($El) { "
+    "  try { "
+    "    $c = $El.Cached; "
+    "    [void]$c.ControlType; "
+    "    return $c "
+    "  } catch { "
+    "    return $El.Current "
+    "  } "
+    "} "
+    "function Get-BoundedUiaNodes($RootEl, [int]$MaxDepth, [int]$MaxNodes) { "
+    "  $out = New-Object System.Collections.ArrayList; "
+    "  if ($RootEl -eq $null) { return ,$out } "
+    "  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker; "
+    "  $scope = $uiaCacheReq.Activate(); "
+    "  try { "
+    "    $queue = New-Object System.Collections.ArrayList; "
+    "    $cachedRoot = try { $RootEl.GetUpdatedCache($uiaCacheReq) } catch { $RootEl }; "
+    "    [void]$queue.Add(@($cachedRoot, 0)); "
+    "    $qi = 0; $visited = 0; "
+    "    while ($qi -lt $queue.Count -and $visited -lt $MaxNodes) { "
+    "      $entry = $queue[$qi]; $qi++; "
+    "      $node = $entry[0]; $depth = [int]$entry[1]; "
+    "      if ($node -eq $null) { continue } "
+    "      $visited++; "
+    "      if ($depth -gt 0) { [void]$out.Add($node) } "
+    "      if ($depth -lt $MaxDepth) { "
+    "        $child = try { $walker.GetFirstChild($node, $uiaCacheReq) } catch { $null }; "
+    "        while ($child -ne $null -and ($visited + $queue.Count - $qi) -lt $MaxNodes) { "
+    "          [void]$queue.Add(@($child, ($depth + 1))); "
+    "          $child = try { $walker.GetNextSibling($child, $uiaCacheReq) } catch { $null } "
+    "        } "
+    "      } "
+    "    } "
+    "  } finally { "
+    "    if ($scope -ne $null) { $scope.Dispose() } "
+    "  } "
+    "  return ,$out "
+    "} "
 )
 
 _POWERSHELL_INSPECT_UI_SCRIPT = (
-    "param([long]$TargetHwnd = 0, [int]$MaxElements = 60, [string]$AppNameBase64 = '') "
+    "param([long]$TargetHwnd = 0, [int]$MaxElements = 60, [string]$AppNameBase64 = '', "
+    f"[int]$MaxDepth = {UIA_MAX_DEPTH}, [int]$MaxNodes = {UIA_MAX_NODES}) "
     "$AppName = if ($AppNameBase64) { "
     "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($AppNameBase64)) "
     "} else { '' }; "
     + _POWERSHELL_UIA_RESOLVE_WINDOW
-    + _POWERSHELL_UIA_TYPES_COND
+    + _POWERSHELL_UIA_BOUNDED_WALK_SETUP
     + "$winTitle = if ($win -ne $null) { "
     "try { [string]$win.Current.Name } catch { '' } } else { '' }; "
     "$items = New-Object System.Collections.ArrayList; "
     "if ($win -ne $null) { "
-    "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $typeCond); "
+    "  $all = Get-BoundedUiaNodes $win $MaxDepth $MaxNodes; "
     "  foreach ($el in $all) { "
     "    try { "
-    "      $cur = $el.Current; "
+    "      $cur = Get-UiaProps $el; "
     "      if ($cur.IsOffscreen) { continue } "
+    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
+    "      if ($ctAllowed -notcontains $ctName) { continue } "
     "      $r = $cur.BoundingRectangle; "
     "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
     "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
@@ -5072,12 +5557,11 @@ _POWERSHELL_INSPECT_UI_SCRIPT = (
     "      $elVal = $null; "
     "      $vp = $null; "
     "      try { "
-    "        if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
-    "[ref]$vp)) { "
-    "          $elVal = [string]$vp.Current.Value "
-    "        } "
+    "        if ($el.TryGetCachedPattern([System.Windows.Automation.ValuePattern]::Pattern, "
+    "[ref]$vp)) { $elVal = [string]$vp.Cached.Value } "
+    "        elseif ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
+    "[ref]$vp)) { $elVal = [string]$vp.Current.Value } "
     "      } catch { $elVal = $null } "
-    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
     "      if ($ctName -eq 'Text' -and [string]::IsNullOrWhiteSpace($elName) "
     "-and [string]::IsNullOrWhiteSpace($elAid) -and [string]::IsNullOrEmpty($elVal)) { continue } "
     "      $cx = [int][Math]::Round($r.Left + ($r.Width / 2.0)); "
@@ -5101,7 +5585,8 @@ _POWERSHELL_INSPECT_UI_SCRIPT = (
 
 _POWERSHELL_CLICK_UI_SCRIPT = (
     "param([long]$TargetHwnd = 0, [string]$TargetNameBase64 = '', "
-    "[string]$ControlTypeFilter = '', [string]$AppNameBase64 = '') "
+    "[string]$ControlTypeFilter = '', [string]$AppNameBase64 = '', "
+    f"[int]$MaxDepth = {UIA_MAX_DEPTH}, [int]$MaxNodes = {UIA_MAX_NODES}) "
     "$TargetName = if ($TargetNameBase64) { "
     "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($TargetNameBase64)) "
     "} else { '' }; "
@@ -5109,33 +5594,25 @@ _POWERSHELL_CLICK_UI_SCRIPT = (
     "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($AppNameBase64)) "
     "} else { '' }; "
     + _POWERSHELL_UIA_RESOLVE_WINDOW
-    + _POWERSHELL_UIA_TYPES_COND
-    + "$searchCond = $typeCond; "
-    "if ($ControlTypeFilter -ne '') { "
-    "  $ctProp = [System.Windows.Automation.ControlType]::$ControlTypeFilter; "
-    "  if ($ctProp -ne $null) { "
-    "    $searchCond = New-Object System.Windows.Automation.PropertyCondition("
-    "[System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ctProp) "
-    "  } "
-    "} "
-    "$exactMatch = $null; $exactIsText = $false; "
+    + _POWERSHELL_UIA_BOUNDED_WALK_SETUP
+    + "$exactMatch = $null; $exactIsText = $false; "
     "$subMatch = $null; $subIsText = $false; $aidMatch = $null; "
     "$avail = New-Object System.Collections.ArrayList; "
     "if ($win -ne $null) { "
-    "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $searchCond); "
+    "  $all = Get-BoundedUiaNodes $win $MaxDepth $MaxNodes; "
     "  foreach ($el in $all) { "
     "    try { "
-    "      $cur = $el.Current; "
+    "      $cur = Get-UiaProps $el; "
     "      if ($cur.IsOffscreen) { continue } "
+    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
+    "      if ($ControlTypeFilter -ne '') { "
+    "        if (-not $ctName.Equals($ControlTypeFilter, "
+    "[System.StringComparison]::OrdinalIgnoreCase)) { continue } "
+    "      } elseif ($ctAllowed -notcontains $ctName) { continue } "
     "      $r = $cur.BoundingRectangle; "
     "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
     "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
     "-or $r.Width -le 0 -or $r.Height -le 0) { continue } "
-    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
-    "      if ($ControlTypeFilter -ne '' -and "
-    "-not $ctName.Equals($ControlTypeFilter, [System.StringComparison]::OrdinalIgnoreCase)) { "
-    "        continue "
-    "      } "
     "      $elName = [string]$cur.Name; "
     "      $elAid = [string]$cur.AutomationId; "
     "      if (-not [string]::IsNullOrWhiteSpace($elName) -and $avail.Count -lt 40) { "
@@ -5164,7 +5641,7 @@ _POWERSHELL_CLICK_UI_SCRIPT = (
     "  @{ found = $false; available = [object[]]$avail.ToArray() } "
     "| ConvertTo-Json -Depth 4 -Compress "
     "} else { "
-    "  $cc = $chosen.Current; "
+    "  $cc = Get-UiaProps $chosen; "
     "  $cr = $cc.BoundingRectangle; "
     "  $cx = [int][Math]::Round($cr.Left + ($cr.Width / 2.0)); "
     "  $cy = [int][Math]::Round($cr.Top + ($cr.Height / 2.0)); "
@@ -5185,23 +5662,26 @@ _POWERSHELL_CLICK_UI_SCRIPT = (
 
 _POWERSHELL_SNAPSHOT_UI_SCRIPT = (
     "param([long]$TargetHwnd = 0, [int]$MaxElements = 80, "
-    "[int]$InteractiveOnly = 0, [string]$AppNameBase64 = '') "
+    "[int]$InteractiveOnly = 0, [string]$AppNameBase64 = '', "
+    f"[int]$MaxDepth = {UIA_MAX_DEPTH}, [int]$MaxNodes = {UIA_MAX_NODES}) "
     "$AppName = if ($AppNameBase64) { "
     "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($AppNameBase64)) "
     "} else { '' }; "
     + _POWERSHELL_UIA_RESOLVE_WINDOW
-    + _POWERSHELL_UIA_TYPES_COND
+    + _POWERSHELL_UIA_BOUNDED_WALK_SETUP
     + "$winTitle = if ($win -ne $null) { "
     "try { [string]$win.Current.Name } catch { '' } } else { '' }; "
     "$winHwnd = if ($win -ne $null) { "
     "try { [long]$win.Current.NativeWindowHandle } catch { 0 } } else { 0 }; "
     "$items = New-Object System.Collections.ArrayList; "
     "if ($win -ne $null) { "
-    "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $typeCond); "
+    "  $all = Get-BoundedUiaNodes $win $MaxDepth $MaxNodes; "
     "  foreach ($el in $all) { "
     "    try { "
-    "      $cur = $el.Current; "
+    "      $cur = Get-UiaProps $el; "
     "      if ($cur.IsOffscreen) { continue } "
+    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
+    "      if ($ctAllowed -notcontains $ctName) { continue } "
     "      $r = $cur.BoundingRectangle; "
     "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
     "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
@@ -5211,7 +5691,6 @@ _POWERSHELL_SNAPSHOT_UI_SCRIPT = (
     "      $bw = [int][Math]::Round($r.Width); "
     "      $bh = [int][Math]::Round($r.Height); "
     "      if ($bw -le 0 -or $bh -le 0) { continue } "
-    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
     "      $isEnabled = [bool]$cur.IsEnabled; "
     "      $isFocused = [bool]$cur.HasKeyboardFocus; "
     "      if ($InteractiveOnly -ne 0 -and ($ctName -eq 'Text' -or -not $isEnabled)) { continue } "
@@ -5220,15 +5699,18 @@ _POWERSHELL_SNAPSHOT_UI_SCRIPT = (
     "      $elVal = $null; "
     "      $vp = $null; "
     "      try { "
-    "        if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
-    "[ref]$vp)) { "
-    "          $elVal = [string]$vp.Current.Value "
-    "        } "
+    "        if ($el.TryGetCachedPattern([System.Windows.Automation.ValuePattern]::Pattern, "
+    "[ref]$vp)) { $elVal = [string]$vp.Cached.Value } "
+    "        elseif ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, "
+    "[ref]$vp)) { $elVal = [string]$vp.Current.Value } "
     "      } catch { $elVal = $null } "
     "      if ($elVal -eq $null) { "
     "        $rvp = $null; "
     "        try { "
-    "          if ($el.TryGetCurrentPattern("
+    "          if ($el.TryGetCachedPattern("
+    "[System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$rvp)) { "
+    "            $elVal = [string]$rvp.Cached.Value "
+    "          } elseif ($el.TryGetCurrentPattern("
     "[System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$rvp)) { "
     "            $elVal = [string]$rvp.Current.Value "
     "          } "
@@ -5261,7 +5743,8 @@ _POWERSHELL_UI_ACT_SCRIPT = (
     "[string]$Action = 'click', [string]$AutomationIdBase64 = '', "
     "[string]$NameBase64 = '', [string]$ControlType = '', "
     "[int]$ExpectedX = 0, [int]$ExpectedY = 0, [int]$ExpectedW = 0, [int]$ExpectedH = 0, "
-    "[int]$CenterX = 0, [int]$CenterY = 0, [string]$ValueBase64 = '') "
+    "[int]$CenterX = 0, [int]$CenterY = 0, [string]$ValueBase64 = '', "
+    f"[int]$MaxDepth = {UIA_MAX_DEPTH}, [int]$MaxNodes = {UIA_MAX_NODES}) "
     "$AppName = if ($WindowTitleBase64) { "
     "[System.Text.Encoding]::UTF8.GetString("
     "[System.Convert]::FromBase64String($WindowTitleBase64)) "
@@ -5277,25 +5760,20 @@ _POWERSHELL_UI_ACT_SCRIPT = (
     "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ValueBase64)) "
     "} else { '' }; "
     + _POWERSHELL_UIA_RESOLVE_WINDOW
-    + _POWERSHELL_UIA_TYPES_COND
-    + "$searchCond = $typeCond; "
-    "if ($ControlType -ne '') { "
-    "  $ctProp = $null; "
-    "  try { $ctProp = [System.Windows.Automation.ControlType]::$ControlType } "
-    "catch { $ctProp = $null }; "
-    "  if ($ctProp -ne $null) { "
-    "    $searchCond = New-Object System.Windows.Automation.PropertyCondition("
-    "[System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ctProp) "
-    "  } "
-    "} "
-    "$chosen = $null; $bestScore = -1; $bestDist = [int]::MaxValue; "
+    + _POWERSHELL_UIA_BOUNDED_WALK_SETUP
+    + "$chosen = $null; $bestScore = -1; $bestDist = [int]::MaxValue; "
     "$chosenCx = $CenterX; $chosenCy = $CenterY; "
     "if ($win -ne $null) { "
-    "  $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $searchCond); "
+    "  $all = Get-BoundedUiaNodes $win $MaxDepth $MaxNodes; "
     "  foreach ($el in $all) { "
     "    try { "
-    "      $cur = $el.Current; "
+    "      $cur = Get-UiaProps $el; "
     "      if ($cur.IsOffscreen) { continue } "
+    "      $ctName = ($cur.ControlType.ProgrammaticName -replace '^ControlType\\.', ''); "
+    "      if ($ControlType -ne '') { "
+    "        if (-not $ctName.Equals($ControlType, "
+    "[System.StringComparison]::OrdinalIgnoreCase)) { continue } "
+    "      } elseif ($ctAllowed -notcontains $ctName) { continue } "
     "      $r = $cur.BoundingRectangle; "
     "      if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height) "
     "-or [double]::IsNaN($r.Width) -or [double]::IsNaN($r.Height) "
@@ -5363,6 +5841,117 @@ _POWERSHELL_UI_ACT_SCRIPT = (
     "cx = $chosenCx; cy = $chosenCy } | ConvertTo-Json -Depth 4 -Compress "
     "}"
 )
+
+
+def _resolve_target_process_info(
+    *,
+    hwnd: int,
+    app_name: str | None = None,
+    user32: Any = None,
+    kernel32: Any = None,
+    window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> tuple[str, str, bool | None]:
+    """Return ``(process_name, window_title, is_pwa_hint)`` for a target HWND/app."""
+    if is_chromium_app_name(app_name):
+        low = (app_name or "").strip().lower()
+        proc = "msedge.exe" if "edge" in low else ("brave.exe" if "brave" in low else "chrome.exe")
+        title = ""
+        if window_enumerator is not None and hwnd > 0:
+            with contextlib.suppress(Exception):
+                for win in window_enumerator():
+                    if int(win.hwnd) == int(hwnd):
+                        title = win.title or ""
+                        break
+        elif hwnd > 0 and (user32 is not None or powershell_runner is None):
+            u32 = user32 if user32 is not None else (
+                _get_win32_user32(None) if sys.platform == "win32" else None
+            )
+            if u32 is not None:
+                title = _read_window_title_os(hwnd, u32) or ""
+        return proc, title, False
+
+    # Look up in window_enumerator when supplied
+    if window_enumerator is not None and hwnd > 0:
+        with contextlib.suppress(Exception):
+            for win in window_enumerator():
+                if int(win.hwnd) == int(hwnd):
+                    is_pwa_hint = (
+                        not _is_browser_tab_window_title(win.title)
+                        if is_chromium_process(win.process_name)
+                        else None
+                    )
+                    return win.process_name, win.title, is_pwa_hint
+
+    # Do not probe live Win32 processes during mock PowerShell tests lacking Win32 doubles
+    has_win32_double = user32 is not None or window_enumerator is not None
+    if powershell_runner is not None and not has_win32_double:
+        return "", "", None
+
+    if hwnd > 0:
+        u32 = user32 if user32 is not None else (
+            _get_win32_user32(None) if sys.platform == "win32" else None
+        )
+        k32 = kernel32 if kernel32 is not None else (
+            _get_win32_kernel32(None) if sys.platform == "win32" else None
+        )
+        title = _read_window_title_os(hwnd, u32) or "" if u32 is not None else ""
+        proc_name = ""
+        if u32 is not None and hasattr(u32, "GetWindowThreadProcessId"):
+            with contextlib.suppress(Exception):
+                pid = ctypes.c_uint32(0)
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                pid_val = int(pid.value)
+                if pid_val > 0 and k32 is not None and hasattr(k32, "OpenProcess"):
+                    h_proc = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_val)
+                    if h_proc:
+                        try:
+                            if hasattr(k32, "QueryFullProcessImageNameW"):
+                                buf = ctypes.create_unicode_buffer(1024)
+                                size = ctypes.c_uint32(1024)
+                                if k32.QueryFullProcessImageNameW(
+                                    h_proc, 0, buf, ctypes.byref(size)
+                                ):
+                                    proc_name = Path(buf.value).name
+                        finally:
+                            with contextlib.suppress(Exception):
+                                k32.CloseHandle(h_proc)
+        if is_chromium_process(proc_name):
+            is_pwa_hint = not _is_browser_tab_window_title(title) if title else None
+            return proc_name, title, is_pwa_hint
+        return proc_name, title, None
+
+    return "", "", None
+
+
+def _chromium_cdp_unavailable_snapshot(
+    *,
+    window_title: str = "",
+    process_name: str = "",
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Fast (<200ms) structured fallback when Chromium UIA is blocked and CDP is off."""
+    return {
+        "ok": False,
+        "status": "cdp_unavailable",
+        "source": "cdp",
+        "cdp_available": False,
+        "snapshot_id": "",
+        "window_title": window_title,
+        "process_name": process_name,
+        "count": 0,
+        "element_count": 0,
+        "elements": [],
+        "message": (
+            "Blocked slow PowerShell UIA traversal on Chromium process "
+            f"'{process_name or 'chrome'}'. CDP remote debugging is currently unavailable."
+        ),
+        "hint": (
+            "Use open_url(...) for direct navigation or enable "
+            f"{CDP_REMOTE_DEBUGGING_HINT.removeprefix('Enable remote debugging at ')}"
+        ),
+        "error": error or CDP_REMOTE_DEBUGGING_HINT,
+    }
 
 
 def _resolve_target_hwnd_optional(
@@ -5697,9 +6286,10 @@ def ui_snapshot(
     user32: Any = None,
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    cdp_bridge: CDPBridge | None = None,
     _target_hwnd: int | None = None,
 ) -> dict[str, Any]:
-    """Capture a semantic UI Automation snapshot and assign compact ref IDs ('e1'..'eN')."""
+    """Capture a semantic UI snapshot (CDP 'b1'..'bN' for Chromium, UIA 'e1'..'eN' for native)."""
     if app_name is not None and not isinstance(app_name, str):
         raise ValueError("app_name must be a string when provided.")
     if isinstance(max_elements, bool) or not isinstance(max_elements, int):
@@ -5722,6 +6312,48 @@ def ui_snapshot(
             kernel32=kernel32,
             window_enumerator=window_enumerator,
             focus_if_app_name=True,
+        )
+
+    # Chromium UIA Guard: NEVER run PowerShell UIA against chrome/msedge/brave.
+    # Always delegate to the CDP bridge or return a fast (<200ms) structured fallback.
+    proc_name, target_title, is_pwa_hint = _resolve_target_process_info(
+        hwnd=hwnd,
+        app_name=cleaned_app,
+        user32=user32,
+        kernel32=kernel32,
+        window_enumerator=window_enumerator,
+        powershell_runner=powershell_runner,
+    )
+    if is_chromium_process(proc_name) or is_chromium_app_name(cleaned_app):
+        bridge = cdp_bridge or get_default_cdp_bridge()
+        eff_title_hint = target_title or (
+            None if is_chromium_app_name(cleaned_app) else cleaned_app
+        )
+        cdp_res = bridge.snapshot_sync(
+            max_elements=min(clamped_max, 60),
+            prefer_pwa=is_pwa_hint,
+            title_hint=eff_title_hint,
+            interactive_only=interactive_only,
+            preferred_browser=(
+                proc_name or (cleaned_app if is_chromium_app_name(cleaned_app) else None)
+            ),
+        )
+        if isinstance(cdp_res, dict) and cdp_res.get("ok"):
+            global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+            _LAST_UI_SNAPSHOT = cdp_res
+            _LAST_UI_SNAPSHOT_TIME = time.time()
+            _LAST_UI_WINDOW_TITLE = str(cdp_res.get("window_title") or cdp_res.get("title") or "")
+            return cdp_res
+        if isinstance(cdp_res, dict) and cdp_res.get("cdp_available") is True:
+            out = dict(cdp_res)
+            if not out.get("window_title"):
+                out["window_title"] = target_title
+            out.setdefault("process_name", proc_name or (cleaned_app or "chrome.exe"))
+            return out
+        return _chromium_cdp_unavailable_snapshot(
+            window_title=target_title,
+            process_name=proc_name or (cleaned_app or "chrome.exe"),
+            error=str(cdp_res.get("error") or "") if isinstance(cdp_res, dict) else None,
         )
 
     app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
@@ -5844,7 +6476,6 @@ def ui_snapshot(
         "element_count": len(llm_elements),
         "elements": llm_elements,
     }
-    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
     _LAST_UI_SNAPSHOT = snap_result
     _LAST_UI_SNAPSHOT_TIME = time.time()
     _LAST_UI_WINDOW_TITLE = window_title
@@ -5877,13 +6508,13 @@ def ui_act(
     focus_backend: FocusPreconditionBackend | None = None,
     expected_hwnd: int | None = None,
     require_foreground: bool = True,
+    cdp_bridge: CDPBridge | None = None,
     _guard: PreconditionGuard | None = None,
     _capture_snapshot: bool = True,
 ) -> dict[str, Any]:
-    """Execute a semantic action on an indexed UI element and return verification diff."""
+    """Execute a semantic action on an indexed UI ('e#') or CDP browser ('b#') element."""
     if not isinstance(ref, str) or not ref.strip():
-        raise ValueError("ref must be a non-empty element reference (e.g. 'e1' or '@e1').")
-    norm_ref = _normalize_ref_id(ref)
+        raise ValueError("ref must be a non-empty element reference (e.g. 'e1', '@e1', or 'b1').")
 
     if not isinstance(action, str) or not action.strip():
         raise ValueError("action must be a non-empty string.")
@@ -5893,6 +6524,18 @@ def ui_act(
             f"Unsupported UI act action {action!r}. Unsupported ui_act action; "
             f"must be one of {sorted(VALID_UI_ACT_ACTIONS)}."
         )
+
+    # Route browser CDP refs ('b1', 'b2', ...) directly to the CDP bridge
+    if is_cdp_ref(ref):
+        bridge = cdp_bridge or get_default_cdp_bridge()
+        return bridge.act_sync(
+            ref,
+            norm_action,
+            text=value if norm_action in {"type", "set_value"} else None,
+            key=value if norm_action == "press" else None,
+        )
+
+    norm_ref = _normalize_ref_id(ref)
 
     if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
         raise ValueError("interval_ms must be an integer.")
@@ -5913,6 +6556,11 @@ def ui_act(
         if len(value) > MAX_GUI_TYPE_TEXT_LEN:
             raise ValueError(
                 f"value length ({len(value)}) exceeds maximum allowed ({MAX_GUI_TYPE_TEXT_LEN})."
+            )
+    elif norm_action == "press":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                "value key name is required for 'press' action (e.g. 'Enter')."
             )
 
     snap_runner = ui_snapshot_fn or ui_snapshot
@@ -6290,6 +6938,32 @@ def ui_act(
                     if _check_abort(step_res):
                         return
                 method = "set_value"
+            elif norm_action == "press":
+                assert value is not None
+                _assert_step("press_focus_click")
+                if _check_abort(
+                    action_runner(
+                        action="click_at",
+                        x=target_cx,
+                        y=target_cy,
+                        clicks=1,
+                        button="left",
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
+                _assert_step("press_key")
+                if _check_abort(
+                    action_runner(
+                        action="press_keys",
+                        keys=[value.strip()],
+                        user32=user32,
+                        **runner_guard_kw,
+                    )
+                ):
+                    return
+                method = "press"
         else:
             acted_via_uia = _run_uia_pattern_step() if can_try_uia else False
             if not acted_via_uia:
@@ -6380,7 +7054,11 @@ def ui_act(
     )
     if ui_snapshot_fn is not None:
         after_snap = ui_snapshot_fn(user32=user32)
-        set_ui_snapshot_state(after_snap)
+        if isinstance(after_snap, dict) and after_snap.get("source") == "cdp":
+            if after_snap.get("ok"):
+                _record_cdp_snapshot_state(after_snap)
+        else:
+            set_ui_snapshot_state(after_snap)
     elif (
         powershell_runner is None
         and shutil.which("powershell.exe") is not None
@@ -6393,10 +7071,19 @@ def ui_act(
         )
         with contextlib.suppress(Exception):
             if ui_snapshot_fn is None and snap_runner is ui_snapshot and after_target_hwnd > 0:
-                after_snap = ui_snapshot(user32=user32, _target_hwnd=after_target_hwnd)
+                if cdp_bridge is not None:
+                    after_snap = ui_snapshot(
+                        user32=user32, cdp_bridge=cdp_bridge, _target_hwnd=after_target_hwnd
+                    )
+                else:
+                    after_snap = ui_snapshot(user32=user32, _target_hwnd=after_target_hwnd)
             else:
                 after_snap = snap_runner(user32=user32)
-            set_ui_snapshot_state(after_snap)
+            if isinstance(after_snap, dict) and after_snap.get("source") == "cdp":
+                if after_snap.get("ok"):
+                    _record_cdp_snapshot_state(after_snap)
+            else:
+                set_ui_snapshot_state(after_snap)
     else:
         after_snap = _LAST_UI_SNAPSHOT or {
             "ok": True,
@@ -6435,6 +7122,7 @@ def inspect_ui_elements(
     user32: Any = None,
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
+    cdp_bridge: CDPBridge | None = None,
 ) -> dict[str, Any]:
     """Inspect visible interactive and readout UI Automation elements in a window."""
     if app_name is not None and not isinstance(app_name, str):
@@ -6455,6 +7143,60 @@ def inspect_ui_elements(
         window_enumerator=window_enumerator,
         focus_if_app_name=True,
     )
+
+    proc_name, target_title, is_pwa_hint = _resolve_target_process_info(
+        hwnd=hwnd,
+        app_name=cleaned_app,
+        user32=user32,
+        kernel32=kernel32,
+        window_enumerator=window_enumerator,
+        powershell_runner=powershell_runner,
+    )
+    if is_chromium_process(proc_name) or is_chromium_app_name(cleaned_app):
+        bridge = cdp_bridge or get_default_cdp_bridge()
+        eff_title_hint = target_title or (
+            None if is_chromium_app_name(cleaned_app) else cleaned_app
+        )
+        cdp_res = bridge.snapshot_sync(
+            max_elements=min(clamped_max, 60),
+            prefer_pwa=is_pwa_hint,
+            title_hint=eff_title_hint,
+            preferred_browser=(
+                proc_name or (cleaned_app if is_chromium_app_name(cleaned_app) else None)
+            ),
+        )
+        if isinstance(cdp_res, dict) and cdp_res.get("ok"):
+            return {
+                "ok": True,
+                "source": "cdp",
+                "window_title": str(cdp_res.get("window_title") or cdp_res.get("title") or ""),
+                "count": int(cdp_res.get("count", 0)),
+                "elements": [
+                    {
+                        "index": idx,
+                        "name": str(el.get("name") or ""),
+                        "automation_id": str(el.get("ref") or ""),
+                        "control_type": str(el.get("role") or ""),
+                        "value": el.get("value"),
+                        "x": 0,
+                        "y": 0,
+                    }
+                    for idx, el in enumerate(cdp_res.get("elements") or [])
+                    if isinstance(el, dict)
+                ],
+            }
+        if isinstance(cdp_res, dict) and cdp_res.get("cdp_available") is True:
+            out = dict(cdp_res)
+            if not out.get("window_title"):
+                out["window_title"] = target_title
+            out.setdefault("count", 0)
+            out.setdefault("elements", [])
+            return out
+        return _chromium_cdp_unavailable_snapshot(
+            window_title=target_title,
+            process_name=proc_name or (cleaned_app or "chrome.exe"),
+            error=str(cdp_res.get("error") or "") if isinstance(cdp_res, dict) else None,
+        )
 
     ps_exe = _resolve_powershell_exe(powershell_runner)
     app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
@@ -6614,6 +7356,24 @@ def click_ui_element(
         if locate_guard is not None:
             locate_guard.assert_ready("click_ui_locate")
 
+        proc_name, target_title, _ = _resolve_target_process_info(
+            hwnd=target_hwnd,
+            app_name=cleaned_app,
+            user32=user32,
+            kernel32=kernel32,
+            window_enumerator=window_enumerator,
+            powershell_runner=powershell_runner,
+        )
+        if is_chromium_process(proc_name) or is_chromium_app_name(cleaned_app):
+            return _chromium_cdp_unavailable_snapshot(
+                window_title=target_title,
+                process_name=proc_name or (cleaned_app or "chrome.exe"),
+                error=(
+                    "Blocked PowerShell UIA click on Chromium window. Use ui_snapshot() + "
+                    "ui_act('b1', 'click') or open_url(...) instead."
+                ),
+            )
+
         ps_exe = _resolve_powershell_exe(powershell_runner)
         name_b64 = base64.b64encode(target_name.encode("utf-8")).decode("ascii")
         app_b64 = (
@@ -6754,8 +7514,8 @@ def _normalize_key_name(raw_key: str) -> str:
 
 def gui_action(
     action: str,
-    x: int | None = None,
-    y: int | None = None,
+    x: int | float | None = None,
+    y: int | float | None = None,
     text: str | None = None,
     keys: list[str] | None = None,
     clicks: int = 1,
@@ -6764,6 +7524,17 @@ def gui_action(
     seconds: float = 1.0,
     interval_ms: int = 12,
     *,
+    coord_space: str | None = None,
+    image_width: int | None = None,
+    image_height: int | None = None,
+    screen_width: int | None = None,
+    screen_height: int | None = None,
+    virtual_left: int | None = None,
+    virtual_top: int | None = None,
+    dpi_scale: float | None = None,
+    ref: str | None = None,
+    key: str | None = None,
+    cdp_bridge: CDPBridge | None = None,
     app_name: str | None = None,
     user32: Any = None,
     kernel32: Any = None,
@@ -6773,13 +7544,60 @@ def gui_action(
     require_foreground: bool = True,
     _guard: PreconditionGuard | None = None,
 ) -> dict[str, Any]:
-    """Perform a safety-bounded low-level GUI input action via Win32 ctypes."""
+    """Perform a safety-bounded GUI input, CDP browser ref/history, or wait action."""
     if not isinstance(action, str):
         raise ValueError("action must be a string.")
     normalized_action = action.strip().lower()
     if normalized_action not in VALID_GUI_ACTIONS:
         raise ValueError(
             f"Unsupported GUI action {action!r}. Must be one of {sorted(VALID_GUI_ACTIONS)}."
+        )
+
+    # Browser history navigation via CDP
+    if normalized_action in {"navigate_back", "navigate_forward"}:
+        bridge = cdp_bridge or get_default_cdp_bridge()
+        direction = "back" if normalized_action == "navigate_back" else "forward"
+        explicit_chromium = is_chromium_app_name(app_name)
+        pref_browser = app_name if explicit_chromium else None
+        pref_pwa = False if explicit_chromium else None
+        res = bridge.navigate_history_sync(
+            direction,
+            prefer_pwa=pref_pwa,
+            preferred_browser=pref_browser,
+        )
+        res.setdefault("action", normalized_action)
+        return res
+
+    # Direct CDP element ref execution (b1..bN) via gui_action
+    if ref is not None:
+        if not is_cdp_ref(ref):
+            raise ValueError(
+                f"gui_action ref must be a browser CDP ref like 'b1', got {ref!r}."
+            )
+        bridge = cdp_bridge or get_default_cdp_bridge()
+        cdp_act_map = {
+            "click": "click",
+            "click_at": "click",
+            "double_click": "double_click",
+            "right_click": "right_click",
+            "type": "type",
+            "type_text": "type",
+            "press": "press",
+            "press_keys": "press",
+        }
+        cdp_action = cdp_act_map.get(normalized_action)
+        if cdp_action is None:
+            raise ValueError(
+                f"Action {action!r} is not supported with browser ref {ref!r}."
+            )
+        eff_key = key or (keys[0] if isinstance(keys, list) and keys else None)
+        res = bridge.act_sync(ref, cdp_action, text=text, key=eff_key)
+        res.setdefault("action", normalized_action)
+        return res
+
+    if normalized_action in {"click", "type", "press"}:
+        raise ValueError(
+            f"Action {normalized_action!r} requires a browser CDP ref (e.g. ref='b1')."
         )
 
     if normalized_action == "wait":
@@ -6799,17 +7617,41 @@ def gui_action(
 
     # Validate arguments before checking focus/window preconditions
     btn = button.strip().lower() if isinstance(button, str) else ""
-    if normalized_action == "click_at":
+    effective_coord_space = (coord_space or "screen").strip().lower()
+    if effective_coord_space not in VALID_COORD_SPACES:
+        raise ValueError(
+            f"Unsupported coord_space {coord_space!r}. "
+            f"Must be one of {sorted(VALID_COORD_SPACES)}."
+        )
+
+    pointer_actions = {"click_at", "double_click", "right_click", "move"}
+    if normalized_action in pointer_actions:
         if x is None or y is None or isinstance(x, bool) or isinstance(y, bool):
-            raise ValueError("x and y integer coordinates are required for 'click_at'.")
-        if not isinstance(x, int) or not isinstance(y, int) or x < 0 or y < 0:
-            raise ValueError("x and y must be non-negative integers for 'click_at'.")
-        if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1 or clicks > 3:
-            raise ValueError("clicks must be an integer between 1 and 3.")
-        if btn not in VALID_CLICK_BUTTONS:
-            raise ValueError(
-                f"Unsupported button {button!r}. Must be one of {sorted(VALID_CLICK_BUTTONS)}."
-            )
+            raise ValueError(f"x and y coordinates are required for '{normalized_action}'.")
+        if effective_coord_space == "screen":
+            if not isinstance(x, int) or not isinstance(y, int) or x < 0 or y < 0:
+                raise ValueError(
+                    f"x and y must be non-negative integers for '{normalized_action}'."
+                )
+        else:
+            if (
+                not isinstance(x, (int, float))
+                or not isinstance(y, (int, float))
+                or not math.isfinite(float(x))
+                or not math.isfinite(float(y))
+                or x < 0
+                or y < 0
+            ):
+                raise ValueError(
+                    f"x and y must be non-negative finite numbers for '{normalized_action}'."
+                )
+        if normalized_action == "click_at":
+            if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1 or clicks > 3:
+                raise ValueError("clicks must be an integer between 1 and 3.")
+            if btn not in VALID_CLICK_BUTTONS:
+                raise ValueError(
+                    f"Unsupported button {button!r}. Must be one of {sorted(VALID_CLICK_BUTTONS)}."
+                )
     elif normalized_action == "type_text":
         if not isinstance(text, str) or len(text) == 0:
             raise ValueError("text must be a non-empty string for 'type_text'.")
@@ -6826,12 +7668,32 @@ def gui_action(
             if (
                 isinstance(x, bool)
                 or isinstance(y, bool)
-                or not isinstance(x, int)
-                or not isinstance(y, int)
+                or not isinstance(x, (int, float))
+                or not isinstance(y, (int, float))
+            ):
+                raise ValueError("x and y must be numeric for 'scroll'.")
+            if effective_coord_space == "screen" and (
+                not isinstance(x, int) or not isinstance(y, int)
             ):
                 raise ValueError("x and y must be integers for 'scroll'.")
             if x < 0 or y < 0:
                 raise ValueError("x and y must be non-negative integers for 'scroll'.")
+
+    def _resolve_physical_xy(u32: Any) -> tuple[int, int, dict[str, Any]]:
+        assert x is not None and y is not None
+        return convert_coordinates_to_screen(
+            x,
+            y,
+            coord_space=effective_coord_space,
+            screen_width=screen_width,
+            screen_height=screen_height,
+            virtual_left=virtual_left,
+            virtual_top=virtual_top,
+            image_width=image_width,
+            image_height=image_height,
+            dpi_scale=dpi_scale,
+            user32=u32,
+        )
 
     def _execute_gui_action(active_guard: PreconditionGuard | None) -> dict[str, Any]:
         if active_guard is not None:
@@ -6839,18 +7701,43 @@ def gui_action(
 
         u32 = _get_win32_user32(user32)
 
-        if normalized_action == "click_at":
-            assert x is not None and y is not None
-            _perform_mouse_click(x, y, clicks=clicks, button=btn, user32=u32)
-            actual_clicks = 2 if btn == "double" and clicks == 1 else clicks
+        if normalized_action in pointer_actions:
+            px, py, coord_meta = _resolve_physical_xy(u32)
+            if normalized_action == "move":
+                if hasattr(u32, "SetCursorPos"):
+                    moved = u32.SetCursorPos(px, py)
+                    if moved is not None and not moved:
+                        raise RuntimeError(f"Win32 SetCursorPos({px}, {py}) failed.")
+                return {
+                    "ok": True,
+                    "status": "completed",
+                    "action": "move",
+                    "x": px,
+                    "y": py,
+                    **coord_meta,
+                }
+
+            eff_btn = (
+                "right"
+                if normalized_action == "right_click"
+                else ("left" if normalized_action == "double_click" else btn)
+            )
+            eff_clicks = (
+                2
+                if normalized_action == "double_click"
+                else (1 if normalized_action == "right_click" else clicks)
+            )
+            _perform_mouse_click(px, py, clicks=eff_clicks, button=eff_btn, user32=u32)
+            actual_clicks = 2 if eff_btn == "double" and eff_clicks == 1 else eff_clicks
             return {
                 "ok": True,
                 "status": "completed",
-                "action": "click_at",
-                "x": x,
-                "y": y,
+                "action": normalized_action,
+                "x": px,
+                "y": py,
                 "clicks": actual_clicks,
-                "button": btn,
+                "button": eff_btn,
+                **coord_meta,
             }
 
         if normalized_action == "type_text":
@@ -6881,10 +7768,15 @@ def gui_action(
             }
 
         # normalized_action == "scroll"
-        if x is not None and y is not None and hasattr(u32, "SetCursorPos"):
-            moved = u32.SetCursorPos(x, y)
-            if moved is not None and not moved:
-                raise RuntimeError(f"Win32 SetCursorPos({x}, {y}) failed.")
+        scroll_x: int | None = None
+        scroll_y: int | None = None
+        coord_meta_scroll: dict[str, Any] = {}
+        if x is not None and y is not None:
+            scroll_x, scroll_y, coord_meta_scroll = _resolve_physical_xy(u32)
+            if hasattr(u32, "SetCursorPos"):
+                moved = u32.SetCursorPos(scroll_x, scroll_y)
+                if moved is not None and not moved:
+                    raise RuntimeError(f"Win32 SetCursorPos({scroll_x}, {scroll_y}) failed.")
 
         clamped_delta = max(-12000, min(12000, delta))
         scroll_input = _INPUT(
@@ -6908,8 +7800,9 @@ def gui_action(
             "status": "completed",
             "action": "scroll",
             "delta": clamped_delta,
-            "x": x,
-            "y": y,
+            "x": scroll_x,
+            "y": scroll_y,
+            **coord_meta_scroll,
         }
 
     if _guard is not None:
@@ -7148,6 +8041,7 @@ def ui_batch(
     focus_backend: FocusPreconditionBackend | None = None,
     expected_hwnd: int | None = None,
     require_foreground: bool = True,
+    cdp_bridge: CDPBridge | None = None,
 ) -> dict[str, Any]:
     """Execute speculative multi-step GUI actions in a single round-trip with state diffing."""
     if not isinstance(steps, list) or len(steps) < 1 or len(steps) > 20:
@@ -7202,20 +8096,78 @@ def ui_batch(
                     f"Step {idx} 'wait' requires non-negative finite number for 'seconds'."
                 )
         elif op == "click_at":
+            raw_cs = s_dict.get("coord_space")
+            eff_space = "screen"
+            if raw_cs is not None:
+                if not isinstance(raw_cs, str) or not raw_cs.strip():
+                    raise ValueError(
+                        f"Step {idx} 'click_at' coord_space must be one of "
+                        f"{sorted(VALID_COORD_SPACES)}."
+                    )
+                eff_space = raw_cs.strip().lower()
+                if eff_space not in VALID_COORD_SPACES:
+                    raise ValueError(
+                        f"Step {idx} 'click_at' unsupported coord_space {raw_cs!r}. "
+                        f"Must be one of {sorted(VALID_COORD_SPACES)}."
+                    )
             x = s_dict.get("x")
             y = s_dict.get("y")
-            if (
-                x is None
-                or y is None
-                or isinstance(x, bool)
-                or isinstance(y, bool)
-                or not isinstance(x, int)
-                or not isinstance(y, int)
-                or x < 0
-                or y < 0
+            if eff_space == "screen":
+                if (
+                    x is None
+                    or y is None
+                    or isinstance(x, bool)
+                    or isinstance(y, bool)
+                    or not isinstance(x, int)
+                    or not isinstance(y, int)
+                    or x < 0
+                    or y < 0
+                ):
+                    raise ValueError(
+                        f"Step {idx} 'click_at' requires non-negative integer 'x' and 'y'."
+                    )
+            else:
+                if (
+                    x is None
+                    or y is None
+                    or isinstance(x, bool)
+                    or isinstance(y, bool)
+                    or not isinstance(x, (int, float))
+                    or not isinstance(y, (int, float))
+                    or not math.isfinite(float(x))
+                    or not math.isfinite(float(y))
+                    or x < 0
+                    or y < 0
+                ):
+                    raise ValueError(
+                        f"Step {idx} 'click_at' requires non-negative numeric 'x' and 'y' "
+                        f"for coord_space={eff_space!r}."
+                    )
+            for dim_key in ("image_width", "image_height", "screen_width", "screen_height"):
+                dim_val = s_dict.get(dim_key)
+                if dim_val is not None and (
+                    isinstance(dim_val, bool) or not isinstance(dim_val, int) or dim_val <= 0
+                ):
+                    raise ValueError(
+                        f"Step {idx} 'click_at' {dim_key} must be a positive integer."
+                    )
+            for off_key in ("virtual_left", "virtual_top"):
+                off_val = s_dict.get(off_key)
+                if off_val is not None and (
+                    isinstance(off_val, bool) or not isinstance(off_val, int)
+                ):
+                    raise ValueError(
+                        f"Step {idx} 'click_at' {off_key} must be an integer."
+                    )
+            dpi_val = s_dict.get("dpi_scale")
+            if dpi_val is not None and (
+                isinstance(dpi_val, bool)
+                or not isinstance(dpi_val, (int, float))
+                or not math.isfinite(float(dpi_val))
+                or float(dpi_val) <= 0
             ):
                 raise ValueError(
-                    f"Step {idx} 'click_at' requires non-negative integer 'x' and 'y'."
+                    f"Step {idx} 'click_at' dpi_scale must be a positive finite number."
                 )
             btn = s_dict.get("button", "left")
             if btn is not None and str(btn).strip().lower() not in VALID_CLICK_BUTTONS:
@@ -7234,10 +8186,21 @@ def ui_batch(
     action_runner = gui_action_fn or gui_action
     title_getter = window_title_fn or (lambda: _get_foreground_window_title(user32))
 
+    def _run_snap() -> dict[str, Any]:
+        if cdp_bridge is not None and snap_runner is ui_snapshot:
+            return snap_runner(user32=user32, cdp_bridge=cdp_bridge)
+        return snap_runner(user32=user32)
+
     is_stale = (time.time() - _LAST_UI_SNAPSHOT_TIME) > 60.0
-    if not _UI_REF_STORE or _LAST_UI_SNAPSHOT is None or is_stale:
-        before_snapshot = snap_runner(user32=user32)
-        set_ui_snapshot_state(before_snapshot)
+    has_fresh_cdp_snap = (
+        isinstance(_LAST_UI_SNAPSHOT, dict)
+        and _LAST_UI_SNAPSHOT.get("source") == "cdp"
+        and not is_stale
+    )
+    if (not _UI_REF_STORE and not has_fresh_cdp_snap) or _LAST_UI_SNAPSHOT is None or is_stale:
+        before_snapshot = _run_snap()
+        if not (isinstance(before_snapshot, dict) and before_snapshot.get("source") == "cdp"):
+            set_ui_snapshot_state(before_snapshot)
     else:
         before_snapshot = _LAST_UI_SNAPSHOT
 
@@ -7297,6 +8260,8 @@ def ui_batch(
                             "_guard": guard,
                             "_capture_snapshot": False,
                         }
+                        if cdp_bridge is not None:
+                            act_kwargs["cdp_bridge"] = cdp_bridge
                         if step_interval is not None and not isinstance(step_interval, bool):
                             with contextlib.suppress(TypeError, ValueError):
                                 act_kwargs["interval_ms"] = int(step_interval)
@@ -7314,6 +8279,14 @@ def ui_batch(
                             abort_res["steps_executed"] = len(step_results)
                             abort_res["step_results"] = step_results
                             return abort_res
+                        if isinstance(act_res, dict) and act_res.get("ok") is False:
+                            raise RuntimeError(
+                                str(
+                                    act_res.get("error")
+                                    or act_res.get("message")
+                                    or f"Action {action!r} on {ref!r} failed"
+                                )
+                            )
                         step_results.append(
                             {
                                 "step": idx,
@@ -7385,17 +8358,47 @@ def ui_batch(
                         )
 
                     elif op == "click_at":
-                        x = int(s_dict["x"])
-                        y = int(s_dict["y"])
+                        raw_cs = s_dict.get("coord_space")
+                        step_cs = (
+                            raw_cs.strip().lower()
+                            if isinstance(raw_cs, str) and raw_cs.strip()
+                            else None
+                        )
+                        x_val: int | float = (
+                            int(s_dict["x"])
+                            if step_cs in (None, "screen")
+                            else float(s_dict["x"])
+                        )
+                        y_val: int | float = (
+                            int(s_dict["y"])
+                            if step_cs in (None, "screen")
+                            else float(s_dict["y"])
+                        )
                         clicks = int(s_dict.get("clicks", 1))
                         btn = str(s_dict.get("button", "left"))
+                        click_extra_kw: dict[str, Any] = {}
+                        if step_cs is not None:
+                            click_extra_kw["coord_space"] = step_cs
+                        for int_geom_key in (
+                            "image_width",
+                            "image_height",
+                            "screen_width",
+                            "screen_height",
+                            "virtual_left",
+                            "virtual_top",
+                        ):
+                            if s_dict.get(int_geom_key) is not None:
+                                click_extra_kw[int_geom_key] = int(s_dict[int_geom_key])
+                        if s_dict.get("dpi_scale") is not None:
+                            click_extra_kw["dpi_scale"] = float(s_dict["dpi_scale"])
                         step_res = action_runner(
                             action="click_at",
-                            x=x,
-                            y=y,
+                            x=x_val,
+                            y=y_val,
                             clicks=clicks,
                             button=btn,
                             user32=user32,
+                            **click_extra_kw,
                             **runner_guard_kw,
                         )
                         if (
@@ -7455,8 +8458,12 @@ def ui_batch(
     if status == "completed" and any(r.get("status") == "error" for r in step_results):
         status = "partial_error"
 
-    after_snapshot = snap_runner(user32=user32)
-    set_ui_snapshot_state(after_snapshot)
+    after_snapshot = _run_snap()
+    if isinstance(after_snapshot, dict) and after_snapshot.get("source") == "cdp":
+        if after_snapshot.get("ok"):
+            _record_cdp_snapshot_state(after_snapshot)
+    else:
+        set_ui_snapshot_state(after_snapshot)
     diff = compute_ui_diff(before_snapshot, after_snapshot)
 
     return {
@@ -7469,12 +8476,21 @@ def ui_batch(
     }
 
 
+def _record_cdp_snapshot_state(cdp_res: dict[str, Any]) -> None:
+    """Record a successful CDP snapshot without overwriting native UIA refs."""
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
+    _LAST_UI_SNAPSHOT = cdp_res
+    _LAST_UI_SNAPSHOT_TIME = time.time()
+    _LAST_UI_WINDOW_TITLE = str(cdp_res.get("window_title") or cdp_res.get("title") or "")
+
+
 def register_windows_os_tools(
     registry: ToolRegistry,
     *,
     risk_level: RiskLevel = RiskLevel.READ_ONLY,
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
+    cdp_bridge: CDPBridge | None = None,
     user32: Any = None,
     kernel32: Any = None,
 ) -> None:
@@ -7504,6 +8520,7 @@ def register_windows_os_tools(
             interactive_only=False if interactive_only is None else interactive_only,
             user32=user32,
             kernel32=kernel32,
+            cdp_bridge=cdp_bridge,
         )
 
     def _ui_act_handler(
@@ -7519,6 +8536,7 @@ def register_windows_os_tools(
             interval_ms=12 if interval_ms is None else interval_ms,
             user32=user32,
             focus_backend=focus_backend,
+            cdp_bridge=cdp_bridge,
         )
 
     def _ui_batch_handler(
@@ -7534,6 +8552,7 @@ def register_windows_os_tools(
             ),
             user32=user32,
             focus_backend=focus_backend,
+            cdp_bridge=cdp_bridge,
         )
 
     def _click_ui_element_handler(
@@ -7550,10 +8569,22 @@ def register_windows_os_tools(
             focus_backend=focus_backend,
         )
 
+    def _open_url_handler(
+        url: str,
+        browser: str | None = None,
+    ) -> dict[str, Any]:
+        return open_url(
+            url,
+            browser,
+            user32=user32,
+            kernel32=kernel32,
+            cdp_bridge=cdp_bridge,
+        )
+
     def _gui_action_handler(
         action: str,
-        x: int | None = None,
-        y: int | None = None,
+        x: int | float | None = None,
+        y: int | float | None = None,
         text: str | None = None,
         keys: list[str] | None = None,
         clicks: int | None = 1,
@@ -7561,6 +8592,11 @@ def register_windows_os_tools(
         delta: int | None = 0,
         seconds: float | None = 1.0,
         interval_ms: int | None = 12,
+        coord_space: str | None = None,
+        image_width: int | None = None,
+        image_height: int | None = None,
+        ref: str | None = None,
+        key: str | None = None,
         app_name: str | None = None,
         expected_hwnd: int | None = None,
     ) -> dict[str, Any]:
@@ -7575,6 +8611,12 @@ def register_windows_os_tools(
             delta=0 if delta is None else delta,
             seconds=1.0 if seconds is None else seconds,
             interval_ms=12 if interval_ms is None else interval_ms,
+            coord_space=coord_space,
+            image_width=image_width,
+            image_height=image_height,
+            ref=ref,
+            key=key,
+            cdp_bridge=cdp_bridge,
             app_name=app_name,
             expected_hwnd=expected_hwnd,
             user32=user32,
@@ -7627,11 +8669,47 @@ def register_windows_os_tools(
         handler=_open_or_focus_handler,
     )
 
+    try:
+        registry.get("open_url")
+    except KeyError:
+        registry.register(
+            name="open_url",
+            description=(
+                "Navigate directly to an http/https URL. Omit 'browser' to navigate inside an "
+                "installed Chromium PWA (e.g. YouTube Watch Later "
+                "'https://www.youtube.com/playlist?list=WL') via CDP without spawning Chrome; "
+                "pass browser='chrome' (or 'edge'/'brave') when the user explicitly asks for "
+                "the browser."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Web URL (http:// or https://) or site shorthand.",
+                    },
+                    "browser": {
+                        "type": "string",
+                        "description": (
+                            "Optional explicit browser (e.g. 'chrome', 'edge'). Omit to navigate "
+                            "inside an installed PWA when available."
+                        ),
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+            risk_level=risk_level,
+            handler=_open_url_handler,
+        )
+
     registry.register(
         name="ui_snapshot",
         description=(
             "Capture visible UI elements and accessibility tree for the active window or "
-            "specified application with stable element reference IDs (e.g. 'e1', 'e2')."
+            "specified application with stable element reference IDs: CDP refs ('b1', 'b2', ...) "
+            "for Chrome/Edge/Brave browsers and Chromium PWAs, or UIA refs ('e1', 'e2', ...) "
+            "for native Windows apps."
         ),
         input_schema={
             "type": "object",
@@ -7659,23 +8737,29 @@ def register_windows_os_tools(
         name="ui_act",
         description=(
             "Perform a semantic action on a UI element identified by its snapshot reference ID "
-            "('ref', e.g. 'e1') with focus precondition checks and updated UI diff."
+            "('b1'..'bN' for Chromium browsers/PWAs via CDP, or 'e1'..'eN' for native Windows "
+            "apps) and return a verified before -> after state diff."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "ref": {
                     "type": "string",
-                    "description": "Element reference ID from ui_snapshot (e.g. 'e1').",
+                    "description": (
+                        "Element reference ID from ui_snapshot (e.g. 'b1' for browser/PWA "
+                        "CDP elements, or 'e1' for native UIA elements)."
+                    ),
                 },
                 "action": {
                     "type": "string",
-                    "enum": list(VALID_UI_ACT_ACTIONS),
+                    "enum": sorted(VALID_UI_ACT_ACTIONS),
                     "description": "Semantic action to execute on the element.",
                 },
                 "value": {
                     "type": "string",
-                    "description": "Text value to set or type for 'set_value' or 'type'.",
+                    "description": (
+                        "Text value for 'set_value'/'type', or key name for 'press' (e.g. 'Enter')."
+                    ),
                 },
                 "interval_ms": {
                     "type": "integer",
@@ -7716,8 +8800,14 @@ def register_windows_os_tools(
                             "keys": {"type": "array", "items": {"type": "string"}},
                             "delta": {"type": "integer"},
                             "seconds": {"type": "number"},
-                            "x": {"type": "integer"},
-                            "y": {"type": "integer"},
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "coord_space": {
+                                "type": "string",
+                                "enum": sorted(VALID_COORD_SPACES),
+                            },
+                            "image_width": {"type": "integer"},
+                            "image_height": {"type": "integer"},
                             "clicks": {"type": "integer"},
                             "button": {
                                 "type": "string",
@@ -7776,8 +8866,10 @@ def register_windows_os_tools(
     registry.register(
         name="gui_action",
         description=(
-            "Perform a low-level desktop GUI input or wait step with focus precondition "
-            "checking: click_at, type_text, press_keys, scroll, or wait."
+            "Perform a desktop GUI input, browser CDP ref/history action, or wait step with "
+            "focus precondition checking and DPI-exact coordinate scaling: click_at, "
+            "double_click, right_click, move, type_text, press_keys, scroll, wait, "
+            "navigate_back, navigate_forward, or ref='b1' with click/type/press."
         ),
         input_schema={
             "type": "object",
@@ -7785,10 +8877,35 @@ def register_windows_os_tools(
                 "action": {
                     "type": "string",
                     "enum": sorted(VALID_GUI_ACTIONS),
-                    "description": "GUI input or wait action to execute.",
+                    "description": "GUI input, CDP browser action, or wait step to execute.",
                 },
-                "x": {"type": "integer", "description": "Horizontal coordinate (>= 0)."},
-                "y": {"type": "integer", "description": "Vertical coordinate (>= 0)."},
+                "x": {"type": "number", "description": "Horizontal coordinate (>= 0)."},
+                "y": {"type": "number", "description": "Vertical coordinate (>= 0)."},
+                "coord_space": {
+                    "type": "string",
+                    "enum": sorted(VALID_COORD_SPACES),
+                    "description": (
+                        "Coordinate space for (x, y): 'normalized_1000' (0..1000 from "
+                        "look_at_screen/inspect_screen), 'image' (pixels in screenshot), or "
+                        "'screen' (physical virtual-screen pixels, default)."
+                    ),
+                },
+                "image_width": {
+                    "type": "integer",
+                    "description": "Screenshot image width when coord_space='image'.",
+                },
+                "image_height": {
+                    "type": "integer",
+                    "description": "Screenshot image height when coord_space='image'.",
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Optional browser CDP ref (e.g. 'b1') for direct CDP execution.",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Single key name (e.g. 'Enter') when using action='press'.",
+                },
                 "text": {"type": "string", "description": "Unicode text to type (1..2000 chars)."},
                 "keys": {
                     "type": "array",

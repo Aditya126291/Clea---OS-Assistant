@@ -28,6 +28,13 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import InvalidURI, WebSocketException
 
 from clea.core import auth
+from clea.core.circuit_breaker import (
+    ActionCircuitBreaker,
+    StateCaptureFn,
+    compute_state_diff,
+    is_state_diff_tool,
+    merge_tool_state_diff,
+)
 from clea.core.protocol import (
     ActivityCancelParams,
     ActivityCancelRequest,
@@ -412,6 +419,7 @@ class VoiceRunner:
         screen_service: ScreenCaptureService | None = None,
         screen_indicator: ScreenIndicator | None = None,
         action_verifier: Any = None,
+        state_capture_fn: StateCaptureFn | None = None,
         debug_audio: bool = False,
         audio_init_retries: int = 8,
         audio_init_retry_delay: float = 1.5,
@@ -423,7 +431,10 @@ class VoiceRunner:
         self.token = token
         self.debug_audio = debug_audio
         self._action_verifier = action_verifier
+        self._state_capture_fn = state_capture_fn
         self._turn_launched_targets: dict[str, dict[str, Any]] = {}
+        self._circuit_breaker = ActionCircuitBreaker()
+        self._last_screen_geometry: dict[str, Any] | None = None
         self._audio_init_retries = max(1, audio_init_retries)
         self._audio_init_retry_delay = max(0.0, audio_init_retry_delay)
         self._daemon_retry_delay = max(0.05, daemon_retry_delay)
@@ -1965,19 +1976,19 @@ class VoiceRunner:
                 elif isinstance(event, InterruptedEvent):
                     # Barge-in: flush output audio immediately
                     logger.debug("Barge-in: flushing audio buffer.")
-                    self._turn_launched_targets.clear()
+                    self.reset_turn_state()
                     if self._audio_manager is not None:
                         self._audio_manager.stop_output()
                     self._set_voice_state("listening")
                 elif isinstance(event, TurnCompleteEvent):
-                    self._turn_launched_targets.clear()
+                    self.reset_turn_state()
                     if self._transcript_history:
                         self._transcript_history[-1]["final"] = True
                     self._set_voice_state("listening")
                 elif isinstance(event, TranscriptOutputEvent):
                     if event.role == "user":
                         self._last_user_speech_time = time.monotonic()
-                        self._turn_launched_targets.clear()
+                        self.reset_turn_state()
                     ts_iso = datetime.now().astimezone().isoformat()
                     norm_evt_text = event.text.strip()
                     if (
@@ -2088,8 +2099,52 @@ class VoiceRunner:
             )
 
     def reset_turn_state(self) -> None:
-        """Reset per-turn launch deduplication state."""
+        """Reset per-turn launch deduplication and click circuit breaker state."""
         self._turn_launched_targets.clear()
+        self._circuit_breaker.reset()
+
+    async def _capture_desktop_state(self) -> dict[str, Any] | None:
+        """Capture lightweight foreground window and GSMTC state if configured."""
+        if self._state_capture_fn is not None:
+            with contextlib.suppress(Exception):
+                return await asyncio.to_thread(self._state_capture_fn)
+            return None
+        verifier = self._action_verifier
+        focus_backend = getattr(verifier, "focus_backend", None) if verifier is not None else None
+        media_backend = getattr(verifier, "media_backend", None) if verifier is not None else None
+        if focus_backend is None and media_backend is None:
+            return None
+
+        def _probe() -> dict[str, Any]:
+            state: dict[str, Any] = {
+                "hwnd": None,
+                "title": "",
+                "process_name": "",
+                "url": "",
+                "page_title": "",
+                "media": None,
+            }
+            if focus_backend is not None:
+                with contextlib.suppress(Exception):
+                    ctx = focus_backend.get_foreground_context()
+                    if ctx is not None:
+                        state["hwnd"] = int(ctx.hwnd) if ctx.hwnd else None
+                        state["title"] = str(ctx.title or "")
+                        state["process_name"] = str(ctx.process_name or "")
+            if media_backend is not None:
+                with contextlib.suppress(Exception):
+                    media = media_backend.get_active_session(timeout_s=0.25)
+                    if media is not None and getattr(media, "available", False):
+                        state["media"] = {
+                            "title": str(getattr(media, "title", "") or ""),
+                            "artist": str(getattr(media, "artist", "") or ""),
+                            "playback_status": str(getattr(media, "playback_status", "") or ""),
+                        }
+            return state
+
+        with contextlib.suppress(Exception):
+            return await asyncio.to_thread(_probe)
+        return None
 
     def _spawn_tool_batch_task(
         self,
@@ -2390,6 +2445,22 @@ class VoiceRunner:
         """Execute or delegate live voice tool call."""
         logger.info("Executing voice tool: %s (%s)", event.name, event.call_id)
 
+        # Hard click / snapshot-failure circuit breaker (per-turn)
+        blocked_payload = self._circuit_breaker.check_before_tool(event.name, event.arguments)
+        if blocked_payload is not None:
+            await backend.send_tool_responses(
+                [
+                    VoiceToolResponse(
+                        call_id=event.call_id,
+                        name=event.name,
+                        response=blocked_payload,
+                        is_error=True,
+                        scheduling="when_idle",
+                    )
+                ]
+            )
+            return
+
         # 1. end_call tool
         if event.name == "end_call":
             reason = str(event.arguments.get("reason", "model_ended_call"))
@@ -2594,6 +2665,29 @@ class VoiceRunner:
                                 )
                                 image_order.append("active_window")
 
+                img_w = getattr(res, "image_width", 0) or res.width
+                img_h = getattr(res, "image_height", 0) or res.height
+                scr_w = getattr(res, "screen_width", 0) or res.width
+                scr_h = getattr(res, "screen_height", 0) or res.height
+                v_left = int(getattr(res, "virtual_left", 0) or 0)
+                v_top = int(getattr(res, "virtual_top", 0) or 0)
+                dpi_scale = float(getattr(res, "dpi_scale", 1.0) or 1.0)
+                coord_space = str(
+                    getattr(res, "coord_space", "normalized_1000") or "normalized_1000"
+                )
+
+                if img_w > 0 and img_h > 0 and scr_w > 0 and scr_h > 0:
+                    self._last_screen_geometry = {
+                        "image_width": int(img_w),
+                        "image_height": int(img_h),
+                        "screen_width": int(scr_w),
+                        "screen_height": int(scr_h),
+                        "virtual_left": v_left,
+                        "virtual_top": v_top,
+                        "dpi_scale": dpi_scale,
+                        "coord_space": coord_space,
+                    }
+
                 payload: dict[str, Any] = {
                     "status": "success",
                     "target": target,
@@ -2602,6 +2696,14 @@ class VoiceRunner:
                     "mime_type": res.mime_type,
                     "width": res.width,
                     "height": res.height,
+                    "image_width": img_w,
+                    "image_height": img_h,
+                    "screen_width": scr_w,
+                    "screen_height": scr_h,
+                    "virtual_left": v_left,
+                    "virtual_top": v_top,
+                    "dpi_scale": dpi_scale,
+                    "coord_space": coord_space,
                     "capture_seq": res.capture_seq,
                     "captured_at": res.captured_at,
                     "window_title": res.window_title,
@@ -2939,20 +3041,54 @@ class VoiceRunner:
             )
 
         async def _execute_rpc_tool(req: BaseRequest, *, error_prefix: str) -> None:
+            should_diff = is_state_diff_tool(event.name, event.arguments)
+            before_state = await self._capture_desktop_state() if should_diff else None
+            is_err = False
+            res_payload: dict[str, Any] = {}
             try:
                 res = await self._rpc(req, timeout=10.0)
+                res_payload = dict(res) if isinstance(res, dict) else {"result": res}
+                merged_diff: dict[str, Any] | None = None
+                if should_diff:
+                    after_state = await self._capture_desktop_state()
+                    captured_diff = (
+                        compute_state_diff(before_state, after_state)
+                        if (before_state is not None or after_state is not None)
+                        else None
+                    )
+                    merged_diff = merge_tool_state_diff(captured_diff, res_payload)
+                    if merged_diff is not None and (
+                        "state_diff" not in res_payload or captured_diff is not None
+                    ):
+                        res_payload["state_diff"] = merged_diff
+                self._circuit_breaker.record_outcome(
+                    event.name,
+                    event.arguments,
+                    result=res_payload,
+                    is_error=False,
+                    state_diff=merged_diff,
+                )
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
-                    response=res,
+                    response=res_payload,
                     is_error=False,
                     scheduling="when_idle",
                 )
             except Exception as exc:
+                is_err = True
+                err_payload = {"error": f"{error_prefix}: {exc}"}
+                self._circuit_breaker.record_outcome(
+                    event.name,
+                    event.arguments,
+                    result=err_payload,
+                    is_error=is_err,
+                    state_diff=None,
+                )
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
-                    response={"error": f"{error_prefix}: {exc}"},
+                    response=err_payload,
                     is_error=True,
                     scheduling="when_idle",
                 )
@@ -3670,6 +3806,22 @@ class VoiceRunner:
             if media_parts:
                 payload["mime_type"] = image_mime_type
 
+            is_img_w = int(res.get("image_width") or res.get("width") or 0)
+            is_img_h = int(res.get("image_height") or res.get("height") or 0)
+            is_scr_w = int(res.get("screen_width") or 0)
+            is_scr_h = int(res.get("screen_height") or 0)
+            if is_img_w > 0 and is_img_h > 0 and is_scr_w > 0 and is_scr_h > 0:
+                self._last_screen_geometry = {
+                    "image_width": is_img_w,
+                    "image_height": is_img_h,
+                    "screen_width": is_scr_w,
+                    "screen_height": is_scr_h,
+                    "virtual_left": int(res.get("virtual_left") or 0),
+                    "virtual_top": int(res.get("virtual_top") or 0),
+                    "dpi_scale": float(res.get("dpi_scale") or 1.0),
+                    "coord_space": str(res.get("coord_space") or "normalized_1000"),
+                }
+
             await backend.send_tool_responses(
                 [
                     VoiceToolResponse(
@@ -3692,8 +3844,18 @@ class VoiceRunner:
                 return
             browser = _req_str("browser")
             norm_target = normalize_launch_target(url)
-            if norm_target and norm_target in self._turn_launched_targets:
-                prev = self._turn_launched_targets[norm_target]
+            is_root_candidate = _is_app_candidate_url(url, norm_target)
+            if is_root_candidate:
+                dedup_key = norm_target
+            else:
+                parsed_u = urllib.parse.urlsplit(url if "://" in url else f"https://{url}")
+                suffix_u = (
+                    f"{parsed_u.path or ''}?{parsed_u.query or ''}#{parsed_u.fragment or ''}"
+                ).rstrip("?#")
+                dedup_key = f"{norm_target}:{suffix_u.lower()}" if norm_target else url.lower()
+
+            if dedup_key and dedup_key in self._turn_launched_targets:
+                prev = self._turn_launched_targets[dedup_key]
                 await backend.send_tool_responses(
                     [
                         VoiceToolResponse(
@@ -3739,11 +3901,12 @@ class VoiceRunner:
                 browser,
             ) or _parse_bool("prefer_browser", default=False)
 
+            before_state = await self._capture_desktop_state()
+
             # Installed-App-First Policy: for root service URLs without explicit browser request,
             # focus/launch the installed app directly; deep URLs flow through daemon os.open_url
-            # which runs the full 3-layer OS resolver (AppUriHandlers -> URL Protocol -> Installed
-            # Apps / running standalone PWAs) and never spawns Chrome/Edge if an app is installed.
-            if not browser_explicit and _is_app_candidate_url(url, norm_target):
+            # which runs the full 3-layer OS resolver + CDP PWA navigation.
+            if not browser_explicit and is_root_candidate:
                 try:
                     app_res = await self._rpc(
                         OsOpenOrFocusAppRequest(
@@ -3776,7 +3939,25 @@ class VoiceRunner:
                             )
                         else:
                             enriched.setdefault("routed_to_installed_app", False)
-                        self._turn_launched_targets[norm_target] = enriched
+                        after_state = await self._capture_desktop_state()
+                        captured_diff = (
+                            compute_state_diff(before_state, after_state)
+                            if (before_state is not None or after_state is not None)
+                            else None
+                        )
+                        merged_diff = merge_tool_state_diff(captured_diff, enriched)
+                        if merged_diff is not None and (
+                            "state_diff" not in enriched or captured_diff is not None
+                        ):
+                            enriched["state_diff"] = merged_diff
+                        self._circuit_breaker.record_outcome(
+                            event.name,
+                            event.arguments,
+                            result=enriched,
+                            is_error=False,
+                            state_diff=merged_diff,
+                        )
+                        self._turn_launched_targets[dedup_key] = enriched
                         await backend.send_tool_responses(
                             [
                                 VoiceToolResponse(
@@ -3804,23 +3985,52 @@ class VoiceRunner:
                     ),
                     timeout=10.0,
                 )
-                if norm_target and res.get("ok", True) is not False and res.get("status") not in (
+                res_dict = dict(res) if isinstance(res, dict) else {"result": res}
+                after_state = await self._capture_desktop_state()
+                captured_diff = (
+                    compute_state_diff(before_state, after_state)
+                    if (before_state is not None or after_state is not None)
+                    else None
+                )
+                merged_diff = merge_tool_state_diff(captured_diff, res_dict)
+                if merged_diff is not None and (
+                    "state_diff" not in res_dict or captured_diff is not None
+                ):
+                    res_dict["state_diff"] = merged_diff
+                self._circuit_breaker.record_outcome(
+                    event.name,
+                    event.arguments,
+                    result=res_dict,
+                    is_error=False,
+                    state_diff=merged_diff,
+                )
+                if dedup_key and res_dict.get("ok", True) is not False and res_dict.get(
+                    "status"
+                ) not in (
                     "error",
                     "non_interactive_desktop",
                 ):
-                    self._turn_launched_targets[norm_target] = dict(res)
+                    self._turn_launched_targets[dedup_key] = dict(res_dict)
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
-                    response=res,
+                    response=res_dict,
                     is_error=False,
                     scheduling="when_idle",
                 )
             except Exception as exc:
+                err_payload = {"error": f"Failed to open URL: {exc}"}
+                self._circuit_breaker.record_outcome(
+                    event.name,
+                    event.arguments,
+                    result=err_payload,
+                    is_error=True,
+                    state_diff=None,
+                )
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
-                    response={"error": f"Failed to open URL: {exc}"},
+                    response=err_payload,
                     is_error=True,
                     scheduling="when_idle",
                 )
@@ -3973,7 +4183,22 @@ class VoiceRunner:
                 await _send_error("action is required.")
                 return
             action_norm = action.lower()
-            if action_norm not in {"click_at", "type_text", "press_keys", "scroll", "wait"}:
+            valid_gui_actions = {
+                "click_at",
+                "double_click",
+                "right_click",
+                "move",
+                "type_text",
+                "press_keys",
+                "scroll",
+                "wait",
+                "navigate_back",
+                "navigate_forward",
+                "click",
+                "type",
+                "press",
+            }
+            if action_norm not in valid_gui_actions:
                 await _send_error(f"Unsupported gui_action: {action!r}")
                 return
 
@@ -3985,12 +4210,37 @@ class VoiceRunner:
                     raise ValueError(f"{key} must be an integer.")
                 return int(raw)
 
+            def _opt_num(key: str) -> int | float | None:
+                raw = event.arguments.get(key)
+                if raw is None:
+                    return None
+                if isinstance(raw, bool):
+                    raise ValueError(f"{key} must be a number.")
+                val = float(raw)
+                if not math.isfinite(val):
+                    raise ValueError(f"{key} must be finite.")
+                return int(val) if val.is_integer() else val
+
+            raw_coord_space = _req_str("coord_space")
+            coord_space_norm: str | None = None
+            if raw_coord_space is not None:
+                coord_space_norm = raw_coord_space.lower()
+                if coord_space_norm not in {"normalized_1000", "image", "screen"}:
+                    await _send_error(f"Unsupported coord_space: {raw_coord_space!r}")
+                    return
+
             try:
-                x_val = _opt_int("x")
-                y_val = _opt_int("y")
+                x_val = _opt_num("x")
+                y_val = _opt_num("y")
                 clicks_val = _opt_int("clicks")
                 delta_val = _opt_int("delta")
                 expected_hwnd_val = _opt_int("expected_hwnd")
+                image_width_val = _opt_int("image_width")
+                image_height_val = _opt_int("image_height")
+                screen_width_val = _opt_int("screen_width")
+                screen_height_val = _opt_int("screen_height")
+                virtual_left_val = _opt_int("virtual_left")
+                virtual_top_val = _opt_int("virtual_top")
                 raw_sec = event.arguments.get("seconds", 1.0)
                 if isinstance(raw_sec, bool):
                     raise ValueError("seconds must be a number.")
@@ -4000,6 +4250,23 @@ class VoiceRunner:
             except (TypeError, ValueError) as exc:
                 await _send_error(str(exc))
                 return
+
+            dpi_scale_val: float | None = None
+            if coord_space_norm in {"normalized_1000", "image"} and self._last_screen_geometry:
+                geom = self._last_screen_geometry
+                if image_width_val is None:
+                    image_width_val = int(geom["image_width"])
+                if image_height_val is None:
+                    image_height_val = int(geom["image_height"])
+                if screen_width_val is None:
+                    screen_width_val = int(geom["screen_width"])
+                if screen_height_val is None:
+                    screen_height_val = int(geom["screen_height"])
+                if virtual_left_val is None:
+                    virtual_left_val = int(geom["virtual_left"])
+                if virtual_top_val is None:
+                    virtual_top_val = int(geom["virtual_top"])
+                dpi_scale_val = float(geom["dpi_scale"])
 
             raw_text = event.arguments.get("text")
             text_val: str | None = None
@@ -4032,6 +4299,16 @@ class VoiceRunner:
                         button=btn_norm,  # type: ignore[arg-type]
                         delta=delta_val if delta_val is not None else 0,
                         seconds=seconds_val,
+                        coord_space=coord_space_norm,  # type: ignore[arg-type]
+                        image_width=image_width_val,
+                        image_height=image_height_val,
+                        screen_width=screen_width_val,
+                        screen_height=screen_height_val,
+                        virtual_left=virtual_left_val,
+                        virtual_top=virtual_top_val,
+                        dpi_scale=dpi_scale_val,
+                        ref=_req_str("ref"),
+                        key=_req_str("key"),
                         app_name=_req_str("app_name"),
                         expected_hwnd=expected_hwnd_val,
                     )
@@ -4076,6 +4353,7 @@ class VoiceRunner:
                 "clear",
                 "double_click",
                 "right_click",
+                "press",
             }
             if action_norm not in valid_actions:
                 await _send_error(f"Unsupported ui_act action: {action!r}")
@@ -4111,9 +4389,35 @@ class VoiceRunner:
             stop_on_error = _parse_bool("stop_on_error", default=True)
             stop_on_win_change = _parse_bool("stop_on_window_change", default=True)
             try:
-                steps = [
-                    UiBatchStep.model_validate(s) if isinstance(s, dict) else s for s in raw_steps
-                ]
+                prepared_steps: list[Any] = []
+                for s in raw_steps:
+                    if isinstance(s, dict):
+                        step_copy = dict(s)
+                        op_norm = str(step_copy.get("op") or "").strip().lower()
+                        raw_cs = step_copy.get("coord_space")
+                        cs_norm = (
+                            raw_cs.strip().lower()
+                            if isinstance(raw_cs, str) and raw_cs.strip()
+                            else None
+                        )
+                        if (
+                            op_norm == "click_at"
+                            and cs_norm in {"normalized_1000", "image"}
+                            and self._last_screen_geometry
+                        ):
+                            geom = self._last_screen_geometry
+                            step_copy["coord_space"] = cs_norm
+                            step_copy.setdefault("image_width", int(geom["image_width"]))
+                            step_copy.setdefault("image_height", int(geom["image_height"]))
+                            step_copy.setdefault("screen_width", int(geom["screen_width"]))
+                            step_copy.setdefault("screen_height", int(geom["screen_height"]))
+                            step_copy.setdefault("virtual_left", int(geom["virtual_left"]))
+                            step_copy.setdefault("virtual_top", int(geom["virtual_top"]))
+                            step_copy.setdefault("dpi_scale", float(geom["dpi_scale"]))
+                        prepared_steps.append(UiBatchStep.model_validate(step_copy))
+                    else:
+                        prepared_steps.append(s)
+                steps = prepared_steps
             except Exception as exc:
                 await _send_error(f"Invalid batch step format: {exc}")
                 return

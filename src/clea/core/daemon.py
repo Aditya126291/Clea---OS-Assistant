@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Coroutine, Iterable, Sequence
@@ -122,7 +123,14 @@ from clea.tools import (
     set_default_timer_manager,
     transform_clipboard,
 )
+from clea.tools.action_harness import (
+    capture_desktop_state,
+    compute_state_diff,
+    merge_tool_state_diff,
+)
+from clea.tools.cdp_bridge import close_default_cdp_bridge
 from clea.tools.git_workspace import inspect_git_workspace
+from clea.tools.guards import Win32FocusPreconditionBackend, WinRTMediaVerificationBackend
 from clea.tools.registry import ToolDefinition
 from clea.tools.vision import MAX_VISION_DIMENSION, _downscale_png
 from clea.tools.windows_os import (
@@ -496,6 +504,8 @@ class CleaDaemon:
             set_default_clipboard_service(None)
         if get_default_screen_vision_service() is self.screen_vision_service:
             set_default_screen_vision_service(None)
+        with contextlib.suppress(Exception):
+            close_default_cdp_bridge()
         for t in list(self._idle_tasks.values()):
             if not t.done():
                 t.cancel()
@@ -3071,6 +3081,38 @@ class CleaDaemon:
             )
         return extra
 
+    async def _capture_desktop_state(self) -> dict[str, Any] | None:
+        """Capture lightweight foreground window, CDP page, and GSMTC state if configured."""
+        if self._focus_backend is None and self._media_backend is None:
+            return None
+        with contextlib.suppress(Exception):
+            return await asyncio.to_thread(
+                capture_desktop_state,
+                focus_backend=self._focus_backend,
+                media_backend=self._media_backend,
+            )
+        return None
+
+    async def _attach_state_diff(
+        self,
+        res: Any,
+        before_state: dict[str, Any] | None,
+    ) -> Any:
+        """Capture post-action state and merge before -> after diff into *res*."""
+        if not isinstance(res, dict):
+            return res
+        after_state = await self._capture_desktop_state() if before_state is not None else None
+        captured_diff = (
+            compute_state_diff(before_state, after_state)
+            if (before_state is not None or after_state is not None)
+            else None
+        )
+        merged = merge_tool_state_diff(captured_diff, res)
+        if merged is not None:
+            res = dict(res)
+            res["state_diff"] = merged
+        return res
+
     async def _handle_os_open_or_focus_app(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         guard_kwargs = self._os_guard_kwargs(open_or_focus_app)
@@ -3234,6 +3276,7 @@ class CleaDaemon:
 
     async def _handle_os_open_url(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
+        before_state = await self._capture_desktop_state()
         try:
             open_kwargs: dict[str, Any] = {}
             accepted_params: set[str] | None = None
@@ -3271,6 +3314,7 @@ class CleaDaemon:
         ) as exc:
             await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
+        res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_open_url",
             url=req.params.url,
@@ -3582,6 +3626,14 @@ class CleaDaemon:
                 question=res.question,
                 width=res.width,
                 height=res.height,
+                image_width=getattr(res, "image_width", None),
+                image_height=getattr(res, "image_height", None),
+                screen_width=getattr(res, "screen_width", None),
+                screen_height=getattr(res, "screen_height", None),
+                virtual_left=getattr(res, "virtual_left", None),
+                virtual_top=getattr(res, "virtual_top", None),
+                dpi_scale=getattr(res, "dpi_scale", None),
+                coord_space=getattr(res, "coord_space", None),
                 artifact_path=res.artifact_path,
                 uia_text=res.uia_text,
                 text=res.text,
@@ -3622,6 +3674,7 @@ class CleaDaemon:
     async def _handle_os_click_ui_element(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         guard_kwargs = self._os_guard_kwargs(click_ui_element)
+        before_state = await self._capture_desktop_state()
         try:
             res = await asyncio.to_thread(
                 click_ui_element,
@@ -3637,6 +3690,7 @@ class CleaDaemon:
         except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
             await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
+        res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_click_ui_element",
             name=res.get("name"),
@@ -3654,9 +3708,26 @@ class CleaDaemon:
         p = req.params
         guard_kwargs = self._os_guard_kwargs(gui_action)
         extra_gui_kwargs: dict[str, Any] = {}
-        app_name_val = getattr(p, "app_name", None)
-        expected_hwnd_val = getattr(p, "expected_hwnd", None)
-        if app_name_val is not None or expected_hwnd_val is not None:
+        optional_gui_fields = (
+            "app_name",
+            "expected_hwnd",
+            "coord_space",
+            "image_width",
+            "image_height",
+            "screen_width",
+            "screen_height",
+            "virtual_left",
+            "virtual_top",
+            "dpi_scale",
+            "ref",
+            "key",
+        )
+        present_optional = {
+            name: getattr(p, name, None)
+            for name in optional_gui_fields
+            if getattr(p, name, None) is not None
+        }
+        if present_optional:
             try:
                 sig = inspect.signature(gui_action)
                 param_names = set(sig.parameters.keys())
@@ -3667,12 +3738,14 @@ class CleaDaemon:
             except (ValueError, TypeError):
                 param_names = set()
                 accepts_kwargs = False
-            if app_name_val is not None and (accepts_kwargs or "app_name" in param_names):
-                extra_gui_kwargs["app_name"] = app_name_val
-            if expected_hwnd_val is not None and (
-                accepts_kwargs or "expected_hwnd" in param_names
-            ):
-                extra_gui_kwargs["expected_hwnd"] = expected_hwnd_val
+            for name, val in present_optional.items():
+                if accepts_kwargs or name in param_names:
+                    extra_gui_kwargs[name] = val
+        before_state = (
+            await self._capture_desktop_state()
+            if str(p.action or "").strip().lower() != "wait"
+            else None
+        )
         try:
             res = await asyncio.to_thread(
                 gui_action,
@@ -3694,6 +3767,7 @@ class CleaDaemon:
         except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
             await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
+        res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_gui_action",
             gui_action=p.action,
@@ -3737,6 +3811,7 @@ class CleaDaemon:
         ws = conn.ws
         p = req.params
         guard_kwargs = self._os_guard_kwargs(ui_act)
+        before_state = await self._capture_desktop_state()
         try:
             try:
                 res = await asyncio.to_thread(
@@ -3761,6 +3836,7 @@ class CleaDaemon:
         except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
             await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
+        res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_ui_act",
             ref=p.ref,
@@ -3780,6 +3856,7 @@ class CleaDaemon:
             s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else s for s in p.steps
         ]
         guard_kwargs = self._os_guard_kwargs(ui_batch)
+        before_state = await self._capture_desktop_state()
         try:
             res = await asyncio.to_thread(
                 ui_batch,
@@ -3795,6 +3872,7 @@ class CleaDaemon:
         except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
             await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
             return
+        res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_ui_batch",
             steps_executed=res.get("steps_executed"),
@@ -4543,6 +4621,8 @@ def build_daemon(
         working_memory=working_memory,
         fact_reconciler=fact_reconciler,
         background_memory_hooks=True,
+        focus_backend=focus_backend,
+        media_backend=media_backend,
     )
     return CleaDaemon(
         agent=agent,
@@ -4596,7 +4676,18 @@ def run_daemon(
     """Blocking entrypoint used by ``clea daemon``."""
     configure_daemon_logging(background=background)
     try:
-        daemon = build_daemon(host=host, port=port)
+        focus_backend: FocusPreconditionBackend | None = (
+            Win32FocusPreconditionBackend() if sys.platform == "win32" else None
+        )
+        media_backend: MediaVerificationBackend | None = (
+            WinRTMediaVerificationBackend() if sys.platform == "win32" else None
+        )
+        daemon = build_daemon(
+            host=host,
+            port=port,
+            focus_backend=focus_backend,
+            media_backend=media_backend,
+        )
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(daemon.serve_forever())
     except Exception:

@@ -28,11 +28,13 @@ from clea.memory.store import default_data_dir
 from clea.surfaces.voice.win32 import (
     _RECT,
     DWMWA_EXTENDED_FRAME_BOUNDS,
+    get_dpi_scale_for_monitor,
     get_window_bounds,
     get_window_process_name,
     get_window_title,
     resolve_app_display_name,
 )
+from clea.tools.cdp_bridge import is_chromium_process
 from clea.tools.clipboard import (
     IMAGE_EXTENSIONS,
     ClipboardService,
@@ -112,6 +114,14 @@ class ScreenInspectionResult(BaseModel):
     dimensions: tuple[int, int] | None = None
     width: int | None = None
     height: int | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    screen_width: int | None = None
+    screen_height: int | None = None
+    virtual_left: int | None = None
+    virtual_top: int | None = None
+    dpi_scale: float | None = None
+    coord_space: str | None = None
     artifact_path: str | None = None
     uia_text: str | None = None
     text: str | None = None
@@ -136,6 +146,19 @@ class ScreenInspectionResult(BaseModel):
             "text": self.text,
             "message": self.message,
         }
+        for geom_key in (
+            "image_width",
+            "image_height",
+            "screen_width",
+            "screen_height",
+            "virtual_left",
+            "virtual_top",
+            "dpi_scale",
+            "coord_space",
+        ):
+            val = getattr(self, geom_key)
+            if val is not None:
+                res[geom_key] = val
         if self.os_window_geometry is not None:
             res["os_window_geometry"] = self.os_window_geometry
         if self.window_layout is not None:
@@ -807,9 +830,16 @@ class Win32ScreenVisionBackend:
         )
 
     def probe_uia_text(self, hwnd: int, max_chars: int = DEFAULT_PROBE_MAX_CHARS) -> str:
-        """Fast UIA text probe extracting readable text controls under hwnd."""
+        """Fast bounded UIA text probe extracting readable text controls under hwnd."""
         if not hwnd:
             return ""
+
+        # Chromium UIA Guard: never invoke UIA traversal on chrome/msedge/brave
+        # (prevents 1.5s-5s hangs and Chrome sticky UIA mode activation).
+        with contextlib.suppress(Exception):
+            proc_name = get_window_process_name(hwnd)
+            if is_chromium_process(proc_name):
+                return ""
 
         # 1. Try uiautomation or pywinauto if installed
         for mod_name in ("uiautomation", "pywinauto"):
@@ -843,39 +873,56 @@ class Win32ScreenVisionBackend:
                 except Exception as exc:
                     logger.debug("Module %s UIA probe failed: %s", mod_name, exc)
 
-        # 2. PowerShell UIAutomationClient fallback
+        # 2. Bounded PowerShell UIAutomationClient TreeWalker + CacheRequest fallback
         ps_script = (
             f"Add-Type -AssemblyName UIAutomationClient; "
+            f"Add-Type -AssemblyName UIAutomationTypes; "
             f"$win = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd}); "
             f"if ($win -eq $null) {{ exit 0 }}; "
-            f"$conds = New-Object System.Collections.ArrayList; "
-            f"[void]$conds.Add((New-Object System.Windows.Automation.PropertyCondition("
-            f"[System.Windows.Automation.AutomationElement]::ControlTypeProperty, "
-            f"[System.Windows.Automation.ControlType]::Text))); "
-            f"[void]$conds.Add((New-Object System.Windows.Automation.PropertyCondition("
-            f"[System.Windows.Automation.AutomationElement]::ControlTypeProperty, "
-            f"[System.Windows.Automation.ControlType]::Edit))); "
-            f"[void]$conds.Add((New-Object System.Windows.Automation.PropertyCondition("
-            f"[System.Windows.Automation.AutomationElement]::ControlTypeProperty, "
-            f"[System.Windows.Automation.ControlType]::Document))); "
-            f"$orCond = New-Object System.Windows.Automation.OrCondition($conds.ToArray()); "
-            f"$items = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $orCond); "
-            f"$txts = New-Object System.Collections.ArrayList; "
-            f"foreach ($it in $items) {{ "
-            f"  try {{ "
-            f"    $n = [string]$it.Current.Name; "
-            f"    if (-not [string]::IsNullOrWhiteSpace($n) -and -not $txts.Contains($n)) {{ "
-            f"      [void]$txts.Add($n); "
-            f"      if ($txts.Count -ge 40) {{ break }} "
-            f"    }} "
-            f"  }} catch {{ continue }} "
-            f"}}; "
-            f"$txts -join [Environment]::NewLine"
+            f"$ctAllowed = @('Text','Edit','Document'); "
+            f"$uiaCacheReq = New-Object System.Windows.Automation.CacheRequest; "
+            f"$uiaCacheReq.TreeScope = [System.Windows.Automation.TreeScope]::Element; "
+            "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::NameProperty); "
+            "$uiaCacheReq.Add("
+            "[System.Windows.Automation.AutomationElement]::ControlTypeProperty); "
+            "$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker; "
+            "$queue = New-Object System.Collections.ArrayList; "
+            "[void]$queue.Add(@($win, 0)); "
+            "$qi = 0; $visited = 0; $maxDepth = 6; $maxNodes = 120; "
+            "$txts = New-Object System.Collections.ArrayList; "
+            "while ($qi -lt $queue.Count -and $visited -lt $maxNodes -and $txts.Count -lt 40) { "
+            "  $entry = $queue[$qi]; $qi++; "
+            "  $node = $entry[0]; $depth = [int]$entry[1]; "
+            "  if ($node -eq $null) { continue }; "
+            "  $visited++; "
+            "  if ($depth -gt 0) { "
+            "    try { "
+            "      $ctRaw = [string]$node.Cached.ControlType.ProgrammaticName; "
+            "      $ct = ($ctRaw -replace '^ControlType\\.', ''); "
+            "      if ($ctAllowed -contains $ct) { "
+            "        $n = [string]$node.Cached.Name; "
+            "        if (-not [string]::IsNullOrWhiteSpace($n) -and -not $txts.Contains($n)) { "
+            "          [void]$txts.Add($n) "
+            "        } "
+            "      } "
+            "    } catch {} "
+            "  }; "
+            "  if ($depth -lt $maxDepth) { "
+            "    $child = try { $walker.GetFirstChild($node, $uiaCacheReq) } catch { $null }; "
+            "    while ($child -ne $null -and ($visited + $queue.Count - $qi) -lt $maxNodes) { "
+            "      [void]$queue.Add(@($child, ($depth + 1))); "
+            "      $child = try { "
+            "        $walker.GetNextSibling($child, $uiaCacheReq) "
+            "      } catch { $null } "
+            "    } "
+            "  } "
+            "}; "
+            "$txts -join [Environment]::NewLine"
         )
         try:
             res = run_powershell_hidden(
                 ps_script,
-                timeout=1.5,
+                timeout=2.5,
                 check=False,
             )
             if res.returncode == 0 and res.stdout.strip():
@@ -1168,7 +1215,9 @@ class ScreenVisionService:
                 ),
             )
 
-        uia_text = self._backend.probe_uia_text(win.hwnd)
+        uia_text = (
+            "" if is_chromium_process(win.process_name) else self._backend.probe_uia_text(win.hwnd)
+        )
         window_layout, os_window_geometry = self._collect_window_layout(target_window=win)
 
         if include_image:
@@ -1179,6 +1228,39 @@ class ScreenVisionService:
                 w, h = capture.width, capture.height
                 if max(w, h) > MAX_VISION_DIMENSION:
                     final_bytes, (w, h) = _downscale_png(final_bytes, MAX_VISION_DIMENSION)
+
+                geom_bounds = win.bounds
+                if geom_bounds is None and isinstance(self._backend, Win32ScreenVisionBackend):
+                    with contextlib.suppress(Exception):
+                        geom_bounds = get_window_bounds(win.hwnd)
+                if (
+                    geom_bounds is not None
+                    and geom_bounds[2] > geom_bounds[0]
+                    and geom_bounds[3] > geom_bounds[1]
+                ):
+                    v_left, v_top = int(geom_bounds[0]), int(geom_bounds[1])
+                    s_width = int(geom_bounds[2] - geom_bounds[0])
+                    s_height = int(geom_bounds[3] - geom_bounds[1])
+                else:
+                    v_left, v_top = 0, 0
+                    s_width, s_height = max(1, capture.width), max(1, capture.height)
+
+                dpi_scale = 1.0
+                if isinstance(self._backend, Win32ScreenVisionBackend) and sys.platform == "win32":
+                    with contextlib.suppress(Exception):
+                        dpi_scale = get_dpi_scale_for_monitor(hwnd=win.hwnd)
+
+                if w > 0 and h > 0 and s_width > 0 and s_height > 0:
+                    _windows_os.set_last_screen_geometry(
+                        image_width=w,
+                        image_height=h,
+                        screen_width=s_width,
+                        screen_height=s_height,
+                        virtual_left=v_left,
+                        virtual_top=v_top,
+                        dpi_scale=dpi_scale,
+                        coord_space="normalized_1000",
+                    )
 
                 saved_path = self._artifact_store.save_png(final_bytes, prefix="vision_window")
                 attachment = {"mime_type": "image/png", "data": final_bytes}
@@ -1201,6 +1283,14 @@ class ScreenVisionService:
                     dimensions=(w, h),
                     width=w,
                     height=h,
+                    image_width=w,
+                    image_height=h,
+                    screen_width=s_width,
+                    screen_height=s_height,
+                    virtual_left=v_left,
+                    virtual_top=v_top,
+                    dpi_scale=dpi_scale,
+                    coord_space="normalized_1000",
                     artifact_path=str(saved_path),
                     uia_text=uia_text or None,
                     message=msg,

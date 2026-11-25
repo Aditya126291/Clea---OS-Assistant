@@ -830,11 +830,11 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="open_url",
             description=(
-                "Validate and open an http/https URL or common site shorthand (e.g. 'github', "
-                "'youtube', 'docs') in the default or specified browser. Prefer "
-                "open_or_focus_app first for installed native/Store/PWA apps unless the user "
-                "explicitly requests the browser/web version or no installed app exists; never "
-                "call both open_or_focus_app and open_url for the same target in one turn."
+                "Validate and navigate directly to an http/https URL or site shorthand. For web "
+                "apps and installed Chromium PWAs (such as YouTube Watch Later "
+                "'https://www.youtube.com/playlist?list=WL'), omit 'browser' to navigate directly "
+                "inside the installed PWA via CDP without spawning Chrome; pass browser='chrome' "
+                "only when the user explicitly requests the browser/Chrome/web version."
             ),
             parameters_schema={
                 "type": "object",
@@ -846,8 +846,8 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     "browser": {
                         "type": "string",
                         "description": (
-                            "Optional browser name or executable (e.g., 'chrome', 'edge', "
-                            "'firefox')."
+                            "Optional explicit browser name (e.g., 'chrome', 'edge'). Omit to "
+                            "navigate inside an installed PWA when available."
                         ),
                     },
                 },
@@ -1022,33 +1022,80 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="gui_action",
             description=(
-                "Perform a low-level desktop GUI input or wait step: click_at screen coordinates, "
-                "type_text via Unicode keystrokes, press_keys (single key or chord like "
-                "['ctrl', 'l']), scroll wheel at optional coordinates, or wait for UI/page loads."
+                "Perform a desktop GUI input, browser CDP ref/history action, or wait step: "
+                "click_at / double_click / right_click / move (pass coord_space='normalized_1000' "
+                "when clicking from look_at_screen), type_text, press_keys, scroll, wait, "
+                "navigate_back, navigate_forward, or act directly on a CDP ref (ref='b1' with "
+                "click/type/press)."
             ),
             parameters_schema={
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["click_at", "type_text", "press_keys", "scroll", "wait"],
-                        "description": "GUI input or wait action to execute.",
+                        "enum": [
+                            "click_at",
+                            "double_click",
+                            "right_click",
+                            "move",
+                            "type_text",
+                            "press_keys",
+                            "scroll",
+                            "wait",
+                            "navigate_back",
+                            "navigate_forward",
+                            "click",
+                            "type",
+                            "press",
+                        ],
+                        "description": "GUI input, CDP ref action, or wait step to execute.",
                     },
                     "x": {
-                        "type": "integer",
+                        "type": "number",
                         "description": (
-                            "Horizontal screen coordinate (>= 0) for click_at or scroll."
+                            "Horizontal coordinate (>= 0) for click_at/double_click/right_click/"
+                            "move/scroll (0..1000 when coord_space='normalized_1000')."
                         ),
                     },
                     "y": {
+                        "type": "number",
+                        "description": (
+                            "Vertical coordinate (>= 0) for click_at/double_click/right_click/"
+                            "move/scroll (0..1000 when coord_space='normalized_1000')."
+                        ),
+                    },
+                    "coord_space": {
+                        "type": "string",
+                        "enum": ["normalized_1000", "image", "screen"],
+                        "description": (
+                            "Coordinate space for (x, y): use 'normalized_1000' for coordinates "
+                            "from look_at_screen, 'image' for screenshot pixels, or 'screen' "
+                            "(default) for physical virtual-screen pixels."
+                        ),
+                    },
+                    "image_width": {
                         "type": "integer",
-                        "description": "Vertical screen coordinate (>= 0) for click_at or scroll.",
+                        "description": "Screenshot image width when coord_space='image'.",
+                    },
+                    "image_height": {
+                        "type": "integer",
+                        "description": "Screenshot image height when coord_space='image'.",
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": (
+                            "Optional browser CDP ref (e.g. 'b1') to click/type/press directly."
+                        ),
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Single key name (e.g. 'Enter') when using action='press'.",
                     },
                     "text": {
                         "type": "string",
                         "description": (
                             "Unicode text (1..2000 chars) to type into the focused control for "
-                            "'type_text'."
+                            "'type_text' or CDP 'type'."
                         ),
                     },
                     "keys": {
@@ -1100,8 +1147,9 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="ui_snapshot",
             description=(
                 "Capture visible UI elements and accessibility tree for the active window or "
-                "specified application with stable element reference IDs (e.g. 'e0', 'e1') "
-                "for subsequent interaction."
+                "specified application with stable element reference IDs: CDP refs ('b1', 'b2', "
+                "...) for Chrome/Edge/Brave browsers and Chromium PWAs, or UIA refs ('e1', 'e2', "
+                "...) for native Windows apps."
             ),
             parameters_schema={
                 "type": "object",
@@ -1128,8 +1176,8 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="ui_act",
             description=(
                 "Perform a semantic action on a UI element identified by its snapshot reference "
-                "ID ('ref', e.g. 'e3'). Automatically captures the resulting UI diff and updated "
-                "snapshot."
+                "ID ('b1'..'bN' for Chromium browser/PWA CDP elements, or 'e1'..'eN' for native "
+                "Windows UIA elements). Returns verified before -> after state diff."
             ),
             parameters_schema={
                 "type": "object",
@@ -1137,7 +1185,8 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                     "ref": {
                         "type": "string",
                         "description": (
-                            "Element reference ID from a preceding ui_snapshot, e.g. 'e0', 'e3'."
+                            "Element reference ID from a preceding ui_snapshot, e.g. 'b1' "
+                            "(browser/PWA CDP) or 'e1' (native UIA)."
                         ),
                     },
                     "action": {
@@ -1149,13 +1198,15 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                             "clear",
                             "double_click",
                             "right_click",
+                            "press",
                         ],
                         "description": "Semantic action to execute on the element.",
                     },
                     "value": {
                         "type": "string",
                         "description": (
-                            "Text value to set or type for 'set_value' or 'type' actions."
+                            "Text value for 'set_value'/'type', or key name for 'press' "
+                            "(e.g. 'Enter')."
                         ),
                     },
                 },
@@ -1220,15 +1271,35 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                                     "description": "Duration for 'wait' op.",
                                 },
                                 "x": {
-                                    "type": "integer",
+                                    "type": "number",
                                     "description": (
                                         "Horizontal coordinate for 'click_at' or 'scroll'."
                                     ),
                                 },
                                 "y": {
-                                    "type": "integer",
+                                    "type": "number",
                                     "description": (
                                         "Vertical coordinate for 'click_at' or 'scroll'."
+                                    ),
+                                },
+                                "coord_space": {
+                                    "type": "string",
+                                    "enum": ["normalized_1000", "image", "screen"],
+                                    "description": (
+                                        "Optional coordinate space for 'click_at' "
+                                        "('normalized_1000', 'image', or 'screen')."
+                                    ),
+                                },
+                                "image_width": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Screenshot image width when coord_space='image'."
+                                    ),
+                                },
+                                "image_height": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Screenshot image height when coord_space='image'."
                                     ),
                                 },
                                 "clicks": {

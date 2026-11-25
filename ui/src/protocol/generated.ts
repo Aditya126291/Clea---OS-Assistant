@@ -522,7 +522,20 @@ export type FrameType63 = "request";
 export type Id64 = string;
 export type SessionId73 = string | null;
 export type Method63 = "os.gui_action";
-export type Action4 = "click_at" | "type_text" | "press_keys" | "scroll" | "wait";
+export type Action4 =
+  | "click_at"
+  | "double_click"
+  | "right_click"
+  | "move"
+  | "type_text"
+  | "press_keys"
+  | "scroll"
+  | "wait"
+  | "navigate_back"
+  | "navigate_forward"
+  | "click"
+  | "type"
+  | "press";
 export type X = number | null;
 export type Y = number | null;
 export type Text2 = string | null;
@@ -531,6 +544,16 @@ export type Clicks = number;
 export type Button = "left" | "right" | "double";
 export type Delta = number;
 export type Seconds = number;
+export type CoordSpace = ("normalized_1000" | "image" | "screen") | null;
+export type ImageWidth = number | null;
+export type ImageHeight = number | null;
+export type ScreenWidth = number | null;
+export type ScreenHeight = number | null;
+export type VirtualLeft = number | null;
+export type VirtualTop = number | null;
+export type DpiScale = number | null;
+export type Ref = string | null;
+export type Key = string | null;
 /**
  * Optional target application or window title for focus precondition enforcement.
  */
@@ -550,8 +573,8 @@ export type FrameType65 = "request";
 export type Id66 = string;
 export type SessionId75 = string | null;
 export type Method65 = "os.ui_act";
-export type Ref = string;
-export type Action5 = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click";
+export type Ref1 = string;
+export type Action5 = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click" | "press";
 export type Value = string | null;
 export type IntervalMs = number;
 export type FrameType66 = "request";
@@ -559,14 +582,22 @@ export type Id67 = string;
 export type SessionId76 = string | null;
 export type Method66 = "os.ui_batch";
 export type Op = "act" | "press_keys" | "scroll" | "wait" | "click_at";
-export type Ref1 = string | null;
-export type Action6 = ("click" | "set_value" | "type" | "clear" | "double_click" | "right_click") | null;
+export type Ref2 = string | null;
+export type Action6 = ("click" | "set_value" | "type" | "clear" | "double_click" | "right_click" | "press") | null;
 export type Value1 = string | null;
 export type Keys1 = string[] | null;
 export type Delta1 = number | null;
 export type Seconds1 = number | null;
 export type X1 = number | null;
 export type Y1 = number | null;
+export type CoordSpace1 = ("normalized_1000" | "image" | "screen") | null;
+export type ImageWidth1 = number | null;
+export type ImageHeight1 = number | null;
+export type ScreenWidth1 = number | null;
+export type ScreenHeight1 = number | null;
+export type VirtualLeft1 = number | null;
+export type VirtualTop1 = number | null;
+export type DpiScale1 = number | null;
 export type Clicks1 = number | null;
 export type Button1 = ("left" | "right" | "double") | null;
 export type IntervalMs1 = number | null;
@@ -1103,6 +1134,7 @@ export type Ok17 = boolean;
 export type Success1 = boolean;
 export type Status13 = string;
 export type Url1 = string;
+export type Title21 = string | null;
 export type Browser1 = string | null;
 export type Message9 = string | null;
 export type RoutedToInstalledApp = boolean;
@@ -1112,6 +1144,14 @@ export type WindowTitle2 = string | null;
 export type ResolutionLayer = string | null;
 export type Guidance = string | null;
 export type ReusedBrowserWindow = boolean;
+export type TargetId = string | null;
+export type IsPwa = boolean | null;
+export type CdpUsed = boolean;
+export type BeforeUrl = string | null;
+export type AfterUrl = string | null;
+export type StateDiff = {
+  [k: string]: unknown | undefined;
+} | null;
 export type Ok18 = boolean;
 export type Success2 = boolean;
 export type Action9 = string;
@@ -1166,6 +1206,14 @@ export type ProcessName = string | null;
 export type Question1 = string | null;
 export type Width2 = number | null;
 export type Height2 = number | null;
+export type ImageWidth2 = number | null;
+export type ImageHeight2 = number | null;
+export type ScreenWidth2 = number | null;
+export type ScreenHeight2 = number | null;
+export type VirtualLeft2 = number | null;
+export type VirtualTop2 = number | null;
+export type DpiScale2 = number | null;
+export type CoordSpace2 = string | null;
 export type ArtifactPath = string | null;
 export type UiaText = string | null;
 export type Text15 = string | null;
@@ -1173,6 +1221,12 @@ export type Message12 = string | null;
 export type ImageBase64 = string | null;
 export type ImageMimeType = string | null;
 export type Ok24 = boolean;
+export type Status20 = string | null;
+export type Source5 = string | null;
+export type CdpAvailable = boolean | null;
+export type Hint = string | null;
+export type Message13 = string | null;
+export type Error8 = string | null;
 export type WindowTitle5 = string;
 export type Count = number;
 export type Index3 = number;
@@ -1184,33 +1238,74 @@ export type X2 = number;
 export type Y2 = number;
 export type Elements = UiElementItem[];
 export type Ok25 = boolean;
-export type Status20 = string;
+export type Status21 = string;
 export type Name7 = string;
 export type ControlType2 = string;
 export type X3 = number;
 export type Y3 = number;
 export type Method68 = string;
+export type CdpAvailable1 = boolean | null;
+export type Hint1 = string | null;
+export type Message14 = string | null;
+export type StateDiff1 = {
+  [k: string]: unknown | undefined;
+} | null;
 export type Reason6 = string | null;
-export type Error8 = string | null;
+export type Error9 = string | null;
 export type Ok26 = boolean;
-export type Status21 = string;
+export type Status22 = string;
+export type Source6 = string | null;
 export type Action11 = string;
+export type Method69 = string | null;
+export type Direction = string | null;
 export type X4 = number | null;
 export type Y4 = number | null;
+export type PhysicalX = number | null;
+export type PhysicalY = number | null;
+export type CoordSpace3 = string | null;
 export type Clicks2 = number | null;
 export type Button2 = string | null;
 export type CharCount3 = number | null;
 export type Keys2 = string[] | null;
 export type Delta2 = number | null;
 export type Seconds2 = number | null;
+export type Ref3 = string | null;
+export type Url2 = string | null;
+export type Title22 = string | null;
+export type BeforeUrl1 = string | null;
+export type AfterUrl1 = string | null;
+export type BeforeTitle = string | null;
+export type AfterTitle = string | null;
+export type TargetId1 = string | null;
+export type IsPwa1 = boolean | null;
+export type CdpAvailable2 = boolean | null;
+export type Hint2 = string | null;
+export type Message15 = string | null;
+export type StateDiff2 = {
+  [k: string]: unknown | undefined;
+} | null;
+export type CircuitBreakerTripped = boolean | null;
+export type SuggestedRecovery = string[] | null;
 export type Reason7 = string | null;
-export type Error9 = string | null;
+export type Error10 = string | null;
 export type Ok27 = boolean;
+export type Status23 = string | null;
+export type Source7 = string | null;
 export type SnapshotId = string;
 export type WindowTitle6 = string;
+export type ProcessName1 = string | null;
+export type Url3 = string | null;
+export type Title23 = string | null;
+export type TargetId2 = string | null;
+export type IsPwa2 = boolean | null;
+export type CdpAvailable3 = boolean | null;
+export type Hint3 = string | null;
+export type Message16 = string | null;
+export type Error11 = string | null;
+export type Truncated3 = boolean | null;
 export type Count1 = number;
 export type ElementCount = number | null;
-export type Ref2 = string;
+export type Ref4 = string;
 export type Role7 = string;
 export type Name8 = string;
 export type Value3 = string | null;
@@ -1222,20 +1317,35 @@ export type Enabled = boolean;
 export type Focused = boolean;
 export type Elements1 = UiSnapshotElement[];
 export type Ok28 = boolean;
-export type Status22 = string;
+export type Status24 = string;
+export type Source8 = string | null;
 export type SnapshotId1 = string;
 export type Action12 = string;
-export type Ref3 = string;
+export type Ref5 = string;
 export type Role8 = string;
 export type Name9 = string;
-export type Method69 = string;
+export type Method70 = string;
 export type X6 = number | null;
 export type Y6 = number | null;
 export type CharCount4 = number | null;
 export type IntervalMs2 = number | null;
+export type Url4 = string | null;
+export type Title24 = string | null;
+export type BeforeUrl2 = string | null;
+export type AfterUrl2 = string | null;
+export type BeforeTitle1 = string | null;
+export type AfterTitle1 = string | null;
+export type TargetId3 = string | null;
+export type IsPwa3 = boolean | null;
+export type CdpAvailable4 = boolean | null;
+export type Hint4 = string | null;
+export type Message17 = string | null;
+export type StateDiff3 = {
+  [k: string]: unknown | undefined;
+} | null;
 export type WindowChanged = boolean;
 export type WindowTitle7 = string;
-export type Ref4 = string;
+export type Ref6 = string;
 export type Role9 = string;
 export type Name10 = string;
 export type OldValue = string | null;
@@ -1244,20 +1354,23 @@ export type ChangedValues = UiDiffChangedValue[];
 export type AddedElements = UiSnapshotElement[];
 export type RemovedCount3 = number;
 export type Reason8 = string | null;
-export type Error10 = string | null;
+export type Error12 = string | null;
 export type Ok29 = boolean;
-export type Status23 = "completed" | "stopped_on_window_change" | "partial_error" | "aborted_precondition";
+export type Status25 = "completed" | "stopped_on_window_change" | "partial_error" | "aborted_precondition";
 export type StepsExecuted = number;
 export type StepResults = {
   [k: string]: unknown | undefined;
 }[];
+export type StateDiff4 = {
+  [k: string]: unknown | undefined;
+} | null;
 export type Reason9 = string | null;
-export type Error11 = string | null;
+export type Error13 = string | null;
 export type Ok30 = boolean;
 export type RepoPath1 = string;
 export type Branch = string;
 export type IsClean = boolean;
-export type Status24 = string;
+export type Status26 = string;
 export type Staged = string[];
 export type Unstaged = string[];
 export type Untracked = string[];
@@ -1295,7 +1408,7 @@ export type MediaVolumeAction =
 export type FactCategory = "preference" | "environment" | "project" | "workflow" | "identity" | "constraint";
 export type FactStatus = "active" | "superseded" | "deleted";
 export type FactOperation = "add" | "update" | "delete" | "noop";
-export type UiActAction = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click";
+export type UiActAction = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click" | "press";
 export type UiBatchOp = "act" | "press_keys" | "scroll" | "wait" | "click_at";
 
 export interface CleaProtocolSchema {
@@ -2136,6 +2249,16 @@ export interface OsGuiActionParams {
   button?: Button;
   delta?: Delta;
   seconds?: Seconds;
+  coord_space?: CoordSpace;
+  image_width?: ImageWidth;
+  image_height?: ImageHeight;
+  screen_width?: ScreenWidth;
+  screen_height?: ScreenHeight;
+  virtual_left?: VirtualLeft;
+  virtual_top?: VirtualTop;
+  dpi_scale?: DpiScale;
+  ref?: Ref;
+  key?: Key;
   app_name?: AppName4;
   expected_hwnd?: ExpectedHwnd;
 }
@@ -2159,7 +2282,7 @@ export interface OsUiActRequest {
   params: OsUiActParams;
 }
 export interface OsUiActParams {
-  ref: Ref;
+  ref: Ref1;
   action: Action5;
   value?: Value;
   interval_ms?: IntervalMs;
@@ -2178,7 +2301,7 @@ export interface OsUiBatchParams {
 }
 export interface UiBatchStep {
   op: Op;
-  ref?: Ref1;
+  ref?: Ref2;
   action?: Action6;
   value?: Value1;
   keys?: Keys1;
@@ -2186,6 +2309,14 @@ export interface UiBatchStep {
   seconds?: Seconds1;
   x?: X1;
   y?: Y1;
+  coord_space?: CoordSpace1;
+  image_width?: ImageWidth1;
+  image_height?: ImageHeight1;
+  screen_width?: ScreenWidth1;
+  screen_height?: ScreenHeight1;
+  virtual_left?: VirtualLeft1;
+  virtual_top?: VirtualTop1;
+  dpi_scale?: DpiScale1;
   clicks?: Clicks1;
   button?: Button1;
   interval_ms?: IntervalMs1;
@@ -3028,6 +3159,7 @@ export interface OsOpenUrlResult {
   success?: Success1;
   status?: Status13;
   url: Url1;
+  title?: Title21;
   browser?: Browser1;
   message?: Message9;
   routed_to_installed_app?: RoutedToInstalledApp;
@@ -3037,6 +3169,12 @@ export interface OsOpenUrlResult {
   resolution_layer?: ResolutionLayer;
   guidance?: Guidance;
   reused_browser_window?: ReusedBrowserWindow;
+  target_id?: TargetId;
+  is_pwa?: IsPwa;
+  cdp_used?: CdpUsed;
+  before_url?: BeforeUrl;
+  after_url?: AfterUrl;
+  state_diff?: StateDiff;
 }
 export interface OsControlSystemResult {
   ok?: Ok18;
@@ -3105,6 +3243,14 @@ export interface OsInspectScreenResult {
   question?: Question1;
   width?: Width2;
   height?: Height2;
+  image_width?: ImageWidth2;
+  image_height?: ImageHeight2;
+  screen_width?: ScreenWidth2;
+  screen_height?: ScreenHeight2;
+  virtual_left?: VirtualLeft2;
+  virtual_top?: VirtualTop2;
+  dpi_scale?: DpiScale2;
+  coord_space?: CoordSpace2;
   artifact_path?: ArtifactPath;
   uia_text?: UiaText;
   text?: Text15;
@@ -3114,6 +3260,12 @@ export interface OsInspectScreenResult {
 }
 export interface OsInspectUiElementsResult {
   ok?: Ok24;
+  status?: Status20;
+  source?: Source5;
+  cdp_available?: CdpAvailable;
+  hint?: Hint;
+  message?: Message13;
+  error?: Error8;
   window_title?: WindowTitle5;
   count?: Count;
   elements?: Elements;
@@ -3129,42 +3281,79 @@ export interface UiElementItem {
 }
 export interface OsClickUiElementResult {
   ok?: Ok25;
-  status?: Status20;
+  status?: Status21;
   name?: Name7;
   control_type?: ControlType2;
   x?: X3;
   y?: Y3;
   method?: Method68;
+  cdp_available?: CdpAvailable1;
+  hint?: Hint1;
+  message?: Message14;
+  state_diff?: StateDiff1;
   reason?: Reason6;
-  error?: Error8;
+  error?: Error9;
   aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface OsGuiActionResult {
   ok?: Ok26;
-  status?: Status21;
+  status?: Status22;
+  source?: Source6;
   action?: Action11;
+  method?: Method69;
+  direction?: Direction;
   x?: X4;
   y?: Y4;
+  physical_x?: PhysicalX;
+  physical_y?: PhysicalY;
+  coord_space?: CoordSpace3;
   clicks?: Clicks2;
   button?: Button2;
   char_count?: CharCount3;
   keys?: Keys2;
   delta?: Delta2;
   seconds?: Seconds2;
+  ref?: Ref3;
+  url?: Url2;
+  title?: Title22;
+  before_url?: BeforeUrl1;
+  after_url?: AfterUrl1;
+  before_title?: BeforeTitle;
+  after_title?: AfterTitle;
+  target_id?: TargetId1;
+  is_pwa?: IsPwa1;
+  cdp_available?: CdpAvailable2;
+  hint?: Hint2;
+  message?: Message15;
+  state_diff?: StateDiff2;
+  circuit_breaker_tripped?: CircuitBreakerTripped;
+  suggested_recovery?: SuggestedRecovery;
   reason?: Reason7;
-  error?: Error9;
+  error?: Error10;
   aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface OsUiSnapshotResult {
   ok?: Ok27;
+  status?: Status23;
+  source?: Source7;
   snapshot_id?: SnapshotId;
   window_title?: WindowTitle6;
+  process_name?: ProcessName1;
+  url?: Url3;
+  title?: Title23;
+  target_id?: TargetId2;
+  is_pwa?: IsPwa2;
+  cdp_available?: CdpAvailable3;
+  hint?: Hint3;
+  message?: Message16;
+  error?: Error11;
+  truncated?: Truncated3;
   count?: Count1;
   element_count?: ElementCount;
   elements?: Elements1;
 }
 export interface UiSnapshotElement {
-  ref: Ref2;
+  ref: Ref4;
   role?: Role7;
   name?: Name8;
   value?: Value3;
@@ -3177,21 +3366,34 @@ export interface UiSnapshotElement {
 }
 export interface OsUiActResult {
   ok?: Ok28;
-  status?: Status22;
+  status?: Status24;
+  source?: Source8;
   snapshot_id?: SnapshotId1;
   action?: Action12;
-  ref?: Ref3;
+  ref?: Ref5;
   role?: Role8;
   name?: Name9;
-  method?: Method69;
+  method?: Method70;
   x?: X6;
   y?: Y6;
   char_count?: CharCount4;
   interval_ms?: IntervalMs2;
+  url?: Url4;
+  title?: Title24;
+  before_url?: BeforeUrl2;
+  after_url?: AfterUrl2;
+  before_title?: BeforeTitle1;
+  after_title?: AfterTitle1;
+  target_id?: TargetId3;
+  is_pwa?: IsPwa3;
+  cdp_available?: CdpAvailable4;
+  hint?: Hint4;
+  message?: Message17;
+  state_diff?: StateDiff3;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
   reason?: Reason8;
-  error?: Error10;
+  error?: Error12;
   aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface UiDiff {
@@ -3202,7 +3404,7 @@ export interface UiDiff {
   removed_count?: RemovedCount3;
 }
 export interface UiDiffChangedValue {
-  ref?: Ref4;
+  ref?: Ref6;
   role?: Role9;
   name?: Name10;
   old_value?: OldValue;
@@ -3210,13 +3412,14 @@ export interface UiDiffChangedValue {
 }
 export interface OsUiBatchResult {
   ok?: Ok29;
-  status?: Status23;
+  status?: Status25;
   steps_executed?: StepsExecuted;
   step_results?: StepResults;
+  state_diff?: StateDiff4;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
   reason?: Reason9;
-  error?: Error11;
+  error?: Error13;
   aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface WorkspaceGitInspectResult {
@@ -3224,7 +3427,7 @@ export interface WorkspaceGitInspectResult {
   repo_path: RepoPath1;
   branch: Branch;
   is_clean?: IsClean;
-  status?: Status24;
+  status?: Status26;
   staged?: Staged;
   unstaged?: Unstaged;
   untracked?: Untracked;

@@ -187,10 +187,18 @@ def test_default_voice_tools_cover_required_tools() -> None:
     assert by_name["gui_action"].parameters_schema["required"] == ["action"]
     assert by_name["gui_action"].parameters_schema["properties"]["action"]["enum"] == [
         "click_at",
+        "double_click",
+        "right_click",
+        "move",
         "type_text",
         "press_keys",
         "scroll",
         "wait",
+        "navigate_back",
+        "navigate_forward",
+        "click",
+        "type",
+        "press",
     ]
     assert by_name["ui_snapshot"].parameters_schema.get("required", []) == []
     assert by_name["ui_act"].parameters_schema["required"] == ["ref", "action"]
@@ -201,6 +209,7 @@ def test_default_voice_tools_cover_required_tools() -> None:
         "clear",
         "double_click",
         "right_click",
+        "press",
     ]
     assert by_name["ui_batch"].parameters_schema["required"] == ["steps"]
     assert by_name["inspect_git_workspace"].parameters_schema.get("required", []) == []
