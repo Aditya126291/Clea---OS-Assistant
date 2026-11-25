@@ -613,7 +613,10 @@ class VoiceRunner:
                     with contextlib.suppress(RuntimeError):
                         running_loop = asyncio.get_running_loop()
                     if running_loop is self._loop:
-                        self._loop.create_task(self._send_daemon_payload(ws, payload))
+                        self._spawn_daemon_callback_task(
+                            self._send_daemon_payload(ws, payload),
+                            name=f"voice-state-{state}",
+                        )
                     else:
                         asyncio.run_coroutine_threadsafe(
                             self._send_daemon_payload(ws, payload),

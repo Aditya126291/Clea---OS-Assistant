@@ -50,9 +50,16 @@ export function Sidebar() {
   const newSession = useCleaStore((s) => s.newSession);
   const tasks = useCleaStore((s) => s.tasks);
   const callOverlayOpen = useCleaStore((s) => s.callOverlayOpen);
+  const callState = useCleaStore((s) => s.callState);
+  const voiceState = useCleaStore((s) => s.voiceState);
   const startVoiceCall = useCleaStore((s) => s.startVoiceCall);
   const endVoiceCall = useCleaStore((s) => s.endVoiceCall);
   const setCommandPaletteOpen = useCleaStore((s) => s.setCommandPaletteOpen);
+  const isVoiceActive =
+    callOverlayOpen ||
+    callState === "active" ||
+    callState === "connecting" ||
+    (voiceState !== "idle" && voiceState !== "error");
 
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
@@ -428,7 +435,7 @@ export function Sidebar() {
       >
         <Button
           size="sm"
-          variant={callOverlayOpen ? "default" : "ghost"}
+          variant={isVoiceActive ? "default" : "ghost"}
           onClick={() => {
             if (!callOverlayOpen) {
               void startVoiceCall();
@@ -436,7 +443,7 @@ export function Sidebar() {
               void endVoiceCall();
             }
           }}
-          aria-pressed={callOverlayOpen}
+          aria-pressed={isVoiceActive}
           className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
         >
           <AudioLines className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />

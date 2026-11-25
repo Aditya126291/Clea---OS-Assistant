@@ -1,11 +1,40 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CleaAvatar, sanitizeSvg } from "@/components/ui/clea-avatar";
 import { CallOverlay as ComponentCallOverlay } from "@/components/voice/CallOverlay";
+import { Sidebar } from "@/features/sidebar/Sidebar";
+import { ThemeProvider } from "@/lib/theme";
+import type { WebSocketLike } from "@/protocol/client";
 import { useCleaStore } from "@/protocol/store";
 import type { VoiceState } from "@/protocol/types";
 import { CallOverlay } from "./CallOverlay";
 import { DevVoiceMockPanel } from "./DevVoiceMockPanel";
+
+class MockVoiceSocket implements WebSocketLike {
+  readyState = 0;
+  sent: Array<Record<string, unknown>> = [];
+  onopen: ((ev: Event) => void) | null = null;
+  onmessage: ((ev: MessageEvent<unknown>) => void) | null = null;
+  onerror: ((ev: Event) => void) | null = null;
+  onclose: ((ev: CloseEvent) => void) | null = null;
+
+  send(data: string): void {
+    this.sent.push(JSON.parse(data) as Record<string, unknown>);
+  }
+
+  close(): void {
+    this.readyState = 3;
+  }
+
+  triggerOpen(): void {
+    this.readyState = 1;
+    this.onopen?.(new Event("open"));
+  }
+
+  triggerMessage(payload: unknown): void {
+    this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+  }
+}
 
 describe("CallOverlay", () => {
   beforeEach(() => {
@@ -323,5 +352,255 @@ describe("CallOverlay", () => {
     expect(btn).toBeInTheDocument();
     fireEvent.click(btn);
     expect(useCleaStore.getState().activeView).toBe("voice");
+  });
+
+  describe("wake-word popup sync, hydration, and active-call attachment", () => {
+    afterEach(() => {
+      useCleaStore.getState().disconnect();
+      useCleaStore.setState({
+        connectionState: "idle",
+        callOverlayOpen: false,
+        callState: "idle",
+        voiceState: "idle",
+        voiceError: null,
+        activeCallId: null,
+        screenCaptureActive: false,
+        screenCaptureTarget: null,
+      });
+    });
+
+    it("auto-opens CallOverlay and highlights Voice button on incoming wake-word voice_state events and closes on idle", () => {
+      useCleaStore.setState({
+        connectionState: "connected",
+        callOverlayOpen: false,
+        callState: "idle",
+        voiceState: "idle",
+        voiceError: null,
+        activeCallId: null,
+      });
+
+      render(
+        <ThemeProvider>
+          <Sidebar />
+          <CallOverlay />
+        </ThemeProvider>,
+      );
+
+      const voiceBtn = screen.getByRole("button", { name: /^Voice$/i });
+      expect(voiceBtn).toHaveAttribute("aria-pressed", "false");
+      expect(screen.queryByLabelText("Voice call overlay")).toBeNull();
+
+      // Incoming wake-word state without any manual button click
+      act(() => {
+        useCleaStore.getState().applyEvent({
+          frame_type: "event",
+          event: "voice_state",
+          data: { state: "thinking" },
+        });
+      });
+
+      expect(screen.getByLabelText("Voice call overlay")).toBeInTheDocument();
+      expect(screen.getByText("Thinking")).toBeInTheDocument();
+      expect(voiceBtn).toHaveAttribute("aria-pressed", "true");
+      expect(useCleaStore.getState().callOverlayOpen).toBe(true);
+      expect(useCleaStore.getState().callState).toBe("active");
+
+      act(() => {
+        useCleaStore.getState().applyEvent({
+          frame_type: "event",
+          event: "voice_state",
+          data: { state: "listening" },
+        });
+      });
+      expect(screen.getByText("Listening")).toBeInTheDocument();
+
+      act(() => {
+        useCleaStore.getState().applyEvent({
+          frame_type: "event",
+          event: "voice_state",
+          data: { state: "speaking" },
+        });
+      });
+      expect(screen.getByText("Speaking")).toBeInTheDocument();
+
+      // Call returns to idle -> popup closes and Voice button resets cleanly
+      act(() => {
+        useCleaStore.getState().applyEvent({
+          frame_type: "event",
+          event: "voice_state",
+          data: { state: "idle" },
+        });
+      });
+
+      expect(screen.queryByLabelText("Voice call overlay")).toBeNull();
+      expect(voiceBtn).toHaveAttribute("aria-pressed", "false");
+      expect(useCleaStore.getState().callOverlayOpen).toBe(false);
+      expect(useCleaStore.getState().callState).toBe("idle");
+    });
+
+    it("hydrates and opens CallOverlay when connecting to daemon mid-call", async () => {
+      let socket: MockVoiceSocket | null = null;
+      useCleaStore.setState({
+        callOverlayOpen: false,
+        callState: "idle",
+        voiceState: "idle",
+        voiceError: null,
+        activeCallId: null,
+      });
+
+      render(
+        <ThemeProvider>
+          <Sidebar />
+          <CallOverlay />
+        </ThemeProvider>,
+      );
+
+      act(() => {
+        useCleaStore.getState().connect({
+          resolveConnection: async () => ({
+            ok: true,
+            info: { token: "tok-1", wsUrl: "ws://127.0.0.1:8765" },
+          }),
+          createWebSocket: () => {
+            socket = new MockVoiceSocket();
+            return socket;
+          },
+        });
+      });
+
+      await waitFor(() => expect(socket).not.toBeNull());
+      act(() => {
+        socket!.triggerOpen();
+      });
+
+      await waitFor(() =>
+        expect(socket!.sent.some((frame) => frame.method === "voice.status")).toBe(true),
+      );
+      const statusReq = socket!.sent.find((frame) => frame.method === "voice.status")!;
+
+      act(() => {
+        socket!.triggerMessage({
+          frame_type: "response",
+          id: statusReq.id,
+          ok: true,
+          result: {
+            call_id: "wake-call-7",
+            call_state: "active",
+            voice_state: "listening",
+            screen_capture_active: false,
+            screen_capture_target: null,
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByLabelText("Voice call overlay")).toBeInTheDocument();
+      });
+      expect(screen.getByText("Listening")).toBeInTheDocument();
+      expect(useCleaStore.getState().activeCallId).toBe("wake-call-7");
+      expect(useCleaStore.getState().callState).toBe("active");
+      expect(screen.getByRole("button", { name: /^Voice$/i })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+
+      // Clicking End Call sends voice.end_call with hydrated call_id
+      fireEvent.click(screen.getByRole("button", { name: /End Call/i }));
+      await waitFor(() =>
+        expect(
+          socket!.sent.some(
+            (frame) =>
+              frame.method === "voice.end_call" &&
+              (frame.params as Record<string, unknown>).call_id === "wake-call-7",
+          ),
+        ).toBe(true),
+      );
+    });
+
+    it("attaches cleanly instead of showing 'A voice call is already active.' when Voice button is clicked mid-call", async () => {
+      let socket: MockVoiceSocket | null = null;
+      useCleaStore.setState({
+        callOverlayOpen: false,
+        callState: "idle",
+        voiceState: "idle",
+        voiceError: null,
+        activeCallId: null,
+      });
+
+      render(
+        <ThemeProvider>
+          <Sidebar />
+          <CallOverlay />
+        </ThemeProvider>,
+      );
+
+      act(() => {
+        useCleaStore.getState().connect({
+          resolveConnection: async () => ({
+            ok: true,
+            info: { token: "tok-2", wsUrl: "ws://127.0.0.1:8765" },
+          }),
+          createWebSocket: () => {
+            socket = new MockVoiceSocket();
+            return socket;
+          },
+        });
+      });
+
+      await waitFor(() => expect(socket).not.toBeNull());
+      act(() => {
+        socket!.triggerOpen();
+      });
+
+      // Click Voice while UI hasn't hydrated yet; simulate daemon replying with "already active" error
+      fireEvent.click(screen.getByRole("button", { name: /^Voice$/i }));
+
+      await waitFor(() =>
+        expect(socket!.sent.some((frame) => frame.method === "voice.start_call")).toBe(true),
+      );
+      const startReq = socket!.sent.find((frame) => frame.method === "voice.start_call")!;
+      const statusCountBefore = socket!.sent.filter((f) => f.method === "voice.status").length;
+
+      act(() => {
+        socket!.triggerMessage({
+          frame_type: "response",
+          id: startReq.id,
+          ok: false,
+          error: "A voice call is already active.",
+        });
+      });
+
+      await waitFor(() => {
+        const statusReqs = socket!.sent.filter((f) => f.method === "voice.status");
+        expect(statusReqs.length).toBeGreaterThan(statusCountBefore);
+      });
+      const latestStatusReq = socket!.sent
+        .filter((f) => f.method === "voice.status")
+        .slice(-1)[0]!;
+
+      act(() => {
+        socket!.triggerMessage({
+          frame_type: "response",
+          id: latestStatusReq.id,
+          ok: true,
+          result: {
+            call_id: "wake-99",
+            call_state: "active",
+            voice_state: "speaking",
+            screen_capture_active: false,
+            screen_capture_target: null,
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText("Speaking")).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/already active/i)).toBeNull();
+      expect(screen.queryByText("Error")).toBeNull();
+      expect(useCleaStore.getState().voiceError).toBeNull();
+      expect(useCleaStore.getState().activeCallId).toBe("wake-99");
+      expect(useCleaStore.getState().callOverlayOpen).toBe(true);
+    });
   });
 });

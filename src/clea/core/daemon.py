@@ -1848,10 +1848,25 @@ class CleaDaemon:
                 ),
             )
         elif method == "voice.start_call":
+            trigger = getattr(req.params, "trigger", "manual")
             if self._call_state != "idle":
+                if (
+                    trigger == "ui"
+                    and self._call_state in ("connecting", "active")
+                    and self._voice_call_id is not None
+                ):
+                    await self._respond(
+                        ws,
+                        req,
+                        METHOD_RESULTS[method](
+                            call_id=self._voice_call_id,
+                            call_state=self._call_state,
+                            voice_state=self._voice_state,
+                        ),
+                    )
+                    return
                 await self._respond(ws, req, error="A voice call is already active.")
                 return
-            trigger = getattr(req.params, "trigger", "manual")
             if trigger in ("wake_word", "hotkey"):
                 conn.is_voice = True
             elif trigger == "ui":
@@ -1867,7 +1882,11 @@ class CleaDaemon:
             self._voice_call_id = call_id
             self._call_state = "active"
             self._call_started_monotonic = time.monotonic()
-            self._voice_state = "idle"
+            self._voice_state = (
+                self._voice_state
+                if self._voice_state in ("thinking", "listening", "speaking", "reconnecting")
+                else "thinking"
+            )
             self._screen_capture_active = False
             self._screen_capture_target = None
             await self._broadcast(

@@ -20,6 +20,8 @@ from clea.core.protocol import (
     AssistantTokenEvent,
     BaseEvent,
     BaseRequest,
+    CallEndedEvent,
+    CallStartedEvent,
     ChatCreateAndOpenParams,
     ChatCreateAndOpenRequest,
     ConversationCreatedEvent,
@@ -31,13 +33,19 @@ from clea.core.protocol import (
     UiNavigateEvent,
     UiNavigateParams,
     UiNavigateRequest,
+    VoiceStartCallParams,
+    VoiceStartCallRequest,
+    VoiceStateEvent,
+    VoiceStatusRequest,
     parse_frame,
 )
 from clea.memory import MemoryStore
 from clea.providers.base import LLMProvider, Message, StreamChunk, TokenUsage
 from clea.surfaces.voice.audio import AudioManager
 from clea.surfaces.voice.backends.base import (
+    AudioOutputEvent,
     ToolCallEvent,
+    TurnCompleteEvent,
     VoiceBackend,
     VoiceBackendEvent,
     VoiceSessionConfig,
@@ -707,3 +715,147 @@ async def test_inspect_activity_and_cancel_running_task(tmp_path: Path) -> None:
         )
         assert nav_frame.ok is True
         assert nav_frame.result["view"] == "activity"
+
+
+async def test_wake_word_call_broadcasts_state_hydrates_late_ui_and_attaches_on_ui_click(
+    tmp_path: Path,
+) -> None:
+    """Wake-word calls broadcast state to UI, hydrate late clients, and attach on UI click."""
+    mem = MemoryStore(base_dir=tmp_path)
+    mem.ensure_initialized()
+    daemon: CleaDaemon = build_daemon(
+        host="127.0.0.1",
+        port=0,
+        provider=FakeStreamingProvider(),
+        memory=mem,
+    )
+    await daemon.start()
+
+    url = f"ws://127.0.0.1:{daemon.bound_port}"
+    backends: list[FakeLiveBackend] = []
+
+    def _backend_factory() -> FakeLiveBackend:
+        b = FakeLiveBackend()
+        backends.append(b)
+        return b
+
+    wake_model = MagicMock()
+    wake_scores = iter([{"hey_jarvis_v0.1": 0.95}])
+    wake_model.predict.side_effect = lambda _arr: next(wake_scores, {"hey_jarvis_v0.1": 0.0})
+    wake_detector = WakeWordDetector(model_instance=wake_model)
+
+    runner = VoiceRunner(
+        config=VoiceConfig(silence_timeout_seconds=60.0),
+        data_dir=tmp_path,
+        daemon_url=url,
+        token=daemon.token,
+        backend_factory=_backend_factory,
+        audio_manager=_make_fake_audio(),
+        wake_word_detector=wake_detector,
+        enable_hotkey=False,
+    )
+
+    ui_events: list[BaseEvent] = []
+    runner_task = asyncio.create_task(runner.run_forever())
+    reader_task: asyncio.Task[None] | None = None
+    try:
+        await _wait_until(lambda: runner._daemon_listener_active)
+
+        async with connect(url, subprotocols=auth.client_subprotocols(daemon.token)) as ui_ws:
+
+            async def _read_ui() -> None:
+                while True:
+                    raw = await ui_ws.recv()
+                    frame = parse_frame(raw)
+                    if isinstance(frame, BaseEvent):
+                        ui_events.append(frame)
+
+            reader_task = asyncio.create_task(_read_ui())
+
+            # Trigger wake-word call from audio chunk (no UI click)
+            runner._on_audio_chunk(b"\x01\x00" * 1280)
+
+            await _wait_until(
+                lambda: (
+                    len(backends) == 1
+                    and runner.call_state == "active"
+                    and any(isinstance(e, CallStartedEvent) for e in ui_events)
+                    and any(
+                        isinstance(e, VoiceStateEvent) and e.data.state == "listening"
+                        for e in ui_events
+                    )
+                )
+            )
+            backend = backends[-1]
+            started_evt = next(e for e in ui_events if isinstance(e, CallStartedEvent))
+            assert started_evt.data.call_id == runner.call_id
+            assert started_evt.data.call_state == "active"
+            voice_states = [
+                e.data.state for e in ui_events if isinstance(e, VoiceStateEvent)
+            ]
+            assert "thinking" in voice_states
+            assert "listening" in voice_states
+
+            # Emit assistant speech -> speaking -> turn complete -> listening
+            await backend.event_queue.put(AudioOutputEvent(pcm_bytes=b"\x02\x00" * 160))
+            await _wait_until(
+                lambda: any(
+                    isinstance(e, VoiceStateEvent) and e.data.state == "speaking"
+                    for e in ui_events
+                )
+            )
+            await backend.event_queue.put(TurnCompleteEvent())
+            await _wait_until(lambda: runner.voice_state == "listening")
+
+            # Late-connecting UI client hydrates active call via voice.status
+            async with connect(
+                url, subprotocols=auth.client_subprotocols(daemon.token)
+            ) as late_ui_ws:
+                status_resp = await _send_rpc(late_ui_ws, VoiceStatusRequest())
+                assert status_resp.ok is True
+                assert status_resp.result["call_id"] == runner.call_id
+                assert status_resp.result["call_state"] == "active"
+                assert status_resp.result["voice_state"] == "listening"
+
+                # Manual UI click (trigger="ui") attaches cleanly instead of erroring
+                attach_resp = await _send_rpc(
+                    late_ui_ws,
+                    VoiceStartCallRequest(params=VoiceStartCallParams(trigger="ui")),
+                )
+                assert attach_resp.ok is True
+                assert attach_resp.result["call_id"] == runner.call_id
+                assert attach_resp.result["call_state"] == "active"
+                assert attach_resp.result["voice_state"] == "listening"
+
+                # Duplicate non-UI start_call is still rejected while active
+                dup_resp = await _send_rpc(
+                    late_ui_ws,
+                    VoiceStartCallRequest(params=VoiceStartCallParams(trigger="wake_word")),
+                )
+                assert dup_resp.ok is False
+                assert "already active" in (dup_resp.error or "")
+
+            # End call and verify idle + call_ended broadcasts reach UI
+            ui_events.clear()
+            await runner.end_call(reason="user_done")
+            await _wait_until(
+                lambda: (
+                    any(
+                        isinstance(e, VoiceStateEvent) and e.data.state == "idle"
+                        for e in ui_events
+                    )
+                    and any(
+                        isinstance(e, CallEndedEvent) and e.data.call_state == "idle"
+                        for e in ui_events
+                    )
+                )
+            )
+    finally:
+        if reader_task is not None and not reader_task.done():
+            reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader_task
+        await runner.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner_task
+        await daemon.stop()

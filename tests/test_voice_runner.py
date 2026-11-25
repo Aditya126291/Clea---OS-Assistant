@@ -1614,3 +1614,73 @@ async def test_voice_runner_ends_call_if_backend_events_stream_terminates_unexpe
     assert runner.call_state == "idle"
     assert runner.voice_state == "error"
     await runner.stop()
+
+
+async def test_voice_runner_wake_word_sends_voice_state_and_start_call_to_daemon(
+    tmp_path: Path,
+) -> None:
+    """Wake-word start sends thinking -> start_call -> listening -> speaking -> idle to daemon."""
+    backend = FakeLiveBackend()
+    audio = create_fake_audio_manager()
+    wake_word = create_fake_wake_word()
+    wake_word._model.predict.side_effect = [  # type: ignore[attr-defined]
+        {"hey_jarvis_v0.1": 0.95},
+        {"hey_jarvis_v0.1": 0.0},
+    ]
+
+    runner = VoiceRunner(
+        config=VoiceConfig(silence_timeout_seconds=60.0),
+        data_dir=tmp_path,
+        backend_factory=lambda: backend,
+        audio_manager=audio,
+        wake_word_detector=wake_word,
+        enable_hotkey=False,
+    )
+
+    sent_frames: list[Any] = []
+
+    class FakeDaemonWs:
+        async def send(self, payload: str) -> None:
+            sent_frames.append(parse_frame(payload))
+
+        async def close(self) -> None:
+            pass
+
+    await runner.start()
+    runner._daemon_ws = FakeDaemonWs()  # type: ignore[assignment]
+    runner._daemon_listener_active = False
+
+    try:
+        # Simulate microphone chunk triggering wake word
+        runner._on_audio_chunk(b"\x01\x00" * 1280)
+        for _ in range(40):
+            if runner.call_state == "active":
+                break
+            await asyncio.sleep(0.02)
+
+        assert runner.call_state == "active"
+
+        await backend.event_queue.put(AudioOutputEvent(pcm_bytes=b"\x02\x00" * 160))
+        for _ in range(40):
+            if runner.voice_state == "speaking":
+                break
+            await asyncio.sleep(0.02)
+        assert runner.voice_state == "speaking"
+
+        await runner.end_call(reason="user_done")
+        await asyncio.sleep(0.05)
+
+        state_events = [f.data.state for f in sent_frames if isinstance(f, VoiceStateEvent)]
+        assert "thinking" in state_events
+        assert "listening" in state_events
+        assert "speaking" in state_events
+        assert state_events[-1] == "idle"
+        assert any(
+            getattr(f, "method", None) == "voice.start_call"
+            and getattr(getattr(f, "params", None), "trigger", None) == "wake_word"
+            for f in sent_frames
+        )
+        assert any(getattr(f, "method", None) == "voice.end_call" for f in sent_frames)
+    finally:
+        runner._daemon_ws = None
+        await runner.stop()

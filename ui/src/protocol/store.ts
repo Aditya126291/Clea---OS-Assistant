@@ -101,6 +101,7 @@ export interface CleaStoreState {
   setMemorySubView: (view: "overview" | "transcripts") => void;
   setCommandPaletteOpen: (open: boolean) => void;
   setCallOverlayOpen: (open: boolean) => void;
+  syncVoiceStatus: () => Promise<boolean>;
   startVoiceCall: () => Promise<void>;
   endVoiceCall: () => Promise<void>;
   loadVoiceHistory: () => Promise<void>;
@@ -143,6 +144,17 @@ export interface CleaStoreState {
 let activeClient: CleaClient | null = null;
 let localMsgSeq = 0;
 let sessionEpoch = 0;
+let voiceSyncEpoch = 0;
+let voiceOverlayAutoOpened = false;
+
+function isActiveVoiceState(state: VoiceState | null | undefined): boolean {
+  return (
+    state === "listening" ||
+    state === "thinking" ||
+    state === "speaking" ||
+    state === "reconnecting"
+  );
+}
 
 function nextRequestId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -330,6 +342,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         }
         void get().loadConversations();
         void get().loadSettings();
+        void get().syncVoiceStatus();
         clientOptions.onConnected?.();
       },
       onDisconnected: (reason, attempt) => {
@@ -353,6 +366,7 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       activeClient.dispose();
       activeClient = null;
     }
+    voiceOverlayAutoOpened = false;
     set({ connectionState: "idle", reconnectAttempt: 0 });
   },
 
@@ -391,7 +405,68 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   },
   setMemorySubView: (view) => set({ memorySubView: view }),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
-  setCallOverlayOpen: (open) => set({ callOverlayOpen: open }),
+  setCallOverlayOpen: (open) => {
+    if (!open) {
+      voiceOverlayAutoOpened = false;
+    }
+    set({ callOverlayOpen: open });
+  },
+
+  syncVoiceStatus: async () => {
+    if (!activeClient?.isConnected) return false;
+    const epoch = voiceSyncEpoch;
+    try {
+      const status = await activeClient.request("voice.status", {});
+      const daemonCallState = status.call_state ?? "idle";
+      const daemonVoiceState = status.voice_state ?? "idle";
+      const isActive =
+        daemonCallState === "active" ||
+        daemonCallState === "connecting" ||
+        isActiveVoiceState(daemonVoiceState);
+
+      if (epoch !== voiceSyncEpoch) {
+        if (isActive && status.call_id) {
+          set((state) =>
+            state.callState !== "idle" && !state.activeCallId
+              ? { activeCallId: status.call_id ?? null }
+              : {},
+          );
+        }
+        return isActive;
+      }
+
+      if (isActive) {
+        voiceOverlayAutoOpened = true;
+        set((state) => ({
+          activeCallId: status.call_id ?? state.activeCallId,
+          callState: daemonCallState === "idle" ? "active" : daemonCallState,
+          voiceState: isActiveVoiceState(daemonVoiceState) ? daemonVoiceState : "listening",
+          voiceError: null,
+          callOverlayOpen: true,
+          screenCaptureActive: Boolean(status.screen_capture_active),
+          screenCaptureTarget: status.screen_capture_target ?? null,
+        }));
+        return true;
+      }
+
+      voiceOverlayAutoOpened = false;
+      set((state) => {
+        const preserveError = state.voiceState === "error" && Boolean(state.voiceError);
+        return {
+          activeCallId: null,
+          callState: "idle",
+          voiceState: preserveError ? "error" : "idle",
+          voiceError: preserveError ? state.voiceError : null,
+          callOverlayOpen: preserveError ? state.callOverlayOpen : false,
+          screenCaptureActive: false,
+          screenCaptureTarget: null,
+        };
+      });
+      return false;
+    } catch {
+      return false;
+    }
+  },
 
   loadVoiceHistory: async () => {
     if (!activeClient?.isConnected) return;
@@ -433,11 +508,43 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       });
       return;
     }
+
+    const { callState, activeCallId, voiceState } = get();
+    if (callState === "active" || callState === "connecting" || activeCallId) {
+      set({
+        callOverlayOpen: true,
+        voiceError: null,
+        voiceState: isActiveVoiceState(voiceState) ? voiceState : "listening",
+      });
+      void get().syncVoiceStatus();
+      return;
+    }
+
+    voiceSyncEpoch += 1;
     set({ callOverlayOpen: true, voiceError: null });
     try {
-      await activeClient.request("voice.start_call", { trigger: "ui" });
+      const res = await activeClient.request("voice.start_call", { trigger: "ui" });
+      voiceSyncEpoch += 1;
+      set((state) => ({
+        activeCallId: res.call_id ?? state.activeCallId,
+        callState: res.call_state ?? "active",
+        voiceState: isActiveVoiceState(res.voice_state)
+          ? (res.voice_state as VoiceState)
+          : isActiveVoiceState(state.voiceState)
+            ? state.voiceState
+            : "thinking",
+        voiceError: null,
+        callOverlayOpen: true,
+      }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (/already active/i.test(msg)) {
+        const attached = await get().syncVoiceStatus();
+        if (attached) {
+          return;
+        }
+      }
+      voiceOverlayAutoOpened = false;
       set({
         voiceState: "error",
         voiceError: msg || "Voice process not running.",
@@ -446,13 +553,27 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
   },
 
   endVoiceCall: async () => {
-    const { activeCallId } = get();
-    if (activeClient?.isConnected && activeCallId) {
+    const { activeCallId, callState, voiceState } = get();
+    voiceSyncEpoch += 1;
+    voiceOverlayAutoOpened = false;
+    const hasLiveCall =
+      Boolean(activeCallId) ||
+      callState === "active" ||
+      callState === "connecting" ||
+      isActiveVoiceState(voiceState);
+    if (activeClient?.isConnected && hasLiveCall) {
       try {
-        await activeClient.request("voice.end_call", {
-          call_id: activeCallId,
-          reason: "ui_button",
-        });
+        await activeClient.request(
+          "voice.end_call",
+          activeCallId
+            ? {
+                call_id: activeCallId,
+                reason: "ui_button",
+              }
+            : {
+                reason: "ui_button",
+              },
+        );
       } catch (err) {
         console.error("Failed ending voice call:", err);
       }
@@ -463,6 +584,8 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
       voiceError: null,
       callState: "idle",
       activeCallId: null,
+      screenCaptureActive: false,
+      screenCaptureTarget: null,
     });
   },
   clearError: () => set({ lastError: null }),
@@ -1132,27 +1255,72 @@ export const useCleaStore = create<CleaStoreState>((set, get) => ({
         break;
       }
       case "voice_state": {
+        voiceSyncEpoch += 1;
+        const nextState = event.data.state;
         const errorMsg =
           ("error" in event.data && typeof event.data.error === "string"
             ? event.data.error
-            : null) ?? (event.data.state === "error" ? "Voice error" : null);
-        set((state) => ({
-          voiceState: event.data.state,
-          voiceError: errorMsg,
-          callOverlayOpen: event.data.state === "error" ? true : state.callOverlayOpen,
-        }));
+            : null) ?? (nextState === "error" ? "Voice error" : null);
+        const activeVoice = isActiveVoiceState(nextState);
+        let shouldHydrateCallId = false;
+
+        set((state) => {
+          if (nextState === "error") {
+            voiceOverlayAutoOpened = false;
+            return {
+              voiceState: "error",
+              voiceError: errorMsg,
+              callOverlayOpen: true,
+            };
+          }
+          if (activeVoice) {
+            if (!state.callOverlayOpen) {
+              voiceOverlayAutoOpened = true;
+            }
+            if (!state.activeCallId && activeClient?.isConnected) {
+              shouldHydrateCallId = true;
+            }
+            return {
+              voiceState: nextState,
+              voiceError: null,
+              callState: state.callState === "idle" ? "active" : state.callState,
+              callOverlayOpen: true,
+            };
+          }
+          // Transition back to idle: auto-close when opened by a daemon/wake-word call
+          const shouldAutoClose = voiceOverlayAutoOpened || Boolean(state.activeCallId);
+          voiceOverlayAutoOpened = false;
+          return {
+            voiceState: "idle",
+            voiceError: null,
+            callState: shouldAutoClose ? "idle" : state.callState,
+            activeCallId: shouldAutoClose ? null : state.activeCallId,
+            screenCaptureActive: shouldAutoClose ? false : state.screenCaptureActive,
+            screenCaptureTarget: shouldAutoClose ? null : state.screenCaptureTarget,
+            callOverlayOpen: shouldAutoClose ? false : state.callOverlayOpen,
+          };
+        });
+        if (shouldHydrateCallId) {
+          void get().syncVoiceStatus();
+        }
         break;
       }
       case "call_started": {
-        set({
+        voiceSyncEpoch += 1;
+        voiceOverlayAutoOpened = true;
+        set((state) => ({
           activeCallId: event.data.call_id,
           callState: event.data.call_state ?? "active",
+          voiceState: isActiveVoiceState(state.voiceState) ? state.voiceState : "thinking",
+          voiceError: null,
           callOverlayOpen: true,
           voiceTranscripts: [],
-        });
+        }));
         break;
       }
       case "call_ended": {
+        voiceSyncEpoch += 1;
+        voiceOverlayAutoOpened = false;
         set((state) => ({
           activeCallId: null,
           callState: event.data.call_state ?? "idle",
