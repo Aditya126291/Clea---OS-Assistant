@@ -43,6 +43,11 @@ from clea.tools.clipboard import (
 from clea.tools.registry import RiskLevel, ToolRegistry
 from clea.tools.subprocess_utils import run_powershell_hidden
 from clea.tools.system_controls import format_window_layout_summary, inspect_window_layout
+from clea.tools.uia_com import (
+    NativeUiaComEngine,
+    get_default_uia_com_engine,
+    has_explicit_default_uia_com_engine,
+)
 
 _ORIG_INSPECT_WINDOW_LAYOUT = inspect_window_layout
 
@@ -483,7 +488,9 @@ class Win32ScreenVisionBackend:
         dwmapi: Any = None,
         kernel32: Any = None,
         shcore: Any = None,
+        uia_backend: NativeUiaComEngine | None = None,
     ) -> None:
+        self._uia_backend = uia_backend
         if sys.platform == "win32":
             self._user32 = user32 if user32 is not None else _try_load_windll("user32")
             self._gdi32 = gdi32 if gdi32 is not None else _try_load_windll("gdi32")
@@ -841,94 +848,115 @@ class Win32ScreenVisionBackend:
             if is_chromium_process(proc_name):
                 return ""
 
-        # 1. Try uiautomation or pywinauto if installed
-        for mod_name in ("uiautomation", "pywinauto"):
-            if mod_name in sys.modules or _is_module_available(mod_name):
-                try:
-                    if mod_name == "uiautomation":
-                        import uiautomation as auto
+        # 0. Primary path: in-process native Win32 COM UIA engine (zero PowerShell overhead)
+        com_probed = False
+        com_engine: NativeUiaComEngine | None = self._uia_backend
+        if com_engine is None and (
+            has_explicit_default_uia_com_engine()
+            or (sys.platform == "win32" and _is_module_available("comtypes"))
+        ):
+            com_engine = get_default_uia_com_engine()
+        if com_engine is not None:
+            try:
+                if com_engine.is_available():
+                    com_text = com_engine.probe_text(hwnd, max_chars=max_chars)
+                    com_probed = True
+                    if com_text and com_text.strip():
+                        return com_text.strip()[:max_chars]
+            except Exception as exc:
+                logger.debug("In-process COM UIA probe failed, falling back: %s", exc)
 
-                        control = auto.ControlFromHandle(hwnd)
-                        if control:
-                            lines: list[str] = []
-                            total_len = 0
-                            for item, _depth in auto.WalkTree(control, maxDepth=4):
-                                name = getattr(item, "Name", None) or ""
-                                if name and name not in lines:
-                                    lines.append(name)
-                                    total_len += len(name)
-                                    if total_len >= max_chars or len(lines) >= 40:
-                                        break
+        # 1. Try uiautomation or pywinauto if installed (only when COM UIA did not already probe)
+        if not com_probed:
+            for mod_name in ("uiautomation", "pywinauto"):
+                if mod_name in sys.modules or _is_module_available(mod_name):
+                    try:
+                        if mod_name == "uiautomation":
+                            import uiautomation as auto
+
+                            control = auto.ControlFromHandle(hwnd)
+                            if control:
+                                lines: list[str] = []
+                                total_len = 0
+                                for item, _depth in auto.WalkTree(control, maxDepth=4):
+                                    name = getattr(item, "Name", None) or ""
+                                    if name and name not in lines:
+                                        lines.append(name)
+                                        total_len += len(name)
+                                        if total_len >= max_chars or len(lines) >= 40:
+                                            break
+                                if lines:
+                                    return "\n".join(lines)[:max_chars]
+                        elif mod_name == "pywinauto":
+                            from pywinauto import Application
+
+                            app = Application().connect(handle=hwnd)
+                            win = app.window(handle=hwnd)
+                            raw_texts = win.texts()
+                            lines = [t.strip() for t in raw_texts if t and t.strip()]
                             if lines:
                                 return "\n".join(lines)[:max_chars]
-                    elif mod_name == "pywinauto":
-                        from pywinauto import Application
+                    except Exception as exc:
+                        logger.debug("Module %s UIA probe failed: %s", mod_name, exc)
 
-                        app = Application().connect(handle=hwnd)
-                        win = app.window(handle=hwnd)
-                        raw_texts = win.texts()
-                        lines = [t.strip() for t in raw_texts if t and t.strip()]
-                        if lines:
-                            return "\n".join(lines)[:max_chars]
-                except Exception as exc:
-                    logger.debug("Module %s UIA probe failed: %s", mod_name, exc)
-
-        # 2. Bounded PowerShell UIAutomationClient TreeWalker + CacheRequest fallback
-        ps_script = (
-            f"Add-Type -AssemblyName UIAutomationClient; "
-            f"Add-Type -AssemblyName UIAutomationTypes; "
-            f"$win = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd}); "
-            f"if ($win -eq $null) {{ exit 0 }}; "
-            f"$ctAllowed = @('Text','Edit','Document'); "
-            f"$uiaCacheReq = New-Object System.Windows.Automation.CacheRequest; "
-            f"$uiaCacheReq.TreeScope = [System.Windows.Automation.TreeScope]::Element; "
-            "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::NameProperty); "
-            "$uiaCacheReq.Add("
-            "[System.Windows.Automation.AutomationElement]::ControlTypeProperty); "
-            "$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker; "
-            "$queue = New-Object System.Collections.ArrayList; "
-            "[void]$queue.Add(@($win, 0)); "
-            "$qi = 0; $visited = 0; $maxDepth = 6; $maxNodes = 120; "
-            "$txts = New-Object System.Collections.ArrayList; "
-            "while ($qi -lt $queue.Count -and $visited -lt $maxNodes -and $txts.Count -lt 40) { "
-            "  $entry = $queue[$qi]; $qi++; "
-            "  $node = $entry[0]; $depth = [int]$entry[1]; "
-            "  if ($node -eq $null) { continue }; "
-            "  $visited++; "
-            "  if ($depth -gt 0) { "
-            "    try { "
-            "      $ctRaw = [string]$node.Cached.ControlType.ProgrammaticName; "
-            "      $ct = ($ctRaw -replace '^ControlType\\.', ''); "
-            "      if ($ctAllowed -contains $ct) { "
-            "        $n = [string]$node.Cached.Name; "
-            "        if (-not [string]::IsNullOrWhiteSpace($n) -and -not $txts.Contains($n)) { "
-            "          [void]$txts.Add($n) "
-            "        } "
-            "      } "
-            "    } catch {} "
-            "  }; "
-            "  if ($depth -lt $maxDepth) { "
-            "    $child = try { $walker.GetFirstChild($node, $uiaCacheReq) } catch { $null }; "
-            "    while ($child -ne $null -and ($visited + $queue.Count - $qi) -lt $maxNodes) { "
-            "      [void]$queue.Add(@($child, ($depth + 1))); "
-            "      $child = try { "
-            "        $walker.GetNextSibling($child, $uiaCacheReq) "
-            "      } catch { $null } "
-            "    } "
-            "  } "
-            "}; "
-            "$txts -join [Environment]::NewLine"
-        )
-        try:
-            res = run_powershell_hidden(
-                ps_script,
-                timeout=2.5,
-                check=False,
+            # 2. Bounded PowerShell UIAutomationClient TreeWalker + CacheRequest fallback
+            ps_script = (
+                f"Add-Type -AssemblyName UIAutomationClient; "
+                f"Add-Type -AssemblyName UIAutomationTypes; "
+                f"$win = [System.Windows.Automation.AutomationElement]::FromHandle("
+                f"[IntPtr]{hwnd}); "
+                f"if ($win -eq $null) {{ exit 0 }}; "
+                f"$ctAllowed = @('Text','Edit','Document'); "
+                f"$uiaCacheReq = New-Object System.Windows.Automation.CacheRequest; "
+                f"$uiaCacheReq.TreeScope = [System.Windows.Automation.TreeScope]::Element; "
+                "$uiaCacheReq.Add([System.Windows.Automation.AutomationElement]::NameProperty); "
+                "$uiaCacheReq.Add("
+                "[System.Windows.Automation.AutomationElement]::ControlTypeProperty); "
+                "$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker; "
+                "$queue = New-Object System.Collections.ArrayList; "
+                "[void]$queue.Add(@($win, 0)); "
+                "$qi = 0; $visited = 0; $maxDepth = 6; $maxNodes = 120; "
+                "$txts = New-Object System.Collections.ArrayList; "
+                "while ($qi -lt $queue.Count -and $visited -lt $maxNodes "
+                "-and $txts.Count -lt 40) { "
+                "  $entry = $queue[$qi]; $qi++; "
+                "  $node = $entry[0]; $depth = [int]$entry[1]; "
+                "  if ($node -eq $null) { continue }; "
+                "  $visited++; "
+                "  if ($depth -gt 0) { "
+                "    try { "
+                "      $ctRaw = [string]$node.Cached.ControlType.ProgrammaticName; "
+                "      $ct = ($ctRaw -replace '^ControlType\\.', ''); "
+                "      if ($ctAllowed -contains $ct) { "
+                "        $n = [string]$node.Cached.Name; "
+                "        if (-not [string]::IsNullOrWhiteSpace($n) -and -not $txts.Contains($n)) { "
+                "          [void]$txts.Add($n) "
+                "        } "
+                "      } "
+                "    } catch {} "
+                "  }; "
+                "  if ($depth -lt $maxDepth) { "
+                "    $child = try { $walker.GetFirstChild($node, $uiaCacheReq) } catch { $null }; "
+                "    while ($child -ne $null -and ($visited + $queue.Count - $qi) -lt $maxNodes) { "
+                "      [void]$queue.Add(@($child, ($depth + 1))); "
+                "      $child = try { "
+                "        $walker.GetNextSibling($child, $uiaCacheReq) "
+                "      } catch { $null } "
+                "    } "
+                "  } "
+                "}; "
+                "$txts -join [Environment]::NewLine"
             )
-            if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()[:max_chars]
-        except Exception as exc:
-            logger.debug("PowerShell UIA probe failed: %s", exc)
+            try:
+                res = run_powershell_hidden(
+                    ps_script,
+                    timeout=2.5,
+                    check=False,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    return res.stdout.strip()[:max_chars]
+            except Exception as exc:
+                logger.debug("PowerShell UIA probe failed: %s", exc)
 
         # 3. Fast Win32 child windows text probe
         if self._user32 and hasattr(self._user32, "EnumChildWindows"):

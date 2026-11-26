@@ -132,12 +132,14 @@ from clea.tools.cdp_bridge import close_default_cdp_bridge
 from clea.tools.git_workspace import inspect_git_workspace
 from clea.tools.guards import Win32FocusPreconditionBackend, WinRTMediaVerificationBackend
 from clea.tools.registry import ToolDefinition
+from clea.tools.uia_com import close_default_uia_com_engine
 from clea.tools.vision import MAX_VISION_DIMENSION, _downscale_png
 from clea.tools.windows_os import (
     cancel_inflight_os_actions,
     click_ui_element,
     control_media_volume,
     control_system,
+    get_installed_apps,
     gui_action,
     inspect_ui_elements,
     open_or_focus_app,
@@ -333,6 +335,7 @@ class CleaDaemon:
         self._consolidation_task_terminal: dict[str, bool] = {}
         self._ended_voice_call_ids: set[str] = set()
         self._startup_task: asyncio.Task[None] | None = None
+        self._app_cache_warmup_task: asyncio.Task[None] | None = None
         self._prune_task: asyncio.Task[Any] | None = None
         if timer_manager is not None:
             self.timer_manager = timer_manager
@@ -491,6 +494,15 @@ class CleaDaemon:
                 self._run_startup_consolidation(),
                 name="startup-consolidation",
             )
+            if os.environ.get("CLEA_DISABLE_STARTUP_APP_WARMUP", "").strip().lower() not in {
+                "1",
+                "true",
+                "yes",
+            }:
+                self._app_cache_warmup_task = self._spawn_background_task(
+                    self._warm_installed_apps_cache(),
+                    name="installed-apps-warmup",
+                )
             await self.timer_manager.start()
         except Exception:
             if self._server is not None:
@@ -500,6 +512,29 @@ class CleaDaemon:
             self._instance_lock.release()
             raise
         logger.info("Clea daemon listening on ws://%s:%d", self.host, self.bound_port)
+
+    async def _warm_installed_apps_cache(self) -> None:
+        """Warm the StartApps catalog asynchronously so first app launch avoids a cold stall."""
+        loop = asyncio.get_running_loop()
+        done_fut: asyncio.Future[None] = loop.create_future()
+
+        def _worker() -> None:
+            try:
+                get_installed_apps()
+            except Exception as exc:
+                logger.debug("Startup installed-apps cache warmup failed: %s", exc)
+            finally:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(
+                        lambda: None if done_fut.done() else done_fut.set_result(None)
+                    )
+
+        threading.Thread(
+            target=_worker,
+            name="clea-installed-apps-warmup",
+            daemon=True,
+        ).start()
+        await done_fut
 
     async def stop(self) -> None:
         """Gracefully close the WebSocket server and remove the token and lock files."""
@@ -513,6 +548,8 @@ class CleaDaemon:
             set_default_screen_vision_service(None)
         with contextlib.suppress(Exception):
             close_default_cdp_bridge()
+        with contextlib.suppress(Exception):
+            close_default_uia_com_engine()
         for t in list(self._idle_tasks.values()):
             if not t.done():
                 t.cancel()
@@ -542,6 +579,11 @@ class CleaDaemon:
                 pending_tasks.append(t)
         if self._startup_task is not None and self._startup_task not in pending_tasks:
             pending_tasks.append(self._startup_task)
+        if (
+            self._app_cache_warmup_task is not None
+            and self._app_cache_warmup_task not in pending_tasks
+        ):
+            pending_tasks.append(self._app_cache_warmup_task)
         for t in pending_tasks:
             if not t.done():
                 t.cancel()
@@ -3978,6 +4020,7 @@ class CleaDaemon:
                         p.action,
                         p.value,
                         interval_ms=p.interval_ms,
+                        refresh_snapshot=p.refresh_snapshot,
                         **cancel_kwargs,
                         **guard_kwargs,
                     )

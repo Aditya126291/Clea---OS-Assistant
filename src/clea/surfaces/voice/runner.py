@@ -4442,6 +4442,8 @@ class VoiceRunner:
             if raw_interval is not None and not isinstance(raw_interval, bool):
                 with contextlib.suppress(TypeError, ValueError):
                     interval_ms = int(raw_interval)
+            raw_refresh = event.arguments.get("refresh_snapshot", False)
+            refresh_snapshot = bool(raw_refresh) if isinstance(raw_refresh, bool) else False
             await _execute_rpc_tool(
                 OsUiActRequest(
                     params=OsUiActParams(
@@ -4449,6 +4451,7 @@ class VoiceRunner:
                         action=action_norm,  # type: ignore[arg-type]
                         value=val_str,
                         interval_ms=interval_ms,
+                        refresh_snapshot=refresh_snapshot,
                     )
                 ),
                 error_prefix="Failed to execute ui_act",

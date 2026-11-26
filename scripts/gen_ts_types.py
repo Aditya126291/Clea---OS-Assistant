@@ -22,6 +22,7 @@ if _SRC_DIR not in sys.path:
 
 from clea.core.protocol import (  # noqa: E402
     METHOD_RESULTS,
+    AccessibilityCoverage,
     ActivityCancelRequest,
     ActivityListRequest,
     ApprovalDecision,
@@ -279,6 +280,7 @@ def build_json_schema() -> dict[str, Any]:
         ui_batch_step: UiBatchStep
         ui_act_action: UiActAction
         ui_batch_op: UiBatchOp
+        accessibility_coverage: AccessibilityCoverage
         clipboard_item: ClipboardItem
         ui_element_item: UiElementItem
         workspace_git_inspect_request: WorkspaceGitInspectRequest

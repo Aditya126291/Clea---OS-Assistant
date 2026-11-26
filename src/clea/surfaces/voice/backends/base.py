@@ -1209,6 +1209,13 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                             "(e.g. 'Enter')."
                         ),
                     },
+                    "refresh_snapshot": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, re-walk the full UI tree after acting. Defaults to false "
+                            "(fast lightweight target delta unless the active window changes)."
+                        ),
+                    },
                 },
                 "required": ["ref", "action"],
             },

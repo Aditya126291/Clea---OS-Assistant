@@ -401,6 +401,7 @@ UiActAction = Literal[
     "click", "set_value", "type", "clear", "double_click", "right_click", "press"
 ]
 UiBatchOp = Literal["act", "press_keys", "scroll", "wait", "click_at"]
+AccessibilityCoverage = Literal["chrome_only", "sparse", "rich"]
 
 
 class OsUiSnapshotParams(_Model):
@@ -414,6 +415,7 @@ class OsUiActParams(_Model):
     action: UiActAction
     value: str | None = None
     interval_ms: int = 12
+    refresh_snapshot: bool = False
 
 
 class UiBatchStep(_Model):
@@ -1639,6 +1641,7 @@ class OsInspectUiElementsResult(_Model):
     status: str | None = None
     source: str | None = None
     cdp_available: bool | None = None
+    accessibility_coverage: AccessibilityCoverage | None = None
     hint: str | None = None
     message: str | None = None
     error: str | None = None
@@ -1730,6 +1733,8 @@ class OsUiSnapshotResult(_Model):
     target_id: str | None = None
     is_pwa: bool | None = None
     cdp_available: bool | None = None
+    accessibility_coverage: AccessibilityCoverage | None = None
+    content_element_count: int | None = None
     hint: str | None = None
     message: str | None = None
     error: str | None = None
@@ -1783,6 +1788,11 @@ class OsUiActResult(_Model):
     state_diff: dict[str, Any] | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
+    active_window_title: str | None = None
+    active_hwnd: int | None = None
+    target_state: dict[str, Any] | None = None
+    snapshot_refreshed: bool | None = None
+    stale_ref: bool | None = None
     reason: str | None = None
     error: str | None = None
     aborted_precondition: PreconditionAbortInfo | None = None

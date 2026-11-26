@@ -578,6 +578,7 @@ export type Ref1 = string;
 export type Action5 = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click" | "press";
 export type Value = string | null;
 export type IntervalMs = number;
+export type RefreshSnapshot = boolean;
 export type FrameType66 = "request";
 export type Id67 = string;
 export type SessionId76 = string | null;
@@ -1230,6 +1231,7 @@ export type Ok24 = boolean;
 export type Status20 = string | null;
 export type Source5 = string | null;
 export type CdpAvailable = boolean | null;
+export type AccessibilityCoverage = ("chrome_only" | "sparse" | "rich") | null;
 export type Hint = string | null;
 export type Message13 = string | null;
 export type Error8 = string | null;
@@ -1308,6 +1310,8 @@ export type Title23 = string | null;
 export type TargetId2 = string | null;
 export type IsPwa2 = boolean | null;
 export type CdpAvailable3 = boolean | null;
+export type AccessibilityCoverage1 = ("chrome_only" | "sparse" | "rich") | null;
+export type ContentElementCount = number | null;
 export type Hint3 = string | null;
 export type Message16 = string | null;
 export type Error11 = string | null;
@@ -1362,6 +1366,13 @@ export type NewValue = string | null;
 export type ChangedValues = UiDiffChangedValue[];
 export type AddedElements = UiSnapshotElement[];
 export type RemovedCount3 = number;
+export type ActiveWindowTitle = string | null;
+export type ActiveHwnd = number | null;
+export type TargetState = {
+  [k: string]: unknown | undefined;
+} | null;
+export type SnapshotRefreshed = boolean | null;
+export type StaleRef = boolean | null;
 export type Reason9 = string | null;
 export type Error12 = string | null;
 export type Ok29 = boolean;
@@ -1424,6 +1435,7 @@ export type FactStatus = "active" | "superseded" | "deleted";
 export type FactOperation = "add" | "update" | "delete" | "noop";
 export type UiActAction = "click" | "set_value" | "type" | "clear" | "double_click" | "right_click" | "press";
 export type UiBatchOp = "act" | "press_keys" | "scroll" | "wait" | "click_at";
+export type AccessibilityCoverage2 = "chrome_only" | "sparse" | "rich";
 
 export interface CleaProtocolSchema {
   request: Request;
@@ -1526,6 +1538,7 @@ export interface CleaProtocolSchema {
   ui_batch_step: UiBatchStep;
   ui_act_action: UiActAction;
   ui_batch_op: UiBatchOp;
+  accessibility_coverage: AccessibilityCoverage2;
   clipboard_item: ClipboardItem;
   ui_element_item: UiElementItem;
   workspace_git_inspect_request: WorkspaceGitInspectRequest;
@@ -2301,6 +2314,7 @@ export interface OsUiActParams {
   action: Action5;
   value?: Value;
   interval_ms?: IntervalMs;
+  refresh_snapshot?: RefreshSnapshot;
 }
 export interface OsUiBatchRequest {
   frame_type?: FrameType66;
@@ -3289,6 +3303,7 @@ export interface OsInspectUiElementsResult {
   status?: Status20;
   source?: Source5;
   cdp_available?: CdpAvailable;
+  accessibility_coverage?: AccessibilityCoverage;
   hint?: Hint;
   message?: Message13;
   error?: Error8;
@@ -3373,6 +3388,8 @@ export interface OsUiSnapshotResult {
   target_id?: TargetId2;
   is_pwa?: IsPwa2;
   cdp_available?: CdpAvailable3;
+  accessibility_coverage?: AccessibilityCoverage1;
+  content_element_count?: ContentElementCount;
   hint?: Hint3;
   message?: Message16;
   error?: Error11;
@@ -3421,6 +3438,11 @@ export interface OsUiActResult {
   state_diff?: StateDiff3;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
+  active_window_title?: ActiveWindowTitle;
+  active_hwnd?: ActiveHwnd;
+  target_state?: TargetState;
+  snapshot_refreshed?: SnapshotRefreshed;
+  stale_ref?: StaleRef;
   reason?: Reason9;
   error?: Error12;
   aborted_precondition?: PreconditionAbortInfo | null;

@@ -51,6 +51,13 @@ from clea.tools.guards import (
 from clea.tools.registry import RiskLevel, ToolRegistry
 from clea.tools.subprocess_utils import run_powershell_hidden
 from clea.tools.system_controls import inspect_window_layout
+from clea.tools.uia_com import (
+    NativeUiaComEngine,
+    UiaComUnavailableError,
+    classify_accessibility_coverage,
+    get_default_uia_com_engine,
+    has_explicit_default_uia_com_engine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -6118,6 +6125,54 @@ def _run_powershell_uia_json(
     return data
 
 
+_ORIG_RUN_POWERSHELL_UIA_JSON = _run_powershell_uia_json
+
+
+def _resolve_uia_com_engine(
+    *,
+    uia_backend: NativeUiaComEngine | None = None,
+    powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> NativeUiaComEngine | None:
+    """Return an active in-process COM UIA engine, or None to fall back to PowerShell UIA."""
+    if (
+        powershell_runner is not None
+        or _run_powershell_uia_json is not _ORIG_RUN_POWERSHELL_UIA_JSON
+    ):
+        return None
+    if uia_backend is not None:
+        return uia_backend if uia_backend.is_available() else None
+    if sys.platform == "win32" or has_explicit_default_uia_com_engine():
+        engine = get_default_uia_com_engine()
+        return engine if engine.is_available() else None
+    return None
+
+
+def _read_foreground_hwnd_and_title(
+    *,
+    user32: Any = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+) -> tuple[int, str]:
+    """Read active foreground HWND and title safely without raising on mocked/headless hosts."""
+    if focus_backend is not None:
+        try:
+            ctx = focus_backend.get_foreground_context()
+            if ctx is not None:
+                return int(getattr(ctx, "hwnd", 0) or 0), str(getattr(ctx, "title", "") or "")
+        except Exception:
+            pass
+    try:
+        u32 = _get_win32_user32(user32)
+        fg_hwnd = 0
+        if hasattr(u32, "GetForegroundWindow"):
+            raw = u32.GetForegroundWindow()
+            if isinstance(raw, int) and not isinstance(raw, bool):
+                fg_hwnd = int(raw)
+        fg_title = _get_foreground_window_title(user32=u32)
+        return fg_hwnd, fg_title
+    except Exception:
+        return 0, ""
+
+
 def _ensure_window_foreground(hwnd: int, u32: Any) -> None:
     """Restore and foreground the target window when it is not currently active."""
     if hwnd <= 0:
@@ -6496,9 +6551,11 @@ def ui_snapshot(
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
     cdp_bridge: CDPBridge | None = None,
+    uia_backend: NativeUiaComEngine | None = None,
     _target_hwnd: int | None = None,
 ) -> dict[str, Any]:
     """Capture a semantic UI snapshot (CDP 'b1'..'bN' for Chromium, UIA 'e1'..'eN' for native)."""
+    global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
     if app_name is not None and not isinstance(app_name, str):
         raise ValueError("app_name must be a string when provided.")
     if isinstance(max_elements, bool) or not isinstance(max_elements, int):
@@ -6523,7 +6580,7 @@ def ui_snapshot(
             focus_if_app_name=True,
         )
 
-    # Chromium UIA Guard: NEVER run PowerShell UIA against chrome/msedge/brave.
+    # Chromium UIA Guard: NEVER run UIA (COM or PowerShell) against chrome/msedge/brave.
     # Always delegate to the CDP bridge or return a fast (<200ms) structured fallback.
     proc_name, target_title, is_pwa_hint = _resolve_target_process_info(
         hwnd=hwnd,
@@ -6548,7 +6605,6 @@ def ui_snapshot(
             ),
         )
         if isinstance(cdp_res, dict) and cdp_res.get("ok"):
-            global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
             _LAST_UI_SNAPSHOT = cdp_res
             _LAST_UI_SNAPSHOT_TIME = time.time()
             _LAST_UI_WINDOW_TITLE = str(cdp_res.get("window_title") or cdp_res.get("title") or "")
@@ -6564,6 +6620,57 @@ def ui_snapshot(
             process_name=proc_name or (cleaned_app or "chrome.exe"),
             error=str(cdp_res.get("error") or "") if isinstance(cdp_res, dict) else None,
         )
+
+    # Primary path on Windows: in-process native COM IUIAutomation engine
+    com_engine = _resolve_uia_com_engine(
+        uia_backend=uia_backend,
+        powershell_runner=powershell_runner,
+    )
+    if com_engine is not None:
+        try:
+            com_snap = com_engine.snapshot(
+                hwnd=hwnd,
+                app_name=cleaned_app,
+                max_elements=clamped_max,
+                interactive_only=interactive_only,
+            )
+            snapshot_id = str(com_snap.get("snapshot_id") or f"snap_{uuid.uuid4().hex[:12]}")
+            window_title = str(com_snap.get("window_title") or target_title or "")
+            raw_com_hwnd = com_snap.get("hwnd")
+            resolved_hwnd = hwnd or (
+                int(raw_com_hwnd)
+                if isinstance(raw_com_hwnd, int) and not isinstance(raw_com_hwnd, bool)
+                else 0
+            )
+            elements_by_ref = dict(com_snap.get("elements_by_ref") or {})
+            llm_elements = list(com_snap.get("elements") or [])
+            _UI_REF_STORE.update(
+                snapshot_id=snapshot_id,
+                window_title=window_title,
+                hwnd=resolved_hwnd,
+                elements_by_ref=elements_by_ref,
+            )
+            snap_result: dict[str, Any] = {
+                "ok": True,
+                "source": "uia_com",
+                "snapshot_id": snapshot_id,
+                "window_title": window_title,
+                "count": len(llm_elements),
+                "element_count": len(llm_elements),
+                "elements": llm_elements,
+                "accessibility_coverage": com_snap.get("accessibility_coverage"),
+                "content_element_count": com_snap.get("content_element_count"),
+            }
+            if com_snap.get("hint"):
+                snap_result["hint"] = com_snap["hint"]
+            _LAST_UI_SNAPSHOT = snap_result
+            _LAST_UI_SNAPSHOT_TIME = time.time()
+            _LAST_UI_WINDOW_TITLE = window_title
+            return snap_result
+        except UiaComUnavailableError as exc:
+            logger.debug("COM UIA snapshot unavailable, falling back to PowerShell: %s", exc)
+        except Exception as exc:
+            logger.debug("COM UIA snapshot failed, falling back to PowerShell: %s", exc)
 
     app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
     interactive_flag = 1 if interactive_only else 0
@@ -6588,8 +6695,8 @@ def ui_snapshot(
     if isinstance(raw_elements, dict):
         raw_elements = [raw_elements]
 
-    llm_elements: list[dict[str, Any]] = []
-    elements_by_ref: dict[str, dict[str, Any]] = {}
+    llm_elements = []
+    elements_by_ref = {}
 
     for item in raw_elements:
         if not isinstance(item, dict):
@@ -6677,6 +6784,9 @@ def ui_snapshot(
         elements_by_ref=elements_by_ref,
     )
 
+    coverage, content_count, guidance = classify_accessibility_coverage(
+        list(elements_by_ref.values())
+    )
     snap_result = {
         "ok": True,
         "snapshot_id": snapshot_id,
@@ -6684,7 +6794,11 @@ def ui_snapshot(
         "count": len(llm_elements),
         "element_count": len(llm_elements),
         "elements": llm_elements,
+        "accessibility_coverage": coverage,
+        "content_element_count": content_count,
     }
+    if guidance:
+        snap_result["hint"] = guidance
     _LAST_UI_SNAPSHOT = snap_result
     _LAST_UI_SNAPSHOT_TIME = time.time()
     _LAST_UI_WINDOW_TITLE = window_title
@@ -6708,6 +6822,7 @@ def ui_act(
     action: str = "click",
     value: str | None = None,
     interval_ms: int = 12,
+    refresh_snapshot: bool = False,
     *,
     powershell_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     user32: Any = None,
@@ -6718,8 +6833,9 @@ def ui_act(
     expected_hwnd: int | None = None,
     require_foreground: bool = True,
     cdp_bridge: CDPBridge | None = None,
+    uia_backend: NativeUiaComEngine | None = None,
     _guard: PreconditionGuard | None = None,
-    _capture_snapshot: bool = True,
+    _capture_snapshot: bool | None = None,
     cancel_event: threading.Event | None = None,
     clipboard_backend: Any | None = None,
 ) -> dict[str, Any]:
@@ -6735,6 +6851,8 @@ def ui_act(
             f"Unsupported UI act action {action!r}. Unsupported ui_act action; "
             f"must be one of {sorted(VALID_UI_ACT_ACTIONS)}."
         )
+    if not isinstance(refresh_snapshot, bool):
+        raise ValueError("refresh_snapshot must be a boolean.")
 
     # Route browser CDP refs ('b1', 'b2', ...) directly to the CDP bridge
     if is_cdp_ref(ref):
@@ -6807,6 +6925,20 @@ def ui_act(
         "elements": list(_UI_REF_STORE.values()),
     }
 
+    is_fake_user32 = (
+        hasattr(user32, "sent_inputs")
+        or hasattr(user32, "cursor_moves")
+        or hasattr(user32, "key_events")
+    )
+    before_fg_hwnd, before_fg_title = _read_foreground_hwnd_and_title(
+        user32=user32, focus_backend=focus_backend
+    )
+
+    com_engine = _resolve_uia_com_engine(
+        uia_backend=uia_backend,
+        powershell_runner=powershell_runner,
+    )
+
     method = ""
     should_guard = _guard is None and (
         focus_backend is not None
@@ -6814,6 +6946,7 @@ def ui_act(
             user32 is None
             and (gui_action_fn is None or gui_action_fn is gui_action)
             and powershell_runner is None
+            and uia_backend is None
         )
     )
     target_guard_hwnd = (
@@ -6824,6 +6957,7 @@ def ui_act(
     resolved_guard_hwnd: int | None = target_guard_hwnd
     active_guard: PreconditionGuard | None = _guard
     aborted_result: dict[str, Any] | None = None
+    stale_result: dict[str, Any] | None = None
 
     def _assert_step(step_label: str) -> None:
         _check_cancelled(cancel_event)
@@ -6835,15 +6969,79 @@ def ui_act(
         if active_guard is not None:
             active_guard.assert_point_targets_window(px, py, step_label=step_label)
 
+    can_try_ps_uia = (
+        powershell_runner is not None
+        or _run_powershell_uia_json is not _ORIG_RUN_POWERSHELL_UIA_JSON
+        or (
+            com_engine is None
+            and uia_backend is None
+            and shutil.which("powershell.exe") is not None
+        )
+    )
     can_try_uia = (
         gui_action_fn is None
         and norm_action in {"click", "set_value"}
-        and (powershell_runner is not None or shutil.which("powershell.exe") is not None)
+        and (com_engine is not None or can_try_ps_uia)
     )
 
     def _run_uia_pattern_step() -> bool:
-        nonlocal method, target_cx, target_cy
+        nonlocal method, target_cx, target_cy, stale_result
         _assert_step(f"uia_{norm_action}")
+
+        # 1. Primary path: direct cached COM IUIAutomationElement pattern dispatch (<15 ms)
+        com_failed = False
+        if com_engine is not None:
+            try:
+                com_res = com_engine.act(snapshot_id, norm_ref, norm_action, value=value)
+                if com_res.get("stale"):
+                    stale_result = {
+                        "ok": False,
+                        "status": "stale_ref",
+                        "stale_ref": True,
+                        "reason": str(com_res.get("reason") or "stale_element"),
+                        "snapshot_id": snapshot_id,
+                        "ref": norm_ref,
+                        "action": norm_action,
+                        "role": entry.get("role", ""),
+                        "name": entry.get("name", ""),
+                        "method": "",
+                        "error": str(
+                            com_res.get("error")
+                            or f"UI element ref {norm_ref!r} is stale. Call ui_snapshot()."
+                        ),
+                    }
+                    return True
+                if com_res.get("found"):
+                    if isinstance(com_res.get("cx"), int) and not isinstance(
+                        com_res.get("cx"), bool
+                    ):
+                        target_cx = int(com_res["cx"])
+                    if isinstance(com_res.get("cy"), int) and not isinstance(
+                        com_res.get("cy"), bool
+                    ):
+                        target_cy = int(com_res["cy"])
+                if com_res.get("acted"):
+                    method = str(
+                        com_res.get("method")
+                        or ("value_pattern" if norm_action == "set_value" else "invoke")
+                    )
+                    return True
+                # Cached handle unsupported or LRU cache miss while COM is healthy -> Win32 fallback
+                return False
+            except UiaComUnavailableError as exc:
+                com_failed = True
+                logger.debug("COM UIA act unavailable, falling back to PowerShell: %s", exc)
+            except Exception as exc:
+                com_failed = True
+                logger.debug("COM UIA act failed, falling back: %s", exc)
+
+        if not (
+            can_try_ps_uia
+            or (com_failed and uia_backend is None and shutil.which("powershell.exe") is not None)
+        ):
+            return False
+
+        # 2. Fallback path: PowerShell UIA pattern dispatch
         title_b64 = (
             base64.b64encode(window_title.encode("utf-8")).decode("ascii")
             if window_title
@@ -7274,10 +7472,13 @@ def ui_act(
                 "method": method,
             }
 
+    if stale_result is not None:
+        return stale_result
+
     if aborted_result is not None:
         return aborted_result
 
-    if not _capture_snapshot:
+    if _capture_snapshot is False:
         res_no_snap: dict[str, Any] = {
             "ok": True,
             "status": "completed",
@@ -7295,12 +7496,132 @@ def ui_act(
             res_no_snap["interval_ms"] = clamped_interval
         return res_no_snap
 
-    after_snap: dict[str, Any] = {}
-    is_fake_user32 = (
-        hasattr(user32, "sent_inputs")
-        or hasattr(user32, "cursor_moves")
-        or hasattr(user32, "key_events")
+    after_fg_hwnd, after_fg_title = _read_foreground_hwnd_and_title(
+        user32=user32, focus_backend=focus_backend
     )
+    window_switched = bool(
+        (before_fg_hwnd > 0 and after_fg_hwnd > 0 and after_fg_hwnd != before_fg_hwnd)
+        or (before_fg_title and after_fg_title and after_fg_title != before_fg_title)
+    )
+    need_full_refresh = bool(
+        refresh_snapshot
+        or (_capture_snapshot is True)
+        or (ui_snapshot_fn is not None)
+        or window_switched
+    )
+
+    if not need_full_refresh:
+        active_hwnd = after_fg_hwnd or (
+            resolved_guard_hwnd
+            if (resolved_guard_hwnd is not None and resolved_guard_hwnd > 0)
+            else snapshot_hwnd
+        )
+        active_title = after_fg_title or window_title
+        old_value = entry.get("value")
+        target_state: dict[str, Any] = {"available": False, "cached": False}
+        if com_engine is not None:
+            try:
+                target_state = com_engine.read_element_state(snapshot_id, norm_ref)
+            except Exception:
+                target_state = {"available": False, "cached": True}
+        if not target_state.get("cached"):
+            inferred_val = (
+                value
+                if norm_action == "set_value"
+                else ("" if norm_action == "clear" else old_value)
+            )
+            target_state = {
+                "available": True,
+                "cached": False,
+                "ref": norm_ref,
+                "role": entry.get("role", ""),
+                "name": entry.get("name", ""),
+                "value": inferred_val,
+                "enabled": entry.get("enabled", True),
+                "focused": entry.get("focused", False),
+            }
+
+        new_value = (
+            target_state.get("value")
+            if target_state.get("available")
+            else (
+                value
+                if norm_action == "set_value"
+                else ("" if norm_action == "clear" else old_value)
+            )
+        )
+        new_name = str(target_state.get("name") or entry.get("name") or "")
+        if target_state.get("available"):
+            updated_entry = dict(entry)
+            updated_entry["name"] = new_name
+            updated_entry["value"] = new_value
+            if "enabled" in target_state:
+                updated_entry["enabled"] = bool(target_state["enabled"])
+            if "focused" in target_state:
+                updated_entry["focused"] = bool(target_state["focused"])
+            _UI_REF_STORE[norm_ref] = updated_entry
+
+        changed_values: list[dict[str, Any]] = []
+        if new_value != old_value:
+            changed_values.append(
+                {
+                    "ref": norm_ref,
+                    "role": entry.get("role", ""),
+                    "name": new_name,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                }
+            )
+        light_diff: dict[str, Any] = {
+            "window_changed": False,
+            "window_title": active_title,
+            "changed_values": changed_values,
+            "added_elements": [],
+            "removed_count": 0,
+        }
+        light_snapshot: dict[str, Any] = {
+            "ok": True,
+            "status": "lightweight_delta",
+            "source": "uia_com" if com_engine is not None else None,
+            "snapshot_id": snapshot_id,
+            "window_title": active_title,
+            "count": 1,
+            "element_count": 1,
+            "elements": [
+                {
+                    "ref": norm_ref,
+                    "role": entry.get("role", ""),
+                    "name": new_name,
+                    "value": new_value,
+                    "enabled": bool(target_state.get("enabled", entry.get("enabled", True))),
+                    "focused": bool(target_state.get("focused", entry.get("focused", False))),
+                }
+            ],
+        }
+        light_res: dict[str, Any] = {
+            "ok": True,
+            "status": "completed",
+            "snapshot_id": snapshot_id,
+            "ref": norm_ref,
+            "action": norm_action,
+            "role": entry.get("role", ""),
+            "name": new_name,
+            "method": method,
+            "x": target_cx,
+            "y": target_cy,
+            "active_window_title": active_title,
+            "active_hwnd": active_hwnd,
+            "target_state": target_state,
+            "snapshot_refreshed": False,
+            "diff": light_diff,
+            "snapshot": light_snapshot,
+        }
+        if norm_action in {"set_value", "type"} and value is not None:
+            light_res["char_count"] = len(value)
+            light_res["interval_ms"] = clamped_interval
+        return light_res
+
+    after_snap: dict[str, Any] = {}
     if ui_snapshot_fn is not None:
         after_snap = ui_snapshot_fn(user32=user32)
         if isinstance(after_snap, dict) and after_snap.get("source") == "cdp":
@@ -7309,29 +7630,39 @@ def ui_act(
         else:
             set_ui_snapshot_state(after_snap)
     elif (
-        powershell_runner is None
-        and shutil.which("powershell.exe") is not None
-        and not is_fake_user32
+        (com_engine is not None or (powershell_runner is None and shutil.which("powershell.exe")))
+        and (not is_fake_user32 or uia_backend is not None or has_explicit_default_uia_com_engine())
     ):
         after_target_hwnd = (
-            resolved_guard_hwnd
-            if (resolved_guard_hwnd is not None and resolved_guard_hwnd > 0)
-            else (snapshot_hwnd if snapshot_hwnd > 0 else 0)
+            after_fg_hwnd
+            if (window_switched and after_fg_hwnd > 0)
+            else (
+                resolved_guard_hwnd
+                if (resolved_guard_hwnd is not None and resolved_guard_hwnd > 0)
+                else (snapshot_hwnd if snapshot_hwnd > 0 else 0)
+            )
         )
         with contextlib.suppress(Exception):
             if ui_snapshot_fn is None and snap_runner is ui_snapshot and after_target_hwnd > 0:
+                snap_kw: dict[str, Any] = {"user32": user32, "_target_hwnd": after_target_hwnd}
                 if cdp_bridge is not None:
-                    after_snap = ui_snapshot(
-                        user32=user32, cdp_bridge=cdp_bridge, _target_hwnd=after_target_hwnd
-                    )
-                else:
-                    after_snap = ui_snapshot(user32=user32, _target_hwnd=after_target_hwnd)
+                    snap_kw["cdp_bridge"] = cdp_bridge
+                if uia_backend is not None:
+                    snap_kw["uia_backend"] = uia_backend
+                after_snap = ui_snapshot(**snap_kw)
             else:
-                after_snap = snap_runner(user32=user32)
+                snap_kw_no_hwnd: dict[str, Any] = {"user32": user32}
+                if (
+                    ui_snapshot_fn is None
+                    and snap_runner is ui_snapshot
+                    and uia_backend is not None
+                ):
+                    snap_kw_no_hwnd["uia_backend"] = uia_backend
+                after_snap = snap_runner(**snap_kw_no_hwnd)
             if isinstance(after_snap, dict) and after_snap.get("source") == "cdp":
                 if after_snap.get("ok"):
                     _record_cdp_snapshot_state(after_snap)
-            else:
+            elif not (isinstance(after_snap, dict) and after_snap.get("source") == "uia_com"):
                 set_ui_snapshot_state(after_snap)
     else:
         after_snap = _LAST_UI_SNAPSHOT or {
@@ -7354,6 +7685,11 @@ def ui_act(
         "method": method,
         "x": target_cx,
         "y": target_cy,
+        "active_window_title": (
+            after_fg_title or str(after_snap.get("window_title") or window_title)
+        ),
+        "active_hwnd": after_fg_hwnd or snapshot_hwnd,
+        "snapshot_refreshed": True,
         "diff": diff,
         "snapshot": after_snap,
     }
@@ -7372,6 +7708,7 @@ def inspect_ui_elements(
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
     cdp_bridge: CDPBridge | None = None,
+    uia_backend: NativeUiaComEngine | None = None,
 ) -> dict[str, Any]:
     """Inspect visible interactive and readout UI Automation elements in a window."""
     if app_name is not None and not isinstance(app_name, str):
@@ -7447,6 +7784,25 @@ def inspect_ui_elements(
             error=str(cdp_res.get("error") or "") if isinstance(cdp_res, dict) else None,
         )
 
+    com_engine = _resolve_uia_com_engine(
+        uia_backend=uia_backend,
+        powershell_runner=powershell_runner,
+    )
+    if com_engine is not None:
+        try:
+            com_res = com_engine.inspect_elements(
+                hwnd=hwnd,
+                app_name=cleaned_app,
+                max_elements=clamped_max,
+            )
+            if not com_res.get("window_title") and target_title:
+                com_res["window_title"] = target_title
+            return com_res
+        except UiaComUnavailableError as exc:
+            logger.debug("COM UIA inspect unavailable, falling back to PowerShell: %s", exc)
+        except Exception as exc:
+            logger.debug("COM UIA inspect failed, falling back to PowerShell: %s", exc)
+
     ps_exe = _resolve_powershell_exe(powershell_runner)
     app_b64 = base64.b64encode(cleaned_app.encode("utf-8")).decode("ascii") if cleaned_app else ""
     ps_cmd = (
@@ -7500,12 +7856,17 @@ def inspect_ui_elements(
         if len(elements) >= clamped_max:
             break
 
-    return {
+    coverage, _, guidance = classify_accessibility_coverage(elements)
+    ps_inspect_out: dict[str, Any] = {
         "ok": True,
         "window_title": window_title,
         "count": len(elements),
         "elements": elements,
+        "accessibility_coverage": coverage,
     }
+    if guidance:
+        ps_inspect_out["hint"] = guidance
+    return ps_inspect_out
 
 
 def _select_matching_ui_element(
@@ -7555,6 +7916,7 @@ def click_ui_element(
     focus_backend: FocusPreconditionBackend | None = None,
     expected_hwnd: int | None = None,
     require_foreground: bool = True,
+    uia_backend: NativeUiaComEngine | None = None,
 ) -> dict[str, Any]:
     """Find and invoke or click a visible UI Automation control by name."""
     if not isinstance(name, str) or not name.strip():
@@ -7588,7 +7950,10 @@ def click_ui_element(
         )
 
     should_guard = focus_backend is not None or (
-        user32 is None and powershell_runner is None and window_enumerator is None
+        user32 is None
+        and powershell_runner is None
+        and window_enumerator is None
+        and uia_backend is None
     )
     guard_hwnd = expected_hwnd if expected_hwnd is not None else (hwnd if hwnd > 0 else None)
     ps_target_hwnd = (
@@ -7622,6 +7987,51 @@ def click_ui_element(
                     "ui_act('b1', 'click') or open_url(...) instead."
                 ),
             )
+
+        com_engine = _resolve_uia_com_engine(
+            uia_backend=uia_backend,
+            powershell_runner=powershell_runner,
+        )
+        if com_engine is not None:
+            com_data: dict[str, Any] | None = None
+            try:
+                com_data = com_engine.click_element(
+                    target_name,
+                    control_type=cleaned_ct,
+                    hwnd=target_hwnd,
+                    app_name=cleaned_app,
+                )
+            except UiaComUnavailableError as exc:
+                logger.debug("COM UIA click unavailable, falling back to PowerShell: %s", exc)
+            except Exception as exc:
+                logger.debug("COM UIA click failed, falling back to PowerShell: %s", exc)
+
+            if com_data is not None:
+                if not com_data.get("found"):
+                    avail_raw = com_data.get("available") or []
+                    avail = [str(item) for item in avail_raw if item]
+                    ct_note = f" (control_type={cleaned_ct!r})" if cleaned_ct else ""
+                    avail_str = ", ".join(avail) if avail else "none"
+                    raise ValueError(
+                        f"UI element {target_name!r}{ct_note} not found. "
+                        f"Available elements: {avail_str}"
+                    )
+                cx = int(com_data.get("x", 0))
+                cy = int(com_data.get("y", 0))
+                invoked = bool(com_data.get("invoked", False))
+                if not invoked:
+                    if mouse_guard_fn is not None:
+                        mouse_guard_fn()
+                    _perform_mouse_click(cx, cy, clicks=1, button="left", user32=user32)
+                return {
+                    "ok": True,
+                    "status": "clicked",
+                    "name": str(com_data.get("name") or target_name),
+                    "control_type": str(com_data.get("control_type") or cleaned_ct or ""),
+                    "x": cx,
+                    "y": cy,
+                    "method": str(com_data.get("method") or "invoke") if invoked else "click",
+                }
 
         ps_exe = _resolve_powershell_exe(powershell_runner)
         name_b64 = base64.b64encode(target_name.encode("utf-8")).decode("ascii")
@@ -8500,7 +8910,10 @@ def ui_batch(
     )
     if (not _UI_REF_STORE and not has_fresh_cdp_snap) or _LAST_UI_SNAPSHOT is None or is_stale:
         before_snapshot = _run_snap()
-        if not (isinstance(before_snapshot, dict) and before_snapshot.get("source") == "cdp"):
+        if not (
+            isinstance(before_snapshot, dict)
+            and before_snapshot.get("source") in {"cdp", "uia_com"}
+        ):
             set_ui_snapshot_state(before_snapshot)
     else:
         before_snapshot = _LAST_UI_SNAPSHOT
@@ -8773,7 +9186,7 @@ def ui_batch(
     if isinstance(after_snapshot, dict) and after_snapshot.get("source") == "cdp":
         if after_snapshot.get("ok"):
             _record_cdp_snapshot_state(after_snapshot)
-    else:
+    elif not (isinstance(after_snapshot, dict) and after_snapshot.get("source") == "uia_com"):
         set_ui_snapshot_state(after_snapshot)
     diff = compute_ui_diff(before_snapshot, after_snapshot)
 
@@ -8839,12 +9252,14 @@ def register_windows_os_tools(
         action: str | None = "click",
         value: str | None = None,
         interval_ms: int | None = 12,
+        refresh_snapshot: bool | None = False,
     ) -> dict[str, Any]:
         return ui_act(
             ref,
             "click" if action is None else action,
             value,
             interval_ms=12 if interval_ms is None else interval_ms,
+            refresh_snapshot=False if refresh_snapshot is None else refresh_snapshot,
             user32=user32,
             focus_backend=focus_backend,
             cdp_bridge=cdp_bridge,
@@ -9075,6 +9490,13 @@ def register_windows_os_tools(
                 "interval_ms": {
                     "type": "integer",
                     "description": "Inter-character typing interval in milliseconds (0..200).",
+                },
+                "refresh_snapshot": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, re-walk the full UI tree after acting. Defaults to false "
+                        "(fast lightweight target delta unless the active window changes)."
+                    ),
                 },
             },
             "required": ["ref", "action"],

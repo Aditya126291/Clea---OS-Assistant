@@ -37,12 +37,20 @@ def _sandbox_clea_environment(
     monkeypatch.setenv("CLEA_CDP_DISABLE_AUTO_DISCOVERY", "1")
     monkeypatch.delenv("CLEA_CDP_WS_URL", raising=False)
     monkeypatch.delenv("CLEA_CDP_URL", raising=False)
+    # Prevent daemon startup from spawning host Get-StartApps PowerShell during unrelated tests.
+    monkeypatch.setenv("CLEA_DISABLE_STARTUP_APP_WARMUP", "1")
 
     from clea.tools.cdp_bridge import set_default_cdp_bridge
-    from clea.tools.windows_os import clear_last_screen_geometry
+    from clea.tools.uia_com import set_default_uia_com_engine
+    from clea.tools.windows_os import (
+        clear_last_screen_geometry,
+        invalidate_installed_apps_cache,
+    )
 
     set_default_cdp_bridge(None)
+    set_default_uia_com_engine(None)
     clear_last_screen_geometry()
+    invalidate_installed_apps_cache()
 
     host_clea = Path(os.environ.get("LOCALAPPDATA", "")) / "clea"
     if host_clea.exists():
