@@ -1255,12 +1255,12 @@ def test_ui_batch_and_ui_act_forward_guard_to_real_gui_action(
                 "ref": "e1",
                 "name": "Input Box",
                 "role": "textbox",
-                "x": 20,
-                "y": 30,
+                "x": 120,
+                "y": 130,
                 "width": 120,
                 "height": 28,
-                "cx": 80,
-                "cy": 44,
+                "cx": 180,
+                "cy": 144,
             }
         ],
     }

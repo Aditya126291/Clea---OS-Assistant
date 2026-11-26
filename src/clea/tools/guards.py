@@ -33,6 +33,9 @@ from clea.surfaces.voice.win32 import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BOUNDS_TOLERANCE_PX = 24
+_GW_OWNER = 4
+_GWL_STYLE = -16
+_WS_POPUP = 0x80000000
 
 
 def _enable_dpi_awareness_guards(user32: Any) -> None:
@@ -174,6 +177,17 @@ class PreconditionFailedError(RuntimeError):
                     f"Focus lost{step_desc}: expected {expected_title!r} "
                     f"({expected_process or 'unknown'}), got {actual_title!r} "
                     f"({actual_process or 'unknown'})."
+                )
+            elif reason == "target_point_outside_window":
+                message = (
+                    f"Target point outside window bounds{step_desc}: "
+                    f"{expected_title!r} (hwnd={expected_hwnd})."
+                )
+            elif reason == "target_point_occluded":
+                message = (
+                    f"Target point occluded{step_desc}: expected {expected_title!r} "
+                    f"(hwnd={expected_hwnd}), hit {actual_title!r} "
+                    f"({actual_process or 'unknown'}, hwnd={actual_hwnd})."
                 )
             else:
                 message = f"Precondition failed ({reason}){step_desc}."
@@ -379,6 +393,14 @@ def _configure_guard_win32_dlls(
         if hasattr(user32, "GetWindowLongW"):
             user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
             user32.GetWindowLongW.restype = ctypes.c_long
+
+        if hasattr(user32, "WindowFromPoint"):
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.WindowFromPoint.restype = ctypes.c_void_p
+
+        if hasattr(user32, "GetClassNameW"):
+            user32.GetClassNameW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, ctypes.c_int]
+            user32.GetClassNameW.restype = ctypes.c_int
 
     if isinstance(dwmapi, ctypes.CDLL) and hasattr(dwmapi, "DwmGetWindowAttribute"):
         dwmapi.DwmGetWindowAttribute.argtypes = [
@@ -619,33 +641,136 @@ class Win32FocusPreconditionBackend:
                     return int(root_owner)
         return int(hwnd)
 
+    def _read_pid(self, hwnd: int) -> int:
+        if (
+            self._user32 is None
+            or not hwnd
+            or not hasattr(self._user32, "GetWindowThreadProcessId")
+        ):
+            return 0
+        try:
+            pid = wintypes.DWORD(0)
+            self._user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value)
+        except Exception:
+            return 0
+
+    def _get_owner_hwnd(self, hwnd: int) -> int:
+        if not hwnd or hwnd <= 0 or self._user32 is None or not hasattr(self._user32, "GetWindow"):
+            return 0
+        try:
+            owner = self._user32.GetWindow(hwnd, _GW_OWNER)
+            if isinstance(owner, int) and not isinstance(owner, bool) and owner > 0:
+                return int(owner)
+        except Exception:
+            return 0
+        return 0
+
+    def _is_owned_or_popup_window(self, hwnd: int) -> bool:
+        if not hwnd or hwnd <= 0 or self._user32 is None:
+            return False
+        if self._get_owner_hwnd(hwnd) > 0:
+            return True
+        if hasattr(self._user32, "GetWindowLongW"):
+            with contextlib.suppress(Exception):
+                style = self._user32.GetWindowLongW(hwnd, _GWL_STYLE)
+                if isinstance(style, int) and not isinstance(style, bool):
+                    if style & _WS_POPUP:
+                        return True
+        if hasattr(self._user32, "GetClassNameW"):
+            with contextlib.suppress(Exception):
+                buf = ctypes.create_unicode_buffer(128)
+                copied = self._user32.GetClassNameW(hwnd, buf, 128)
+                cls_name = buf.value.strip().lower() if copied else ""
+                if cls_name == "#32768" or any(
+                    tok in cls_name for tok in ("popup", "menu", "dropdown", "tooltip")
+                ):
+                    return True
+        return False
+
     def is_same_window_tree(self, expected_hwnd: int, actual_hwnd: int) -> bool:
         if not expected_hwnd or not actual_hwnd or expected_hwnd <= 0 or actual_hwnd <= 0:
             return False
-        if int(expected_hwnd) == int(actual_hwnd):
+        exp_int = int(expected_hwnd)
+        act_int = int(actual_hwnd)
+        if exp_int == act_int:
             return True
         if self._user32 is None:
             return False
         if hasattr(self._user32, "IsChild"):
             with contextlib.suppress(Exception):
-                if bool(self._user32.IsChild(expected_hwnd, actual_hwnd)) or bool(
-                    self._user32.IsChild(actual_hwnd, expected_hwnd)
+                if bool(self._user32.IsChild(exp_int, act_int)) or bool(
+                    self._user32.IsChild(act_int, exp_int)
                 ):
                     return True
+        exp_root = exp_int
+        act_root = act_int
+        exp_owner = exp_int
+        act_owner = act_int
         if hasattr(self._user32, "GetAncestor"):
-            exp_root = self.get_root_hwnd(expected_hwnd)
-            act_root = self.get_root_hwnd(actual_hwnd)
+            exp_root = self.get_root_hwnd(exp_int)
+            act_root = self.get_root_hwnd(act_int)
             if exp_root and act_root and exp_root == act_root:
                 return True
-            exp_owner = self.get_root_owner_hwnd(expected_hwnd)
-            act_owner = self.get_root_owner_hwnd(actual_hwnd)
+            exp_owner = self.get_root_owner_hwnd(exp_int)
+            act_owner = self.get_root_owner_hwnd(act_int)
             if exp_owner and act_owner and (
                 exp_owner == act_owner
-                or exp_owner == int(actual_hwnd)
-                or act_owner == int(expected_hwnd)
+                or exp_owner == act_int
+                or act_owner == exp_int
+                or exp_owner == act_root
+                or act_owner == exp_root
             ):
                 return True
+
+        # Walk explicit Win32 GW_OWNER chain (owned menus, modals, dropdown popups)
+        target_anchors = {h for h in (exp_int, exp_root, exp_owner) if h > 0}
+        cur = act_int
+        seen_owners: set[int] = {cur}
+        for _ in range(6):
+            parent_owner = self._get_owner_hwnd(cur)
+            if parent_owner <= 0:
+                break
+            if parent_owner in target_anchors:
+                return True
+            if parent_owner in seen_owners:
+                break
+            seen_owners.add(parent_owner)
+            cur = parent_owner
+
+        # Same non-zero PID + popup/owned/menu window class (common in Electron/WinUI menus)
+        if self._is_owned_or_popup_window(act_int) or (
+            act_root != act_int and self._is_owned_or_popup_window(act_root)
+        ):
+            exp_pid = self._read_pid(exp_int)
+            act_pid = self._read_pid(act_int)
+            if exp_pid > 0 and act_pid > 0 and exp_pid == act_pid:
+                return True
         return False
+
+    def window_from_point(self, px: int, py: int) -> int | None:
+        """Return the HWND physically under screen point *(px, py)* via Win32 WindowFromPoint."""
+        if self._user32 is None or not hasattr(self._user32, "WindowFromPoint"):
+            return None
+        try:
+            hwnd = self._user32.WindowFromPoint(wintypes.POINT(int(px), int(py)))
+            if isinstance(hwnd, int) and not isinstance(hwnd, bool) and hwnd > 0:
+                return int(hwnd)
+        except Exception:
+            return None
+        return None
+
+    def get_foreground_hwnd(self) -> int | None:
+        """Fast foreground HWND lookup without OpenProcess or DWM queries."""
+        if self._user32 is None or not hasattr(self._user32, "GetForegroundWindow"):
+            return None
+        try:
+            fg = self._user32.GetForegroundWindow()
+            if isinstance(fg, int) and not isinstance(fg, bool) and fg > 0:
+                return int(fg)
+        except Exception:
+            return None
+        return None
 
     def get_foreground_context(self) -> WindowContext | None:
         if self._user32 is None or not hasattr(self._user32, "GetForegroundWindow"):
@@ -853,7 +978,7 @@ class PreconditionGuard:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         return False
 
-    def assert_ready(self, step_label: str = "") -> WindowContext:
+    def assert_ready(self, step_label: str = "", *, fast: bool = False) -> WindowContext:
         """Validate target existence, unminimized state, and foreground focus."""
         if self._target is None:
             raise PreconditionFailedError(
@@ -882,27 +1007,82 @@ class PreconditionGuard:
             )
 
         if self._require_foreground:
-            fg = self._backend.get_foreground_context()
-            fg_matches = fg is not None and fg.hwnd == target.hwnd
-            if (
-                not fg_matches
-                and fg is not None
-                and hasattr(self._backend, "is_same_window_tree")
-            ):
-                fg_matches = bool(self._backend.is_same_window_tree(target.hwnd, fg.hwnd))
-            if not fg_matches:
-                raise PreconditionFailedError(
-                    reason="focus_lost",
-                    expected_hwnd=target.hwnd,
-                    expected_title=target.title,
-                    expected_process=target.process_name,
-                    actual_hwnd=fg.hwnd if fg is not None else None,
-                    actual_title=fg.title if fg is not None else "",
-                    actual_process=fg.process_name if fg is not None else "",
-                    step_label=step_label,
-                )
+            fast_verified = False
+            if hasattr(self._backend, "get_foreground_hwnd"):
+                fg_hwnd = self._backend.get_foreground_hwnd()
+                if fg_hwnd is not None and fg_hwnd > 0:
+                    if fg_hwnd == target.hwnd or (
+                        hasattr(self._backend, "is_same_window_tree")
+                        and self._backend.is_same_window_tree(target.hwnd, fg_hwnd)
+                    ):
+                        fast_verified = True
+            if not fast_verified:
+                fg = self._backend.get_foreground_context()
+                fg_matches = fg is not None and fg.hwnd == target.hwnd
+                if (
+                    not fg_matches
+                    and fg is not None
+                    and hasattr(self._backend, "is_same_window_tree")
+                ):
+                    fg_matches = bool(self._backend.is_same_window_tree(target.hwnd, fg.hwnd))
+                if not fg_matches:
+                    raise PreconditionFailedError(
+                        reason="focus_lost",
+                        expected_hwnd=target.hwnd,
+                        expected_title=target.title,
+                        expected_process=target.process_name,
+                        actual_hwnd=fg.hwnd if fg is not None else None,
+                        actual_title=fg.title if fg is not None else "",
+                        actual_process=fg.process_name if fg is not None else "",
+                        step_label=step_label,
+                    )
 
+        if fast:
+            return target
         return self._backend.get_window_context(target.hwnd) or target
+
+    def assert_point_targets_window(
+        self,
+        px: int,
+        py: int,
+        *,
+        step_label: str = "",
+    ) -> WindowContext:
+        """Verify *(px, py)* lies inside target bounds and hits target's window tree."""
+        ctx = self.assert_ready(step_label=step_label)
+        bounds = ctx.bounds
+        if bounds is not None and len(bounds) == 4:
+            left, top, right, bottom = bounds
+            if right > left and bottom > top:
+                if not (left <= int(px) < right and top <= int(py) < bottom):
+                    raise PreconditionFailedError(
+                        reason="target_point_outside_window",
+                        expected_hwnd=ctx.hwnd,
+                        expected_title=ctx.title,
+                        expected_process=ctx.process_name,
+                        step_label=step_label,
+                    )
+
+        if hasattr(self._backend, "window_from_point"):
+            hit_hwnd = self._backend.window_from_point(int(px), int(py))
+            if hit_hwnd is not None and hit_hwnd > 0:
+                same_tree = hit_hwnd == ctx.hwnd or (
+                    hasattr(self._backend, "is_same_window_tree")
+                    and bool(self._backend.is_same_window_tree(ctx.hwnd, hit_hwnd))
+                )
+                if not same_tree:
+                    occ = self._backend.get_window_context(hit_hwnd)
+                    raise PreconditionFailedError(
+                        reason="target_point_occluded",
+                        expected_hwnd=ctx.hwnd,
+                        expected_title=ctx.title,
+                        expected_process=ctx.process_name,
+                        actual_hwnd=hit_hwnd,
+                        actual_title=occ.title if occ is not None else "",
+                        actual_process=occ.process_name if occ is not None else "",
+                        step_label=step_label,
+                    )
+        return ctx
 
 
 # ---------------------------------------------------------------------------

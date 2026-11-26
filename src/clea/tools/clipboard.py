@@ -211,6 +211,10 @@ def _configure_win32_signatures(
         user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
         user32.RegisterClipboardFormatW.restype = wintypes.UINT
 
+        if hasattr(user32, "EnumClipboardFormats"):
+            user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
+            user32.EnumClipboardFormats.restype = wintypes.UINT
+
         if hasattr(user32, "GetClipboardSequenceNumber"):
             user32.GetClipboardSequenceNumber.argtypes = []
             user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
@@ -388,6 +392,27 @@ def _convert_dib_to_png(dib_bytes: bytes) -> tuple[bytes | None, tuple[int, int]
         return None, None
 
 
+_NON_HGLOBAL_CLIPBOARD_FORMATS = frozenset(
+    {
+        CF_BITMAP,
+        3,  # CF_METAFILEPICT
+        9,  # CF_PALETTE
+        14,  # CF_ENHMETAFILE
+        0x0080,  # CF_OWNERDISPLAY
+        0x0081,  # CF_DSPTEXT
+        0x0082,  # CF_DSPBITMAP
+        0x0083,  # CF_DSPMETAFILEPICT
+        0x008E,  # CF_DSPENHMETAFILE
+    }
+)
+
+_CLIPBOARD_HISTORY_EXCLUSION_FORMATS = (
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+)
+
+
 class Win32ClipboardBackend:
     """Win32 ctypes implementation with lock contention retries and priority format detection."""
 
@@ -421,14 +446,19 @@ class Win32ClipboardBackend:
             return 0
 
     @contextmanager
-    def open_clipboard(self) -> Iterator[None]:
-        """Context manager attempting OpenClipboard up to 3 times with 25ms backoff."""
+    def open_clipboard(
+        self,
+        *,
+        attempts: int = 3,
+        retry_delay_s: float = 0.025,
+    ) -> Iterator[None]:
+        """Context manager attempting OpenClipboard with configurable retry backoff."""
         if not self._user32 or not hasattr(self._user32, "OpenClipboard"):
             raise RuntimeError("Win32 user32.OpenClipboard is not available.")
 
+        total_attempts = max(1, int(attempts))
         opened = False
-        attempts = 3
-        for attempt in range(attempts):
+        for attempt in range(total_attempts):
             try:
                 res = self._user32.OpenClipboard(None)
             except Exception as exc:
@@ -437,12 +467,13 @@ class Win32ClipboardBackend:
             if res:
                 opened = True
                 break
-            if attempt < attempts - 1:
-                time.sleep(0.025)
+            if attempt < total_attempts - 1:
+                time.sleep(retry_delay_s)
 
         if not opened:
             raise ClipboardLockedError(
-                "Windows clipboard is currently locked by another application after 3 attempts."
+                "Windows clipboard is currently locked by another application "
+                f"after {total_attempts} attempts."
             )
 
         try:
@@ -619,6 +650,155 @@ class Win32ClipboardBackend:
             if not self._user32.SetClipboardData(CF_UNICODETEXT, h_mem):
                 self._kernel32.GlobalFree(h_mem)
                 raise RuntimeError("Failed to set clipboard data.")
+
+    def _get_exclusion_format_ids(self) -> dict[str, int]:
+        """Resolve Win32 registered format IDs used to hide transient writes from Win+V."""
+        if not self._user32 or not hasattr(self._user32, "RegisterClipboardFormatW"):
+            return {}
+        out: dict[str, int] = {}
+        for name in _CLIPBOARD_HISTORY_EXCLUSION_FORMATS:
+            with contextlib.suppress(Exception):
+                fmt_id = self._user32.RegisterClipboardFormatW(name)
+                if isinstance(fmt_id, int) and fmt_id > 0:
+                    out[name] = fmt_id
+        return out
+
+    def _set_raw_format_locked(self, fmt_id: int, raw_bytes: bytes) -> bool:
+        """Write raw bytes into the currently open clipboard under *fmt_id*."""
+        alloc_size = max(len(raw_bytes), 1)
+        h_mem = self._kernel32.GlobalAlloc(GMEM_MOVEABLE, alloc_size)
+        if not h_mem:
+            return False
+        p_mem = self._kernel32.GlobalLock(h_mem)
+        if not p_mem:
+            if hasattr(self._kernel32, "GlobalFree"):
+                with contextlib.suppress(Exception):
+                    self._kernel32.GlobalFree(h_mem)
+            return False
+        try:
+            payload = raw_bytes if raw_bytes else b"\x00"
+            ctypes.memmove(p_mem, payload, len(payload))
+        finally:
+            self._kernel32.GlobalUnlock(h_mem)
+
+        if not self._user32.SetClipboardData(fmt_id, h_mem):
+            if hasattr(self._kernel32, "GlobalFree"):
+                with contextlib.suppress(Exception):
+                    self._kernel32.GlobalFree(h_mem)
+            return False
+        return True
+
+    def _mark_exclude_from_history_locked(self) -> None:
+        """Tag the current open clipboard write so Win+V and Cloud Clipboard ignore it."""
+        zero_dword = struct.pack("<I", 0)
+        for _name, fmt_id in self._get_exclusion_format_ids().items():
+            with contextlib.suppress(Exception):
+                self._set_raw_format_locked(fmt_id, zero_dword)
+
+    def capture_raw_formats(
+        self,
+        *,
+        attempts: int = 5,
+        retry_delay_s: float = 0.02,
+        max_total_bytes: int = 32 * 1024 * 1024,
+    ) -> dict[int, bytes]:
+        """Capture all HGLOBAL clipboard formats for lossless post-paste restoration."""
+        if not self._user32 or not self._kernel32:
+            return {}
+
+        exclusion_ids = set(self._get_exclusion_format_ids().values())
+        captured: dict[int, bytes] = {}
+        total_bytes = 0
+
+        with self.open_clipboard(attempts=attempts, retry_delay_s=retry_delay_s):
+            format_ids: list[int] = []
+            if hasattr(self._user32, "EnumClipboardFormats"):
+                cur = 0
+                for _ in range(64):
+                    nxt = self._user32.EnumClipboardFormats(cur)
+                    if not isinstance(nxt, int) or nxt <= 0:
+                        break
+                    if nxt in format_ids:
+                        break
+                    format_ids.append(nxt)
+                    cur = nxt
+            elif hasattr(self._user32, "IsClipboardFormatAvailable"):
+                candidates = [CF_UNICODETEXT, CF_TEXT, CF_DIBV5, CF_DIB, CF_HDROP]
+                if hasattr(self._user32, "RegisterClipboardFormatW"):
+                    for reg_name in ("HTML Format", "Rich Text Format", "PNG"):
+                        with contextlib.suppress(Exception):
+                            reg_id = self._user32.RegisterClipboardFormatW(reg_name)
+                            if isinstance(reg_id, int) and reg_id > 0:
+                                candidates.append(reg_id)
+                for cand in candidates:
+                    with contextlib.suppress(Exception):
+                        if self._user32.IsClipboardFormatAvailable(cand):
+                            format_ids.append(cand)
+
+            for fmt_id in format_ids:
+                if fmt_id in _NON_HGLOBAL_CLIPBOARD_FORMATS or fmt_id in exclusion_ids:
+                    continue
+                if 0x0300 <= fmt_id <= 0x03FF:
+                    continue
+                h_data = None
+                with contextlib.suppress(Exception):
+                    h_data = self._user32.GetClipboardData(fmt_id)
+                if not h_data:
+                    continue
+                raw = None
+                with contextlib.suppress(Exception):
+                    raw = self._read_global_bytes(h_data, f"fmt:{fmt_id}")
+                if raw is None:
+                    continue
+                if total_bytes + len(raw) > max_total_bytes:
+                    logger.warning(
+                        "Skipping clipboard format %d (%d bytes) exceeding capture budget.",
+                        fmt_id,
+                        len(raw),
+                    )
+                    continue
+                captured[fmt_id] = raw
+                total_bytes += len(raw)
+
+        return captured
+
+    def write_text_transient(
+        self,
+        text: str,
+        *,
+        attempts: int = 5,
+        retry_delay_s: float = 0.02,
+    ) -> None:
+        """Write Unicode text transiently and mark it excluded from Windows Clipboard History."""
+        if not self._user32 or not self._kernel32:
+            raise RuntimeError("Win32 clipboard APIs are not available.")
+
+        encoded = (text + "\0").encode("utf-16le")
+        with self.open_clipboard(attempts=attempts, retry_delay_s=retry_delay_s):
+            self._user32.EmptyClipboard()
+            if not self._set_raw_format_locked(CF_UNICODETEXT, encoded):
+                raise RuntimeError("Failed to set transient clipboard text data.")
+            self._mark_exclude_from_history_locked()
+
+    def restore_raw_formats(
+        self,
+        saved: dict[int, bytes],
+        *,
+        exclude_history: bool = True,
+        attempts: int = 5,
+        retry_delay_s: float = 0.02,
+    ) -> None:
+        """Restore captured HGLOBAL clipboard formats, optionally hiding from Win+V."""
+        if not self._user32 or not self._kernel32:
+            raise RuntimeError("Win32 clipboard APIs are not available.")
+
+        with self.open_clipboard(attempts=attempts, retry_delay_s=retry_delay_s):
+            self._user32.EmptyClipboard()
+            for fmt_id, raw_bytes in saved.items():
+                if not self._set_raw_format_locked(int(fmt_id), raw_bytes):
+                    logger.warning("Failed to restore clipboard format %s.", fmt_id)
+            if exclude_history:
+                self._mark_exclude_from_history_locked()
 
 
 # ------------------------------------------------ Local Extension & Collision Detection

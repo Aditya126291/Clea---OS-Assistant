@@ -25,7 +25,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,7 @@ from clea.tools.cdp_bridge import (
     is_chromium_app_name,
     is_chromium_process,
 )
+from clea.tools.clipboard import ClipboardLockedError, Win32ClipboardBackend
 from clea.tools.guards import (
     ActionVerifier,
     FocusPreconditionBackend,
@@ -4655,10 +4656,12 @@ def control_system(
                 if outcome.occluded_by_unrelated_window:
                     res_snap["occluded_by_unrelated_window"] = True
                     res_snap["occluding_windows"] = list(outcome.occluding_windows)
+            invalidate_last_screen_geometry(f"control_system:{canon_snap}")
             return res_snap
 
         if normalized in ("minimize_window", "minimize"):
             u32.ShowWindow(target_hwnd, SW_MINIMIZE)
+            invalidate_last_screen_geometry("control_system:minimize_window")
             res_win: dict[str, Any] = {
                 "ok": True,
                 "success": True,
@@ -4674,6 +4677,7 @@ def control_system(
             return res_win
         if normalized in ("maximize_window", "maximize"):
             u32.ShowWindow(target_hwnd, SW_MAXIMIZE)
+            invalidate_last_screen_geometry("control_system:maximize_window")
             res_win = {
                 "ok": True,
                 "success": True,
@@ -4689,6 +4693,7 @@ def control_system(
             return res_win
         if normalized in ("restore_window", "restore"):
             u32.ShowWindow(target_hwnd, SW_RESTORE)
+            invalidate_last_screen_geometry("control_system:restore_window")
             res_win = {
                 "ok": True,
                 "success": True,
@@ -4704,6 +4709,7 @@ def control_system(
             return res_win
         if normalized in ("close_window", "close"):
             u32.PostMessageW(target_hwnd, WM_CLOSE, 0, 0)
+            invalidate_last_screen_geometry("control_system:close_window")
             res_win = {
                 "ok": True,
                 "success": True,
@@ -4832,10 +4838,13 @@ def set_last_screen_geometry(
     virtual_top: int = 0,
     dpi_scale: float = 1.0,
     coord_space: str = "normalized_1000",
+    target_hwnd: int | None = None,
+    window_bounds: tuple[int, int, int, int] | list[int] | None = None,
+    capture_seq: int | None = None,
 ) -> dict[str, Any]:
     """Store the latest screenshot geometry so subsequent gui_action calls scale accurately."""
     global _LAST_SCREEN_GEOMETRY
-    geom = {
+    geom: dict[str, Any] = {
         "image_width": max(1, int(image_width)),
         "image_height": max(1, int(image_height)),
         "screen_width": max(1, int(screen_width)),
@@ -4845,6 +4854,12 @@ def set_last_screen_geometry(
         "dpi_scale": float(dpi_scale) if dpi_scale and dpi_scale > 0 else 1.0,
         "coord_space": str(coord_space or "normalized_1000"),
     }
+    if target_hwnd is not None and int(target_hwnd) > 0:
+        geom["target_hwnd"] = int(target_hwnd)
+    if window_bounds is not None and len(window_bounds) == 4:
+        geom["window_bounds"] = tuple(int(v) for v in window_bounds)
+    if capture_seq is not None:
+        geom["capture_seq"] = int(capture_seq)
     with _SCREEN_GEOMETRY_LOCK:
         _LAST_SCREEN_GEOMETRY = geom
     return dict(geom)
@@ -4861,6 +4876,13 @@ def clear_last_screen_geometry() -> None:
     global _LAST_SCREEN_GEOMETRY
     with _SCREEN_GEOMETRY_LOCK:
         _LAST_SCREEN_GEOMETRY = None
+
+
+def invalidate_last_screen_geometry(reason: str = "") -> None:
+    """Invalidate cached screenshot geometry after window layout or focus mutations."""
+    if reason:
+        logger.debug("Invalidating cached screen geometry: %s", reason)
+    clear_last_screen_geometry()
 
 
 def _query_virtual_screen_metrics(user32: Any = None) -> tuple[int, int, int, int]:
@@ -6146,6 +6168,185 @@ def _send_key_chord(u32: Any, keys: list[str]) -> list[str]:
     return normalized_keys
 
 
+_OS_INPUT_LOCK = threading.RLock()
+_ACTIVE_CANCEL_LOCK = threading.Lock()
+_ACTIVE_CANCEL_EVENTS: set[threading.Event] = set()
+
+BULK_TEXT_PASTE_THRESHOLD: int = 40
+
+_MODIFIER_VK_CANDIDATES: tuple[tuple[int, bool], ...] = (
+    (0xA2, False),  # VK_LCONTROL
+    (0xA3, True),   # VK_RCONTROL
+    (0x11, False),  # VK_CONTROL
+    (0xA0, False),  # VK_LSHIFT
+    (0xA1, False),  # VK_RSHIFT
+    (0x10, False),  # VK_SHIFT
+    (0xA4, False),  # VK_LMENU
+    (0xA5, True),   # VK_RMENU
+    (0x12, False),  # VK_MENU
+    (0x5B, True),   # VK_LWIN
+    (0x5C, True),   # VK_RWIN
+)
+
+
+class ActionCancelledError(RuntimeError):
+    """Raised when an in-flight Win32 OS input action is cancelled out-of-band."""
+
+
+@contextlib.contextmanager
+def track_cancellable_os_action(
+    cancel_event: threading.Event | None = None,
+) -> Iterator[threading.Event]:
+    """Register a cooperative cancellation event for the duration of an OS action."""
+    ev = cancel_event if cancel_event is not None else threading.Event()
+    with _ACTIVE_CANCEL_LOCK:
+        _ACTIVE_CANCEL_EVENTS.add(ev)
+    try:
+        yield ev
+    finally:
+        with _ACTIVE_CANCEL_LOCK:
+            _ACTIVE_CANCEL_EVENTS.discard(ev)
+
+
+def cancel_inflight_os_actions() -> int:
+    """Signal all registered in-flight OS input cancellation events and return count."""
+    with _ACTIVE_CANCEL_LOCK:
+        events = list(_ACTIVE_CANCEL_EVENTS)
+    for ev in events:
+        ev.set()
+    return len(events)
+
+
+def _check_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ActionCancelledError("os_action_cancelled")
+
+
+def _release_stuck_modifiers(u32: Any) -> list[int]:
+    """Release any physically/logically stuck modifier keys via KEYEVENTF_KEYUP."""
+    if u32 is None or not hasattr(u32, "GetAsyncKeyState") or not hasattr(u32, "SendInput"):
+        return []
+    released: list[int] = []
+    events: list[_INPUT] = []
+    for vk, is_ext in _MODIFIER_VK_CANDIDATES:
+        with contextlib.suppress(Exception):
+            raw_state = u32.GetAsyncKeyState(vk)
+            if isinstance(raw_state, int) and not isinstance(raw_state, bool):
+                if (raw_state & 0x8000) != 0:
+                    flags = KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if is_ext else 0)
+                    events.append(
+                        _INPUT(
+                            type=INPUT_KEYBOARD,
+                            union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags)),
+                        )
+                    )
+                    released.append(vk)
+    if events:
+        with contextlib.suppress(Exception):
+            _send_win32_inputs(u32, events)
+    return released
+
+
+def enter_text_tiered(
+    text: str,
+    *,
+    u32: Any,
+    interval_ms: int = 12,
+    sleep_fn: Callable[[float], None] | None = None,
+    guard: PreconditionGuard | None = None,
+    clipboard_backend: Any | None = None,
+    cancel_event: threading.Event | None = None,
+    use_bulk_paste: bool | None = None,
+    paste_settle_s: float = 0.15,
+    step_label: str = "type_text",
+) -> dict[str, Any]:
+    """Enter text via Tier-2 atomic clipboard paste (bulk/multiline) or Tier-3 SendInput.
+
+    Note: Tier-1 ``ValuePattern`` has replace semantics and is strictly reserved for
+    ``ui_act(action="set_value")``, never append-style typing.
+    """
+    _check_cancelled(cancel_event)
+    sleeper = sleep_fn or time.sleep
+    should_paste = (
+        use_bulk_paste
+        if use_bulk_paste is not None
+        else (len(text) >= BULK_TEXT_PASTE_THRESHOLD or "\n" in text or "\r" in text)
+    )
+
+    effective_cb: Any | None = clipboard_backend
+    if effective_cb is None and should_paste and isinstance(u32, ctypes.CDLL):
+        effective_cb = Win32ClipboardBackend()
+
+    if (
+        should_paste
+        and effective_cb is not None
+        and hasattr(effective_cb, "capture_raw_formats")
+        and hasattr(effective_cb, "write_text_transient")
+        and hasattr(effective_cb, "restore_raw_formats")
+    ):
+        with _OS_INPUT_LOCK:
+            _check_cancelled(cancel_event)
+            _release_stuck_modifiers(u32)
+            if guard is not None:
+                guard.assert_ready(step_label=f"{step_label}:pre_paste")
+            saved_formats: dict[int, bytes] | None = None
+            try:
+                saved_formats = effective_cb.capture_raw_formats(attempts=5, retry_delay_s=0.02)
+                effective_cb.write_text_transient(text, attempts=5, retry_delay_s=0.02)
+            except ClipboardLockedError as lock_exc:
+                logger.info(
+                    "Clipboard locked before bulk paste (%s); falling back to SendInput.",
+                    lock_exc,
+                )
+                saved_formats = None
+            else:
+                restored_ok = True
+                try:
+                    _check_cancelled(cancel_event)
+                    if guard is not None:
+                        guard.assert_ready(step_label=f"{step_label}:ctrl_v")
+                    _send_key_chord(u32, ["ctrl", "v"])
+                    remaining = max(0.0, float(paste_settle_s))
+                    while remaining > 0.0:
+                        _check_cancelled(cancel_event)
+                        chunk = min(0.025, remaining)
+                        sleeper(chunk)
+                        remaining -= chunk
+                finally:
+                    try:
+                        effective_cb.restore_raw_formats(
+                            saved_formats or {},
+                            exclude_history=True,
+                            attempts=5,
+                            retry_delay_s=0.02,
+                        )
+                    except Exception as restore_exc:
+                        restored_ok = False
+                        logger.warning("Failed to restore clipboard after paste: %s", restore_exc)
+                return {
+                    "method": "clipboard_paste_atomic",
+                    "char_count": len(text),
+                    "interval_ms": 0,
+                    "clipboard_restored": restored_ok,
+                }
+
+    with _OS_INPUT_LOCK:
+        clamped_interval = _send_unicode_text(
+            u32,
+            text,
+            interval_ms=interval_ms,
+            sleep_fn=sleeper,
+            guard=guard,
+            step_label=step_label,
+            cancel_event=cancel_event,
+        )
+    return {
+        "method": "send_unicode_text",
+        "char_count": len(text),
+        "interval_ms": clamped_interval,
+    }
+
+
 def _send_unicode_text(
     u32: Any,
     text: str,
@@ -6154,6 +6355,7 @@ def _send_unicode_text(
     sleep_fn: Callable[[float], None] | None = None,
     guard: PreconditionGuard | None = None,
     step_label: str = "type_text",
+    cancel_event: threading.Event | None = None,
 ) -> int:
     """Send Unicode text via Win32 SendInput with atomic keydown/keyup pairs."""
     if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
@@ -6236,9 +6438,16 @@ def _send_unicode_text(
     sleeper = sleep_fn or time.sleep
     delay_s = clamped_interval / 1000.0
     last_idx = len(normalized_text) - 1
+    _release_stuck_modifiers(u32)
+    is_real_guard = isinstance(guard, PreconditionGuard)
     for char_idx, ch in enumerate(normalized_text):
+        _check_cancelled(cancel_event)
         if guard is not None:
-            guard.assert_ready(step_label=f"{step_label}_char_{char_idx}")
+            if is_real_guard:
+                guard.assert_ready(step_label=f"{step_label}_char_{char_idx}", fast=True)
+            else:
+                guard.assert_ready(step_label=f"{step_label}_char_{char_idx}")
+        _check_cancelled(cancel_event)
         for pair in _encode_char_pairs(ch):
             _send_win32_inputs(u32, pair)
         if clamped_interval > 0 and char_idx < last_idx:
@@ -6511,6 +6720,8 @@ def ui_act(
     cdp_bridge: CDPBridge | None = None,
     _guard: PreconditionGuard | None = None,
     _capture_snapshot: bool = True,
+    cancel_event: threading.Event | None = None,
+    clipboard_backend: Any | None = None,
 ) -> dict[str, Any]:
     """Execute a semantic action on an indexed UI ('e#') or CDP browser ('b#') element."""
     if not isinstance(ref, str) or not ref.strip():
@@ -6615,8 +6826,14 @@ def ui_act(
     aborted_result: dict[str, Any] | None = None
 
     def _assert_step(step_label: str) -> None:
+        _check_cancelled(cancel_event)
         if active_guard is not None:
             active_guard.assert_ready(step_label)
+
+    def _assert_point(px: int, py: int, step_label: str) -> None:
+        _check_cancelled(cancel_event)
+        if active_guard is not None:
+            active_guard.assert_point_targets_window(px, py, step_label=step_label)
 
     can_try_uia = (
         gui_action_fn is None
@@ -6690,61 +6907,66 @@ def ui_act(
         if active_guard is None:
             _ensure_window_foreground(snapshot_hwnd, u32)
 
-        if norm_action == "click":
-            _assert_step("win32_click")
-            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-            method = "win32_click"
-        elif norm_action == "double_click":
-            _assert_step("win32_double_click")
-            _perform_mouse_click(
-                target_cx, target_cy, clicks=1, button="double", user32=u32
-            )
-            method = "win32_double_click"
-        elif norm_action == "right_click":
-            _assert_step("win32_right_click")
-            _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
-            method = "win32_right_click"
-        elif norm_action == "set_value":
-            assert value is not None
-            _assert_step("set_value_click")
-            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-            _assert_step("set_value_select_all")
-            _send_key_chord(u32, ["ctrl", "a"])
-            _assert_step("set_value_backspace")
-            _send_key_chord(u32, ["backspace"])
-            if value:
-                _assert_step("set_value_type_text")
-                _send_unicode_text(
-                    u32,
+        with _OS_INPUT_LOCK:
+            if norm_action == "click":
+                _assert_point(target_cx, target_cy, "win32_click")
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                method = "win32_click"
+            elif norm_action == "double_click":
+                _assert_point(target_cx, target_cy, "win32_double_click")
+                _perform_mouse_click(
+                    target_cx, target_cy, clicks=1, button="double", user32=u32
+                )
+                method = "win32_double_click"
+            elif norm_action == "right_click":
+                _assert_point(target_cx, target_cy, "win32_right_click")
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="right", user32=u32)
+                method = "win32_right_click"
+            elif norm_action == "set_value":
+                assert value is not None
+                _assert_point(target_cx, target_cy, "set_value_click")
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                _assert_step("set_value_select_all")
+                _send_key_chord(u32, ["ctrl", "a"])
+                _assert_step("set_value_backspace")
+                _send_key_chord(u32, ["backspace"])
+                if value:
+                    _assert_step("set_value_type_text")
+                    enter_text_tiered(
+                        value,
+                        u32=u32,
+                        interval_ms=clamped_interval,
+                        sleep_fn=sleep_fn,
+                        guard=active_guard,
+                        clipboard_backend=clipboard_backend,
+                        cancel_event=cancel_event,
+                        step_label="set_value_type_text",
+                    )
+                method = "keyboard_fallback"
+            elif norm_action == "type":
+                assert value is not None
+                _assert_point(target_cx, target_cy, "type_click")
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                _assert_step("type_text")
+                enter_text_tiered(
                     value,
+                    u32=u32,
                     interval_ms=clamped_interval,
                     sleep_fn=sleep_fn,
                     guard=active_guard,
-                    step_label="set_value_type_text",
+                    clipboard_backend=clipboard_backend,
+                    cancel_event=cancel_event,
+                    step_label="type_text",
                 )
-            method = "keyboard_fallback"
-        elif norm_action == "type":
-            assert value is not None
-            _assert_step("type_click")
-            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-            _assert_step("type_text")
-            _send_unicode_text(
-                u32,
-                value,
-                interval_ms=clamped_interval,
-                sleep_fn=sleep_fn,
-                guard=active_guard,
-                step_label="type_text",
-            )
-            method = "win32_type"
-        else:  # "clear"
-            _assert_step("clear_click")
-            _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
-            _assert_step("clear_select_all")
-            _send_key_chord(u32, ["ctrl", "a"])
-            _assert_step("clear_backspace")
-            _send_key_chord(u32, ["backspace"])
-            method = "win32_clear"
+                method = "win32_type"
+            else:  # "clear"
+                _assert_point(target_cx, target_cy, "clear_click")
+                _perform_mouse_click(target_cx, target_cy, clicks=1, button="left", user32=u32)
+                _assert_step("clear_select_all")
+                _send_key_chord(u32, ["ctrl", "a"])
+                _assert_step("clear_backspace")
+                _send_key_chord(u32, ["backspace"])
+                method = "win32_clear"
 
     def _run_act_steps() -> None:
         nonlocal method, aborted_result
@@ -7020,10 +7242,37 @@ def ui_act(
                 }
             )
             return abort
+        except ActionCancelledError as exc:
+            return {
+                "ok": False,
+                "status": "cancelled",
+                "cancelled": True,
+                "error": str(exc),
+                "snapshot_id": snapshot_id,
+                "ref": norm_ref,
+                "action": norm_action,
+                "role": entry.get("role", ""),
+                "name": entry.get("name", ""),
+                "method": method,
+            }
         finally:
             active_guard = None
     else:
-        _run_act_steps()
+        try:
+            _run_act_steps()
+        except ActionCancelledError as exc:
+            return {
+                "ok": False,
+                "status": "cancelled",
+                "cancelled": True,
+                "error": str(exc),
+                "snapshot_id": snapshot_id,
+                "ref": norm_ref,
+                "action": norm_action,
+                "role": entry.get("role", ""),
+                "name": entry.get("name", ""),
+                "method": method,
+            }
 
     if aborted_result is not None:
         return aborted_result
@@ -7543,6 +7792,8 @@ def gui_action(
     expected_hwnd: int | None = None,
     require_foreground: bool = True,
     _guard: PreconditionGuard | None = None,
+    cancel_event: threading.Event | None = None,
+    clipboard_backend: Any | None = None,
 ) -> dict[str, Any]:
     """Perform a safety-bounded GUI input, CDP browser ref/history, or wait action."""
     if not isinstance(action, str):
@@ -7696,38 +7947,46 @@ def gui_action(
         )
 
     def _execute_gui_action(active_guard: PreconditionGuard | None) -> dict[str, Any]:
+        _check_cancelled(cancel_event)
         if active_guard is not None:
             active_guard.assert_ready(f"gui_action:{normalized_action}")
 
         u32 = _get_win32_user32(user32)
 
         if normalized_action in pointer_actions:
-            px, py, coord_meta = _resolve_physical_xy(u32)
-            if normalized_action == "move":
-                if hasattr(u32, "SetCursorPos"):
-                    moved = u32.SetCursorPos(px, py)
-                    if moved is not None and not moved:
-                        raise RuntimeError(f"Win32 SetCursorPos({px}, {py}) failed.")
-                return {
-                    "ok": True,
-                    "status": "completed",
-                    "action": "move",
-                    "x": px,
-                    "y": py,
-                    **coord_meta,
-                }
+            with _OS_INPUT_LOCK:
+                _check_cancelled(cancel_event)
+                px, py, coord_meta = _resolve_physical_xy(u32)
+                if normalized_action == "move":
+                    if hasattr(u32, "SetCursorPos"):
+                        moved = u32.SetCursorPos(px, py)
+                        if moved is not None and not moved:
+                            raise RuntimeError(f"Win32 SetCursorPos({px}, {py}) failed.")
+                    return {
+                        "ok": True,
+                        "status": "completed",
+                        "action": "move",
+                        "x": px,
+                        "y": py,
+                        **coord_meta,
+                    }
 
-            eff_btn = (
-                "right"
-                if normalized_action == "right_click"
-                else ("left" if normalized_action == "double_click" else btn)
-            )
-            eff_clicks = (
-                2
-                if normalized_action == "double_click"
-                else (1 if normalized_action == "right_click" else clicks)
-            )
-            _perform_mouse_click(px, py, clicks=eff_clicks, button=eff_btn, user32=u32)
+                if active_guard is not None:
+                    active_guard.assert_point_targets_window(
+                        px, py, step_label=f"gui_action:{normalized_action}"
+                    )
+
+                eff_btn = (
+                    "right"
+                    if normalized_action == "right_click"
+                    else ("left" if normalized_action == "double_click" else btn)
+                )
+                eff_clicks = (
+                    2
+                    if normalized_action == "double_click"
+                    else (1 if normalized_action == "right_click" else clicks)
+                )
+                _perform_mouse_click(px, py, clicks=eff_clicks, button=eff_btn, user32=u32)
             actual_clicks = 2 if eff_btn == "double" and eff_clicks == 1 else eff_clicks
             return {
                 "ok": True,
@@ -7742,24 +8001,33 @@ def gui_action(
 
         if normalized_action == "type_text":
             assert text is not None
-            clamped_interval = _send_unicode_text(
-                u32,
+            entry_res = enter_text_tiered(
                 text,
+                u32=u32,
                 interval_ms=interval_ms,
                 sleep_fn=sleep_fn,
                 guard=active_guard,
+                clipboard_backend=clipboard_backend,
+                cancel_event=cancel_event,
                 step_label="gui_action_type_text",
             )
-            return {
+            res_type: dict[str, Any] = {
                 "ok": True,
                 "status": "completed",
                 "action": "type_text",
-                "char_count": len(text),
-                "interval_ms": clamped_interval,
+                "char_count": entry_res["char_count"],
+                "interval_ms": entry_res["interval_ms"],
+                "entry_method": entry_res["method"],
             }
+            if "clipboard_restored" in entry_res:
+                res_type["clipboard_restored"] = entry_res["clipboard_restored"]
+            return res_type
 
         if normalized_action == "press_keys":
-            normalized_keys = _send_key_chord(u32, keys or [])
+            with _OS_INPUT_LOCK:
+                _check_cancelled(cancel_event)
+                _release_stuck_modifiers(u32)
+                normalized_keys = _send_key_chord(u32, keys or [])
             return {
                 "ok": True,
                 "status": "completed",
@@ -7771,29 +8039,35 @@ def gui_action(
         scroll_x: int | None = None
         scroll_y: int | None = None
         coord_meta_scroll: dict[str, Any] = {}
-        if x is not None and y is not None:
-            scroll_x, scroll_y, coord_meta_scroll = _resolve_physical_xy(u32)
-            if hasattr(u32, "SetCursorPos"):
-                moved = u32.SetCursorPos(scroll_x, scroll_y)
-                if moved is not None and not moved:
-                    raise RuntimeError(f"Win32 SetCursorPos({scroll_x}, {scroll_y}) failed.")
-
         clamped_delta = max(-12000, min(12000, delta))
-        scroll_input = _INPUT(
-            type=INPUT_MOUSE,
-            union=_INPUT_UNION(
-                mi=_MOUSEINPUT(
-                    mouseData=clamped_delta & 0xFFFFFFFF,
-                    dwFlags=MOUSEEVENTF_WHEEL,
-                )
-            ),
-        )
-        if hasattr(u32, "SendInput"):
-            _send_win32_inputs(u32, [scroll_input])
-        elif hasattr(u32, "mouse_event"):
-            u32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, clamped_delta & 0xFFFFFFFF, 0)
-        else:
-            raise RuntimeError("Win32 SendInput/mouse_event is unavailable.")
+        with _OS_INPUT_LOCK:
+            _check_cancelled(cancel_event)
+            if x is not None and y is not None:
+                scroll_x, scroll_y, coord_meta_scroll = _resolve_physical_xy(u32)
+                if active_guard is not None:
+                    active_guard.assert_point_targets_window(
+                        scroll_x, scroll_y, step_label="gui_action:scroll"
+                    )
+                if hasattr(u32, "SetCursorPos"):
+                    moved = u32.SetCursorPos(scroll_x, scroll_y)
+                    if moved is not None and not moved:
+                        raise RuntimeError(f"Win32 SetCursorPos({scroll_x}, {scroll_y}) failed.")
+
+            scroll_input = _INPUT(
+                type=INPUT_MOUSE,
+                union=_INPUT_UNION(
+                    mi=_MOUSEINPUT(
+                        mouseData=clamped_delta & 0xFFFFFFFF,
+                        dwFlags=MOUSEEVENTF_WHEEL,
+                    )
+                ),
+            )
+            if hasattr(u32, "SendInput"):
+                _send_win32_inputs(u32, [scroll_input])
+            elif hasattr(u32, "mouse_event"):
+                u32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, clamped_delta & 0xFFFFFFFF, 0)
+            else:
+                raise RuntimeError("Win32 SendInput/mouse_event is unavailable.")
 
         return {
             "ok": True,
@@ -7806,7 +8080,16 @@ def gui_action(
         }
 
     if _guard is not None:
-        return _execute_gui_action(_guard)
+        try:
+            return _execute_gui_action(_guard)
+        except ActionCancelledError as exc:
+            return {
+                "ok": False,
+                "status": "cancelled",
+                "cancelled": True,
+                "error": str(exc),
+                "action": normalized_action,
+            }
 
     should_guard = focus_backend is not None or user32 is None
     resolved_expected_hwnd = expected_hwnd
@@ -7844,8 +8127,25 @@ def gui_action(
             abort = exc.to_abort_payload()
             abort["action"] = normalized_action
             return abort
+        except ActionCancelledError as exc:
+            return {
+                "ok": False,
+                "status": "cancelled",
+                "cancelled": True,
+                "error": str(exc),
+                "action": normalized_action,
+            }
 
-    return _execute_gui_action(None)
+    try:
+        return _execute_gui_action(None)
+    except ActionCancelledError as exc:
+        return {
+            "ok": False,
+            "status": "cancelled",
+            "cancelled": True,
+            "error": str(exc),
+            "action": normalized_action,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -8042,6 +8342,7 @@ def ui_batch(
     expected_hwnd: int | None = None,
     require_foreground: bool = True,
     cdp_bridge: CDPBridge | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Execute speculative multi-step GUI actions in a single round-trip with state diffing."""
     if not isinstance(steps, list) or len(steps) < 1 or len(steps) > 20:
@@ -8237,6 +8538,7 @@ def ui_batch(
                 else {}
             )
             for idx, s in enumerate(steps):
+                _check_cancelled(cancel_event)
                 s_dict = (
                     s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else dict(s)
                 )
@@ -8418,7 +8720,7 @@ def ui_batch(
                         )
                         trigger_nav = True
 
-                except PreconditionFailedError:
+                except (PreconditionFailedError, ActionCancelledError):
                     raise
                 except Exception as exc:
                     step_results.append(
@@ -8454,6 +8756,15 @@ def ui_batch(
         abort["steps_executed"] = len(step_results)
         abort["step_results"] = step_results
         return abort
+    except ActionCancelledError as exc:
+        return {
+            "ok": False,
+            "status": "cancelled",
+            "cancelled": True,
+            "error": str(exc),
+            "steps_executed": len(step_results),
+            "step_results": step_results,
+        }
 
     if status == "completed" and any(r.get("status") == "error" for r in step_results):
         status = "partial_error"

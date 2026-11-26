@@ -178,6 +178,8 @@ import type {
   OsUiActResult,
   OsUiBatchParams,
   OsUiBatchResult,
+  OsCancelInflightParams,
+  OsCancelInflightResult,
   UiSnapshotElement,
   UiDiff,
   UiDiffChangedValue,
@@ -368,6 +370,8 @@ export type {
   OsUiActResult,
   OsUiBatchParams,
   OsUiBatchResult,
+  OsCancelInflightParams,
+  OsCancelInflightResult,
   UiSnapshotElement,
   UiDiff,
   UiDiffChangedValue,
@@ -448,6 +452,7 @@ export interface MethodParamsMap {
   "os.ui_snapshot": OsUiSnapshotParams;
   "os.ui_act": OsUiActParams;
   "os.ui_batch": OsUiBatchParams;
+  "os.cancel_inflight": OsCancelInflightParams;
   "workspace.git_inspect": WorkspaceGitInspectParams;
 }
 
@@ -519,6 +524,7 @@ export interface MethodResultMap {
   "os.ui_snapshot": OsUiSnapshotResult;
   "os.ui_act": OsUiActResult;
   "os.ui_batch": OsUiBatchResult;
+  "os.cancel_inflight": OsCancelInflightResult;
   "workspace.git_inspect": WorkspaceGitInspectResult;
 }
 

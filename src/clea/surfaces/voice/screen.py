@@ -73,6 +73,7 @@ class ScreenCaptureResult:
     virtual_top: int = 0
     dpi_scale: float = 1.0
     coord_space: str = "normalized_1000"
+    hwnd: int | None = None
 
 
 def is_window_blocked(
@@ -364,6 +365,7 @@ class ScreenCaptureService:
                 monitor_bounds=win_info.monitor_bounds,
                 captured_at=captured_at,
                 capture_seq=seq,
+                hwnd=win_info.hwnd if win_info else None,
             )
 
         target_mon: MonitorInfo | None = None
@@ -497,6 +499,7 @@ class ScreenCaptureService:
                 virtual_top=v_top,
                 dpi_scale=dpi_scale,
                 coord_space="normalized_1000",
+                hwnd=win_info.hwnd if win_info else None,
             )
         except Exception as exc:
             logger.warning("Screen capture failed: %s", exc)
@@ -517,4 +520,5 @@ class ScreenCaptureService:
                 capture_seq=seq,
                 window_layout=window_layout,
                 window_geometry_summary=window_geometry_summary,
+                hwnd=win_info.hwnd if win_info else None,
             )

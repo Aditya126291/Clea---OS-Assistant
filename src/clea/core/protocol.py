@@ -445,6 +445,10 @@ class OsUiBatchParams(_Model):
     stop_on_window_change: bool = True
 
 
+class OsCancelInflightParams(_Model):
+    reason: str = Field(default="user_cancelled", max_length=200)
+
+
 class WorkspaceGitInspectParams(_Model):
     repo_path: str | None = None
     include_diff: bool = False
@@ -827,6 +831,11 @@ class OsUiBatchRequest(_Request):
     params: OsUiBatchParams
 
 
+class OsCancelInflightRequest(_Request):
+    method: Literal["os.cancel_inflight"] = "os.cancel_inflight"
+    params: OsCancelInflightParams = Field(default_factory=OsCancelInflightParams)
+
+
 class WorkspaceGitInspectRequest(_Request):
     method: Literal["workspace.git_inspect"] = "workspace.git_inspect"
     params: WorkspaceGitInspectParams = Field(default_factory=WorkspaceGitInspectParams)
@@ -900,6 +909,7 @@ RequestFrame = Annotated[
     | OsUiSnapshotRequest
     | OsUiActRequest
     | OsUiBatchRequest
+    | OsCancelInflightRequest
     | WorkspaceGitInspectRequest,
     Field(discriminator="method"),
 ]
@@ -1687,6 +1697,9 @@ class OsGuiActionResult(_Model):
     state_diff: dict[str, Any] | None = None
     circuit_breaker_tripped: bool | None = None
     suggested_recovery: list[str] | None = None
+    entry_method: str | None = None
+    clipboard_restored: bool | None = None
+    cancelled: bool | None = None
     reason: str | None = None
     error: str | None = None
     aborted_precondition: PreconditionAbortInfo | None = None
@@ -1782,15 +1795,23 @@ class OsUiBatchResult(_Model):
         "stopped_on_window_change",
         "partial_error",
         "aborted_precondition",
+        "cancelled",
     ] = "completed"
     steps_executed: int = 0
     step_results: list[dict[str, Any]] = Field(default_factory=list)
     state_diff: dict[str, Any] | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
+    cancelled: bool | None = None
     reason: str | None = None
     error: str | None = None
     aborted_precondition: PreconditionAbortInfo | None = None
+
+
+class OsCancelInflightResult(_Model):
+    ok: bool = True
+    cancelled: bool = True
+    cancelled_count: int = 0
 
 
 class GitWorktreeItem(_Model):
@@ -1888,6 +1909,7 @@ METHOD_RESULTS: dict[str, type[_Model]] = {
     "os.ui_snapshot": OsUiSnapshotResult,
     "os.ui_act": OsUiActResult,
     "os.ui_batch": OsUiBatchResult,
+    "os.cancel_inflight": OsCancelInflightResult,
     "workspace.git_inspect": WorkspaceGitInspectResult,
 }
 """Result payload model for each request method (carried in ``ResponseFrame.result``)."""

@@ -90,6 +90,7 @@ from clea.core.protocol import (  # noqa: E402
     MemoryStatusRequest,
     MemoryUpdatedData,
     MemoryUpdatedEvent,
+    OsCancelInflightRequest,
     OsClickUiElementRequest,
     OsControlMediaVolumeRequest,
     OsControlSystemRequest,
@@ -271,6 +272,7 @@ def build_json_schema() -> dict[str, Any]:
         os_ui_snapshot_request: OsUiSnapshotRequest
         os_ui_act_request: OsUiActRequest
         os_ui_batch_request: OsUiBatchRequest
+        os_cancel_inflight_request: OsCancelInflightRequest
         ui_snapshot_element: UiSnapshotElement
         ui_diff: UiDiff
         ui_diff_changed_value: UiDiffChangedValue

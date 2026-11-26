@@ -278,6 +278,7 @@ def test_every_method_has_a_result_model() -> None:
                 "os.ui_batch",
                 {"steps": [{"op": "act", "ref": "e0", "action": "click"}]},
             ),
+            ("os.cancel_inflight", {}),
             ("workspace.git_inspect", {}),
         ]
     }

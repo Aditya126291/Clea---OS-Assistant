@@ -134,6 +134,7 @@ from clea.tools.guards import Win32FocusPreconditionBackend, WinRTMediaVerificat
 from clea.tools.registry import ToolDefinition
 from clea.tools.vision import MAX_VISION_DIMENSION, _downscale_png
 from clea.tools.windows_os import (
+    cancel_inflight_os_actions,
     click_ui_element,
     control_media_volume,
     control_system,
@@ -143,6 +144,7 @@ from clea.tools.windows_os import (
     open_url,
     read_clipboard,
     select_clipboard_item,
+    track_cancellable_os_action,
     ui_act,
     ui_batch,
     ui_snapshot,
@@ -155,6 +157,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 120.0
 _LOCALHOST_ONLY = {"127.0.0.1", "localhost", "::1"}
+_ASYNC_SERIALIZED_OS_METHODS = frozenset(
+    {"os.click_ui_element", "os.gui_action", "os.ui_act", "os.ui_batch"}
+)
 
 ServerFrameOut = Any  # any ResponseFrame or event model; all are pydantic models
 
@@ -321,6 +326,8 @@ class CleaDaemon:
         self._task_metadata: dict[str, dict[str, Any]] = {}
         self._recent_task_records: dict[str, dict[str, Any]] = {}
         self._bg_task_write_lock = threading.Lock()
+        self._os_input_exec_lock = asyncio.Lock()
+        self._os_inflight_tasks: set[asyncio.Task[Any]] = set()
         self._cancelled_task_ids: set[str] = set()
         self._task_started_at: dict[str, str] = {}
         self._consolidation_task_terminal: dict[str, bool] = {}
@@ -524,7 +531,12 @@ class CleaDaemon:
                     ),
                     timeout=flush_timeout,
                 )
+        with contextlib.suppress(Exception):
+            cancel_inflight_os_actions()
         pending_tasks = list(self._background_tasks)
+        for t in list(self._os_inflight_tasks):
+            if t not in pending_tasks:
+                pending_tasks.append(t)
         for t in list(self._idle_tasks.values()):
             if t not in pending_tasks:
                 pending_tasks.append(t)
@@ -991,6 +1003,10 @@ class CleaDaemon:
                         )
                         continue
 
+                    if frame.method in _ASYNC_SERIALIZED_OS_METHODS:
+                        self._spawn_os_rpc_task(conn, frame)
+                        continue
+
                     try:
                         await self._dispatch_request(conn, frame)
                     except ConnectionClosed:
@@ -1259,6 +1275,61 @@ class CleaDaemon:
         assert isinstance(result, expected), f"{req.method} must return {expected.__name__}"
         await self._send(
             ws, ResponseFrame(id=req.id, session_id=sid, result=result.model_dump(mode="json"))
+        )
+
+    def _spawn_os_rpc_task(self, conn: _Connection, req: Any) -> asyncio.Task[None]:
+        """Run a mutating OS RPC off the WebSocket reader loop so cancel_inflight can preempt."""
+        cancel_ev = threading.Event()
+
+        async def _runner() -> None:
+            try:
+                with track_cancellable_os_action(cancel_ev):
+                    await self._dispatch_request(conn, req)
+            except asyncio.CancelledError:
+                cancel_ev.set()
+                with contextlib.suppress(Exception):
+                    await self._respond(
+                        conn.ws,
+                        req,
+                        error="os_action_cancelled",
+                    )
+            except ConnectionClosed:
+                cancel_ev.set()
+            except Exception as exc:
+                logger.exception(
+                    "Unhandled error in async OS RPC %s: %s",
+                    getattr(req, "method", "<unknown>"),
+                    exc,
+                )
+                with contextlib.suppress(Exception):
+                    await self._respond(
+                        conn.ws,
+                        req,
+                        error=str(exc).strip() or type(exc).__name__,
+                    )
+
+        task = asyncio.create_task(_runner(), name=f"os-rpc-{req.method}-{req.id}")
+        task._clea_cancel_ev = cancel_ev  # type: ignore[attr-defined]
+        self._os_inflight_tasks.add(task)
+        conn.tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task[None]) -> None:
+            self._os_inflight_tasks.discard(done_task)
+            conn.tasks.discard(done_task)
+
+        task.add_done_callback(_cleanup)
+        return task
+
+    async def _handle_os_cancel_inflight(self, conn: _Connection, req: Any) -> None:
+        ws = conn.ws
+        reason = getattr(req.params, "reason", "user_cancelled")
+        count = cancel_inflight_os_actions()
+        self._audit_log("os_cancel_inflight", reason=reason, cancelled_count=count)
+        model_cls = METHOD_RESULTS["os.cancel_inflight"]
+        await self._respond(
+            ws,
+            req,
+            model_cls(ok=True, cancelled=True, cancelled_count=count),
         )
 
     async def _dispatch_request(self, conn: _Connection, req: Any) -> None:
@@ -2293,6 +2364,8 @@ class CleaDaemon:
             await self._handle_os_ui_act(conn, req)
         elif method == "os.ui_batch":
             await self._handle_os_ui_batch(conn, req)
+        elif method == "os.cancel_inflight":
+            await self._handle_os_cancel_inflight(conn, req)
         elif method == "workspace.git_inspect":
             await self._handle_workspace_git_inspect(conn, req)
 
@@ -3671,25 +3744,62 @@ class CleaDaemon:
         filtered = {k: v for k, v in res.items() if k in valid_fields}
         await self._respond(ws, req, model_cls(**filtered))
 
+    @staticmethod
+    def _current_task_cancel_event() -> threading.Event | None:
+        task = asyncio.current_task()
+        if task is None:
+            return None
+        ev = getattr(task, "_clea_cancel_ev", None)
+        return ev if isinstance(ev, threading.Event) else None
+
+    @staticmethod
+    def _cancel_kwarg_for(fn: Any, cancel_ev: threading.Event | None) -> dict[str, Any]:
+        if cancel_ev is None:
+            return {}
+        try:
+            sig = inspect.signature(fn)
+            if "cancel_event" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                return {"cancel_event": cancel_ev}
+        except (ValueError, TypeError):
+            pass
+        return {}
+
     async def _handle_os_click_ui_element(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
-        guard_kwargs = self._os_guard_kwargs(click_ui_element)
-        before_state = await self._capture_desktop_state()
-        try:
-            res = await asyncio.to_thread(
-                click_ui_element,
-                req.params.name,
-                req.params.control_type,
-                req.params.app_name,
-                **guard_kwargs,
-            )
-        except PreconditionFailedError as exc:
-            res = exc.to_abort_payload()
-            res["name"] = req.params.name
-            res["control_type"] = req.params.control_type or ""
-        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+        cancel_ev = self._current_task_cancel_event()
+        if cancel_ev is not None and cancel_ev.is_set():
+            await self._respond(ws, req, error="os_action_cancelled")
             return
+        guard_kwargs = self._os_guard_kwargs(click_ui_element)
+        async with self._os_input_exec_lock:
+            if cancel_ev is not None and cancel_ev.is_set():
+                await self._respond(ws, req, error="os_action_cancelled")
+                return
+            before_state = await self._capture_desktop_state()
+            try:
+                res = await asyncio.to_thread(
+                    click_ui_element,
+                    req.params.name,
+                    req.params.control_type,
+                    req.params.app_name,
+                    **guard_kwargs,
+                )
+            except PreconditionFailedError as exc:
+                res = exc.to_abort_payload()
+                res["name"] = req.params.name
+                res["control_type"] = req.params.control_type or ""
+            except (
+                ValueError,
+                OSError,
+                RuntimeError,
+                TimeoutError,
+                TypeError,
+                OverflowError,
+            ) as exc:
+                await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+                return
         res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_click_ui_element",
@@ -3706,6 +3816,21 @@ class CleaDaemon:
     async def _handle_os_gui_action(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         p = req.params
+        cancel_ev = self._current_task_cancel_event()
+        if cancel_ev is not None and cancel_ev.is_set():
+            model_cls = METHOD_RESULTS["os.gui_action"]
+            await self._respond(
+                ws,
+                req,
+                model_cls(
+                    ok=False,
+                    status="cancelled",
+                    action=p.action,
+                    cancelled=True,
+                    error="os_action_cancelled",
+                ),
+            )
+            return
         guard_kwargs = self._os_guard_kwargs(gui_action)
         extra_gui_kwargs: dict[str, Any] = {}
         optional_gui_fields = (
@@ -3741,32 +3866,56 @@ class CleaDaemon:
             for name, val in present_optional.items():
                 if accepts_kwargs or name in param_names:
                     extra_gui_kwargs[name] = val
-        before_state = (
-            await self._capture_desktop_state()
-            if str(p.action or "").strip().lower() != "wait"
-            else None
-        )
-        try:
-            res = await asyncio.to_thread(
-                gui_action,
-                p.action,
-                p.x,
-                p.y,
-                p.text,
-                p.keys,
-                p.clicks,
-                p.button,
-                p.delta,
-                p.seconds,
-                **extra_gui_kwargs,
-                **guard_kwargs,
+        extra_gui_kwargs.update(self._cancel_kwarg_for(gui_action, cancel_ev))
+
+        async with self._os_input_exec_lock:
+            if cancel_ev is not None and cancel_ev.is_set():
+                model_cls = METHOD_RESULTS["os.gui_action"]
+                await self._respond(
+                    ws,
+                    req,
+                    model_cls(
+                        ok=False,
+                        status="cancelled",
+                        action=p.action,
+                        cancelled=True,
+                        error="os_action_cancelled",
+                    ),
+                )
+                return
+            before_state = (
+                await self._capture_desktop_state()
+                if str(p.action or "").strip().lower() != "wait"
+                else None
             )
-        except PreconditionFailedError as exc:
-            res = exc.to_abort_payload()
-            res["action"] = p.action
-        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
-            return
+            try:
+                res = await asyncio.to_thread(
+                    gui_action,
+                    p.action,
+                    p.x,
+                    p.y,
+                    p.text,
+                    p.keys,
+                    p.clicks,
+                    p.button,
+                    p.delta,
+                    p.seconds,
+                    **extra_gui_kwargs,
+                    **guard_kwargs,
+                )
+            except PreconditionFailedError as exc:
+                res = exc.to_abort_payload()
+                res["action"] = p.action
+            except (
+                ValueError,
+                OSError,
+                RuntimeError,
+                TimeoutError,
+                TypeError,
+                OverflowError,
+            ) as exc:
+                await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+                return
         res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_gui_action",
@@ -3810,32 +3959,49 @@ class CleaDaemon:
     async def _handle_os_ui_act(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         p = req.params
-        guard_kwargs = self._os_guard_kwargs(ui_act)
-        before_state = await self._capture_desktop_state()
-        try:
-            try:
-                res = await asyncio.to_thread(
-                    ui_act,
-                    p.ref,
-                    p.action,
-                    p.value,
-                    interval_ms=p.interval_ms,
-                    **guard_kwargs,
-                )
-            except TypeError:
-                res = await asyncio.to_thread(
-                    ui_act,
-                    p.ref,
-                    p.action,
-                    p.value,
-                )
-        except PreconditionFailedError as exc:
-            res = exc.to_abort_payload()
-            res["ref"] = p.ref
-            res["action"] = p.action
-        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+        cancel_ev = self._current_task_cancel_event()
+        if cancel_ev is not None and cancel_ev.is_set():
+            await self._respond(ws, req, error="os_action_cancelled")
             return
+        guard_kwargs = self._os_guard_kwargs(ui_act)
+        cancel_kwargs = self._cancel_kwarg_for(ui_act, cancel_ev)
+        async with self._os_input_exec_lock:
+            if cancel_ev is not None and cancel_ev.is_set():
+                await self._respond(ws, req, error="os_action_cancelled")
+                return
+            before_state = await self._capture_desktop_state()
+            try:
+                try:
+                    res = await asyncio.to_thread(
+                        ui_act,
+                        p.ref,
+                        p.action,
+                        p.value,
+                        interval_ms=p.interval_ms,
+                        **cancel_kwargs,
+                        **guard_kwargs,
+                    )
+                except TypeError:
+                    res = await asyncio.to_thread(
+                        ui_act,
+                        p.ref,
+                        p.action,
+                        p.value,
+                    )
+            except PreconditionFailedError as exc:
+                res = exc.to_abort_payload()
+                res["ref"] = p.ref
+                res["action"] = p.action
+            except (
+                ValueError,
+                OSError,
+                RuntimeError,
+                TimeoutError,
+                TypeError,
+                OverflowError,
+            ) as exc:
+                await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+                return
         res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_ui_act",
@@ -3852,26 +4018,60 @@ class CleaDaemon:
     async def _handle_os_ui_batch(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         p = req.params
+        cancel_ev = self._current_task_cancel_event()
+        if cancel_ev is not None and cancel_ev.is_set():
+            model_cls = METHOD_RESULTS["os.ui_batch"]
+            await self._respond(
+                ws,
+                req,
+                model_cls(
+                    ok=False,
+                    status="cancelled",
+                    cancelled=True,
+                    error="os_action_cancelled",
+                ),
+            )
+            return
         steps_raw = [
             s.model_dump(exclude_unset=True) if hasattr(s, "model_dump") else s for s in p.steps
         ]
         guard_kwargs = self._os_guard_kwargs(ui_batch)
-        before_state = await self._capture_desktop_state()
-        try:
-            res = await asyncio.to_thread(
-                ui_batch,
-                steps_raw,
-                p.stop_on_error,
-                p.stop_on_window_change,
-                **guard_kwargs,
-            )
-        except PreconditionFailedError as exc:
-            res = exc.to_abort_payload()
-            res["steps_executed"] = 0
-            res["step_results"] = []
-        except (ValueError, OSError, RuntimeError, TimeoutError, TypeError, OverflowError) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
-            return
+        cancel_kwargs = self._cancel_kwarg_for(ui_batch, cancel_ev)
+        async with self._os_input_exec_lock:
+            if cancel_ev is not None and cancel_ev.is_set():
+                model_cls = METHOD_RESULTS["os.ui_batch"]
+                await self._respond(
+                    ws,
+                    req,
+                    model_cls(
+                        ok=False, status="cancelled", cancelled=True, error="os_action_cancelled"
+                    ),
+                )
+                return
+            before_state = await self._capture_desktop_state()
+            try:
+                res = await asyncio.to_thread(
+                    ui_batch,
+                    steps_raw,
+                    p.stop_on_error,
+                    p.stop_on_window_change,
+                    **cancel_kwargs,
+                    **guard_kwargs,
+                )
+            except PreconditionFailedError as exc:
+                res = exc.to_abort_payload()
+                res["steps_executed"] = 0
+                res["step_results"] = []
+            except (
+                ValueError,
+                OSError,
+                RuntimeError,
+                TimeoutError,
+                TypeError,
+                OverflowError,
+            ) as exc:
+                await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+                return
         res = await self._attach_state_diff(res, before_state)
         self._audit_log(
             "os_ui_batch",

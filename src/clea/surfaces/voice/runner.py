@@ -66,6 +66,8 @@ from clea.core.protocol import (
     MemoryManageFactRequest,
     MemorySearchEpisodicParams,
     MemorySearchEpisodicRequest,
+    OsCancelInflightParams,
+    OsCancelInflightRequest,
     OsClickUiElementParams,
     OsClickUiElementRequest,
     OsControlMediaVolumeParams,
@@ -435,6 +437,8 @@ class VoiceRunner:
         self._turn_launched_targets: dict[str, dict[str, Any]] = {}
         self._circuit_breaker = ActionCircuitBreaker()
         self._last_screen_geometry: dict[str, Any] | None = None
+        self._active_target_hwnd: int | None = None
+        self._capture_seq: int = 0
         self._audio_init_retries = max(1, audio_init_retries)
         self._audio_init_retry_delay = max(0.0, audio_init_retry_delay)
         self._daemon_retry_delay = max(0.05, daemon_retry_delay)
@@ -2099,9 +2103,10 @@ class VoiceRunner:
             )
 
     def reset_turn_state(self) -> None:
-        """Reset per-turn launch deduplication and click circuit breaker state."""
+        """Reset per-turn launch deduplication, target HWND, and click circuit breaker state."""
         self._turn_launched_targets.clear()
         self._circuit_breaker.reset()
+        self._active_target_hwnd = None
 
     async def _capture_desktop_state(self) -> dict[str, Any] | None:
         """Capture lightweight foreground window and GSMTC state if configured."""
@@ -2676,6 +2681,16 @@ class VoiceRunner:
                     getattr(res, "coord_space", "normalized_1000") or "normalized_1000"
                 )
 
+                self._capture_seq += 1
+                effective_cap_seq = int(getattr(res, "capture_seq", 0) or self._capture_seq)
+                resolved_cap_hwnd = (
+                    getattr(active_res, "hwnd", None) if active_res is not None else None
+                )
+                if not resolved_cap_hwnd:
+                    resolved_cap_hwnd = getattr(res, "hwnd", None)
+                if isinstance(resolved_cap_hwnd, int) and resolved_cap_hwnd > 0:
+                    self._active_target_hwnd = int(resolved_cap_hwnd)
+
                 if img_w > 0 and img_h > 0 and scr_w > 0 and scr_h > 0:
                     self._last_screen_geometry = {
                         "image_width": int(img_w),
@@ -2686,6 +2701,9 @@ class VoiceRunner:
                         "virtual_top": v_top,
                         "dpi_scale": dpi_scale,
                         "coord_space": coord_space,
+                        "capture_seq": effective_cap_seq,
+                        "target_hwnd": self._active_target_hwnd,
+                        "window_bounds": list(res.window_bounds) if res.window_bounds else None,
                     }
 
                 payload: dict[str, Any] = {
@@ -2705,6 +2723,7 @@ class VoiceRunner:
                     "dpi_scale": dpi_scale,
                     "coord_space": coord_space,
                     "capture_seq": res.capture_seq,
+                    "target_hwnd": self._active_target_hwnd,
                     "captured_at": res.captured_at,
                     "window_title": res.window_title,
                     "active_window_title": res.window_title,
@@ -3048,6 +3067,14 @@ class VoiceRunner:
             try:
                 res = await self._rpc(req, timeout=10.0)
                 res_payload = dict(res) if isinstance(res, dict) else {"result": res}
+                if isinstance(req, (OsUiSnapshotRequest, OsOpenUrlRequest)):
+                    raw_target_hwnd = res_payload.get("hwnd") or res_payload.get("window_hwnd")
+                    if (
+                        isinstance(raw_target_hwnd, int)
+                        and not isinstance(raw_target_hwnd, bool)
+                        and raw_target_hwnd > 0
+                    ):
+                        self._active_target_hwnd = int(raw_target_hwnd)
                 merged_diff: dict[str, Any] | None = None
                 if should_diff:
                     after_state = await self._capture_desktop_state()
@@ -3077,6 +3104,22 @@ class VoiceRunner:
                 )
             except Exception as exc:
                 is_err = True
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) and isinstance(
+                    req,
+                    (
+                        OsGuiActionRequest,
+                        OsUiActRequest,
+                        OsUiBatchRequest,
+                        OsClickUiElementRequest,
+                    ),
+                ):
+                    with contextlib.suppress(Exception):
+                        await self._rpc(
+                            OsCancelInflightRequest(
+                                params=OsCancelInflightParams(reason="rpc_timeout")
+                            ),
+                            timeout=1.5,
+                        )
                 err_payload = {"error": f"{error_prefix}: {exc}"}
                 self._circuit_breaker.record_outcome(
                     event.name,
@@ -3427,6 +3470,15 @@ class VoiceRunner:
                     "aborted_precondition",
                 ):
                     self._turn_launched_targets[norm_target] = dict(res)
+                raw_focus_hwnd = res.get("hwnd") if isinstance(res, dict) else None
+                if (
+                    isinstance(raw_focus_hwnd, int)
+                    and not isinstance(raw_focus_hwnd, bool)
+                    and raw_focus_hwnd > 0
+                ):
+                    self._active_target_hwnd = int(raw_focus_hwnd)
+                if isinstance(res, dict) and res.get("ok", True) is not False:
+                    self._last_screen_geometry = None
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
@@ -4109,6 +4161,10 @@ class VoiceRunner:
                 if isinstance(res, dict):
                     res = dict(res)
                     await self._verify_control_system_window_state(eff_action, res, hwnd)
+                    if eff_action in _WINDOW_LAYOUT_ACTIONS:
+                        self._last_screen_geometry = None
+                        if eff_action in ("minimize", "minimize_window", "close", "close_window"):
+                            self._active_target_hwnd = None
                 tool_resp = VoiceToolResponse(
                     call_id=event.call_id,
                     name=event.name,
@@ -4287,6 +4343,27 @@ class VoiceRunner:
                 await _send_error(f"Unsupported mouse button: {raw_button!r}")
                 return
 
+            ref_arg = _req_str("ref")
+            app_arg = _req_str("app_name")
+            if (
+                expected_hwnd_val is None
+                and ref_arg is None
+                and app_arg is None
+                and action_norm
+                in {
+                    "click_at",
+                    "double_click",
+                    "right_click",
+                    "move",
+                    "type_text",
+                    "press_keys",
+                    "scroll",
+                }
+                and self._active_target_hwnd is not None
+                and self._active_target_hwnd > 0
+            ):
+                expected_hwnd_val = int(self._active_target_hwnd)
+
             await _execute_rpc_tool(
                 OsGuiActionRequest(
                     params=OsGuiActionParams(
@@ -4307,9 +4384,9 @@ class VoiceRunner:
                         virtual_left=virtual_left_val,
                         virtual_top=virtual_top_val,
                         dpi_scale=dpi_scale_val,
-                        ref=_req_str("ref"),
+                        ref=ref_arg,
                         key=_req_str("key"),
-                        app_name=_req_str("app_name"),
+                        app_name=app_arg,
                         expected_hwnd=expected_hwnd_val,
                     )
                 ),

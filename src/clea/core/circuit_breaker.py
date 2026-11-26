@@ -299,6 +299,8 @@ class ActionCircuitBreaker:
     last_state: dict[str, Any] = field(default_factory=dict)
     _visited_signatures: list[tuple[Any, str, str, str]] = field(default_factory=list)
     _blind_streak_origin: tuple[Any, str, str, str] | None = None
+    _streak_expected_process: str = ""
+    _streak_expected_hwnd: int | None = None
 
     def reset(self) -> None:
         """Reset all breaker counters and tripped state for a new turn or after recovery."""
@@ -309,6 +311,8 @@ class ActionCircuitBreaker:
         self.trip_reason = ""
         self._visited_signatures.clear()
         self._blind_streak_origin = None
+        self._streak_expected_process = ""
+        self._streak_expected_hwnd = None
 
     def build_blocked_payload(self) -> dict[str, Any]:
         """Return the structured tool response when the circuit breaker blocks an action."""
@@ -430,16 +434,22 @@ class ActionCircuitBreaker:
             if effective_diff is None and isinstance(res_dict.get("state_diff"), dict):
                 effective_diff = res_dict["state_diff"]
 
-            before_sig = (
-                _state_signature(effective_diff.get("before"))
-                if isinstance(effective_diff, dict)
-                else (None, "", "", "")
-            )
-            after_sig = (
-                _state_signature(effective_diff.get("after"))
-                if isinstance(effective_diff, dict)
-                else (None, "", "", "")
-            )
+            has_diff = isinstance(effective_diff, dict)
+            before_raw = effective_diff.get("before") if has_diff else None
+            after_raw = effective_diff.get("after") if has_diff else None
+            before_state = before_raw if isinstance(before_raw, dict) else {}
+            after_state = after_raw if isinstance(after_raw, dict) else {}
+
+            before_sig = _state_signature(before_state)
+            after_sig = _state_signature(after_state)
+
+            before_proc = str(before_state.get("process_name") or "").strip().lower()
+            after_proc = str(after_state.get("process_name") or "").strip().lower()
+
+            if self._streak_expected_process == "" and before_proc:
+                self._streak_expected_process = before_proc
+                raw_hwnd = before_state.get("hwnd")
+                self._streak_expected_hwnd = int(raw_hwnd) if isinstance(raw_hwnd, int) else None
 
             if self._blind_streak_origin is None and not _is_empty_sig(before_sig):
                 self._blind_streak_origin = before_sig
@@ -449,32 +459,55 @@ class ActionCircuitBreaker:
             changed = bool(isinstance(effective_diff, dict) and effective_diff.get("changed"))
             failed = is_error or res_dict.get("ok") is False
 
+            is_click = is_blind_click_action(norm, arguments)
+            expected_proc = self._streak_expected_process or before_proc
+            focus_hijacked = bool(
+                is_click
+                and expected_proc
+                and after_proc
+                and after_proc != expected_proc
+                and isinstance(effective_diff, dict)
+                and effective_diff.get("window_changed")
+                and not effective_diff.get("url_changed")
+                and not effective_diff.get("media_changed")
+            )
+
             # Detect unintended bounce back to an earlier visited state
             bounced = (
                 changed
+                and not focus_hijacked
                 and not _is_empty_sig(after_sig)
                 and (
                     after_sig == self._blind_streak_origin
                     or after_sig in self._visited_signatures
                 )
             )
-            no_forward_progress = failed or (not changed) or bounced
+            no_forward_progress = failed or (not changed) or bounced or focus_hijacked
 
             if not _is_empty_sig(after_sig) and after_sig not in self._visited_signatures:
                 self._visited_signatures.append(after_sig)
 
-            is_click = is_blind_click_action(norm, arguments)
             if no_forward_progress:
                 self.blind_loop_no_progress_count += 1
                 if is_click:
-                    if bounced and self.blind_click_no_progress_count == 0:
+                    if (bounced or focus_hijacked) and self.blind_click_no_progress_count == 0:
                         self.blind_click_no_progress_count = self.max_blind_clicks_without_progress
+                    elif focus_hijacked:
+                        self.blind_click_no_progress_count = max(
+                            self.blind_click_no_progress_count + 1,
+                            self.max_blind_clicks_without_progress,
+                        )
                     else:
                         self.blind_click_no_progress_count += 1
 
                 if self.blind_click_no_progress_count >= self.max_blind_clicks_without_progress:
                     self.tripped = True
-                    if bounced:
+                    if focus_hijacked:
+                        self.trip_reason = (
+                            f"unintended_focus_switch: blind click switched focus from "
+                            f"{expected_proc!r} to unrelated process {after_proc!r}."
+                        )
+                    elif bounced:
                         self.trip_reason = (
                             f"{self.blind_click_no_progress_count} consecutive blind click actions "
                             "produced an unintended state bounce with no verified forward progress."
