@@ -46,6 +46,15 @@ MediaVolumeAction = Literal[
     "next_track",
     "previous_track",
 ]
+VerificationScope = Literal[
+    "dispatch_only",
+    "window_focus",
+    "window_layout",
+    "media_session",
+    "ui_element_delta",
+    "in_app_view",
+    "browser_dom",
+]
 
 
 def new_id() -> str:
@@ -394,6 +403,14 @@ class OsGuiActionParams(_Model):
     expected_hwnd: int | None = Field(
         default=None,
         description="Optional explicit target HWND for focus precondition enforcement.",
+    )
+    capture_id: str | None = Field(
+        default=None,
+        description="Optional screen capture ID used to validate coordinate freshness.",
+    )
+    capture_bounds: list[int] | None = Field(
+        default=None,
+        description="Optional physical DWM capture bounds [left, top, right, bottom].",
     )
 
 
@@ -1470,6 +1487,9 @@ class OsOpenOrFocusAppResult(_Model):
     target_path: str | None = None
     error: str | None = None
     verification: ActionVerificationInfo | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
+    state_diff: dict[str, Any] | None = None
 
 
 class OsControlMediaVolumeResult(_Model):
@@ -1477,6 +1497,9 @@ class OsControlMediaVolumeResult(_Model):
     action: MediaVolumeAction
     level: int | None = None
     verification: ActionVerificationInfo | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
+    state_diff: dict[str, Any] | None = None
 
 
 class ClipboardItem(_Model):
@@ -1540,6 +1563,9 @@ class OsOpenUrlResult(_Model):
     cdp_used: bool = False
     before_url: str | None = None
     after_url: str | None = None
+    protocol_scheme: str | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
     state_diff: dict[str, Any] | None = None
 
 
@@ -1557,6 +1583,9 @@ class OsControlSystemResult(_Model):
     message: str | None = None
     rect: dict[str, int] | None = None
     verification: ActionVerificationInfo | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
+    state_diff: dict[str, Any] | None = None
     aborted_precondition: PreconditionAbortInfo | None = None
 
 
@@ -1605,6 +1634,9 @@ class OsInspectScreenResult(_Model):
         "non_interactive_desktop",
     ] = "ok"
     source: str | None = None
+    hwnd: int | None = None
+    capture_id: str | None = None
+    capture_bounds: list[int] | None = None
     window_title: str | None = None
     process_name: str | None = None
     question: str | None = None
@@ -1662,6 +1694,8 @@ class OsClickUiElementResult(_Model):
     hint: str | None = None
     message: str | None = None
     state_diff: dict[str, Any] | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
     reason: str | None = None
     error: str | None = None
     aborted_precondition: PreconditionAbortInfo | None = None
@@ -1678,6 +1712,8 @@ class OsGuiActionResult(_Model):
     y: int | None = None
     physical_x: int | None = None
     physical_y: int | None = None
+    expected_hwnd: int | None = None
+    actual_hwnd: int | None = None
     coord_space: str | None = None
     clicks: int | None = None
     button: str | None = None
@@ -1698,6 +1734,8 @@ class OsGuiActionResult(_Model):
     hint: str | None = None
     message: str | None = None
     state_diff: dict[str, Any] | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
     circuit_breaker_tripped: bool | None = None
     suggested_recovery: list[str] | None = None
     entry_method: str | None = None
@@ -1786,6 +1824,8 @@ class OsUiActResult(_Model):
     hint: str | None = None
     message: str | None = None
     state_diff: dict[str, Any] | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
     active_window_title: str | None = None
@@ -1810,6 +1850,8 @@ class OsUiBatchResult(_Model):
     steps_executed: int = 0
     step_results: list[dict[str, Any]] = Field(default_factory=list)
     state_diff: dict[str, Any] | None = None
+    verification_scope: VerificationScope | None = None
+    goal_verified: bool | None = None
     diff: UiDiff | None = None
     snapshot: OsUiSnapshotResult | None = None
     cancelled: bool | None = None

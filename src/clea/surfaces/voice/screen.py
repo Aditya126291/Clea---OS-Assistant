@@ -14,6 +14,7 @@ import io
 import logging
 import sys
 import threading
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,7 @@ from clea.surfaces.voice.win32 import (
 logger = logging.getLogger(__name__)
 
 NATIVE_PNG_MAX_BYTES = 2_500_000
+MAX_VISION_DIMENSION = 1568
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,8 @@ class ScreenCaptureResult:
     dpi_scale: float = 1.0
     coord_space: str = "normalized_1000"
     hwnd: int | None = None
+    capture_id: str | None = None
+    capture_bounds: tuple[int, int, int, int] | None = None
 
 
 def is_window_blocked(
@@ -178,11 +182,21 @@ def encode_native_frame(
     *,
     fallback_jpeg_quality: int = 94,
     max_png_bytes: int = NATIVE_PNG_MAX_BYTES,
+    max_side: int | None = None,
 ) -> tuple[bytes, str]:
-    """Encode an un-downscaled 1:1 native frame as lossless PNG (with JPEG fallback if huge)."""
+    """Encode a native frame as lossless PNG (with optional max_side cap and JPEG fallback)."""
     img = image
     if img.mode != "RGB":
         img = img.convert("RGB")
+
+    w, h = img.size
+    longest = max(w, h)
+    if max_side is not None and max_side > 0 and longest > max_side and longest > 0:
+        scale = max_side / float(longest)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img = img.resize((new_w, new_h), resample=resample)
 
     png_buf = io.BytesIO()
     img.save(png_buf, format="PNG", compress_level=1)
@@ -430,8 +444,18 @@ class ScreenCaptureService:
             img = self._grab_screen_region(capture_bounds, virtual_origin=virtual_origin)
             raw_w, raw_h = img.width, img.height
             if target == "active_window":
-                frame_bytes, mime_type = encode_native_frame(img)
-                encoded_w, encoded_h = raw_w, raw_h
+                longest = max(raw_w, raw_h)
+                if longest > MAX_VISION_DIMENSION and longest > 0:
+                    scale = MAX_VISION_DIMENSION / float(longest)
+                    encoded_w = max(1, int(round(raw_w * scale)))
+                    encoded_h = max(1, int(round(raw_h * scale)))
+                    frame_bytes, mime_type = encode_native_frame(
+                        img,
+                        max_side=MAX_VISION_DIMENSION,
+                    )
+                else:
+                    frame_bytes, mime_type = encode_native_frame(img)
+                    encoded_w, encoded_h = raw_w, raw_h
             else:
                 frame_bytes = encode_frame(
                     img,
@@ -465,6 +489,9 @@ class ScreenCaptureService:
                 v_left, v_top = int(virtual_origin[0]), int(virtual_origin[1])
                 s_width, s_height = raw_w, raw_h
 
+            effective_capture_bounds = (v_left, v_top, v_left + s_width, v_top + s_height)
+            capture_id = f"cap_{uuid.uuid4().hex[:12]}"
+
             dpi_scale = 1.0
             if self._has_injected_api or (sys.platform == "win32" and self._grabber is None):
                 with contextlib.suppress(Exception):
@@ -477,8 +504,8 @@ class ScreenCaptureService:
             return ScreenCaptureResult(
                 image_bytes=frame_bytes,
                 target=target,
-                width=img.width,
-                height=img.height,
+                width=encoded_w,
+                height=encoded_h,
                 window_title=win_info.title if win_info else None,
                 process_name=win_info.process_name if win_info else None,
                 blocked=False,
@@ -500,6 +527,8 @@ class ScreenCaptureService:
                 dpi_scale=dpi_scale,
                 coord_space="normalized_1000",
                 hwnd=win_info.hwnd if win_info else None,
+                capture_id=capture_id,
+                capture_bounds=effective_capture_bounds,
             )
         except Exception as exc:
             logger.warning("Screen capture failed: %s", exc)

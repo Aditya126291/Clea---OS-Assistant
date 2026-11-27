@@ -17,6 +17,8 @@ WakeWordEngine = Literal["auto", "livekit", "openwakeword"]
 
 VOICE_CONFIG_FILENAME = "voice_config.toml"
 DEFAULT_VAD_SILENCE_DURATION_MS = 1000
+RECOMMENDED_MIN_IMAGE_MAX_SIDE = 1280
+RECOMMENDED_MEDIA_RESOLUTION: MediaResolution = "high"
 
 
 class ScreenBlocklistConfig(BaseModel):
@@ -258,3 +260,25 @@ def load_voice_config(
     raw_text = target.read_text(encoding="utf-8-sig")
     raw = tomllib.loads(raw_text)
     return VoiceConfig.model_validate(_apply_voice_env_overrides(raw))
+
+
+def check_legacy_vision_config_warnings(
+    config: VoiceConfig,
+    config_path: Path | None = None,
+) -> list[str]:
+    """Return non-destructive warnings when ``voice_config.toml`` uses degraded vision settings."""
+    warnings: list[str] = []
+    source = str(config_path) if config_path is not None else VOICE_CONFIG_FILENAME
+    if config.image_max_side < RECOMMENDED_MIN_IMAGE_MAX_SIDE:
+        warnings.append(
+            f"Legacy vision config in {source}: image_max_side={config.image_max_side} "
+            f"is below the recommended minimum of {RECOMMENDED_MIN_IMAGE_MAX_SIDE} "
+            "(default 1920). Raise image_max_side for sharper screen grounding."
+        )
+    if config.media_resolution != RECOMMENDED_MEDIA_RESOLUTION:
+        warnings.append(
+            f"Legacy vision config in {source}: media_resolution={config.media_resolution!r} "
+            f"is below the recommended {RECOMMENDED_MEDIA_RESOLUTION!r}. "
+            'Set media_resolution = "high" for accurate visual coordinate calibration.'
+        )
+    return warnings

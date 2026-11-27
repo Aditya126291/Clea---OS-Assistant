@@ -70,6 +70,7 @@ class GeminiLiveBackend(VoiceBackend):
         self._reconnect_count = 0
         self._last_assistant_transcript: tuple[str, bool] | None = None
         self._turn_completed: bool = False
+        self._cancelled_call_ids: set[str] = set()
 
     @property
     def model_name(self) -> str:
@@ -79,6 +80,10 @@ class GeminiLiveBackend(VoiceBackend):
     def resumption_handle(self) -> str | None:
         """Current session resumption handle if available."""
         return self._resumption_handle
+
+    def is_call_cancelled(self, call_id: str) -> bool:
+        """Return True if Gemini Live already cancelled *call_id* via tool_call_cancellation."""
+        return bool(call_id) and call_id in self._cancelled_call_ids
 
     async def connect(self, config: VoiceSessionConfig) -> None:
         """Establish a live WebSocket session with Gemini Live API."""
@@ -278,6 +283,7 @@ class GeminiLiveBackend(VoiceBackend):
         self._session = session
         self._last_assistant_transcript = None
         self._turn_completed = False
+        self._cancelled_call_ids.clear()
         self._receive_task = asyncio.create_task(
             self._receive_loop(),
             name="GeminiLiveBackendReceiveLoop",
@@ -392,6 +398,16 @@ class GeminiLiveBackend(VoiceBackend):
     async def _handle_server_message(self, msg: types.LiveServerMessage) -> None:
         has_tool_call = bool(msg.tool_call is not None and msg.tool_call.function_calls)
 
+        # Pre-register server-cancelled call IDs before emitting InterruptedEvent so
+        # consumers handling same-frame interrupted + tool_call_cancellation never send
+        # duplicate or invalid tool responses for server-cancelled calls.
+        if msg.tool_call_cancellation is not None and msg.tool_call_cancellation.ids:
+            if len(self._cancelled_call_ids) > 512:
+                self._cancelled_call_ids.clear()
+            for cancelled_id in msg.tool_call_cancellation.ids:
+                if cancelled_id:
+                    self._cancelled_call_ids.add(cancelled_id)
+
         # 1. Content and audio
         if msg.server_content is not None:
             sc = msg.server_content
@@ -470,6 +486,8 @@ class GeminiLiveBackend(VoiceBackend):
             self._last_assistant_transcript = None
             for fc in msg.tool_call.function_calls:
                 call_id = fc.id or ""
+                if call_id:
+                    self._cancelled_call_ids.discard(call_id)
                 name = fc.name or ""
                 args = dict(fc.args) if fc.args else {}
                 await self._events_queue.put(
@@ -570,8 +588,23 @@ class GeminiLiveBackend(VoiceBackend):
         if session is None or self._closed or not responses:
             return
 
-        formatted: list[types.FunctionResponse] = []
+        active_responses: list[VoiceToolResponse] = []
+        skipped_ids: list[str] = []
         for r in responses:
+            if r.call_id and r.call_id in self._cancelled_call_ids:
+                skipped_ids.append(r.call_id)
+                continue
+            active_responses.append(r)
+        if skipped_ids:
+            logger.debug(
+                "Suppressing tool response(s) for server-cancelled call_id(s): %s",
+                skipped_ids,
+            )
+        if not active_responses:
+            return
+
+        formatted: list[types.FunctionResponse] = []
+        for r in active_responses:
             sched = types.FunctionResponseScheduling.WHEN_IDLE
             if r.scheduling == "interrupt":
                 sched = types.FunctionResponseScheduling.INTERRUPT
@@ -638,6 +671,7 @@ class GeminiLiveBackend(VoiceBackend):
         if self._closed:
             return
         self._closed = True
+        self._cancelled_call_ids.clear()
 
         if self._receive_task is not None:
             self._receive_task.cancel()

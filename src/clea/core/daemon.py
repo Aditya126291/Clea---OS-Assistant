@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ctypes
 import inspect
 import logging
 import logging.handlers
@@ -13,7 +14,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Coroutine, Iterable, Sequence
+import urllib.parse
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -130,9 +132,18 @@ from clea.tools.action_harness import (
 )
 from clea.tools.cdp_bridge import close_default_cdp_bridge
 from clea.tools.git_workspace import inspect_git_workspace
-from clea.tools.guards import Win32FocusPreconditionBackend, WinRTMediaVerificationBackend
+from clea.tools.guards import (
+    Win32FocusPreconditionBackend,
+    WinRTMediaVerificationBackend,
+    apply_verification_metadata,
+)
 from clea.tools.registry import ToolDefinition
 from clea.tools.uia_com import close_default_uia_com_engine
+from clea.tools.view_fingerprint import (
+    WindowViewFingerprint,
+    cancellable_settle_wait,
+    capture_window_view_fingerprint,
+)
 from clea.tools.vision import MAX_VISION_DIMENSION, _downscale_png
 from clea.tools.windows_os import (
     cancel_inflight_os_actions,
@@ -273,6 +284,9 @@ class CleaDaemon:
         focus_backend: FocusPreconditionBackend | None = None,
         media_backend: MediaVerificationBackend | None = None,
         action_verifier: ActionVerifier | None = None,
+        view_fingerprint_fn: Callable[..., WindowViewFingerprint | None] | None = None,
+        view_settle_seconds: float = 0.2,
+        view_settle_fn: Callable[..., bool] | None = None,
     ) -> None:
         self.host = _validate_localhost(host)
         self.port = port
@@ -291,6 +305,9 @@ class CleaDaemon:
         self._focus_backend = focus_backend
         self._media_backend = media_backend
         self._action_verifier = action_verifier
+        self._view_fingerprint_fn = view_fingerprint_fn
+        self._view_settle_seconds = max(0.0, float(view_settle_seconds))
+        self._view_settle_fn = view_settle_fn
         self._server: Server | None = None
         self._busy_sessions: set[str] = set()
         self._busy_turn_tokens: dict[str, str] = {}
@@ -3196,27 +3213,153 @@ class CleaDaemon:
             )
         return extra
 
-    async def _capture_desktop_state(self) -> dict[str, Any] | None:
-        """Capture lightweight foreground window, CDP page, and GSMTC state if configured."""
-        if self._focus_backend is None and self._media_backend is None:
+    def _is_live_win32_focus_backend(self) -> bool:
+        return (
+            sys.platform == "win32"
+            and isinstance(self._focus_backend, Win32FocusPreconditionBackend)
+            and isinstance(getattr(self._focus_backend, "_user32", None), ctypes.CDLL)
+        )
+
+    async def _capture_view_fingerprint(
+        self,
+        hwnd: int | None = None,
+        *,
+        include_heading: bool = True,
+    ) -> WindowViewFingerprint | None:
+        """Capture an in-app WindowViewFingerprint via injected hook or live Win32 backend."""
+        if self._view_fingerprint_fn is not None:
+            def _invoke_hook() -> WindowViewFingerprint | None:
+                assert self._view_fingerprint_fn is not None
+                try:
+                    return self._view_fingerprint_fn(hwnd)
+                except TypeError:
+                    return self._view_fingerprint_fn()
+
+            with contextlib.suppress(Exception):
+                return await asyncio.to_thread(_invoke_hook)
+            return None
+        if not self._is_live_win32_focus_backend():
             return None
         with contextlib.suppress(Exception):
             return await asyncio.to_thread(
-                capture_desktop_state,
+                capture_window_view_fingerprint,
+                hwnd,
+                include_heading=include_heading,
                 focus_backend=self._focus_backend,
-                media_backend=self._media_backend,
             )
         return None
+
+    async def _settle_for_view_capture(
+        self,
+        *,
+        seconds: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        wait_s = self._view_settle_seconds if seconds is None else max(0.0, float(seconds))
+        if self._view_settle_fn is not None:
+            def _invoke_settle() -> bool:
+                assert self._view_settle_fn is not None
+                try:
+                    return bool(self._view_settle_fn(wait_s, cancel_event=cancel_event))
+                except TypeError:
+                    try:
+                        return bool(self._view_settle_fn(wait_s))
+                    except TypeError:
+                        return bool(self._view_settle_fn())
+
+            return await asyncio.to_thread(_invoke_settle)
+        if wait_s <= 0.0:
+            return not (cancel_event is not None and cancel_event.is_set())
+        return await asyncio.to_thread(
+            cancellable_settle_wait,
+            wait_s,
+            cancel_event=cancel_event,
+        )
+
+    async def _capture_desktop_state(
+        self,
+        *,
+        include_view_fingerprint: bool = False,
+        include_media: bool = True,
+        target_hwnd: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Capture lightweight foreground window, CDP page, GSMTC, and optional view state."""
+        state: dict[str, Any] | None = None
+        if self._focus_backend is not None or (include_media and self._media_backend is not None):
+            with contextlib.suppress(Exception):
+                state = await asyncio.to_thread(
+                    capture_desktop_state,
+                    focus_backend=self._focus_backend,
+                    media_backend=self._media_backend if include_media else None,
+                    include_media=include_media,
+                )
+        if include_view_fingerprint and (
+            self._view_fingerprint_fn is not None or self._is_live_win32_focus_backend()
+        ):
+            fp_hwnd = target_hwnd
+            if fp_hwnd is None and isinstance(state, dict):
+                raw_h = state.get("hwnd")
+                if isinstance(raw_h, int) and not isinstance(raw_h, bool):
+                    fp_hwnd = raw_h
+            fp = await self._capture_view_fingerprint(fp_hwnd)
+            if fp is not None:
+                state = dict(state) if isinstance(state, dict) else {
+                    "hwnd": fp.hwnd,
+                    "title": "",
+                    "process_name": "",
+                }
+                if state.get("hwnd") is None and fp.hwnd is not None:
+                    state["hwnd"] = fp.hwnd
+                if fp.dhash_hex:
+                    state["dhash"] = fp.dhash_hex
+                if fp.heading:
+                    state["heading"] = fp.heading
+                state["view_fingerprint"] = fp.to_dict()
+        return state
 
     async def _attach_state_diff(
         self,
         res: Any,
         before_state: dict[str, Any] | None,
+        *,
+        include_view_fingerprint: bool = False,
+        include_media: bool = True,
+        settle: bool = False,
+        cancel_event: threading.Event | None = None,
+        target_hwnd: int | None = None,
     ) -> Any:
         """Capture post-action state and merge before -> after diff into *res*."""
         if not isinstance(res, dict):
             return res
-        after_state = await self._capture_desktop_state() if before_state is not None else None
+        if (
+            settle
+            and before_state is not None
+            and res.get("ok", res.get("success", True)) is not False
+            and (
+                self._view_fingerprint_fn is not None
+                or self._is_live_win32_focus_backend()
+                or self._view_settle_fn is not None
+            )
+        ):
+            await self._settle_for_view_capture(cancel_event=cancel_event)
+
+        after_hwnd = target_hwnd
+        if after_hwnd is None:
+            for key in ("hwnd", "window_hwnd", "active_hwnd"):
+                cand = res.get(key)
+                if isinstance(cand, int) and not isinstance(cand, bool) and cand > 0:
+                    after_hwnd = cand
+                    break
+
+        after_state = (
+            await self._capture_desktop_state(
+                include_view_fingerprint=include_view_fingerprint,
+                include_media=include_media,
+                target_hwnd=after_hwnd,
+            )
+            if before_state is not None
+            else None
+        )
         captured_diff = (
             compute_state_diff(before_state, after_state)
             if (before_state is not None or after_state is not None)
@@ -3228,9 +3371,40 @@ class CleaDaemon:
             res["state_diff"] = merged
         return res
 
+    @staticmethod
+    def _extract_url_scheme(raw_url: str | None) -> str:
+        stripped = (raw_url or "").strip()
+        if not stripped:
+            return ""
+        try:
+            scheme = urllib.parse.urlsplit(stripped).scheme.strip().lower()
+        except Exception:
+            return ""
+        return scheme
+
+    @staticmethod
+    def _state_diff_telemetry(res: dict[str, Any]) -> tuple[bool | None, bool | None, int | None]:
+        sd = res.get("state_diff")
+        if not isinstance(sd, dict):
+            return (None, None, None)
+        changed = sd.get("changed")
+        view_changed = sd.get("view_changed")
+        after_hwnd: int | None = None
+        after = sd.get("after")
+        if isinstance(after, dict):
+            raw_h = after.get("hwnd")
+            if isinstance(raw_h, int) and not isinstance(raw_h, bool):
+                after_hwnd = raw_h
+        return (
+            bool(changed) if changed is not None else None,
+            bool(view_changed) if view_changed is not None else None,
+            after_hwnd,
+        )
+
     async def _handle_os_open_or_focus_app(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
         guard_kwargs = self._os_guard_kwargs(open_or_focus_app)
+        before_state = await self._capture_desktop_state(include_media=False)
         try:
             res = await asyncio.to_thread(
                 open_or_focus_app,
@@ -3246,11 +3420,23 @@ class CleaDaemon:
             TypeError,
             OverflowError,
         ) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+            err_msg = str(exc).strip() or type(exc).__name__
+            self._audit_log(
+                "os_open_or_focus_app",
+                app=req.params.app_name,
+                status="error",
+                error_type=type(exc).__name__,
+                error=err_msg,
+            )
+            await self._respond(ws, req, error=err_msg)
             return
+        res = await self._attach_state_diff(res, before_state, include_media=False)
+        res = apply_verification_metadata("open_or_focus_app", res)
         audit_details: dict[str, Any] = {
             "app": res.get("app"),
             "status": res.get("status"),
+            "verification_scope": res.get("verification_scope"),
+            "goal_verified": res.get("goal_verified"),
         }
         logged_target = res.get("target_path") or req.params.target_path
         if logged_target:
@@ -3281,11 +3467,27 @@ class CleaDaemon:
             TypeError,
             OverflowError,
         ) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+            err_msg = str(exc).strip() or type(exc).__name__
+            self._audit_log(
+                "os_control_media_volume",
+                media_action=req.params.action,
+                level=req.params.level,
+                status="error",
+                error_type=type(exc).__name__,
+                error=err_msg,
+            )
+            await self._respond(ws, req, error=err_msg)
             return
+        res = apply_verification_metadata(
+            "control_media_volume",
+            res,
+            action=req.params.action,
+        )
         audit_details: dict[str, Any] = {
             "media_action": res.get("action"),
             "level": res.get("level"),
+            "verification_scope": res.get("verification_scope"),
+            "goal_verified": res.get("goal_verified"),
         }
         if isinstance(res.get("verification"), dict):
             audit_details["verified"] = res["verification"].get("verified")
@@ -3391,7 +3593,8 @@ class CleaDaemon:
 
     async def _handle_os_open_url(self, conn: _Connection, req: Any) -> None:
         ws = conn.ws
-        before_state = await self._capture_desktop_state()
+        parsed_scheme = self._extract_url_scheme(req.params.url)
+        before_state = await self._capture_desktop_state(include_view_fingerprint=True)
         try:
             open_kwargs: dict[str, Any] = {}
             accepted_params: set[str] | None = None
@@ -3427,14 +3630,48 @@ class CleaDaemon:
             TypeError,
             OverflowError,
         ) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+            err_msg = str(exc).strip() or type(exc).__name__
+            self._audit_log(
+                "os_open_url",
+                url=req.params.url,
+                scheme=parsed_scheme,
+                browser=req.params.browser,
+                status="error",
+                error_type=type(exc).__name__,
+                error=err_msg,
+            )
+            await self._respond(ws, req, error=err_msg)
             return
-        res = await self._attach_state_diff(res, before_state)
+        res_scheme = (
+            str(res.get("protocol_scheme") or parsed_scheme or "").strip().lower()
+            if isinstance(res, dict)
+            else parsed_scheme
+        )
+        is_custom_scheme = (bool(res_scheme) and res_scheme not in {"http", "https"}) or (
+            isinstance(res, dict)
+            and str(res.get("resolution_layer") or "").strip().lower()
+            in {"url_protocol", "custom_protocol"}
+        )
+        res = await self._attach_state_diff(
+            res,
+            before_state,
+            include_view_fingerprint=True,
+            settle=is_custom_scheme,
+        )
+        if isinstance(res, dict) and res_scheme and not res.get("protocol_scheme"):
+            if res_scheme not in {"http", "https"}:
+                res = dict(res)
+                res["protocol_scheme"] = res_scheme
+        res = apply_verification_metadata("open_url", res)
+        _, view_changed, _ = self._state_diff_telemetry(res)
         self._audit_log(
             "os_open_url",
             url=req.params.url,
+            scheme=res_scheme or self._extract_url_scheme(res.get("url")),
             browser=req.params.browser,
             status=res.get("status"),
+            view_changed=view_changed,
+            goal_verified=res.get("goal_verified"),
         )
         model_cls = METHOD_RESULTS["os.open_url"]
         valid_fields = set(model_cls.model_fields.keys())
@@ -3456,6 +3693,13 @@ class CleaDaemon:
             req.params.window_title
             or getattr(req.params, "title", None)
             or getattr(req.params, "title_query", None)
+        )
+        norm_action = (action or "").strip().lower()
+        is_settings_action = norm_action in {"open_settings", "settings"}
+        before_state = await self._capture_desktop_state(
+            include_view_fingerprint=is_settings_action,
+            include_media=False,
+            target_hwnd=req.params.hwnd,
         )
 
         try:
@@ -3511,7 +3755,17 @@ class CleaDaemon:
             TypeError,
             OverflowError,
         ) as exc:
-            await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+            err_msg = str(exc).strip() or type(exc).__name__
+            self._audit_log(
+                "os_control_system",
+                system_action=action,
+                status="error",
+                page=req.params.page,
+                uri=req.params.uri,
+                error_type=type(exc).__name__,
+                error=err_msg,
+            )
+            await self._respond(ws, req, error=err_msg)
             return
 
         # Ensure window snap/layout actions wait for ActionVerifier.verify_window_state
@@ -3523,7 +3777,6 @@ class CleaDaemon:
             and not isinstance(res.get("hwnd"), bool)
             and (self._action_verifier is not None or self._focus_backend is not None)
         ):
-            norm_act = (action or "").strip().lower()
             snap_map = {
                 "snap_left": (None, "left"),
                 "snap_left_window": (None, "left"),
@@ -3538,8 +3791,8 @@ class CleaDaemon:
                 "close": ("closed", None),
                 "close_window": ("closed", None),
             }
-            if norm_act in snap_map:
-                expected_state, expected_snap = snap_map[norm_act]
+            if norm_action in snap_map:
+                expected_state, expected_snap = snap_map[norm_action]
                 active_verifier = self._action_verifier or ActionVerifier(
                     focus_backend=self._focus_backend,
                     media_backend=self._media_backend,
@@ -3563,12 +3816,32 @@ class CleaDaemon:
                     res["success"] = False
                     res["status"] = "verification_failed"
 
+        res = await self._attach_state_diff(
+            res,
+            before_state,
+            include_view_fingerprint=is_settings_action,
+            include_media=False,
+            settle=is_settings_action,
+            cancel_event=self._current_task_cancel_event(),
+            target_hwnd=res.get("hwnd") if isinstance(res, dict) else None,
+        )
+        res = apply_verification_metadata("control_system", res, action=action)
+        _, view_changed, _ = self._state_diff_telemetry(res)
+
         audit_sys: dict[str, Any] = {
             "system_action": action,
             "status": res.get("status"),
+            "page": req.params.page,
+            "uri": res.get("uri") or req.params.uri,
+            "view_changed": view_changed,
+            "goal_verified": res.get("goal_verified"),
+            "verification_scope": res.get("verification_scope"),
+            "verified": (
+                res["verification"].get("verified")
+                if isinstance(res.get("verification"), dict)
+                else None
+            ),
         }
-        if isinstance(res.get("verification"), dict):
-            audit_sys["verified"] = res["verification"].get("verified")
         self._audit_log("os_control_system", **audit_sys)
         model_cls = METHOD_RESULTS["os.control_system"]
         valid_fields = set(model_cls.model_fields.keys())
@@ -3728,6 +4001,12 @@ class CleaDaemon:
         if isinstance(res.attachment, dict) and isinstance(res.attachment.get("data"), bytes):
             image_base64 = base64.b64encode(res.attachment["data"]).decode("ascii")
             image_mime_type = str(res.attachment.get("mime_type") or "image/png")
+        raw_capture_bounds = getattr(res, "capture_bounds", None)
+        capture_bounds_list = (
+            [int(v) for v in raw_capture_bounds]
+            if isinstance(raw_capture_bounds, (list, tuple)) and len(raw_capture_bounds) == 4
+            else None
+        )
         model_cls = METHOD_RESULTS["os.inspect_screen"]
         await self._respond(
             ws,
@@ -3736,6 +4015,9 @@ class CleaDaemon:
                 ok=(res.status == "ok"),
                 status=res.status,
                 source=res.source,
+                hwnd=getattr(res, "hwnd", None),
+                capture_id=getattr(res, "capture_id", None),
+                capture_bounds=capture_bounds_list,
                 window_title=res.window_title,
                 process_name=res.process_name,
                 question=res.question,
@@ -3819,7 +4101,7 @@ class CleaDaemon:
             if cancel_ev is not None and cancel_ev.is_set():
                 await self._respond(ws, req, error="os_action_cancelled")
                 return
-            before_state = await self._capture_desktop_state()
+            before_state = await self._capture_desktop_state(include_view_fingerprint=True)
             try:
                 res = await asyncio.to_thread(
                     click_ui_element,
@@ -3840,15 +4122,33 @@ class CleaDaemon:
                 TypeError,
                 OverflowError,
             ) as exc:
-                await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+                err_msg = str(exc).strip() or type(exc).__name__
+                self._audit_log(
+                    "os_click_ui_element",
+                    name=req.params.name,
+                    control_type=req.params.control_type,
+                    status="error",
+                    error_type=type(exc).__name__,
+                    error=err_msg,
+                )
+                await self._respond(ws, req, error=err_msg)
                 return
-        res = await self._attach_state_diff(res, before_state)
+        res = await self._attach_state_diff(
+            res,
+            before_state,
+            include_view_fingerprint=True,
+            cancel_event=cancel_ev,
+        )
+        res = apply_verification_metadata("click_ui_element", res)
+        _, view_changed, _ = self._state_diff_telemetry(res)
         self._audit_log(
             "os_click_ui_element",
             name=res.get("name"),
             control_type=res.get("control_type"),
             method=res.get("method"),
             status=res.get("status"),
+            view_changed=view_changed,
+            goal_verified=res.get("goal_verified"),
         )
         model_cls = METHOD_RESULTS["os.click_ui_element"]
         valid_fields = set(model_cls.model_fields.keys())
@@ -3870,6 +4170,8 @@ class CleaDaemon:
                     action=p.action,
                     cancelled=True,
                     error="os_action_cancelled",
+                    verification_scope="dispatch_only",
+                    goal_verified=False,
                 ),
             )
             return
@@ -3878,6 +4180,8 @@ class CleaDaemon:
         optional_gui_fields = (
             "app_name",
             "expected_hwnd",
+            "capture_id",
+            "capture_bounds",
             "coord_space",
             "image_width",
             "image_height",
@@ -3910,6 +4214,7 @@ class CleaDaemon:
                     extra_gui_kwargs[name] = val
         extra_gui_kwargs.update(self._cancel_kwarg_for(gui_action, cancel_ev))
 
+        is_wait_action = str(p.action or "").strip().lower() == "wait"
         async with self._os_input_exec_lock:
             if cancel_ev is not None and cancel_ev.is_set():
                 model_cls = METHOD_RESULTS["os.gui_action"]
@@ -3922,12 +4227,17 @@ class CleaDaemon:
                         action=p.action,
                         cancelled=True,
                         error="os_action_cancelled",
+                        verification_scope="dispatch_only",
+                        goal_verified=False,
                     ),
                 )
                 return
             before_state = (
-                await self._capture_desktop_state()
-                if str(p.action or "").strip().lower() != "wait"
+                await self._capture_desktop_state(
+                    include_view_fingerprint=True,
+                    target_hwnd=p.expected_hwnd,
+                )
+                if not is_wait_action
                 else None
             )
             try:
@@ -3956,13 +4266,59 @@ class CleaDaemon:
                 TypeError,
                 OverflowError,
             ) as exc:
-                await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+                err_msg = str(exc).strip() or type(exc).__name__
+                self._audit_log(
+                    "os_gui_action",
+                    gui_action=p.action,
+                    status="error",
+                    coord_space=p.coord_space,
+                    x=p.x,
+                    y=p.y,
+                    expected_hwnd=p.expected_hwnd,
+                    error_type=type(exc).__name__,
+                    error=err_msg,
+                )
+                await self._respond(ws, req, error=err_msg)
                 return
-        res = await self._attach_state_diff(res, before_state)
+        res = await self._attach_state_diff(
+            res,
+            before_state,
+            include_view_fingerprint=not is_wait_action,
+            cancel_event=cancel_ev,
+            target_hwnd=p.expected_hwnd,
+        )
+        res = apply_verification_metadata("gui_action", res, action=p.action)
+        sd_changed, view_changed, after_hwnd = self._state_diff_telemetry(res)
         self._audit_log(
             "os_gui_action",
             gui_action=p.action,
             status=res.get("status"),
+            coord_space=res.get("coord_space") or p.coord_space,
+            x=p.x if p.x is not None else res.get("x"),
+            y=p.y if p.y is not None else res.get("y"),
+            physical_x=(
+                res.get("physical_x")
+                if res.get("physical_x") is not None
+                else res.get("x")
+            ),
+            physical_y=(
+                res.get("physical_y")
+                if res.get("physical_y") is not None
+                else res.get("y")
+            ),
+            expected_hwnd=(
+                res.get("expected_hwnd")
+                if res.get("expected_hwnd") is not None
+                else p.expected_hwnd
+            ),
+            actual_hwnd=(
+                res.get("actual_hwnd")
+                if res.get("actual_hwnd") is not None
+                else after_hwnd
+            ),
+            state_diff_changed=sd_changed,
+            view_changed=view_changed,
+            goal_verified=res.get("goal_verified"),
         )
         model_cls = METHOD_RESULTS["os.gui_action"]
         valid_fields = set(model_cls.model_fields.keys())
@@ -4011,7 +4367,7 @@ class CleaDaemon:
             if cancel_ev is not None and cancel_ev.is_set():
                 await self._respond(ws, req, error="os_action_cancelled")
                 return
-            before_state = await self._capture_desktop_state()
+            before_state = await self._capture_desktop_state(include_view_fingerprint=True)
             try:
                 try:
                     res = await asyncio.to_thread(
@@ -4043,15 +4399,36 @@ class CleaDaemon:
                 TypeError,
                 OverflowError,
             ) as exc:
-                await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
+                err_msg = str(exc).strip() or type(exc).__name__
+                self._audit_log(
+                    "os_ui_act",
+                    ref=p.ref,
+                    ui_action=p.action,
+                    status="error",
+                    error_type=type(exc).__name__,
+                    error=err_msg,
+                )
+                await self._respond(ws, req, error=err_msg)
                 return
-        res = await self._attach_state_diff(res, before_state)
+        res = await self._attach_state_diff(
+            res,
+            before_state,
+            include_view_fingerprint=True,
+            cancel_event=cancel_ev,
+        )
+        res = apply_verification_metadata("ui_act", res, action=p.action)
+        _, view_changed, _ = self._state_diff_telemetry(res)
         self._audit_log(
             "os_ui_act",
             ref=p.ref,
             ui_action=p.action,
             status=res.get("status"),
             reason=res.get("reason"),
+            role=res.get("role"),
+            name=res.get("name"),
+            method=res.get("method"),
+            view_changed=view_changed,
+            goal_verified=res.get("goal_verified"),
         )
         model_cls = METHOD_RESULTS["os.ui_act"]
         valid_fields = set(model_cls.model_fields.keys())
@@ -4116,11 +4493,13 @@ class CleaDaemon:
                 await self._respond(ws, req, error=str(exc).strip() or type(exc).__name__)
                 return
         res = await self._attach_state_diff(res, before_state)
+        res = apply_verification_metadata("ui_batch", res)
         self._audit_log(
             "os_ui_batch",
             steps_executed=res.get("steps_executed"),
             status=res.get("status"),
             reason=res.get("reason"),
+            goal_verified=res.get("goal_verified"),
         )
         model_cls = METHOD_RESULTS["os.ui_batch"]
         valid_fields = set(model_cls.model_fields.keys())

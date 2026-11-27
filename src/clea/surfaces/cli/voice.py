@@ -34,7 +34,11 @@ from clea.surfaces.voice.backends.base import (
     TurnCompleteEvent,
     VoiceSessionConfig,
 )
-from clea.surfaces.voice.config import load_voice_config, voice_config_path
+from clea.surfaces.voice.config import (
+    check_legacy_vision_config_warnings,
+    load_voice_config,
+    voice_config_path,
+)
 from clea.surfaces.voice.lock import VoiceAlreadyRunningError
 from clea.surfaces.voice.runner import VoiceRunner, voice_log_path
 from clea.surfaces.voice.wake_word import (
@@ -200,8 +204,46 @@ def _configure_voice_service_logging() -> None:
         )
 
 
+def build_default_action_verifier(
+    *,
+    focus_backend: Any = None,
+    media_backend: Any = None,
+) -> Any:
+    """Build a default ``ActionVerifier`` wired with Win32/WinRT backends on Windows.
+
+    Respects ``sys.platform == "win32"`` and allows injectable backend overrides
+    so callers and tests never touch live OS hooks unintentionally.
+    """
+    from clea.tools.guards import (
+        ActionVerifier,
+        Win32FocusPreconditionBackend,
+        WinRTMediaVerificationBackend,
+    )
+
+    if focus_backend is None and media_backend is None and sys.platform != "win32":
+        return None
+    resolved_focus = (
+        focus_backend
+        if focus_backend is not None
+        else (Win32FocusPreconditionBackend() if sys.platform == "win32" else None)
+    )
+    resolved_media = (
+        media_backend
+        if media_backend is not None
+        else (WinRTMediaVerificationBackend() if sys.platform == "win32" else None)
+    )
+    return ActionVerifier(
+        focus_backend=resolved_focus,
+        media_backend=resolved_media,
+    )
+
+
 def run_voice_service(
-    *, host: str = "127.0.0.1", port: int = 8765, debug_audio: bool = False
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    debug_audio: bool = False,
+    action_verifier: Any = None,
 ) -> None:
     """Run the main Clea voice background surface."""
     _configure_voice_service_logging()
@@ -209,7 +251,13 @@ def run_voice_service(
     daemon_url = f"ws://{host}:{port}"
 
     try:
-        config = load_voice_config()
+        cfg_path = voice_config_path()
+        config = load_voice_config(cfg_path)
+        for warning_msg in check_legacy_vision_config_warnings(config, config_path=cfg_path):
+            logger.warning("%s", warning_msg)
+            if sys.stderr is not None:
+                print(f"[!] Warning: {warning_msg}", file=sys.stderr)
+
         if not auth.read_token():
             logger.info(
                 "Clea daemon session token not found yet; voice surface will connect when "
@@ -222,10 +270,14 @@ def run_voice_service(
                 file=sys.stderr,
             )
 
+        resolved_verifier = (
+            action_verifier if action_verifier is not None else build_default_action_verifier()
+        )
         runner = VoiceRunner(
             config=config,
             daemon_url=daemon_url,
             token=None,
+            action_verifier=resolved_verifier,
             debug_audio=debug_audio,
         )
         print("Starting Clea voice service (press Ctrl+C to quit)...")
@@ -262,9 +314,10 @@ def run_voice_doctor(*, download_models: bool = False) -> None:
     print("=== Clea Voice Doctor ===")
     print(f"Python: {sys.version.split()[0]} ({sys.platform})")
     print(f"Data directory: {default_data_dir()}")
-    print(f"Config path: {voice_config_path()}")
+    cfg_path = voice_config_path()
+    print(f"Config path: {cfg_path}")
 
-    config = load_voice_config()
+    config = load_voice_config(cfg_path)
     print(
         f"Config: wake_word='{config.wake_word_model}', engine='{config.wake_word_engine}', "
         f"hotkey='{config.hotkey}'"
@@ -277,8 +330,14 @@ def run_voice_doctor(*, download_models: bool = False) -> None:
         f"        vad_mode='{config.vad_mode}', "
         f"vad_silence_duration_ms={config.vad_silence_duration_ms}"
     )
+    print(
+        f"        vision: image_max_side={config.image_max_side}, "
+        f"media_resolution='{config.media_resolution}'"
+    )
     print(f"        google_search_grounding={config.enable_web_search}")
     print(f"        preferred_hostapi='{config.preferred_hostapi}'")
+    for warning_msg in check_legacy_vision_config_warnings(config, config_path=cfg_path):
+        print(f"[!] Warning: {warning_msg}")
 
     # 1. Check GEMINI_LIVE_API_KEY / GEMINI_API_KEY
     live_key = os.environ.get("GEMINI_LIVE_API_KEY", "").strip()

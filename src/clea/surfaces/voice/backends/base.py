@@ -830,18 +830,24 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         VoiceToolDeclaration(
             name="open_url",
             description=(
-                "Validate and navigate directly to an http/https URL or site shorthand. For web "
-                "apps and installed Chromium PWAs (such as YouTube Watch Later "
+                "Validate and navigate directly to an http/https URL, site shorthand, or "
+                "registered OS custom URL protocol (e.g. 'spotify:...'). For web apps and "
+                "installed Chromium PWAs (such as YouTube Watch Later "
                 "'https://www.youtube.com/playlist?list=WL'), omit 'browser' to navigate directly "
                 "inside the installed PWA via CDP without spawning Chrome; pass browser='chrome' "
-                "only when the user explicitly requests the browser/Chrome/web version."
+                "only when the user explicitly requests the browser/Chrome/web version. Always "
+                "verify custom-protocol or web navigation via returned goal_verified / "
+                "state_diff.view_changed before claiming success."
             ),
             parameters_schema={
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Web URL (http:// or https://) or site shorthand to open.",
+                        "description": (
+                            "Web URL (http:// or https://), site shorthand, or registered OS "
+                            "URL protocol URI (e.g. 'spotify:...') to open."
+                        ),
                     },
                     "browser": {
                         "type": "string",
@@ -942,7 +948,11 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
         ),
         VoiceToolDeclaration(
             name="write_clipboard",
-            description="Write plain text to the Windows clipboard.",
+            description=(
+                "Write plain text to the Windows clipboard when the user explicitly asks to "
+                "copy text. For typing text into application fields, prefer gui_action(type_text), "
+                "ui_act(type), or ui_act(set_value) instead of write_clipboard + Ctrl+V."
+            ),
             parameters_schema={
                 "type": "object",
                 "properties": {
@@ -1023,8 +1033,10 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
             name="gui_action",
             description=(
                 "Perform a desktop GUI input, browser CDP ref/history action, or wait step: "
-                "click_at / double_click / right_click / move (pass coord_space='normalized_1000' "
-                "when clicking from look_at_screen), type_text, press_keys, scroll, wait, "
+                "click_at / double_click / right_click / move (always pass "
+                "coord_space='normalized_1000' with [0..1000] coordinates when clicking from "
+                "either inspect_screen or look_at_screen), type_text (preferred over "
+                "write_clipboard + Ctrl+V for entering text), press_keys, scroll, wait, "
                 "navigate_back, navigate_forward, or act directly on a CDP ref (ref='b1' with "
                 "click/type/press)."
             ),
@@ -1068,9 +1080,11 @@ def default_voice_tools() -> list[VoiceToolDeclaration]:
                         "type": "string",
                         "enum": ["normalized_1000", "image", "screen"],
                         "description": (
-                            "Coordinate space for (x, y): use 'normalized_1000' for coordinates "
-                            "from look_at_screen, 'image' for screenshot pixels, or 'screen' "
-                            "(default) for physical virtual-screen pixels."
+                            "Coordinate space for (x, y): always use 'normalized_1000' for "
+                            "coordinates from inspect_screen or look_at_screen (omitted "
+                            "coord_space inherits the active capture's normalized_1000 geometry), "
+                            "'image' for screenshot pixels, or 'screen' for explicit physical "
+                            "virtual-screen pixels."
                         ),
                     },
                     "image_width": {

@@ -563,6 +563,14 @@ export type AppName4 = string | null;
  * Optional explicit target HWND for focus precondition enforcement.
  */
 export type ExpectedHwnd = number | null;
+/**
+ * Optional screen capture ID used to validate coordinate freshness.
+ */
+export type CaptureId = string | null;
+/**
+ * Optional physical DWM capture bounds [left, top, right, bottom].
+ */
+export type CaptureBounds = number[] | null;
 export type FrameType64 = "request";
 export type Id65 = string;
 export type SessionId74 = string | null;
@@ -1089,6 +1097,21 @@ export type Status11 = string;
 export type OutcomeKind = ("verified" | "unavailable" | "failed") | null;
 export type Reason5 = string;
 export type ElapsedMs = number;
+export type VerificationScope =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified = boolean | null;
+export type StateDiff = {
+  [k: string]: unknown | undefined;
+} | null;
 export type Ok14 = boolean;
 export type Action8 =
   | "mute"
@@ -1101,6 +1124,21 @@ export type Action8 =
   | "next_track"
   | "previous_track";
 export type Level2 = number | null;
+export type VerificationScope1 =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified1 = boolean | null;
+export type StateDiff1 = {
+  [k: string]: unknown | undefined;
+} | null;
 export type Ok15 = boolean;
 export type Kind2 = string;
 export type Text13 = string;
@@ -1156,7 +1194,20 @@ export type IsPwa = boolean | null;
 export type CdpUsed = boolean;
 export type BeforeUrl = string | null;
 export type AfterUrl = string | null;
-export type StateDiff = {
+export type ProtocolScheme = string | null;
+export type VerificationScope2 =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified2 = boolean | null;
+export type StateDiff2 = {
   [k: string]: unknown | undefined;
 } | null;
 export type Ok18 = boolean;
@@ -1172,6 +1223,21 @@ export type Uri1 = string | null;
 export type Message10 = string | null;
 export type Rect = {
   [k: string]: number | undefined;
+} | null;
+export type VerificationScope3 =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified3 = boolean | null;
+export type StateDiff3 = {
+  [k: string]: unknown | undefined;
 } | null;
 export type Status15 = string;
 export type Reason6 = string;
@@ -1208,6 +1274,9 @@ export type Error7 = string | null;
 export type Ok23 = boolean;
 export type Status19 = "ok" | "minimized" | "not_found" | "empty" | "error" | "non_interactive_desktop";
 export type Source4 = string | null;
+export type Hwnd3 = number | null;
+export type CaptureId1 = string | null;
+export type CaptureBounds1 = number[] | null;
 export type WindowTitle4 = string | null;
 export type ProcessName = string | null;
 export type Question1 = string | null;
@@ -1255,9 +1324,21 @@ export type Method69 = string;
 export type CdpAvailable1 = boolean | null;
 export type Hint1 = string | null;
 export type Message14 = string | null;
-export type StateDiff1 = {
+export type StateDiff4 = {
   [k: string]: unknown | undefined;
 } | null;
+export type VerificationScope4 =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified4 = boolean | null;
 export type Reason7 = string | null;
 export type Error9 = string | null;
 export type Ok26 = boolean;
@@ -1270,6 +1351,8 @@ export type X4 = number | null;
 export type Y4 = number | null;
 export type PhysicalX = number | null;
 export type PhysicalY = number | null;
+export type ExpectedHwnd2 = number | null;
+export type ActualHwnd1 = number | null;
 export type CoordSpace3 = string | null;
 export type Clicks2 = number | null;
 export type Button2 = string | null;
@@ -1289,9 +1372,21 @@ export type IsPwa1 = boolean | null;
 export type CdpAvailable2 = boolean | null;
 export type Hint2 = string | null;
 export type Message15 = string | null;
-export type StateDiff2 = {
+export type StateDiff5 = {
   [k: string]: unknown | undefined;
 } | null;
+export type VerificationScope5 =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified5 = boolean | null;
 export type CircuitBreakerTripped = boolean | null;
 export type SuggestedRecovery = string[] | null;
 export type EntryMethod = string | null;
@@ -1353,9 +1448,21 @@ export type IsPwa3 = boolean | null;
 export type CdpAvailable4 = boolean | null;
 export type Hint4 = string | null;
 export type Message17 = string | null;
-export type StateDiff3 = {
+export type StateDiff6 = {
   [k: string]: unknown | undefined;
 } | null;
+export type VerificationScope6 =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified6 = boolean | null;
 export type WindowChanged = boolean;
 export type WindowTitle7 = string;
 export type Ref6 = string;
@@ -1382,9 +1489,21 @@ export type StepsExecuted = number;
 export type StepResults = {
   [k: string]: unknown | undefined;
 }[];
-export type StateDiff4 = {
+export type StateDiff7 = {
   [k: string]: unknown | undefined;
 } | null;
+export type VerificationScope7 =
+  | (
+      | "dispatch_only"
+      | "window_focus"
+      | "window_layout"
+      | "media_session"
+      | "ui_element_delta"
+      | "in_app_view"
+      | "browser_dom"
+    )
+  | null;
+export type GoalVerified7 = boolean | null;
 export type Cancelled1 = boolean | null;
 export type Reason10 = string | null;
 export type Error13 = string | null;
@@ -2289,6 +2408,8 @@ export interface OsGuiActionParams {
   key?: Key;
   app_name?: AppName4;
   expected_hwnd?: ExpectedHwnd;
+  capture_id?: CaptureId;
+  capture_bounds?: CaptureBounds;
 }
 export interface OsUiSnapshotRequest {
   frame_type?: FrameType64;
@@ -3138,6 +3259,9 @@ export interface OsOpenOrFocusAppResult {
   target_path?: TargetPath1;
   error?: Error4;
   verification?: ActionVerificationInfo | null;
+  verification_scope?: VerificationScope;
+  goal_verified?: GoalVerified;
+  state_diff?: StateDiff;
 }
 export interface ActionVerificationInfo {
   verified: Verified;
@@ -3155,6 +3279,9 @@ export interface OsControlMediaVolumeResult {
   action: Action8;
   level?: Level2;
   verification?: ActionVerificationInfo | null;
+  verification_scope?: VerificationScope1;
+  goal_verified?: GoalVerified1;
+  state_diff?: StateDiff1;
 }
 export interface OsReadClipboardResult {
   ok?: Ok15;
@@ -3214,7 +3341,10 @@ export interface OsOpenUrlResult {
   cdp_used?: CdpUsed;
   before_url?: BeforeUrl;
   after_url?: AfterUrl;
-  state_diff?: StateDiff;
+  protocol_scheme?: ProtocolScheme;
+  verification_scope?: VerificationScope2;
+  goal_verified?: GoalVerified2;
+  state_diff?: StateDiff2;
 }
 export interface OsControlSystemResult {
   ok?: Ok18;
@@ -3230,6 +3360,9 @@ export interface OsControlSystemResult {
   message?: Message10;
   rect?: Rect;
   verification?: ActionVerificationInfo | null;
+  verification_scope?: VerificationScope3;
+  goal_verified?: GoalVerified3;
+  state_diff?: StateDiff3;
   aborted_precondition?: PreconditionAbortInfo | null;
 }
 export interface PreconditionAbortInfo {
@@ -3278,6 +3411,9 @@ export interface OsInspectScreenResult {
   ok?: Ok23;
   status?: Status19;
   source?: Source4;
+  hwnd?: Hwnd3;
+  capture_id?: CaptureId1;
+  capture_bounds?: CaptureBounds1;
   window_title?: WindowTitle4;
   process_name?: ProcessName;
   question?: Question1;
@@ -3331,7 +3467,9 @@ export interface OsClickUiElementResult {
   cdp_available?: CdpAvailable1;
   hint?: Hint1;
   message?: Message14;
-  state_diff?: StateDiff1;
+  state_diff?: StateDiff4;
+  verification_scope?: VerificationScope4;
+  goal_verified?: GoalVerified4;
   reason?: Reason7;
   error?: Error9;
   aborted_precondition?: PreconditionAbortInfo | null;
@@ -3347,6 +3485,8 @@ export interface OsGuiActionResult {
   y?: Y4;
   physical_x?: PhysicalX;
   physical_y?: PhysicalY;
+  expected_hwnd?: ExpectedHwnd2;
+  actual_hwnd?: ActualHwnd1;
   coord_space?: CoordSpace3;
   clicks?: Clicks2;
   button?: Button2;
@@ -3366,7 +3506,9 @@ export interface OsGuiActionResult {
   cdp_available?: CdpAvailable2;
   hint?: Hint2;
   message?: Message15;
-  state_diff?: StateDiff2;
+  state_diff?: StateDiff5;
+  verification_scope?: VerificationScope5;
+  goal_verified?: GoalVerified5;
   circuit_breaker_tripped?: CircuitBreakerTripped;
   suggested_recovery?: SuggestedRecovery;
   entry_method?: EntryMethod;
@@ -3435,7 +3577,9 @@ export interface OsUiActResult {
   cdp_available?: CdpAvailable4;
   hint?: Hint4;
   message?: Message17;
-  state_diff?: StateDiff3;
+  state_diff?: StateDiff6;
+  verification_scope?: VerificationScope6;
+  goal_verified?: GoalVerified6;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
   active_window_title?: ActiveWindowTitle;
@@ -3466,7 +3610,9 @@ export interface OsUiBatchResult {
   status?: Status25;
   steps_executed?: StepsExecuted;
   step_results?: StepResults;
-  state_diff?: StateDiff4;
+  state_diff?: StateDiff7;
+  verification_scope?: VerificationScope7;
+  goal_verified?: GoalVerified7;
   diff?: UiDiff | null;
   snapshot?: OsUiSnapshotResult | null;
   cancelled?: Cancelled1;

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from clea.core.protocol import VerificationScope
 from clea.surfaces.voice.win32 import (
     _MONITORINFOEXW,
     _RECT,
@@ -228,6 +229,270 @@ UNAVAILABLE_VERIFICATION_REASONS = frozenset(
         "winrt_timeout",
     }
 )
+
+_FAILED_ACTION_STATUSES = frozenset(
+    {
+        "error",
+        "failed",
+        "aborted",
+        "aborted_precondition",
+        "cancelled",
+        "blocked_by_circuit_breaker",
+        "verification_failed",
+        "stale_ref",
+        "target_not_found",
+        "non_interactive_desktop",
+        "timeout",
+    }
+)
+
+_WINDOW_LAYOUT_SYSTEM_ACTIONS = frozenset(
+    {
+        "snap_left",
+        "snap_right",
+        "snap_left_window",
+        "snap_right_window",
+        "maximize",
+        "maximize_window",
+        "minimize",
+        "minimize_window",
+        "restore",
+        "restore_window",
+        "close",
+        "close_window",
+    }
+)
+
+
+def classify_action_verification(
+    tool_name: str,
+    *,
+    action: str | None = None,
+    result: dict[str, Any] | None = None,
+    state_diff: dict[str, Any] | None = None,
+    verification: dict[str, Any] | None = None,
+    expected_scope: VerificationScope | None = None,
+) -> tuple[VerificationScope, bool]:
+    """Determine ``(verification_scope, goal_verified)`` for an OS/browser action.
+
+    Separates "command dispatched" from "user-visible goal verified" so models
+    never conflate media transport changes or no-op dispatches with confirmed
+    in-app navigation or goal completion.
+    """
+    res = result if isinstance(result, dict) else {}
+    diff = (
+        state_diff
+        if isinstance(state_diff, dict)
+        else (res.get("state_diff") if isinstance(res.get("state_diff"), dict) else {})
+    )
+    ver = (
+        verification
+        if isinstance(verification, dict)
+        else (res.get("verification") if isinstance(res.get("verification"), dict) else None)
+    )
+
+    norm_tool = (tool_name or "").strip().lower().removeprefix("os.")
+    norm_action = (action if action is not None else str(res.get("action") or "")).strip().lower()
+    status = str(res.get("status") or "").strip().lower()
+    ok = res.get("ok", res.get("success", True)) is not False
+
+    def _apply_expected_scope(
+        achieved: VerificationScope, verified: bool
+    ) -> tuple[VerificationScope, bool]:
+        if expected_scope is None or not verified:
+            return (achieved, verified)
+        if achieved == expected_scope:
+            return (achieved, True)
+        # browser_dom satisfies in_app_view goals for browser-hosted apps
+        if expected_scope == "in_app_view" and achieved == "browser_dom":
+            return (achieved, True)
+        return (achieved, False)
+
+    if not ok or status in _FAILED_ACTION_STATUSES:
+        if norm_tool == "control_media_volume":
+            return ("media_session", False)
+        if norm_tool == "open_or_focus_app":
+            return ("window_focus", False)
+        if norm_tool == "control_system" and norm_action in _WINDOW_LAYOUT_SYSTEM_ACTIONS:
+            return ("window_layout", False)
+        return ("dispatch_only", False)
+
+    view_changed = bool(diff.get("view_changed") or res.get("view_changed"))
+    window_changed = bool(diff.get("window_changed"))
+    url_changed = bool(diff.get("url_changed"))
+    title_changed = bool(diff.get("title_changed"))
+    media_changed = bool(diff.get("media_changed"))
+    cdp_used = bool(res.get("cdp_used") or res.get("source") == "cdp")
+    ver_verified: bool | None = bool(ver.get("verified")) if isinstance(ver, dict) else None
+
+    if norm_tool == "control_media_volume":
+        if ver_verified is not None:
+            return _apply_expected_scope("media_session", ver_verified)
+        if norm_action == "set_volume":
+            return _apply_expected_scope("media_session", True)
+        return _apply_expected_scope("media_session", media_changed)
+
+    if norm_tool == "open_or_focus_app":
+        if ver_verified is not None:
+            return _apply_expected_scope("window_focus", ver_verified)
+        if status == "focused" and bool(res.get("hwnd")):
+            return _apply_expected_scope("window_focus", True)
+        if window_changed or view_changed:
+            return _apply_expected_scope("window_focus", True)
+        return _apply_expected_scope("dispatch_only", False)
+
+    if norm_tool == "control_system":
+        if norm_action in {"open_settings", "settings"}:
+            if view_changed:
+                return _apply_expected_scope("in_app_view", True)
+            if window_changed:
+                return _apply_expected_scope("window_focus", True)
+            return _apply_expected_scope("dispatch_only", False)
+        if norm_action in _WINDOW_LAYOUT_SYSTEM_ACTIONS:
+            if ver_verified is not None:
+                return _apply_expected_scope("window_layout", ver_verified)
+            return _apply_expected_scope("window_layout", window_changed)
+        if norm_action in {"inspect_window_layout", "inspect_layout", "layout"}:
+            return _apply_expected_scope("window_layout", True)
+        if norm_action in {
+            "get_brightness",
+            "set_brightness",
+            "step_brightness",
+            "brightness_up",
+            "brightness_down",
+        }:
+            return _apply_expected_scope("dispatch_only", True)
+        return _apply_expected_scope("dispatch_only", bool(window_changed or view_changed))
+
+    if norm_tool == "open_url":
+        if cdp_used:
+            verified = bool(url_changed or title_changed or status == "navigated")
+            return _apply_expected_scope("browser_dom", verified)
+        is_custom_proto = str(res.get("resolution_layer") or "").strip().lower() in {
+            "url_protocol",
+            "custom_protocol",
+        } or (
+            bool(res.get("protocol_scheme"))
+            and str(res.get("protocol_scheme") or "").strip().lower() not in {"http", "https"}
+        )
+        if is_custom_proto:
+            if view_changed:
+                return _apply_expected_scope("in_app_view", True)
+            if window_changed:
+                return _apply_expected_scope("window_focus", True)
+            return _apply_expected_scope("dispatch_only", False)
+        if url_changed:
+            return _apply_expected_scope("browser_dom", True)
+        if view_changed:
+            return _apply_expected_scope("in_app_view", True)
+        if window_changed or (
+            bool(res.get("routed_to_installed_app"))
+            and status == "focused"
+            and bool(res.get("window_hwnd") or res.get("hwnd"))
+        ):
+            return _apply_expected_scope("window_focus", True)
+        return _apply_expected_scope("dispatch_only", False)
+
+    if norm_tool == "gui_action":
+        if norm_action == "wait":
+            return _apply_expected_scope("dispatch_only", True)
+        raw_ref = str(res.get("ref") or "").strip().lstrip("@").lower()
+        if cdp_used or (raw_ref.startswith("b") and raw_ref[1:].isdigit()):
+            verified = bool(diff.get("changed")) if diff else (status in {"navigated", "completed"})
+            return _apply_expected_scope("browser_dom", verified)
+        if view_changed:
+            return _apply_expected_scope("in_app_view", True)
+        if url_changed:
+            return _apply_expected_scope("browser_dom", True)
+        if window_changed or title_changed:
+            return _apply_expected_scope("window_focus", True)
+        if media_changed:
+            return _apply_expected_scope("media_session", True)
+        return _apply_expected_scope("dispatch_only", False)
+
+    if norm_tool in {"ui_act", "click_ui_element", "ui_batch"}:
+        if cdp_used:
+            verified = bool(diff.get("changed")) if diff else True
+            return _apply_expected_scope("browser_dom", verified)
+        if view_changed:
+            return _apply_expected_scope("in_app_view", True)
+        if url_changed:
+            return _apply_expected_scope("browser_dom", True)
+        ui_diff = res.get("diff")
+        has_ui_diff = isinstance(ui_diff, dict) and bool(
+            ui_diff.get("changed_values")
+            or ui_diff.get("added_elements")
+            or ui_diff.get("removed_count")
+            or ui_diff.get("window_changed")
+        )
+        if has_ui_diff:
+            return _apply_expected_scope("ui_element_delta", True)
+        if window_changed or title_changed:
+            return _apply_expected_scope("window_focus", True)
+        target_state = res.get("target_state")
+        if isinstance(target_state, dict) and target_state.get("available") is True:
+            return _apply_expected_scope("ui_element_delta", True)
+        method = str(res.get("method") or "").strip().lower()
+        if method in {"invoke", "select", "toggle", "expand_collapse", "value_pattern"}:
+            return _apply_expected_scope("ui_element_delta", True)
+        return _apply_expected_scope("dispatch_only", False)
+
+    if view_changed:
+        return _apply_expected_scope("in_app_view", True)
+    if url_changed:
+        return _apply_expected_scope("browser_dom", True)
+    if window_changed:
+        return _apply_expected_scope("window_focus", True)
+    if media_changed:
+        return _apply_expected_scope("media_session", True)
+    return _apply_expected_scope("dispatch_only", False)
+
+
+def apply_verification_metadata(
+    tool_name: str,
+    result: dict[str, Any],
+    *,
+    action: str | None = None,
+    state_diff: dict[str, Any] | None = None,
+    expected_scope: VerificationScope | None = None,
+) -> dict[str, Any]:
+    """Attach ``verification_scope`` and ``goal_verified`` to a tool result copy.
+
+    Preserves explicit tool-reported ``verification_scope`` / ``goal_verified``
+    unless ``state_diff`` provides stronger observed evidence (e.g. ``view_changed``).
+    """
+    out = dict(result)
+    effective_diff = (
+        state_diff
+        if isinstance(state_diff, dict)
+        else (out.get("state_diff") if isinstance(out.get("state_diff"), dict) else None)
+    )
+    computed_scope, computed_verified = classify_action_verification(
+        tool_name,
+        action=action,
+        result=out,
+        state_diff=effective_diff,
+        expected_scope=expected_scope,
+    )
+    existing_scope = out.get("verification_scope")
+    existing_verified = out.get("goal_verified")
+    if (
+        isinstance(existing_scope, str)
+        and existing_scope
+        and isinstance(existing_verified, bool)
+    ):
+        if (
+            isinstance(effective_diff, dict)
+            and effective_diff.get("view_changed")
+            and not existing_verified
+        ):
+            out["verification_scope"] = "in_app_view"
+            out["goal_verified"] = True
+        return out
+
+    out["verification_scope"] = computed_scope
+    out["goal_verified"] = computed_verified
+    return out
 
 
 @dataclass(frozen=True)

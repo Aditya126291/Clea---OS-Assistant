@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import importlib
 import inspect
 import json
@@ -159,7 +160,12 @@ from clea.surfaces.voice.backends.base import (
     VoiceToolResponse,
 )
 from clea.surfaces.voice.backends.gemini_live import GeminiLiveBackend
-from clea.surfaces.voice.config import VoiceConfig, load_voice_config
+from clea.surfaces.voice.config import (
+    VoiceConfig,
+    check_legacy_vision_config_warnings,
+    load_voice_config,
+    voice_config_path,
+)
 from clea.surfaces.voice.lock import VoiceInstanceLock
 from clea.surfaces.voice.memory_hooks import (
     _VOICE_COMPANION_SESSION_ID,
@@ -314,6 +320,24 @@ _WINDOW_LAYOUT_ACTIONS: frozenset[str] = frozenset(
         "restore",
         "close",
     }
+)
+
+_POINTER_GUI_ACTIONS: frozenset[str] = frozenset(
+    {
+        "click_at",
+        "double_click",
+        "right_click",
+        "move",
+    }
+)
+
+_CURRENT_VOICE_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_voice_call_id",
+    default=None,
+)
+_CURRENT_TURN_EPOCH: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "_current_turn_epoch",
+    default=None,
 )
 
 
@@ -497,9 +521,14 @@ class VoiceRunner:
         self._last_fps_report_time: float = time.monotonic()
 
         self._call_generation: int = 0
+        self._turn_epoch: int = 0
         self._active_tool_calls: int = 0
         self._tool_exec_lock: asyncio.Lock | None = None
         self._active_tool_tasks: set[asyncio.Task[Any]] = set()
+        self._call_id_to_task: dict[str, tuple[asyncio.Task[Any], str | None, int]] = {}
+        self._call_id_to_name: dict[str, str] = {}
+        self._server_cancelled_call_ids: set[str] = set()
+        self._barge_in_responded_call_ids: set[str] = set()
         self._audio_health_task: asyncio.Task[None] | None = None
         self._audio_health_poll_interval: float = 3.0
         self._input_warmup_timeout: float = 1.5
@@ -590,11 +619,19 @@ class VoiceRunner:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending_tasks[req.id] = fut
+        active_cid = _CURRENT_VOICE_CALL_ID.get()
+        if active_cid and active_cid in self._call_id_to_task:
+            task, _old_rpc, ep = self._call_id_to_task[active_cid]
+            self._call_id_to_task[active_cid] = (task, req.id, ep)
         try:
             await ws.send(req.model_dump_json())
             return dict(await asyncio.wait_for(fut, timeout=timeout) or {})
         finally:
             self._pending_tasks.pop(req.id, None)
+            if active_cid and active_cid in self._call_id_to_task:
+                task, cur_rpc, ep = self._call_id_to_task[active_cid]
+                if cur_rpc == req.id:
+                    self._call_id_to_task[active_cid] = (task, None, ep)
 
     async def _rpc(self, req: BaseRequest, *, timeout: float = 10.0) -> dict[str, Any]:
         """Run a typed daemon RPC over the active listener socket or transient fallback."""
@@ -658,6 +695,11 @@ class VoiceRunner:
     async def start(self) -> None:
         """Start the voice runner with DPI awareness, lock acquisition, and background tasks."""
         enable_per_monitor_dpi_awareness()
+        for warning_msg in check_legacy_vision_config_warnings(
+            self.config,
+            config_path=voice_config_path(self.data_dir),
+        ):
+            logger.warning("%s", warning_msg)
         self._loop = asyncio.get_running_loop()
         self._lock.acquire()
         try:
@@ -1314,9 +1356,17 @@ class VoiceRunner:
 
         call_start_t0 = time.monotonic()
         self._call_generation += 1
+        self._turn_epoch += 1
         call_gen = self._call_generation
         self._wake_word_pending_trigger = False
         self._active_tool_calls = 0
+        self._call_id_to_task.clear()
+        self._call_id_to_name.clear()
+        self._server_cancelled_call_ids.clear()
+        self._barge_in_responded_call_ids.clear()
+        self._circuit_breaker.reset()
+        self._active_target_hwnd = None
+        self._last_screen_geometry = None
 
         if self._call_id is None:
             self._call_id = new_id()
@@ -1642,10 +1692,15 @@ class VoiceRunner:
             self._outbound_audio_queue = None
 
         current_task = asyncio.current_task()
+        self._turn_epoch += 1
         for tool_task in list(self._active_tool_tasks):
             if tool_task is not current_task and not tool_task.done():
                 tool_task.cancel()
         self._active_tool_tasks.clear()
+        self._call_id_to_task.clear()
+        self._call_id_to_name.clear()
+        self._server_cancelled_call_ids.clear()
+        self._barge_in_responded_call_ids.clear()
         self._active_tool_calls = 0
 
         if self._watch_screen_task is not None:
@@ -1693,6 +1748,9 @@ class VoiceRunner:
         self._call_id = None
         self._transcript_history.clear()
         self._turn_launched_targets.clear()
+        self._circuit_breaker.reset()
+        self._active_target_hwnd = None
+        self._last_screen_geometry = None
         self._stall_timer_armed = False
         self._stall_accumulated_seconds = 0.0
         self._audio_sent_start_time = None
@@ -1978,21 +2036,27 @@ class VoiceRunner:
                     if self._audio_manager is not None:
                         self._audio_manager.play_audio(event.pcm_bytes)
                 elif isinstance(event, InterruptedEvent):
-                    # Barge-in: flush output audio immediately
-                    logger.debug("Barge-in: flushing audio buffer.")
-                    self.reset_turn_state()
+                    # Barge-in: flush output audio immediately, bump turn epoch, and cancel
+                    # in-flight tool tasks + daemon actions without wedging Gemini Live.
+                    logger.debug("Barge-in: flushing audio buffer and cancelling inflight tools.")
+                    self._turn_epoch += 1
                     if self._audio_manager is not None:
                         self._audio_manager.stop_output()
+                    await self._cancel_inflight_tools_on_barge_in(backend)
+                    self._turn_launched_targets.clear()
                     self._set_voice_state("listening")
                 elif isinstance(event, TurnCompleteEvent):
-                    self.reset_turn_state()
+                    await self._handle_turn_complete()
                     if self._transcript_history:
                         self._transcript_history[-1]["final"] = True
                     self._set_voice_state("listening")
                 elif isinstance(event, TranscriptOutputEvent):
                     if event.role == "user":
                         self._last_user_speech_time = time.monotonic()
-                        self.reset_turn_state()
+                        # Never wipe circuit breaker or target HWND mid-utterance on streaming
+                        # user transcript chunks; only reset per-turn launch dedup on final text.
+                        if event.final:
+                            self._turn_launched_targets.clear()
                     ts_iso = datetime.now().astimezone().isoformat()
                     norm_evt_text = event.text.strip()
                     if (
@@ -2047,11 +2111,33 @@ class VoiceRunner:
                     tool_batch = self._drain_contiguous_tool_calls(backend, event)
                     self._spawn_tool_batch_task(tool_batch, backend)
                 elif isinstance(event, ToolCallCancellationEvent):
+                    cancelled_any = False
+                    tasks_to_cancel: set[asyncio.Task[Any]] = set()
                     for cid in event.call_ids:
-                        fut = self._pending_tasks.pop(cid, None)
-                        if fut and not fut.done():
-                            fut.cancel()
-                    if self._state == "thinking" and self._active_tool_calls == 0:
+                        if cid:
+                            self._server_cancelled_call_ids.add(cid)
+                        entry = self._call_id_to_task.pop(cid, None)
+                        self._call_id_to_name.pop(cid, None)
+                        if entry is not None:
+                            task, rpc_id, _ep = entry
+                            cancelled_any = True
+                            if rpc_id is not None:
+                                rpc_fut = self._pending_tasks.pop(rpc_id, None)
+                                if rpc_fut is not None and not rpc_fut.done():
+                                    rpc_fut.cancel()
+                            if not task.done():
+                                tasks_to_cancel.add(task)
+                        legacy_fut = self._pending_tasks.pop(cid, None)
+                        if legacy_fut is not None and not legacy_fut.done():
+                            legacy_fut.cancel()
+                            cancelled_any = True
+                    for task in tasks_to_cancel:
+                        task.cancel()
+                    if cancelled_any or event.call_ids:
+                        self._fire_cancel_inflight(reason="user_barge_in")
+                    if self._state == "thinking" and (
+                        self._active_tool_calls == 0 or not self._call_id_to_task
+                    ):
                         self._set_voice_state("listening")
                 elif isinstance(event, UsageUpdateEvent):
                     self._usage_record["input_tokens"] += event.input_tokens
@@ -2102,11 +2188,164 @@ class VoiceRunner:
                 reason=f"consumer_error: {exc}", error=f"Voice stream failed: {exc}"
             )
 
-    def reset_turn_state(self) -> None:
-        """Reset per-turn launch deduplication, target HWND, and click circuit breaker state."""
+    def reset_turn_state(
+        self,
+        *,
+        preserve_workflow: bool = False,
+        current_hwnd: int | None = None,
+        current_dhash: str = "",
+    ) -> None:
+        """Reset per-turn launch deduplication and optionally workflow target/breaker state."""
         self._turn_launched_targets.clear()
+        if preserve_workflow:
+            was_reset = self._circuit_breaker.on_turn_complete(
+                current_hwnd=current_hwnd,
+                current_dhash=current_dhash,
+            )
+            if was_reset:
+                self._active_target_hwnd = (
+                    int(current_hwnd)
+                    if isinstance(current_hwnd, int)
+                    and not isinstance(current_hwnd, bool)
+                    and current_hwnd > 0
+                    else None
+                )
+                self._last_screen_geometry = None
+            elif (
+                isinstance(current_hwnd, int)
+                and not isinstance(current_hwnd, bool)
+                and current_hwnd > 0
+                and self._active_target_hwnd is not None
+                and int(current_hwnd) != int(self._active_target_hwnd)
+            ):
+                self._active_target_hwnd = int(current_hwnd)
+                self._last_screen_geometry = None
+            return
         self._circuit_breaker.reset()
         self._active_target_hwnd = None
+
+    async def _handle_turn_complete(self) -> None:
+        """Preserve blind-click streaks and target HWND on TurnComplete when view is unchanged."""
+        cur_state = await self._capture_desktop_state()
+        cur_hwnd: int | None = None
+        cur_dhash = ""
+        if isinstance(cur_state, dict):
+            raw_hwnd = cur_state.get("hwnd")
+            if isinstance(raw_hwnd, int) and not isinstance(raw_hwnd, bool) and raw_hwnd > 0:
+                cur_hwnd = int(raw_hwnd)
+            cur_dhash = str(cur_state.get("dhash") or "").strip()
+        self.reset_turn_state(
+            preserve_workflow=True,
+            current_hwnd=cur_hwnd,
+            current_dhash=cur_dhash,
+        )
+
+    def _fire_cancel_inflight(self, *, reason: str = "user_barge_in") -> None:
+        """Fire out-of-band ``os.cancel_inflight`` to the daemon without blocking the event loop."""
+        has_custom_rpc = "_rpc" in self.__dict__
+        ws = self._daemon_ws
+        if not has_custom_rpc and ws is None:
+            return
+
+        req = OsCancelInflightRequest(params=OsCancelInflightParams(reason=reason))
+
+        async def _send_cancel() -> None:
+            with contextlib.suppress(Exception):
+                if has_custom_rpc:
+                    await self._rpc(req, timeout=1.5)
+                elif self._daemon_ws is not None and self._daemon_listener_active:
+                    await self._request_daemon(req, timeout=1.5)
+                elif self._daemon_ws is not None:
+                    await self._daemon_ws.send(req.model_dump_json())
+
+        self._spawn_daemon_callback_task(_send_cancel(), name=f"os-cancel-inflight-{reason}")
+
+    def _is_call_server_cancelled(self, call_id: str, backend: VoiceBackend | None) -> bool:
+        if not call_id:
+            return False
+        if call_id in self._server_cancelled_call_ids:
+            return True
+        is_cancelled_fn = (
+            getattr(backend, "is_call_cancelled", None) if backend is not None else None
+        )
+        if callable(is_cancelled_fn):
+            with contextlib.suppress(Exception):
+                return bool(is_cancelled_fn(call_id))
+        return False
+
+    def _peek_queued_tool_cancellations(self, backend: VoiceBackend) -> set[str]:
+        """Peek immediately queued ToolCallCancellationEvent IDs without consuming the queue."""
+        q: asyncio.Queue[Any] | None = getattr(backend, "_events_queue", None) or getattr(
+            backend, "event_queue", None
+        )
+        internal_deque = getattr(q, "_queue", None) if q is not None else None
+        if not internal_deque:
+            return set()
+        found: set[str] = set()
+        for item in list(internal_deque):
+            if isinstance(item, ToolCallCancellationEvent):
+                for cid in item.call_ids:
+                    if cid:
+                        found.add(cid)
+            else:
+                break
+        return found
+
+    async def _cancel_inflight_tools_on_barge_in(self, backend: VoiceBackend) -> None:
+        """Cancel active tool tasks on InterruptedEvent and keep Gemini Live unwedged."""
+        queued_server_cancels = self._peek_queued_tool_cancellations(backend)
+        if queued_server_cancels:
+            self._server_cancelled_call_ids.update(queued_server_cancels)
+
+        current_epoch = self._turn_epoch
+        tasks_to_cancel: set[asyncio.Task[Any]] = set()
+        fast_responses: list[VoiceToolResponse] = []
+        had_inflight = self._active_tool_calls > 0 or bool(self._call_id_to_task)
+
+        for cid, entry in list(self._call_id_to_task.items()):
+            task, rpc_id, ep = entry
+            if ep >= current_epoch:
+                continue
+            self._call_id_to_task.pop(cid, None)
+            tool_name = self._call_id_to_name.pop(cid, "tool")
+            if rpc_id is not None:
+                rpc_fut = self._pending_tasks.pop(rpc_id, None)
+                if rpc_fut is not None and not rpc_fut.done():
+                    rpc_fut.cancel()
+            if not task.done():
+                tasks_to_cancel.add(task)
+            if (
+                not self._is_call_server_cancelled(cid, backend)
+                and cid not in self._barge_in_responded_call_ids
+            ):
+                self._barge_in_responded_call_ids.add(cid)
+                fast_responses.append(
+                    VoiceToolResponse(
+                        call_id=cid,
+                        name=tool_name,
+                        response={
+                            "ok": False,
+                            "cancelled": True,
+                            "reason": "user_barge_in",
+                        },
+                        is_error=False,
+                        scheduling="silent",
+                    )
+                )
+
+        for task in list(self._active_tool_tasks):
+            if not task.done() and getattr(task, "_clea_turn_epoch", -1) < current_epoch:
+                tasks_to_cancel.add(task)
+
+        for task in tasks_to_cancel:
+            task.cancel()
+
+        if had_inflight or tasks_to_cancel or fast_responses:
+            self._fire_cancel_inflight(reason="user_barge_in")
+
+        if fast_responses:
+            with contextlib.suppress(Exception):
+                await backend.send_tool_responses(fast_responses)
 
     async def _capture_desktop_state(self) -> dict[str, Any] | None:
         """Capture lightweight foreground window and GSMTC state if configured."""
@@ -2115,8 +2354,16 @@ class VoiceRunner:
                 return await asyncio.to_thread(self._state_capture_fn)
             return None
         verifier = self._action_verifier
-        focus_backend = getattr(verifier, "focus_backend", None) if verifier is not None else None
-        media_backend = getattr(verifier, "media_backend", None) if verifier is not None else None
+        focus_backend = (
+            getattr(verifier, "focus_backend", None) or getattr(verifier, "_focus_backend", None)
+            if verifier is not None
+            else None
+        )
+        media_backend = (
+            getattr(verifier, "media_backend", None) or getattr(verifier, "_media_backend", None)
+            if verifier is not None
+            else None
+        )
         if focus_backend is None and media_backend is None:
             return None
 
@@ -2160,21 +2407,37 @@ class VoiceRunner:
         if self._tool_exec_lock is None:
             self._tool_exec_lock = asyncio.Lock()
         lock = self._tool_exec_lock
+        batch_epoch = self._turn_epoch
 
         async def _runner() -> None:
             async with lock:
-                if self._call_state != "active" or self._active_backend is not backend:
+                if (
+                    self._call_state != "active"
+                    or self._active_backend is not backend
+                    or batch_epoch < self._turn_epoch
+                ):
                     return
-                await self._execute_tool_call_batch(batch, backend)
+                await self._execute_tool_call_batch(batch, backend, turn_epoch=batch_epoch)
 
         task = asyncio.create_task(
             _runner(),
             name=f"VoiceRunnerToolBatch-{batch[0].name}",
         )
+        task._clea_turn_epoch = batch_epoch  # type: ignore[attr-defined]
         self._active_tool_tasks.add(task)
+        for ev in batch:
+            self._server_cancelled_call_ids.discard(ev.call_id)
+            self._barge_in_responded_call_ids.discard(ev.call_id)
+            self._call_id_to_task[ev.call_id] = (task, None, batch_epoch)
+            self._call_id_to_name[ev.call_id] = ev.name
 
         def _done(done_task: asyncio.Task[None]) -> None:
             self._active_tool_tasks.discard(done_task)
+            for ev in batch:
+                existing = self._call_id_to_task.get(ev.call_id)
+                if existing is not None and existing[0] is done_task:
+                    self._call_id_to_task.pop(ev.call_id, None)
+                    self._call_id_to_name.pop(ev.call_id, None)
             if not done_task.cancelled():
                 exc = done_task.exception()
                 if exc is not None:
@@ -2234,19 +2497,74 @@ class VoiceRunner:
         self,
         batch: list[ToolCallEvent],
         backend: VoiceBackend,
+        *,
+        turn_epoch: int | None = None,
     ) -> None:
         """Execute a batch of tool calls and send all responses in a single backend call."""
         batch_t0 = time.monotonic()
+        effective_epoch = self._turn_epoch if turn_epoch is None else turn_epoch
+        epoch_token = _CURRENT_TURN_EPOCH.set(effective_epoch)
         self._active_tool_calls += 1
         # Disarm stall watchdog while tools execute so slow RPCs never cause false reconnects
         self._stall_timer_armed = False
         self._stall_accumulated_seconds = 0.0
         self._audio_sent_start_time = None
+        runner_self = self
+
+        class _EpochGuardedBackend(VoiceBackend):
+            backend_name = backend.backend_name
+
+            @property
+            def model_name(self) -> str:
+                return backend.model_name
+
+            async def connect(self, config: VoiceSessionConfig) -> None:
+                await backend.connect(config)
+
+            async def close(self) -> None:
+                await backend.close()
+
+            async def send_audio(self, pcm_bytes: bytes) -> None:
+                await backend.send_audio(pcm_bytes)
+
+            async def send_video_frame(
+                self, image_bytes: bytes, *, mime_type: str = "image/jpeg"
+            ) -> None:
+                await backend.send_video_frame(image_bytes, mime_type=mime_type)
+
+            async def send_text(self, text: str, *, end_of_turn: bool = True) -> None:
+                await backend.send_text(text, end_of_turn=end_of_turn)
+
+            async def send_tool_responses(self, responses: list[VoiceToolResponse]) -> None:
+                if effective_epoch < runner_self._turn_epoch:
+                    logger.debug(
+                        "Dropping stale-epoch tool response(s) (epoch=%d < current=%d).",
+                        effective_epoch,
+                        runner_self._turn_epoch,
+                    )
+                    return
+                filtered = [
+                    r
+                    for r in responses
+                    if not runner_self._is_call_server_cancelled(r.call_id, backend)
+                    and r.call_id not in runner_self._barge_in_responded_call_ids
+                ]
+                if filtered:
+                    await backend.send_tool_responses(filtered)
+
+            def events(self) -> AsyncIterator[Any]:
+                return backend.events()
+
+        guarded_backend: VoiceBackend = _EpochGuardedBackend()
         try:
             if len(batch) <= 1:
                 for ev in batch:
+                    if effective_epoch < self._turn_epoch or self._is_call_server_cancelled(
+                        ev.call_id, backend
+                    ):
+                        continue
                     try:
-                        await self._handle_tool_call(ev, backend)
+                        await self._handle_tool_call(ev, guarded_backend)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -2254,7 +2572,7 @@ class VoiceRunner:
                             "Unhandled error in voice tool %s (%s): %s", ev.name, ev.call_id, exc
                         )
                         with contextlib.suppress(Exception):
-                            await backend.send_tool_responses(
+                            await guarded_backend.send_tool_responses(
                                 [
                                     VoiceToolResponse(
                                         call_id=ev.call_id,
@@ -2302,11 +2620,15 @@ class VoiceRunner:
             proxy = _BatchProxy()
             try:
                 for ev in batch:
+                    if effective_epoch < self._turn_epoch or self._is_call_server_cancelled(
+                        ev.call_id, backend
+                    ):
+                        continue
                     if ev.name == "end_call":
                         if collected:
-                            await backend.send_tool_responses(list(collected))
+                            await guarded_backend.send_tool_responses(list(collected))
                             collected.clear()
-                        await self._handle_tool_call(ev, backend)
+                        await self._handle_tool_call(ev, guarded_backend)
                         return
                     try:
                         await self._handle_tool_call(ev, proxy)
@@ -2331,9 +2653,10 @@ class VoiceRunner:
             finally:
                 if collected:
                     with contextlib.suppress(Exception):
-                        await backend.send_tool_responses(list(collected))
+                        await guarded_backend.send_tool_responses(list(collected))
                     collected.clear()
         finally:
+            _CURRENT_TURN_EPOCH.reset(epoch_token)
             self._active_tool_calls = max(0, self._active_tool_calls - 1)
             self._stall_timer_armed = False
             self._stall_accumulated_seconds = 0.0
@@ -2448,6 +2771,14 @@ class VoiceRunner:
 
     async def _handle_tool_call(self, event: ToolCallEvent, backend: VoiceBackend) -> None:
         """Execute or delegate live voice tool call."""
+        call_token = _CURRENT_VOICE_CALL_ID.set(event.call_id)
+        try:
+            await self._handle_tool_call_inner(event, backend)
+        finally:
+            _CURRENT_VOICE_CALL_ID.reset(call_token)
+
+    async def _handle_tool_call_inner(self, event: ToolCallEvent, backend: VoiceBackend) -> None:
+        """Inner tool call dispatcher bound to ``_CURRENT_VOICE_CALL_ID``."""
         logger.info("Executing voice tool: %s (%s)", event.name, event.call_id)
 
         # Hard click / snapshot-failure circuit breaker (per-turn)
@@ -2489,6 +2820,9 @@ class VoiceRunner:
                 loop = asyncio.get_running_loop()
                 fut: asyncio.Future[dict[str, Any]] = loop.create_future()
                 self._pending_tasks[req.id] = fut
+                if event.call_id in self._call_id_to_task:
+                    t, _old_rpc, ep = self._call_id_to_task[event.call_id]
+                    self._call_id_to_task[event.call_id] = (t, req.id, ep)
 
                 try:
                     await self._daemon_ws.send(req.model_dump_json())
@@ -2501,6 +2835,8 @@ class VoiceRunner:
                         is_error=False,
                         scheduling="when_idle",
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     tool_resp = VoiceToolResponse(
                         call_id=event.call_id,
@@ -2511,6 +2847,10 @@ class VoiceRunner:
                     )
                 finally:
                     self._pending_tasks.pop(req.id, None)
+                    if event.call_id in self._call_id_to_task:
+                        t, cur_rpc, ep = self._call_id_to_task[event.call_id]
+                        if cur_rpc == req.id:
+                            self._call_id_to_task[event.call_id] = (t, None, ep)
 
                 await backend.send_tool_responses([tool_resp])
             else:
@@ -2539,9 +2879,14 @@ class VoiceRunner:
                 await backend.send_tool_responses([resp])
                 return
 
-            target = str(event.arguments.get("target", "full_screen"))
+            raw_target = event.arguments.get("target")
+            target = (
+                str(raw_target).strip()
+                if isinstance(raw_target, str) and raw_target.strip()
+                else "active_window"
+            )
             if target not in ("active_window", "full_screen"):
-                target = "full_screen"
+                target = "active_window"
 
             raw_monitor = event.arguments.get("monitor")
             monitor: int | None = None
@@ -2615,60 +2960,6 @@ class VoiceRunner:
                     )
                 ]
                 image_order: list[str] = [target]
-                active_res = None
-
-                # When full-screen context is requested alongside an active window on the same
-                # display, also attach a 1:1 native-resolution active-window crop atomically so
-                # small text and UI elements remain sharp on the exact same turn.
-                if target == "full_screen" and res.window_bounds is not None:
-                    wl, wt, wr, wb = res.window_bounds
-                    if wr > wl and wb > wt:
-                        active_overlaps_target = True
-                        if res.monitor_bounds is not None:
-                            ml, mt, mr, mb = res.monitor_bounds
-                            active_overlaps_target = min(mr, wr) > max(ml, wl) and min(
-                                mb, wb
-                            ) > max(mt, wt)
-                        if active_overlaps_target:
-                            cap_kwargs: dict[str, Any] = {"target": "active_window"}
-                            try:
-                                cap_sig = inspect.signature(self._screen_service.capture)
-                                if "include_layout" in cap_sig.parameters:
-                                    cap_kwargs["include_layout"] = False
-                            except (TypeError, ValueError):
-                                pass
-                            candidate = await asyncio.to_thread(
-                                self._screen_service.capture,
-                                **cap_kwargs,
-                            )
-                            candidate_blocked = candidate.blocked or is_window_blocked(
-                                candidate.window_title or "",
-                                candidate.process_name or "",
-                                self.config.blocklist,
-                            )
-                            same_monitor = (
-                                res.monitor_index is None
-                                or candidate.monitor_index is None
-                                or candidate.monitor_index == res.monitor_index
-                            )
-                            same_window = (candidate.process_name, candidate.window_title) == (
-                                res.process_name,
-                                res.window_title,
-                            )
-                            if (
-                                not candidate_blocked
-                                and candidate.image_bytes
-                                and same_monitor
-                                and same_window
-                            ):
-                                active_res = candidate
-                                media_parts.append(
-                                    VoiceToolMediaPart(
-                                        data=active_res.image_bytes,
-                                        mime_type=active_res.mime_type,
-                                    )
-                                )
-                                image_order.append("active_window")
 
                 img_w = getattr(res, "image_width", 0) or res.width
                 img_h = getattr(res, "image_height", 0) or res.height
@@ -2683,13 +2974,27 @@ class VoiceRunner:
 
                 self._capture_seq += 1
                 effective_cap_seq = int(getattr(res, "capture_seq", 0) or self._capture_seq)
-                resolved_cap_hwnd = (
-                    getattr(active_res, "hwnd", None) if active_res is not None else None
-                )
-                if not resolved_cap_hwnd:
-                    resolved_cap_hwnd = getattr(res, "hwnd", None)
-                if isinstance(resolved_cap_hwnd, int) and resolved_cap_hwnd > 0:
+                capture_id = str(getattr(res, "capture_id", None) or "").strip() or new_id()
+                raw_cap_bounds = getattr(res, "capture_bounds", None)
+                if (
+                    isinstance(raw_cap_bounds, (list, tuple))
+                    and len(raw_cap_bounds) == 4
+                    and all(isinstance(v, int) and not isinstance(v, bool) for v in raw_cap_bounds)
+                ):
+                    capture_bounds_list: list[int] | None = [int(v) for v in raw_cap_bounds]
+                elif scr_w > 0 and scr_h > 0:
+                    capture_bounds_list = [v_left, v_top, v_left + int(scr_w), v_top + int(scr_h)]
+                else:
+                    capture_bounds_list = None
+
+                resolved_cap_hwnd = getattr(res, "hwnd", None)
+                if (
+                    isinstance(resolved_cap_hwnd, int)
+                    and not isinstance(resolved_cap_hwnd, bool)
+                    and resolved_cap_hwnd > 0
+                ):
                     self._active_target_hwnd = int(resolved_cap_hwnd)
+                    self._circuit_breaker.on_turn_complete(current_hwnd=self._active_target_hwnd)
 
                 if img_w > 0 and img_h > 0 and scr_w > 0 and scr_h > 0:
                     self._last_screen_geometry = {
@@ -2702,6 +3007,9 @@ class VoiceRunner:
                         "dpi_scale": dpi_scale,
                         "coord_space": coord_space,
                         "capture_seq": effective_cap_seq,
+                        "capture_id": capture_id,
+                        "capture_bounds": capture_bounds_list,
+                        "hwnd": self._active_target_hwnd,
                         "target_hwnd": self._active_target_hwnd,
                         "window_bounds": list(res.window_bounds) if res.window_bounds else None,
                     }
@@ -2723,6 +3031,9 @@ class VoiceRunner:
                     "dpi_scale": dpi_scale,
                     "coord_space": coord_space,
                     "capture_seq": res.capture_seq,
+                    "capture_id": capture_id,
+                    "capture_bounds": capture_bounds_list,
+                    "hwnd": self._active_target_hwnd,
                     "target_hwnd": self._active_target_hwnd,
                     "captured_at": res.captured_at,
                     "window_title": res.window_title,
@@ -2733,10 +3044,6 @@ class VoiceRunner:
                     "monitor_index": res.monitor_index,
                     "monitor_bounds": list(res.monitor_bounds) if res.monitor_bounds else None,
                 }
-                if active_res is not None:
-                    payload["active_window_mime_type"] = active_res.mime_type
-                    payload["active_window_width"] = active_res.width
-                    payload["active_window_height"] = active_res.height
                 if getattr(res, "window_layout", None) is not None:
                     payload["window_layout"] = res.window_layout
                 if getattr(res, "window_geometry_summary", None):
@@ -3060,12 +3367,15 @@ class VoiceRunner:
             )
 
         async def _execute_rpc_tool(req: BaseRequest, *, error_prefix: str) -> None:
+            call_epoch = _CURRENT_TURN_EPOCH.get()
             should_diff = is_state_diff_tool(event.name, event.arguments)
             before_state = await self._capture_desktop_state() if should_diff else None
             is_err = False
             res_payload: dict[str, Any] = {}
             try:
                 res = await self._rpc(req, timeout=10.0)
+                if call_epoch is not None and call_epoch < self._turn_epoch:
+                    return
                 res_payload = dict(res) if isinstance(res, dict) else {"result": res}
                 if isinstance(req, (OsUiSnapshotRequest, OsOpenUrlRequest)):
                     raw_target_hwnd = res_payload.get("hwnd") or res_payload.get("window_hwnd")
@@ -3088,6 +3398,8 @@ class VoiceRunner:
                         "state_diff" not in res_payload or captured_diff is not None
                     ):
                         res_payload["state_diff"] = merged_diff
+                if call_epoch is not None and call_epoch < self._turn_epoch:
+                    return
                 self._circuit_breaker.record_outcome(
                     event.name,
                     event.arguments,
@@ -3102,7 +3414,11 @@ class VoiceRunner:
                     is_error=False,
                     scheduling="when_idle",
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
+                if call_epoch is not None and call_epoch < self._turn_epoch:
+                    return
                 is_err = True
                 if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) and isinstance(
                     req,
@@ -3858,20 +4174,53 @@ class VoiceRunner:
             if media_parts:
                 payload["mime_type"] = image_mime_type
 
+            raw_is_hwnd = res.get("hwnd")
+            resolved_is_hwnd: int | None = None
+            if (
+                isinstance(raw_is_hwnd, int)
+                and not isinstance(raw_is_hwnd, bool)
+                and raw_is_hwnd > 0
+            ):
+                resolved_is_hwnd = int(raw_is_hwnd)
+                self._active_target_hwnd = resolved_is_hwnd
+                self._circuit_breaker.on_turn_complete(current_hwnd=resolved_is_hwnd)
+
             is_img_w = int(res.get("image_width") or res.get("width") or 0)
             is_img_h = int(res.get("image_height") or res.get("height") or 0)
             is_scr_w = int(res.get("screen_width") or 0)
             is_scr_h = int(res.get("screen_height") or 0)
+            is_v_left = int(res.get("virtual_left") or 0)
+            is_v_top = int(res.get("virtual_top") or 0)
+            raw_is_bounds = res.get("capture_bounds")
+            if (
+                isinstance(raw_is_bounds, (list, tuple))
+                and len(raw_is_bounds) == 4
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in raw_is_bounds)
+            ):
+                is_cap_bounds: list[int] | None = [int(v) for v in raw_is_bounds]
+            elif is_scr_w > 0 and is_scr_h > 0:
+                is_cap_bounds = [is_v_left, is_v_top, is_v_left + is_scr_w, is_v_top + is_scr_h]
+            else:
+                is_cap_bounds = None
+            is_cap_id = str(res.get("capture_id") or "").strip() or None
+
+            effective_is_hwnd = (
+                resolved_is_hwnd if resolved_is_hwnd is not None else self._active_target_hwnd
+            )
             if is_img_w > 0 and is_img_h > 0 and is_scr_w > 0 and is_scr_h > 0:
                 self._last_screen_geometry = {
                     "image_width": is_img_w,
                     "image_height": is_img_h,
                     "screen_width": is_scr_w,
                     "screen_height": is_scr_h,
-                    "virtual_left": int(res.get("virtual_left") or 0),
-                    "virtual_top": int(res.get("virtual_top") or 0),
+                    "virtual_left": is_v_left,
+                    "virtual_top": is_v_top,
                     "dpi_scale": float(res.get("dpi_scale") or 1.0),
                     "coord_space": str(res.get("coord_space") or "normalized_1000"),
+                    "hwnd": effective_is_hwnd,
+                    "target_hwnd": effective_is_hwnd,
+                    "capture_id": is_cap_id,
+                    "capture_bounds": is_cap_bounds,
                 }
 
             await backend.send_tool_responses(
@@ -4277,6 +4626,8 @@ class VoiceRunner:
                     raise ValueError(f"{key} must be finite.")
                 return int(val) if val.is_integer() else val
 
+            ref_arg = _req_str("ref")
+            app_arg = _req_str("app_name")
             raw_coord_space = _req_str("coord_space")
             coord_space_norm: str | None = None
             if raw_coord_space is not None:
@@ -4284,6 +4635,19 @@ class VoiceRunner:
                 if coord_space_norm not in {"normalized_1000", "image", "screen"}:
                     await _send_error(f"Unsupported coord_space: {raw_coord_space!r}")
                     return
+            elif (
+                action_norm in _POINTER_GUI_ACTIONS
+                and ref_arg is None
+                and self._last_screen_geometry
+            ):
+                geom_cs = str(
+                    self._last_screen_geometry.get("coord_space") or "normalized_1000"
+                ).strip().lower()
+                coord_space_norm = (
+                    geom_cs
+                    if geom_cs in {"normalized_1000", "image", "screen"}
+                    else "normalized_1000"
+                )
 
             try:
                 x_val = _opt_num("x")
@@ -4308,6 +4672,16 @@ class VoiceRunner:
                 return
 
             dpi_scale_val: float | None = None
+            capture_id_val: str | None = _req_str("capture_id")
+            capture_bounds_val: list[int] | None = None
+            raw_bounds_arg = event.arguments.get("capture_bounds")
+            if (
+                isinstance(raw_bounds_arg, (list, tuple))
+                and len(raw_bounds_arg) == 4
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in raw_bounds_arg)
+            ):
+                capture_bounds_val = [int(v) for v in raw_bounds_arg]
+
             if coord_space_norm in {"normalized_1000", "image"} and self._last_screen_geometry:
                 geom = self._last_screen_geometry
                 if image_width_val is None:
@@ -4323,6 +4697,10 @@ class VoiceRunner:
                 if virtual_top_val is None:
                     virtual_top_val = int(geom["virtual_top"])
                 dpi_scale_val = float(geom["dpi_scale"])
+                if capture_id_val is None and geom.get("capture_id"):
+                    capture_id_val = str(geom["capture_id"])
+                if capture_bounds_val is None and isinstance(geom.get("capture_bounds"), list):
+                    capture_bounds_val = [int(v) for v in geom["capture_bounds"]]
 
             raw_text = event.arguments.get("text")
             text_val: str | None = None
@@ -4343,8 +4721,6 @@ class VoiceRunner:
                 await _send_error(f"Unsupported mouse button: {raw_button!r}")
                 return
 
-            ref_arg = _req_str("ref")
-            app_arg = _req_str("app_name")
             if (
                 expected_hwnd_val is None
                 and ref_arg is None
@@ -4359,10 +4735,20 @@ class VoiceRunner:
                     "press_keys",
                     "scroll",
                 }
-                and self._active_target_hwnd is not None
-                and self._active_target_hwnd > 0
             ):
-                expected_hwnd_val = int(self._active_target_hwnd)
+                geom_hwnd = (
+                    self._last_screen_geometry.get("hwnd")
+                    or self._last_screen_geometry.get("target_hwnd")
+                    if self._last_screen_geometry
+                    else None
+                )
+                candidate_hwnd = self._active_target_hwnd or geom_hwnd
+                if (
+                    isinstance(candidate_hwnd, int)
+                    and not isinstance(candidate_hwnd, bool)
+                    and candidate_hwnd > 0
+                ):
+                    expected_hwnd_val = int(candidate_hwnd)
 
             await _execute_rpc_tool(
                 OsGuiActionRequest(
@@ -4384,6 +4770,8 @@ class VoiceRunner:
                         virtual_left=virtual_left_val,
                         virtual_top=virtual_top_val,
                         dpi_scale=dpi_scale_val,
+                        capture_id=capture_id_val,
+                        capture_bounds=capture_bounds_val,
                         ref=ref_arg,
                         key=_req_str("key"),
                         app_name=app_arg,
@@ -4480,6 +4868,15 @@ class VoiceRunner:
                             if isinstance(raw_cs, str) and raw_cs.strip()
                             else None
                         )
+                        if op_norm == "click_at" and cs_norm is None and self._last_screen_geometry:
+                            geom_cs = str(
+                                self._last_screen_geometry.get("coord_space") or "normalized_1000"
+                            ).strip().lower()
+                            cs_norm = (
+                                geom_cs
+                                if geom_cs in {"normalized_1000", "image", "screen"}
+                                else "normalized_1000"
+                            )
                         if (
                             op_norm == "click_at"
                             and cs_norm in {"normalized_1000", "image"}

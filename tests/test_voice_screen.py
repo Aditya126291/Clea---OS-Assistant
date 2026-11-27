@@ -151,8 +151,12 @@ def test_screen_capture_service_mocked_grabber() -> None:
     res = svc.capture(target="full_screen")
     assert res.blocked is False
     assert res.image_bytes is not None
-    assert res.width == 800
-    assert res.height == 600
+    assert res.width == 768
+    assert res.height == 576
+    assert res.image_width == 768
+    assert res.image_height == 576
+    assert res.screen_width == 800
+    assert res.screen_height == 600
 
 
 def test_screen_capture_service_active_window_blocklist() -> None:
@@ -475,8 +479,12 @@ def test_screen_capture_minimized_active_window_falls_back_to_monitor() -> None:
     res = svc.capture(target="active_window")
     assert res.blocked is False
     assert res.window_bounds is None
-    assert res.width == 1920
-    assert res.height == 1080
+    assert res.width == 1568
+    assert res.height == 882
+    assert res.image_width == 1568
+    assert res.image_height == 882
+    assert res.screen_width == 1920
+    assert res.screen_height == 1080
 
 
 async def test_voice_runner_look_at_screen_sends_ground_truth_and_pulses_indicator(
@@ -628,11 +636,15 @@ def test_screen_capture_service_clips_offscreen_window_bounds() -> None:
     off_svc = ScreenCaptureService(api=off_api, grabber=lambda *a, **k: canvas.copy())
     off_res = off_svc.capture(target="active_window")
     assert off_res.image_bytes is not None
-    assert off_res.width == 1920
-    assert off_res.height == 1080
+    assert off_res.width == 1568
+    assert off_res.height == 882
+    assert off_res.image_width == 1568
+    assert off_res.image_height == 882
+    assert off_res.screen_width == 1920
+    assert off_res.screen_height == 1080
 
 
-async def test_voice_runner_look_at_screen_full_screen_also_sends_native_active_window_crop(
+async def test_voice_runner_look_at_screen_full_screen_sends_single_frame_matching_geometry(
     tmp_path: Path,
 ) -> None:
     api = _make_dual_monitor_mock_api()
@@ -658,7 +670,7 @@ async def test_voice_runner_look_at_screen_full_screen_also_sends_native_active_
     await runner.start_call(trigger="test")
 
     call_ev = ToolCallEvent(
-        call_id="call-full-dual",
+        call_id="call-full-single",
         name="look_at_screen",
         arguments={"target": "full_screen", "reason": "inspect desktop and code"},
     )
@@ -666,19 +678,15 @@ async def test_voice_runner_look_at_screen_full_screen_also_sends_native_active_
 
     assert len(backend.sent_video_frames) == 0
     resp = backend.sent_tool_responses[0]
-    assert len(resp.media_parts) == 2
-    assert [p.mime_type for p in resp.media_parts] == ["image/jpeg", "image/png"]
+    assert len(resp.media_parts) == 1
+    assert [p.mime_type for p in resp.media_parts] == ["image/jpeg"]
     full_img = Image.open(io.BytesIO(resp.media_parts[0].data))
-    native_img = Image.open(io.BytesIO(resp.media_parts[1].data))
     assert full_img.size == (1920, 1080)
-    assert native_img.size == (1500, 840)
 
     assert resp.response["status"] == "success"
-    assert resp.response["frames_sent"] == 2
-    assert resp.response["image_order"] == ["full_screen", "active_window"]
-    assert resp.response["active_window_mime_type"] == "image/png"
-    assert resp.response["active_window_width"] == 1500
-    assert resp.response["active_window_height"] == 840
+    assert resp.response["frames_sent"] == 1
+    assert resp.response["image_order"] == ["full_screen"]
+    assert "active_window_mime_type" not in resp.response
 
     await runner.end_call(reason="done")
     await runner.stop()

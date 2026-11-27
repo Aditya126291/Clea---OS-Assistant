@@ -50,6 +50,7 @@ from clea.tools.uia_com import (
 )
 
 _ORIG_INSPECT_WINDOW_LAYOUT = inspect_window_layout
+_ORIG_GET_WINDOW_BOUNDS = get_window_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class WindowCapture(BaseModel):
     height: int
     window_title: str | None = None
     process_name: str | None = None
+    capture_bounds: tuple[int, int, int, int] | None = None
 
 
 class ScreenInspectionResult(BaseModel):
@@ -115,6 +117,9 @@ class ScreenInspectionResult(BaseModel):
     )
     window_title: str | None = None
     process_name: str | None = None
+    hwnd: int | None = None
+    capture_id: str | None = None
+    capture_bounds: tuple[int, int, int, int] | None = None
     question: str | None = None
     dimensions: tuple[int, int] | None = None
     width: int | None = None
@@ -152,6 +157,9 @@ class ScreenInspectionResult(BaseModel):
             "message": self.message,
         }
         for geom_key in (
+            "hwnd",
+            "capture_id",
+            "capture_bounds",
             "image_width",
             "image_height",
             "screen_width",
@@ -623,7 +631,43 @@ class Win32ScreenVisionBackend:
             if matched:
                 minimized = self.is_minimized(hwnd)
                 has_title = bool(title.strip())
-                bounds = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+                rect_bounds: tuple[int, int, int, int] | None = (
+                    (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+                    if rect.right > rect.left and rect.bottom > rect.top
+                    else None
+                )
+                bounds: tuple[int, int, int, int] | None = None
+                if get_window_bounds is not _ORIG_GET_WINDOW_BOUNDS or isinstance(
+                    self._user32, ctypes.CDLL
+                ):
+                    with contextlib.suppress(Exception):
+                        bounds = get_window_bounds(hwnd)
+                if (
+                    bounds is None
+                    and self._dwmapi is not None
+                    and hasattr(self._dwmapi, "DwmGetWindowAttribute")
+                ):
+                    dwm_rect = _RECT()
+                    with contextlib.suppress(Exception):
+                        hr = self._dwmapi.DwmGetWindowAttribute(
+                            hwnd,
+                            DWMWA_EXTENDED_FRAME_BOUNDS,
+                            ctypes.byref(dwm_rect),
+                            ctypes.sizeof(dwm_rect),
+                        )
+                        if (
+                            hr == 0
+                            and dwm_rect.right > dwm_rect.left
+                            and dwm_rect.bottom > dwm_rect.top
+                        ):
+                            bounds = (
+                                int(dwm_rect.left),
+                                int(dwm_rect.top),
+                                int(dwm_rect.right),
+                                int(dwm_rect.bottom),
+                            )
+                if bounds is None:
+                    bounds = rect_bounds
                 win_info = WindowInfo(
                     hwnd=hwnd,
                     title=title,
@@ -794,6 +838,12 @@ class Win32ScreenVisionBackend:
         img = Image.frombuffer("RGBA", (full_w, full_h), raw_bytes, "raw", "BGRA", 0, 1).copy()
 
         # 5. Crop invisible 7-8px drop-shadow margins if DWM bounds are valid sub-rectangle
+        effective_capture_bounds: tuple[int, int, int, int] = (
+            int(win_rect.left),
+            int(win_rect.top),
+            int(win_rect.right),
+            int(win_rect.bottom),
+        )
         if obtained_dwm:
             crop_w = dwm_rect.right - dwm_rect.left
             crop_h = dwm_rect.bottom - dwm_rect.top
@@ -808,6 +858,12 @@ class Win32ScreenVisionBackend:
                     and (crop_x > 0 or crop_y > 0 or crop_x2 < full_w or crop_y2 < full_h)
                 ):
                     img = img.crop((crop_x, crop_y, crop_x2, crop_y2))
+                    effective_capture_bounds = (
+                        int(win_rect.left + crop_x),
+                        int(win_rect.top + crop_y),
+                        int(win_rect.left + crop_x2),
+                        int(win_rect.top + crop_y2),
+                    )
 
         # Promote all-zero-alpha BGRX frames and mixed DWM+GDI zero-alpha client frames to opaque
         # RGBA; preserve genuine premultiplied BGRA alpha where A==0 only appears on RGB==(0,0,0).
@@ -834,6 +890,7 @@ class Win32ScreenVisionBackend:
             height=img.height,
             window_title=title,
             process_name=proc_name,
+            capture_bounds=effective_capture_bounds,
         )
 
     def probe_uia_text(self, hwnd: int, max_chars: int = DEFAULT_PROBE_MAX_CHARS) -> str:
@@ -1257,7 +1314,9 @@ class ScreenVisionService:
                 if max(w, h) > MAX_VISION_DIMENSION:
                     final_bytes, (w, h) = _downscale_png(final_bytes, MAX_VISION_DIMENSION)
 
-                geom_bounds = win.bounds
+                geom_bounds = capture.capture_bounds
+                if geom_bounds is None:
+                    geom_bounds = win.bounds
                 if geom_bounds is None and isinstance(self._backend, Win32ScreenVisionBackend):
                     with contextlib.suppress(Exception):
                         geom_bounds = get_window_bounds(win.hwnd)
@@ -1272,6 +1331,14 @@ class ScreenVisionService:
                 else:
                     v_left, v_top = 0, 0
                     s_width, s_height = max(1, capture.width), max(1, capture.height)
+
+                effective_capture_bounds: tuple[int, int, int, int] = (
+                    v_left,
+                    v_top,
+                    v_left + s_width,
+                    v_top + s_height,
+                )
+                capture_id = f"cap_{uuid.uuid4().hex[:12]}"
 
                 dpi_scale = 1.0
                 if isinstance(self._backend, Win32ScreenVisionBackend) and sys.platform == "win32":
@@ -1288,6 +1355,9 @@ class ScreenVisionService:
                         virtual_top=v_top,
                         dpi_scale=dpi_scale,
                         coord_space="normalized_1000",
+                        hwnd=win.hwnd,
+                        capture_id=capture_id,
+                        capture_bounds=effective_capture_bounds,
                     )
 
                 saved_path = self._artifact_store.save_png(final_bytes, prefix="vision_window")
@@ -1307,6 +1377,9 @@ class ScreenVisionService:
                     source=source,
                     window_title=win.title,
                     process_name=win.process_name,
+                    hwnd=win.hwnd,
+                    capture_id=capture_id,
+                    capture_bounds=effective_capture_bounds,
                     question=q_norm,
                     dimensions=(w, h),
                     width=w,
@@ -1333,6 +1406,7 @@ class ScreenVisionService:
                     source=source,
                     window_title=win.title,
                     process_name=win.process_name,
+                    hwnd=win.hwnd,
                     question=q_norm,
                     uia_text=uia_text or None,
                     message=f"Failed capturing window pixels: {exc}",
@@ -1353,6 +1427,7 @@ class ScreenVisionService:
             source=source,
             window_title=win.title,
             process_name=win.process_name,
+            hwnd=win.hwnd,
             question=q_norm,
             uia_text=uia_text or None,
             message=msg,

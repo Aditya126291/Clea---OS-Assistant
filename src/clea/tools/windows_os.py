@@ -109,6 +109,8 @@ PROCESS_QUERY_LIMITED_INFORMATION: int = 0x1000
 _ALLOWED_MS_SETTINGS: frozenset[str] = frozenset(
     {
         "ms-settings:",
+        "ms-settings:home",
+        "ms-settings:system",
         "ms-settings:display",
         "ms-settings:sound",
         "ms-settings:notifications",
@@ -116,9 +118,12 @@ _ALLOWED_MS_SETTINGS: frozenset[str] = frozenset(
         "ms-settings:powersleep",
         "ms-settings:batterysaver",
         "ms-settings:storagesense",
+        "ms-settings:storagepolicies",
         "ms-settings:multitasking",
+        "ms-settings:clipboard",
         "ms-settings:project",
         "ms-settings:about",
+        "ms-settings:accounts",
         "ms-settings:bluetooth",
         "ms-settings:connecteddevices",
         "ms-settings:printers",
@@ -134,32 +139,72 @@ _ALLOWED_MS_SETTINGS: frozenset[str] = frozenset(
         "ms-settings:appsfeatures",
         "ms-settings:defaultapps",
         "ms-settings:optionalfeatures",
+        "ms-settings:startupapps",
         "ms-settings:dateandtime",
         "ms-settings:regionlanguage",
         "ms-settings:gaming-gamebar",
         "ms-settings:easeofaccess",
         "ms-settings:privacy",
+        "ms-settings:privacy-microphone",
+        "ms-settings:privacy-webcam",
+        "ms-settings:privacy-location",
+        "ms-settings:windowsdefender",
         "ms-settings:windowsupdate",
     }
 )
 
 _ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
+_DANGEROUS_URL_SCHEMES: frozenset[str] = frozenset(
+    {
+        "file",
+        "javascript",
+        "vbscript",
+        "jscript",
+        "ms-msdt",
+        "search-ms",
+        "shell",
+        "cmd",
+        "powershell",
+        "hta",
+        "wscript",
+        "data",
+        "blob",
+        "ms-officecmd",
+    }
+)
+
 _DANGEROUS_SCHEME_PREFIXES: tuple[str, ...] = (
     "file:",
     "javascript:",
-    "data:",
     "vbscript:",
+    "jscript:",
+    "ms-msdt:",
+    "search-ms:",
+    "shell:",
     "cmd:",
     "powershell:",
+    "hta:",
+    "wscript:",
+    "data:",
+    "blob:",
+    "ms-officecmd:",
     "ms-settings:",
-    "shell:",
     "ws:",
     "wss:",
     "about:",
     "chrome:",
     "edge:",
 )
+
+_RFC3986_SCHEME_PREFIX_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+_HOST_PORT_RE = re.compile(
+    r"^(?:localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+):\d+(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+_CUSTOM_URL_FORBIDDEN_CHARS_RE = re.compile(r"[|;`$()<>\"'\\]|&&|\|\|")
+_STALE_GEOMETRY_TOLERANCE_PX: int = 12
+_SCREEN_GEOMETRY_MAX_AGE_S: float = 120.0
 
 _SITE_SHORTCUTS: dict[str, str] = {
     "google": "https://www.google.com",
@@ -1693,6 +1738,136 @@ def _extract_exe_stem_from_command(raw_cmd: Any) -> str:
         exe_part = stripped.split()[0]
     stem = Path(exe_part).stem.strip()
     return stem
+
+
+def is_registered_url_protocol(
+    scheme: str,
+    *,
+    registry_lookup: Callable[[str], bool] | None = None,
+) -> bool:
+    """Return True if *scheme* is a safe, OS-registered Windows URL Protocol.
+
+    Enforces ``_DANGEROUS_URL_SCHEMES`` unconditionally (even when ``registry_lookup`` is
+    injected) and checks ``HKCR\\<scheme>\\URL Protocol`` (plus
+    ``HKCU\\Software\\Classes\\<scheme>\\URL Protocol``) via ``winreg`` on Windows.
+    """
+    if not isinstance(scheme, str):
+        return False
+    clean = scheme.strip().lower().rstrip(":")
+    if (
+        not clean
+        or len(clean) < 2
+        or not re.fullmatch(r"[a-z][a-z0-9+.-]*", clean)
+        or clean in _DANGEROUS_URL_SCHEMES
+        or clean in _DISALLOWED_SHELL_BINARIES
+        or clean in {"http", "https", "ms-settings", "ws", "wss", "about", "chrome", "edge"}
+    ):
+        return False
+
+    if registry_lookup is not None:
+        return bool(registry_lookup(clean))
+
+    if sys.platform != "win32":
+        return False
+
+    try:
+        import winreg
+    except ImportError:
+        return False
+
+    roots = (
+        (winreg.HKEY_CLASSES_ROOT, clean),
+        (winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{clean}"),
+    )
+    for root_hive, subkey in roots:
+        try:
+            with winreg.OpenKey(root_hive, subkey) as key:
+                try:
+                    winreg.QueryValueEx(key, "URL Protocol")
+                    return True
+                except FileNotFoundError:
+                    continue
+        except OSError:
+            continue
+    return False
+
+
+def _capture_view_fp_safe(
+    hwnd: int | None = None,
+    *,
+    view_fingerprint_fn: Callable[..., Any] | None = None,
+    include_heading: bool = True,
+) -> Any:
+    """Capture a WindowViewFingerprint safely via injected callback or view_fingerprint.py."""
+    if view_fingerprint_fn is not None:
+        try:
+            return view_fingerprint_fn(hwnd)
+        except TypeError:
+            return view_fingerprint_fn()
+    try:
+        from clea.tools.view_fingerprint import capture_window_view_fingerprint
+
+        return capture_window_view_fingerprint(hwnd=hwnd, include_heading=include_heading)
+    except Exception:
+        return None
+
+
+def _compare_view_fps_safe(before: Any, after: Any) -> dict[str, Any]:
+    """Compare two WindowViewFingerprint snapshots safely."""
+    try:
+        from clea.tools.view_fingerprint import compare_view_fingerprints
+
+        return compare_view_fingerprints(before, after)
+    except Exception:
+        if before is None or after is None:
+            return {
+                "view_changed": False,
+                "visual_delta": 0.0,
+                "heading_before": str(getattr(before, "heading", "") or ""),
+                "heading_after": str(getattr(after, "heading", "") or ""),
+                "heading_changed": False,
+            }
+        b_hex = str(getattr(before, "dhash_hex", "") or "")
+        a_hex = str(getattr(after, "dhash_hex", "") or "")
+        b_head = str(getattr(before, "heading", "") or "")
+        a_head = str(getattr(after, "heading", "") or "")
+        delta = 0.0
+        if b_hex and a_hex:
+            try:
+                xor_bits = int(b_hex, 16) ^ int(a_hex, 16)
+                delta = round(xor_bits.bit_count() / 256.0, 4)
+            except ValueError:
+                delta = 1.0 if b_hex != a_hex else 0.0
+        heading_changed = bool(b_head and a_head and b_head != a_head) or (
+            not b_head and bool(a_head)
+        )
+        return {
+            "view_changed": bool(delta >= 0.04 or heading_changed),
+            "visual_delta": delta,
+            "heading_before": b_head,
+            "heading_after": a_head,
+            "heading_changed": heading_changed,
+        }
+
+
+def _cancellable_settle_wait_safe(
+    seconds: float,
+    *,
+    cancel_event: threading.Event | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+) -> bool:
+    """Wait briefly for async UI navigation while respecting cancellation."""
+    if seconds <= 0:
+        return not (cancel_event is not None and cancel_event.is_set())
+    try:
+        from clea.tools.view_fingerprint import cancellable_settle_wait
+
+        return cancellable_settle_wait(seconds, cancel_event=cancel_event, sleep_fn=sleep_fn)
+    except Exception:
+        if cancel_event is not None:
+            return not cancel_event.wait(seconds)
+        (sleep_fn or time.sleep)(seconds)
+        return True
 
 
 def _check_url_protocol_registered(scheme: str) -> dict[str, str] | None:
@@ -3416,6 +3591,7 @@ def open_url(
     app_catalog_fetcher: Callable[[], list[dict[str, str]]] | None = None,
     app_uri_handler_finder: Callable[[str], list[dict[str, str]]] | None = None,
     url_protocol_checker: Callable[[str], bool | dict[str, Any] | None] | None = None,
+    registry_lookup: Callable[[str], bool] | None = None,
     user32: Any = None,
     kernel32: Any = None,
     window_enumerator: Callable[[], list[EnumeratedWindow]] | None = None,
@@ -3423,18 +3599,24 @@ def open_url(
     user_request: str | None = None,
     cdp_bridge: CDPBridge | None = None,
     pwa_launch_settle_s: float | None = None,
+    view_fingerprint_fn: Callable[..., Any] | None = None,
+    settle_wait_s: float | None = None,
+    cancel_event: threading.Event | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    verify_view: bool | None = None,
 ) -> dict[str, Any]:
-    """Validate and open an http/https URL using dynamic 3-layer OS app-first routing.
+    """Validate and open an http/https URL or registered OS custom URL Protocol URI.
 
-    Unless the caller explicitly requests a browser (``prefer_browser=True``, ``browser=...``,
-    or browser phrasing in ``user_request``), resolves dynamically across:
+    For ``http``/``https`` URLs, unless the caller explicitly requests a browser
+    (``prefer_browser=True``, ``browser=...``, or browser phrasing in ``user_request``),
+    resolves dynamically across:
       1. Windows ``AppUriHandlers`` (Store / MSIX apps)
       2. Windows Registry custom ``URL Protocol`` keys (native Win32 / Electron apps)
       3. Running standalone app/PWA windows & live ``get_installed_apps()`` catalog
 
-    When an installed app matches, focuses/restores its single window (or launches once)
-    without spawning a browser. When browser opening is explicitly requested or no app
-    is installed, reuses any existing browser window and never spawns ``--new-window``.
+    For non-http/https URIs with a valid RFC 3986 leading ``<scheme>:``, enforces the
+    dangerous-scheme blocklist and verifies ``HKCR\\<scheme>\\URL Protocol`` before
+    launching directly via the OS protocol handler (never ``shell=True``).
     """
     effective_popen = popen_fn if popen_fn is not None else subprocess.Popen
     if not isinstance(url, str):
@@ -3443,12 +3625,12 @@ def open_url(
     if not stripped:
         raise ValueError("url must not be empty.")
 
-    if any(ord(ch) < 32 for ch in stripped):
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in stripped):
         raise ValueError("URL contains invalid control characters.")
 
     lower_stripped = stripped.lower()
     if any(lower_stripped.startswith(prefix) for prefix in _DANGEROUS_SCHEME_PREFIXES):
-        raise ValueError(f"Disallowed URL scheme in {url!r}. Only http and https URLs are allowed.")
+        raise ValueError(f"Disallowed URL scheme in {url!r}.")
 
     # Reject local Windows drive paths (e.g. C:\..., C:/..., C:calc.exe)
     if re.match(r"^[A-Za-z]:", stripped):
@@ -3464,6 +3646,205 @@ def open_url(
     first_token = re.split(r"[\s/\\?#]", lower_stripped)[0]
     if first_token in _DISALLOWED_SHELL_BINARIES:
         raise ValueError(f"Disallowed command or shell binary in URL: {url!r}")
+
+    # Detect valid RFC 3986 leading <scheme>: without mangling custom protocols into https://
+    scheme_match = (
+        None if _HOST_PORT_RE.match(stripped) else _RFC3986_SCHEME_PREFIX_RE.match(stripped)
+    )
+    if scheme_match is not None:
+        detected_scheme = scheme_match.group(1).lower()
+        if (
+            detected_scheme in _DANGEROUS_URL_SCHEMES
+            or detected_scheme in _DISALLOWED_SHELL_BINARIES
+            or detected_scheme in {"ms-settings", "ws", "wss", "about", "chrome", "edge"}
+        ):
+            raise ValueError(f"Disallowed URL scheme '{detected_scheme}' in {url!r}.")
+
+        if detected_scheme not in _ALLOWED_URL_SCHEMES:
+            if any(ch.isspace() for ch in stripped):
+                raise ValueError(
+                    f"Whitespace is not permitted in custom protocol URI: {url!r}"
+                )
+            if _CUSTOM_URL_FORBIDDEN_CHARS_RE.search(stripped):
+                raise ValueError(
+                    f"Disallowed shell metacharacter in custom protocol URI: {url!r}"
+                )
+            before_query = stripped.split("?", 1)[0]
+            if "&" in before_query:
+                raise ValueError(
+                    f"Disallowed shell metacharacter '&' in custom protocol URI: {url!r}"
+                )
+
+            eff_registry_lookup: Callable[[str], bool] | None = registry_lookup
+            if eff_registry_lookup is None and url_protocol_checker is not None:
+
+                def _protocol_checker_adapter(
+                    scheme_arg: str,
+                    _checker: Callable[[str], bool | dict[str, Any] | None] = url_protocol_checker,
+                ) -> bool:
+                    return bool(_checker(scheme_arg))
+
+                eff_registry_lookup = _protocol_checker_adapter
+
+            if not is_registered_url_protocol(
+                detected_scheme,
+                registry_lookup=eff_registry_lookup,
+            ):
+                raise ValueError(
+                    f"Unregistered or unsupported URL scheme '{detected_scheme}' in {url!r}."
+                )
+
+            non_default = _check_interactive_desktop(desktop_name_fn)
+            if non_default is not None:
+                return {
+                    "ok": False,
+                    "success": False,
+                    "url": stripped,
+                    "scheme": detected_scheme,
+                    "protocol_scheme": detected_scheme,
+                    "browser": None,
+                    "routed_to_installed_app": False,
+                    "resolution_layer": "url_protocol",
+                    "status": "non_interactive_desktop",
+                    "goal_verified": False,
+                    "verification_scope": "dispatch_only",
+                    "message": (
+                        f"Cannot launch URL protocol '{detected_scheme}:' visibly because the "
+                        f"daemon is running on isolated desktop '{non_default}' instead of "
+                        "'WinSta0\\Default'."
+                    ),
+                }
+
+            should_verify_view = (
+                view_fingerprint_fn is not None
+                or verify_view is True
+                or (
+                    verify_view is None
+                    and startfile_fn is None
+                    and popen_fn is None
+                    and sys.platform == "win32"
+                )
+            )
+            u32_proto = user32
+            if u32_proto is None and should_verify_view and sys.platform == "win32":
+                with contextlib.suppress(Exception):
+                    u32_proto = _get_win32_user32(None)
+
+            before_hwnd = 0
+            if u32_proto is not None and hasattr(u32_proto, "GetForegroundWindow"):
+                with contextlib.suppress(Exception):
+                    raw_fg = u32_proto.GetForegroundWindow()
+                    if isinstance(raw_fg, int) and not isinstance(raw_fg, bool) and raw_fg > 0:
+                        before_hwnd = raw_fg
+            before_win_hwnds = (
+                {int(w.hwnd) for w in window_enumerator()}
+                if window_enumerator is not None
+                else set()
+            )
+            before_fp = (
+                _capture_view_fp_safe(
+                    before_hwnd or None,
+                    view_fingerprint_fn=view_fingerprint_fn,
+                )
+                if should_verify_view
+                else None
+            )
+
+            _open_via_shell(
+                stripped,
+                startfile_fn=startfile_fn,
+                popen_fn=effective_popen,
+            )
+
+            if should_verify_view:
+                eff_settle = (
+                    settle_wait_s
+                    if settle_wait_s is not None
+                    else (0.2 if view_fingerprint_fn is None else 0.0)
+                )
+                _cancellable_settle_wait_safe(
+                    eff_settle,
+                    cancel_event=cancel_event,
+                    sleep_fn=sleep_fn,
+                )
+
+            after_hwnd = 0
+            if u32_proto is not None and hasattr(u32_proto, "GetForegroundWindow"):
+                with contextlib.suppress(Exception):
+                    raw_fg_after = u32_proto.GetForegroundWindow()
+                    if (
+                        isinstance(raw_fg_after, int)
+                        and not isinstance(raw_fg_after, bool)
+                        and raw_fg_after > 0
+                    ):
+                        after_hwnd = raw_fg_after
+            after_win_hwnds = (
+                {int(w.hwnd) for w in window_enumerator()}
+                if window_enumerator is not None
+                else set()
+            )
+            after_fp = (
+                _capture_view_fp_safe(
+                    after_hwnd or before_hwnd or None,
+                    view_fingerprint_fn=view_fingerprint_fn,
+                )
+                if should_verify_view
+                else None
+            )
+
+            view_diff = (
+                _compare_view_fps_safe(before_fp, after_fp)
+                if should_verify_view
+                else {
+                    "view_changed": False,
+                    "visual_delta": 0.0,
+                    "heading_before": "",
+                    "heading_after": "",
+                    "heading_changed": False,
+                }
+            )
+            window_changed = bool(
+                (after_hwnd > 0 and after_hwnd != before_hwnd)
+                or bool(after_win_hwnds - before_win_hwnds)
+            )
+            view_changed = bool(view_diff.get("view_changed", False))
+            visual_delta = float(view_diff.get("visual_delta", 0.0))
+            heading_before = str(view_diff.get("heading_before", "") or "")
+            heading_after = str(view_diff.get("heading_after", "") or "")
+            goal_verified = bool(view_changed or window_changed)
+            verification_scope = "in_app_view" if goal_verified else "dispatch_only"
+
+            return {
+                "ok": True,
+                "success": True,
+                "status": "launched",
+                "url": stripped,
+                "scheme": detected_scheme,
+                "protocol_scheme": detected_scheme,
+                "browser": None,
+                "launched_app": True,
+                "routed_to_installed_app": True,
+                "resolution_layer": "url_protocol",
+                "hwnd": after_hwnd or None,
+                "window_changed": window_changed,
+                "view_changed": view_changed,
+                "visual_delta": visual_delta,
+                "heading_before": heading_before,
+                "heading_after": heading_after,
+                "goal_verified": goal_verified,
+                "verification_scope": verification_scope,
+                "state_diff": {
+                    "changed": goal_verified,
+                    "window_changed": window_changed,
+                    "view_changed": view_changed,
+                    "visual_delta": visual_delta,
+                    "heading_before": heading_before,
+                    "heading_after": heading_after,
+                },
+                "message": (
+                    f"Launched registered URL protocol '{detected_scheme}:' via OS handler."
+                ),
+            }
 
     # If URL has no scheme, the host portion before path cannot have unencoded spaces
     if "://" not in stripped:
@@ -4393,6 +4774,11 @@ def control_system(
     focus_backend: FocusPreconditionBackend | None = None,
     verifier: ActionVerifier | None = None,
     verify_timeout_s: float = 0.6,
+    view_fingerprint_fn: Callable[..., Any] | None = None,
+    settle_wait_s: float | None = None,
+    cancel_event: threading.Event | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    verify_view: bool | None = None,
     **_extra: Any,
 ) -> dict[str, Any]:
     """Control Windows display brightness, window state, screen lock, or settings navigation."""
@@ -4758,6 +5144,30 @@ def control_system(
                 f"Allowed settings: {', '.join(sorted(_ALLOWED_MS_SETTINGS))}."
             )
 
+        should_verify_view = (
+            view_fingerprint_fn is not None
+            or verify_view is True
+            or (
+                verify_view is None
+                and startfile_fn is None
+                and popen_fn is subprocess.Popen
+                and sys.platform == "win32"
+            )
+        )
+
+        before_hwnd, before_title = (0, "")
+        before_fp = None
+        if should_verify_view:
+            with contextlib.suppress(Exception):
+                before_hwnd, before_title = _read_foreground_hwnd_and_title(
+                    user32=user32,
+                    focus_backend=focus_backend,
+                )
+            before_fp = _capture_view_fp_safe(
+                before_hwnd or None,
+                view_fingerprint_fn=view_fingerprint_fn,
+            )
+
         starter = startfile_fn or getattr(os, "startfile", None)
         if starter is not None:
             starter(target_uri)
@@ -4768,11 +5178,74 @@ def control_system(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+
+        if not should_verify_view:
+            return {
+                "ok": True,
+                "success": True,
+                "action": "open_settings",
+                "uri": target_uri,
+            }
+
+        eff_settle = (
+            settle_wait_s
+            if settle_wait_s is not None
+            else (0.2 if view_fingerprint_fn is None else 0.0)
+        )
+        _cancellable_settle_wait_safe(
+            eff_settle,
+            cancel_event=cancel_event,
+            sleep_fn=sleep_fn,
+        )
+
+        after_hwnd, after_title = (0, "")
+        with contextlib.suppress(Exception):
+            after_hwnd, after_title = _read_foreground_hwnd_and_title(
+                user32=user32,
+                focus_backend=focus_backend,
+            )
+        after_fp = _capture_view_fp_safe(
+            after_hwnd or before_hwnd or None,
+            view_fingerprint_fn=view_fingerprint_fn,
+        )
+        view_diff = _compare_view_fps_safe(before_fp, after_fp)
+        window_changed = bool(
+            (before_hwnd > 0 and after_hwnd > 0 and after_hwnd != before_hwnd)
+            or (before_title and after_title and after_title != before_title)
+        )
+        view_changed = bool(view_diff.get("view_changed", False))
+        visual_delta = float(view_diff.get("visual_delta", 0.0))
+        heading_before = str(view_diff.get("heading_before", "") or "")
+        heading_after = str(view_diff.get("heading_after", "") or "")
+        heading_changed = bool(view_diff.get("heading_changed", False))
+        goal_verified = bool(view_changed or window_changed)
+        verification_scope = (
+            "in_app_view"
+            if view_changed
+            else ("window_focus" if window_changed else "dispatch_only")
+        )
         return {
             "ok": True,
             "success": True,
             "action": "open_settings",
             "uri": target_uri,
+            "window_changed": window_changed,
+            "view_changed": view_changed,
+            "visual_delta": visual_delta,
+            "heading_before": heading_before,
+            "heading_after": heading_after,
+            "heading_changed": heading_changed,
+            "goal_verified": goal_verified,
+            "verification_scope": verification_scope,
+            "state_diff": {
+                "changed": goal_verified,
+                "window_changed": window_changed,
+                "view_changed": view_changed,
+                "visual_delta": visual_delta,
+                "heading_before": heading_before,
+                "heading_after": heading_after,
+                "heading_changed": heading_changed,
+            },
         }
 
     raise ValueError(f"Unhandled system action: {action!r}")
@@ -4846,7 +5319,10 @@ def set_last_screen_geometry(
     dpi_scale: float = 1.0,
     coord_space: str = "normalized_1000",
     target_hwnd: int | None = None,
+    hwnd: int | None = None,
     window_bounds: tuple[int, int, int, int] | list[int] | None = None,
+    capture_bounds: tuple[int, int, int, int] | list[int] | None = None,
+    capture_id: str | None = None,
     capture_seq: int | None = None,
 ) -> dict[str, Any]:
     """Store the latest screenshot geometry so subsequent gui_action calls scale accurately."""
@@ -4860,16 +5336,105 @@ def set_last_screen_geometry(
         "virtual_top": int(virtual_top),
         "dpi_scale": float(dpi_scale) if dpi_scale and dpi_scale > 0 else 1.0,
         "coord_space": str(coord_space or "normalized_1000"),
+        "captured_at": time.monotonic(),
     }
-    if target_hwnd is not None and int(target_hwnd) > 0:
-        geom["target_hwnd"] = int(target_hwnd)
-    if window_bounds is not None and len(window_bounds) == 4:
-        geom["window_bounds"] = tuple(int(v) for v in window_bounds)
+    resolved_hwnd = (
+        int(hwnd)
+        if hwnd is not None and int(hwnd) > 0
+        else (int(target_hwnd) if target_hwnd is not None and int(target_hwnd) > 0 else None)
+    )
+    if resolved_hwnd is not None:
+        geom["hwnd"] = resolved_hwnd
+        geom["target_hwnd"] = resolved_hwnd
+    resolved_bounds = (
+        capture_bounds
+        if capture_bounds is not None and len(capture_bounds) == 4
+        else (window_bounds if window_bounds is not None and len(window_bounds) == 4 else None)
+    )
+    if resolved_bounds is not None:
+        bounds_tuple = tuple(int(v) for v in resolved_bounds)
+        geom["capture_bounds"] = bounds_tuple
+        geom["window_bounds"] = bounds_tuple
+    if capture_id is not None and str(capture_id).strip():
+        geom["capture_id"] = str(capture_id).strip()
     if capture_seq is not None:
         geom["capture_seq"] = int(capture_seq)
     with _SCREEN_GEOMETRY_LOCK:
         _LAST_SCREEN_GEOMETRY = geom
     return dict(geom)
+
+
+def _is_valid_recent_screen_geometry(
+    geom: dict[str, Any] | None,
+    *,
+    max_age_s: float = _SCREEN_GEOMETRY_MAX_AGE_S,
+) -> bool:
+    """Return True if *geom* contains positive screen dimensions and is not expired."""
+    if not isinstance(geom, dict):
+        return False
+    sw = geom.get("screen_width")
+    sh = geom.get("screen_height")
+    if not isinstance(sw, int) or not isinstance(sh, int) or sw <= 0 or sh <= 0:
+        return False
+    captured_at = geom.get("captured_at")
+    if (
+        isinstance(captured_at, (int, float))
+        and (time.monotonic() - float(captured_at)) > max_age_s
+    ):
+        return False
+    return True
+
+
+def _query_live_window_bounds(
+    hwnd: int,
+    *,
+    window_bounds_fn: Callable[[int], tuple[int, int, int, int] | None] | None = None,
+    active_guard: PreconditionGuard | None = None,
+    focus_backend: FocusPreconditionBackend | None = None,
+    user32: Any = None,
+) -> tuple[int, int, int, int] | None:
+    """Query live physical DWM extended frame bounds for *hwnd* without throwing."""
+    if not hwnd or hwnd <= 0:
+        return None
+    if window_bounds_fn is not None:
+        with contextlib.suppress(Exception):
+            res = window_bounds_fn(hwnd)
+            if isinstance(res, (tuple, list)) and len(res) == 4:
+                return tuple(int(v) for v in res)
+        return None
+    guard_backend = getattr(active_guard, "backend", None) or getattr(
+        active_guard, "_backend", None
+    )
+    for backend_obj in (guard_backend, focus_backend):
+        if backend_obj is not None and hasattr(backend_obj, "get_extended_frame_bounds"):
+            with contextlib.suppress(Exception):
+                res = backend_obj.get_extended_frame_bounds(hwnd)
+                if isinstance(res, (tuple, list)) and len(res) == 4:
+                    return tuple(int(v) for v in res)
+    if user32 is not None and not isinstance(user32, ctypes.CDLL):
+        if hasattr(user32, "get_extended_frame_bounds"):
+            with contextlib.suppress(Exception):
+                res = user32.get_extended_frame_bounds(hwnd)
+                if isinstance(res, (tuple, list)) and len(res) == 4:
+                    return tuple(int(v) for v in res)
+        if hasattr(user32, "GetWindowRect"):
+            with contextlib.suppress(Exception):
+                rect = _OSRECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    if rect.right > rect.left and rect.bottom > rect.top:
+                        return (
+                            int(rect.left),
+                            int(rect.top),
+                            int(rect.right),
+                            int(rect.bottom),
+                        )
+        return None
+    if sys.platform == "win32":
+        with contextlib.suppress(Exception):
+            from clea.surfaces.voice.win32 import get_window_bounds
+
+            return get_window_bounds(hwnd)
+    return None
 
 
 def get_last_screen_geometry() -> dict[str, Any] | None:
@@ -5122,6 +5687,8 @@ class _UiRefStore:
         self.window_title: str = ""
         self.hwnd: int = 0
         self.elements_by_ref: dict[str, dict[str, Any]] = {}
+        self.stale: bool = False
+        self.stale_reason: str = ""
 
     def update(
         self,
@@ -5137,6 +5704,8 @@ class _UiRefStore:
             self.window_title = window_title
             self.hwnd = hwnd
             self.elements_by_ref = {k: dict(v) for k, v in elements_by_ref.items()}
+            self.stale = False
+            self.stale_reason = ""
 
     def clear(self) -> None:
         """Clear the stored snapshot and ref table."""
@@ -5145,11 +5714,24 @@ class _UiRefStore:
             self.window_title = ""
             self.hwnd = 0
             self.elements_by_ref = {}
+            self.stale = False
+            self.stale_reason = ""
+
+    def mark_stale(self, reason: str = "view_changed") -> None:
+        """Mark the current ref table stale after an in-app view transition."""
+        with self._lock:
+            self.stale = True
+            self.stale_reason = str(reason or "view_changed")
 
     def resolve(self, ref: str) -> tuple[str, str, int, dict[str, Any]]:
         """Look up a ref (supporting optional leading '@' and case-insensitivity)."""
         norm_ref = _normalize_ref_id(ref)
         with self._lock:
+            if self.stale:
+                raise ValueError(
+                    f"Unknown or stale UI ref {ref!r}: UI snapshot {self.snapshot_id} is stale "
+                    f"({self.stale_reason or 'view_changed'}). Call ui_snapshot() again."
+                )
             if not self.snapshot_id or not self.elements_by_ref:
                 raise ValueError(
                     f"Unknown or stale UI ref {ref!r}: no active snapshot. "
@@ -6838,6 +7420,8 @@ def ui_act(
     _capture_snapshot: bool | None = None,
     cancel_event: threading.Event | None = None,
     clipboard_backend: Any | None = None,
+    view_fingerprint_fn: Callable[..., Any] | None = None,
+    verify_view: bool | None = None,
 ) -> dict[str, Any]:
     """Execute a semantic action on an indexed UI ('e#') or CDP browser ('b#') element."""
     if not isinstance(ref, str) or not ref.strip():
@@ -6896,7 +7480,7 @@ def ui_act(
     action_runner = gui_action_fn or gui_action
 
     global _LAST_UI_SNAPSHOT, _LAST_UI_SNAPSHOT_TIME, _LAST_UI_WINDOW_TITLE
-    if not _UI_REF_STORE and ui_snapshot_fn is not None:
+    if (not _UI_REF_STORE or _UI_REF_STORE.stale) and ui_snapshot_fn is not None:
         snap = snap_runner(user32=user32)
         set_ui_snapshot_state(snap)
 
@@ -6932,6 +7516,27 @@ def ui_act(
     )
     before_fg_hwnd, before_fg_title = _read_foreground_hwnd_and_title(
         user32=user32, focus_backend=focus_backend
+    )
+    should_verify_view = (
+        view_fingerprint_fn is not None
+        or verify_view is True
+        or (
+            verify_view is None
+            and not is_fake_user32
+            and user32 is None
+            and powershell_runner is None
+            and uia_backend is None
+            and gui_action_fn is None
+            and sys.platform == "win32"
+        )
+    )
+    before_view_fp = (
+        _capture_view_fp_safe(
+            before_fg_hwnd or (snapshot_hwnd if snapshot_hwnd > 0 else None),
+            view_fingerprint_fn=view_fingerprint_fn,
+        )
+        if should_verify_view
+        else None
     )
 
     com_engine = _resolve_uia_com_engine(
@@ -7616,6 +8221,30 @@ def ui_act(
             "diff": light_diff,
             "snapshot": light_snapshot,
         }
+        if should_verify_view:
+            after_view_fp = _capture_view_fp_safe(
+                active_hwnd or None,
+                view_fingerprint_fn=view_fingerprint_fn,
+            )
+            view_diff = _compare_view_fps_safe(before_view_fp, after_view_fp)
+            view_changed = bool(view_diff.get("view_changed", False))
+            visual_delta = float(view_diff.get("visual_delta", 0.0))
+            heading_before = str(view_diff.get("heading_before", "") or "")
+            heading_after = str(view_diff.get("heading_after", "") or "")
+            light_diff["view_changed"] = view_changed
+            light_diff["visual_delta"] = visual_delta
+            light_diff["heading_before"] = heading_before
+            light_diff["heading_after"] = heading_after
+            light_res["view_changed"] = view_changed
+            light_res["visual_delta"] = visual_delta
+            light_res["heading_before"] = heading_before
+            light_res["heading_after"] = heading_after
+            if view_changed:
+                _UI_REF_STORE.mark_stale("view_changed")
+                _LAST_UI_SNAPSHOT_TIME = 0.0
+                light_res["refs_stale"] = True
+                light_res["goal_verified"] = True
+                light_res["verification_scope"] = "in_app_view"
         if norm_action in {"set_value", "type"} and value is not None:
             light_res["char_count"] = len(value)
             light_res["interval_ms"] = clamped_interval
@@ -8191,6 +8820,9 @@ def gui_action(
     virtual_left: int | None = None,
     virtual_top: int | None = None,
     dpi_scale: float | None = None,
+    capture_id: str | None = None,
+    capture_bounds: tuple[int, int, int, int] | list[int] | None = None,
+    window_bounds_fn: Callable[[int], tuple[int, int, int, int] | None] | None = None,
     ref: str | None = None,
     key: str | None = None,
     cdp_bridge: CDPBridge | None = None,
@@ -8278,14 +8910,88 @@ def gui_action(
 
     # Validate arguments before checking focus/window preconditions
     btn = button.strip().lower() if isinstance(button, str) else ""
-    effective_coord_space = (coord_space or "screen").strip().lower()
+    pointer_actions = {"click_at", "double_click", "right_click", "move"}
+
+    cached_geom = get_last_screen_geometry()
+    active_geom: dict[str, Any] | None = None
+    if _is_valid_recent_screen_geometry(cached_geom):
+        assert cached_geom is not None
+        if capture_id is None or cached_geom.get("capture_id") in (None, capture_id):
+            active_geom = cached_geom
+
+    explicit_capture_bounds: tuple[int, int, int, int] | None = None
+    if capture_bounds is not None and len(capture_bounds) == 4:
+        cb = tuple(int(v) for v in capture_bounds)
+        if cb[2] > cb[0] and cb[3] > cb[1]:
+            explicit_capture_bounds = cb
+
+    norm_capture_bounds: tuple[int, int, int, int] | None = explicit_capture_bounds
+    if norm_capture_bounds is None and active_geom is not None:
+        raw_cb = active_geom.get("capture_bounds") or active_geom.get("window_bounds")
+        if isinstance(raw_cb, (tuple, list)) and len(raw_cb) == 4:
+            cb = tuple(int(v) for v in raw_cb)
+            if cb[2] > cb[0] and cb[3] > cb[1]:
+                norm_capture_bounds = cb
+
+    has_passed_capture_geom = (
+        explicit_capture_bounds is not None
+        or (screen_width is not None and screen_height is not None)
+    )
+    if coord_space is None:
+        if normalized_action in pointer_actions and (
+            has_passed_capture_geom or active_geom is not None
+        ):
+            inherited_cs = (
+                str(active_geom.get("coord_space") or "normalized_1000").strip().lower()
+                if active_geom is not None
+                else "normalized_1000"
+            )
+            effective_coord_space = (
+                inherited_cs if inherited_cs in VALID_COORD_SPACES else "normalized_1000"
+            )
+        else:
+            effective_coord_space = "screen"
+    else:
+        effective_coord_space = coord_space.strip().lower()
+
     if effective_coord_space not in VALID_COORD_SPACES:
         raise ValueError(
             f"Unsupported coord_space {coord_space!r}. "
             f"Must be one of {sorted(VALID_COORD_SPACES)}."
         )
 
-    pointer_actions = {"click_at", "double_click", "right_click", "move"}
+    eff_virtual_left = virtual_left
+    eff_virtual_top = virtual_top
+    eff_screen_width = screen_width
+    eff_screen_height = screen_height
+    eff_image_width = image_width
+    eff_image_height = image_height
+    eff_dpi_scale = dpi_scale
+
+    if norm_capture_bounds is not None and eff_screen_width is None and eff_screen_height is None:
+        if eff_virtual_left is None:
+            eff_virtual_left = norm_capture_bounds[0]
+        if eff_virtual_top is None:
+            eff_virtual_top = norm_capture_bounds[1]
+        eff_screen_width = norm_capture_bounds[2] - norm_capture_bounds[0]
+        eff_screen_height = norm_capture_bounds[3] - norm_capture_bounds[1]
+
+    if active_geom is not None:
+        if eff_virtual_left is None:
+            eff_virtual_left = int(active_geom["virtual_left"])
+        if eff_virtual_top is None:
+            eff_virtual_top = int(active_geom["virtual_top"])
+        if eff_screen_width is None:
+            eff_screen_width = int(active_geom["screen_width"])
+        if eff_screen_height is None:
+            eff_screen_height = int(active_geom["screen_height"])
+        if eff_image_width is None:
+            eff_image_width = int(active_geom["image_width"])
+        if eff_image_height is None:
+            eff_image_height = int(active_geom["image_height"])
+        if eff_dpi_scale is None:
+            eff_dpi_scale = float(active_geom["dpi_scale"])
+
     if normalized_action in pointer_actions:
         if x is None or y is None or isinstance(x, bool) or isinstance(y, bool):
             raise ValueError(f"x and y coordinates are required for '{normalized_action}'.")
@@ -8346,24 +9052,95 @@ def gui_action(
             x,
             y,
             coord_space=effective_coord_space,
-            screen_width=screen_width,
-            screen_height=screen_height,
-            virtual_left=virtual_left,
-            virtual_top=virtual_top,
-            image_width=image_width,
-            image_height=image_height,
-            dpi_scale=dpi_scale,
+            screen_width=eff_screen_width,
+            screen_height=eff_screen_height,
+            virtual_left=eff_virtual_left,
+            virtual_top=eff_virtual_top,
+            image_width=eff_image_width,
+            image_height=eff_image_height,
+            dpi_scale=eff_dpi_scale,
             user32=u32,
         )
 
-    def _execute_gui_action(active_guard: PreconditionGuard | None) -> dict[str, Any]:
+    def _read_actual_hwnd(u32: Any, active_guard: PreconditionGuard | None) -> int | None:
+        guard_backend = getattr(active_guard, "backend", None) or getattr(
+            active_guard, "_backend", None
+        )
+        for backend_obj in (guard_backend, focus_backend):
+            if backend_obj is not None and hasattr(backend_obj, "get_foreground_context"):
+                with contextlib.suppress(Exception):
+                    fg_ctx = backend_obj.get_foreground_context()
+                    if fg_ctx is not None and isinstance(fg_ctx.hwnd, int) and fg_ctx.hwnd > 0:
+                        return int(fg_ctx.hwnd)
+        if u32 is not None and hasattr(u32, "GetForegroundWindow"):
+            with contextlib.suppress(Exception):
+                raw_fg = u32.GetForegroundWindow()
+                if isinstance(raw_fg, int) and not isinstance(raw_fg, bool) and raw_fg > 0:
+                    return int(raw_fg)
+        return None
+
+    active_geom_hwnd: int | None = None
+    if active_geom is not None:
+        raw_geom_hwnd = active_geom.get("hwnd") or active_geom.get("target_hwnd")
+        if (
+            isinstance(raw_geom_hwnd, int)
+            and not isinstance(raw_geom_hwnd, bool)
+            and raw_geom_hwnd > 0
+        ):
+            active_geom_hwnd = raw_geom_hwnd
+
+    def _execute_gui_action(
+        active_guard: PreconditionGuard | None,
+        eff_expected_hwnd: int | None,
+    ) -> dict[str, Any]:
         _check_cancelled(cancel_event)
         if active_guard is not None:
             active_guard.assert_ready(f"gui_action:{normalized_action}")
 
         u32 = _get_win32_user32(user32)
+        audit_expected_hwnd = (
+            eff_expected_hwnd if eff_expected_hwnd is not None else active_geom_hwnd
+        )
+        actual_fg_hwnd = _read_actual_hwnd(u32, active_guard)
 
         if normalized_action in pointer_actions:
+            stale_check_bounds = (
+                explicit_capture_bounds
+                if explicit_capture_bounds is not None
+                else (norm_capture_bounds if effective_coord_space != "screen" else None)
+            )
+            if audit_expected_hwnd is not None and stale_check_bounds is not None:
+                live_bounds = _query_live_window_bounds(
+                    audit_expected_hwnd,
+                    window_bounds_fn=window_bounds_fn,
+                    active_guard=active_guard,
+                    focus_backend=focus_backend,
+                    user32=user32,
+                )
+                if live_bounds is not None and any(
+                    abs(int(live_bounds[i]) - int(stale_check_bounds[i]))
+                    > _STALE_GEOMETRY_TOLERANCE_PX
+                    for i in range(4)
+                ):
+                    return {
+                        "ok": False,
+                        "status": "aborted",
+                        "reason": "stale_screen_geometry",
+                        "action": normalized_action,
+                        "goal_verified": False,
+                        "verification_scope": "dispatch_only",
+                        "coord_space": effective_coord_space,
+                        "expected_hwnd": audit_expected_hwnd,
+                        "actual_hwnd": actual_fg_hwnd,
+                        "expected_bounds": list(stale_check_bounds),
+                        "actual_bounds": list(live_bounds),
+                        "error": (
+                            f"Target window (hwnd={audit_expected_hwnd}) moved or resized since "
+                            f"screen capture: captured {stale_check_bounds}, live {live_bounds}. "
+                            "Recapture screen before clicking."
+                        ),
+                    }
+
             with _OS_INPUT_LOCK:
                 _check_cancelled(cancel_event)
                 px, py, coord_meta = _resolve_physical_xy(u32)
@@ -8378,6 +9155,8 @@ def gui_action(
                         "action": "move",
                         "x": px,
                         "y": py,
+                        "expected_hwnd": audit_expected_hwnd,
+                        "actual_hwnd": actual_fg_hwnd,
                         **coord_meta,
                     }
 
@@ -8406,6 +9185,8 @@ def gui_action(
                 "y": py,
                 "clicks": actual_clicks,
                 "button": eff_btn,
+                "expected_hwnd": audit_expected_hwnd,
+                "actual_hwnd": actual_fg_hwnd,
                 **coord_meta,
             }
 
@@ -8428,6 +9209,8 @@ def gui_action(
                 "char_count": entry_res["char_count"],
                 "interval_ms": entry_res["interval_ms"],
                 "entry_method": entry_res["method"],
+                "expected_hwnd": audit_expected_hwnd,
+                "actual_hwnd": actual_fg_hwnd,
             }
             if "clipboard_restored" in entry_res:
                 res_type["clipboard_restored"] = entry_res["clipboard_restored"]
@@ -8443,6 +9226,8 @@ def gui_action(
                 "status": "completed",
                 "action": "press_keys",
                 "keys": normalized_keys,
+                "expected_hwnd": audit_expected_hwnd,
+                "actual_hwnd": actual_fg_hwnd,
             }
 
         # normalized_action == "scroll"
@@ -8486,12 +9271,14 @@ def gui_action(
             "delta": clamped_delta,
             "x": scroll_x,
             "y": scroll_y,
+            "expected_hwnd": audit_expected_hwnd,
+            "actual_hwnd": actual_fg_hwnd,
             **coord_meta_scroll,
         }
 
     if _guard is not None:
         try:
-            return _execute_gui_action(_guard)
+            return _execute_gui_action(_guard, expected_hwnd)
         except ActionCancelledError as exc:
             return {
                 "ok": False,
@@ -8532,7 +9319,7 @@ def gui_action(
                 expected_hwnd=resolved_expected_hwnd,
                 require_foreground=require_foreground,
             ) as guard:
-                return _execute_gui_action(guard)
+                return _execute_gui_action(guard, resolved_expected_hwnd)
         except PreconditionFailedError as exc:
             abort = exc.to_abort_payload()
             abort["action"] = normalized_action
@@ -8547,7 +9334,7 @@ def gui_action(
             }
 
     try:
-        return _execute_gui_action(None)
+        return _execute_gui_action(None, resolved_expected_hwnd)
     except ActionCancelledError as exc:
         return {
             "ok": False,
@@ -8902,7 +9689,7 @@ def ui_batch(
             return snap_runner(user32=user32, cdp_bridge=cdp_bridge)
         return snap_runner(user32=user32)
 
-    is_stale = (time.time() - _LAST_UI_SNAPSHOT_TIME) > 60.0
+    is_stale = _UI_REF_STORE.stale or (time.time() - _LAST_UI_SNAPSHOT_TIME) > 60.0
     has_fresh_cdp_snap = (
         isinstance(_LAST_UI_SNAPSHOT, dict)
         and _LAST_UI_SNAPSHOT.get("source") == "cdp"
@@ -9321,6 +10108,8 @@ def register_windows_os_tools(
         coord_space: str | None = None,
         image_width: int | None = None,
         image_height: int | None = None,
+        capture_id: str | None = None,
+        capture_bounds: list[int] | None = None,
         ref: str | None = None,
         key: str | None = None,
         app_name: str | None = None,
@@ -9340,6 +10129,8 @@ def register_windows_os_tools(
             coord_space=coord_space,
             image_width=image_width,
             image_height=image_height,
+            capture_id=capture_id,
+            capture_bounds=capture_bounds,
             ref=ref,
             key=key,
             cdp_bridge=cdp_bridge,
